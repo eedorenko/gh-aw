@@ -202,10 +202,13 @@ async function sendOTLPMetrics(payload, endpointOverride) {
  *   inputTokens?: number,
  *   outputTokens?: number,
  *   emitsTokenUsage?: boolean,
+ *   toolCalls?: number,
+ *   failedToolCalls?: number,
+ *   outputItemTypes?: string[],
  * }} opts
  * @returns {any[]}
  */
-function buildBuiltinRunMetrics({ jobName = "", workflow = "", engine = "", model = "", conclusion = "", startMs, endMs, inputTokens, outputTokens, emitsTokenUsage = false }) {
+function buildBuiltinRunMetrics({ jobName = "", workflow = "", engine = "", model = "", conclusion = "", startMs, endMs, inputTokens, outputTokens, emitsTokenUsage = false, toolCalls, failedToolCalls, outputItemTypes = [] }) {
   const { buildAttr } = require("./send_otlp_span.cjs");
   /** @type {Array<[string, string]>} */
   const common = [
@@ -239,6 +242,24 @@ function buildBuiltinRunMetrics({ jobName = "", workflow = "", engine = "", mode
         metrics.push(buildOTLPMetric({ name, type: "counter", unit: "{token}", value, attributes: attrs([["gen_ai.request.model", model], ["gh-aw.engine", engine]]), startMs, endMs }));
       }
     }
+  }
+  const isCount = (/** @type {unknown} */ n) => typeof n === "number" && Number.isFinite(n) && n > 0;
+  if (isCount(toolCalls)) {
+    const failed = isCount(failedToolCalls) ? Math.min(/** @type {number} */ (failedToolCalls), /** @type {number} */ (toolCalls)) : 0;
+    const ok = /** @type {number} */ (toolCalls) - failed;
+    for (const [status, value] of /** @type {Array<[string, number]>} */ ([["ok", ok], ["error", failed]])) {
+      if (value > 0) {
+        metrics.push(buildOTLPMetric({ name: "gh_aw.tool_calls", type: "counter", unit: "{call}", value, attributes: attrs([["gh-aw.tool.status", status]]), startMs, endMs }));
+      }
+    }
+  }
+  /** @type {Record<string, number>} */
+  const byType = {};
+  for (const t of outputItemTypes) {
+    if (typeof t === "string" && t) byType[t] = (byType[t] || 0) + 1;
+  }
+  for (const [type, value] of Object.entries(byType)) {
+    metrics.push(buildOTLPMetric({ name: "gh_aw.safe_outputs", type: "counter", unit: "{item}", value, attributes: attrs([["gh-aw.safe_output.type", type]]), startMs, endMs }));
   }
   return metrics;
 }

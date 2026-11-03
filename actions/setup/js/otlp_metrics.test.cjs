@@ -73,6 +73,24 @@ describe("otlp_metrics.cjs", () => {
     });
   });
 
+  describe("buildBuiltinRunMetrics tool calls and safe outputs", () => {
+    const base = { jobName: "conclusion", startMs: 0, endMs: 1000, conclusion: "success" };
+
+    it("emits tool call counters split by status and safe output counters by type", () => {
+      const metrics = m.buildBuiltinRunMetrics({ ...base, toolCalls: 5, failedToolCalls: 2, outputItemTypes: ["add_comment", "add_comment", "create_issue"] });
+      const names = metrics.map((/** @type {any} */ x) => x.name);
+      expect(names.filter((/** @type {string} */ n) => n === "gh_aw.tool_calls")).toHaveLength(2);
+      expect(names.filter((/** @type {string} */ n) => n === "gh_aw.safe_outputs")).toHaveLength(2);
+      const ok = metrics.find((/** @type {any} */ x) => x.name === "gh_aw.tool_calls" && x.sum.dataPoints[0].asInt === "3" || x.sum?.dataPoints[0].asDouble === 3);
+      expect(ok).toBeDefined();
+    });
+
+    it("emits nothing extra when counts are absent", () => {
+      const metrics = m.buildBuiltinRunMetrics(base);
+      expect(metrics.map((/** @type {any} */ x) => x.name)).toEqual(["gh_aw.run.duration"]);
+    });
+  });
+
   describe("logMetric", () => {
     /** @type {Record<string, string | undefined>} */
     let saved;

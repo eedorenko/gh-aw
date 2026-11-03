@@ -2692,7 +2692,11 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   if (process.env.GH_AW_OTEL_METRICS === "true") {
     try {
       const { buildBuiltinRunMetrics, buildOTLPMetricsPayload, sendOTLPMetrics } = require("./otlp_metrics.cjs");
+      const gateway = readJSONIfExists("/tmp/gh-aw/usage/activity/summary.json")?.gateway;
       const metrics = buildBuiltinRunMetrics({
+        toolCalls: jobName === "conclusion" ? gateway?.total_calls : undefined,
+        failedToolCalls: jobName === "conclusion" ? gateway?.failed_calls : undefined,
+        outputItemTypes: rawItemTypes,
         jobName,
         workflow: workflowName,
         engine: engineId,
