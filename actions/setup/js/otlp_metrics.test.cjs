@@ -96,6 +96,7 @@ describe("otlp_metrics.cjs", () => {
     let saved;
     beforeEach(() => {
       saved = { ...process.env };
+      for (const k of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) delete process.env[k];
       vi.spyOn(console, "warn").mockImplementation(() => {});
     });
     afterEach(() => {
@@ -114,6 +115,21 @@ describe("otlp_metrics.cjs", () => {
       const body = JSON.parse(init.body);
       expect(body.resourceMetrics[0].scopeMetrics[0].metrics[0].name).toBe("my.count");
       vi.unstubAllGlobals();
+    });
+
+    it("rejects negative counters and invalid histogram buckets without throwing", async () => {
+      expect(() => m.buildOTLPMetric({ name: "c", value: -1, type: "counter" })).toThrow();
+      expect(() => m.buildOTLPMetric({ name: "h", value: 1, type: "histogram", buckets: [1, 1, 5] })).toThrow();
+      expect(() => m.buildOTLPMetric({ name: "h", value: 1, type: "histogram", buckets: [1, Infinity] })).toThrow();
+      await expect(m.logMetric("c", -1, { type: "counter" })).resolves.toBeUndefined();
+    });
+
+    it("encodes unsafe integers as doubles and sets a real interval start", () => {
+      const big = m.buildOTLPMetric({ name: "g", value: 1e20 });
+      expect(big.gauge.dataPoints[0].asDouble).toBe(1e20);
+      const c = m.buildOTLPMetric({ name: "c", value: 1, type: "counter", endMs: Date.now() + 1000 });
+      const dp = c.sum.dataPoints[0];
+      expect(BigInt(dp.startTimeUnixNano)).toBeLessThan(BigInt(dp.timeUnixNano));
     });
 
     it("never throws on invalid input", async () => {

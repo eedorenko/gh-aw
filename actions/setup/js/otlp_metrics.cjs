@@ -22,6 +22,9 @@ const AGGREGATION_TEMPORALITY_DELTA = 1;
 /** Default explicit histogram bucket bounds, in seconds. */
 const DEFAULT_HISTOGRAM_BUCKETS = [1, 5, 15, 30, 60, 120, 300, 600, 1800, 3600];
 
+/** Process start, used as the interval start for custom delta points. */
+const PROCESS_START_MS = Date.now();
+
 const METRIC_TYPES = ["counter", "gauge", "histogram"];
 
 /**
@@ -38,7 +41,7 @@ function toUnixNano(ms) {
  * @returns {{asInt: string} | {asDouble: number}}
  */
 function buildNumberValue(value) {
-  return Number.isInteger(value) ? { asInt: String(value) } : { asDouble: value };
+  return Number.isSafeInteger(value) ? { asInt: String(value) } : { asDouble: value };
 }
 
 /**
@@ -65,9 +68,12 @@ function buildOTLPMetric({ name, value, type = "gauge", unit = "", description =
     throw new Error(`metric ${name}: value must be a finite number`);
   }
   const end = endMs ?? Date.now();
-  const start = startMs ?? end;
+  const start = Math.min(startMs ?? PROCESS_START_MS, end);
   const base = { name, ...(unit ? { unit } : {}), ...(description ? { description } : {}) };
 
+  if (type === "counter" && value < 0) {
+    throw new Error(`metric ${name}: counter value must not be negative`);
+  }
   if (type === "gauge") {
     return { ...base, gauge: { dataPoints: [{ attributes, timeUnixNano: toUnixNano(end), ...buildNumberValue(value) }] } };
   }
@@ -83,6 +89,9 @@ function buildOTLPMetric({ name, value, type = "gauge", unit = "", description =
   }
   // histogram: a single observation placed into its explicit bucket
   const bounds = [...buckets].sort((a, b) => a - b);
+  if (bounds.some((b, i) => typeof b !== "number" || !Number.isFinite(b) || (i > 0 && b <= bounds[i - 1]))) {
+    throw new Error(`metric ${name}: histogram buckets must be finite and strictly increasing`);
+  }
   const bucketCounts = new Array(bounds.length + 1).fill("0");
   let idx = bounds.findIndex(b => value <= b);
   if (idx === -1) idx = bounds.length;
