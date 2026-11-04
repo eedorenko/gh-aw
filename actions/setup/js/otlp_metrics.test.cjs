@@ -147,6 +147,19 @@ describe("otlp_metrics.cjs", () => {
       vi.unstubAllGlobals();
     });
 
+    it("shares interval history across equivalent attribute orderings", async () => {
+      const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+      vi.stubGlobal("fetch", fetchMock);
+      delete process.env.GH_AW_OTLP_ENDPOINTS;
+      const endpoint = "http://collector.example:4318/";
+      await m.logMetric("order.count", 1, { type: "counter", attributes: { a: "x", b: "y" }, endpoint });
+      await new Promise(r => setTimeout(r, 5));
+      await m.logMetric("order.count", 1, { type: "counter", attributes: { b: "y", a: "x" }, endpoint });
+      const dp = i => JSON.parse(fetchMock.mock.calls[i][1].body).resourceMetrics[0].scopeMetrics[0].metrics[0].sum.dataPoints[0];
+      expect(dp(1).startTimeUnixNano).toBe(dp(0).timeUnixNano);
+      vi.unstubAllGlobals();
+    });
+
     it("never throws on invalid input", async () => {
       await expect(m.logMetric("bad", NaN)).resolves.toBeUndefined();
       expect(console.warn).toHaveBeenCalled();

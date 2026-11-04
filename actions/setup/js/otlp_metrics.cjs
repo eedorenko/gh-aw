@@ -317,7 +317,12 @@ async function logMetric(name, value, options = {}) {
       staged: awInfo.staged === true,
     });
     const attributes = Object.entries(options.attributes || {}).map(([k, v]) => buildAttr(k, v));
-    const seriesKey = JSON.stringify([name, options.type || "gauge", attributes]);
+    // Canonical key: sanitized (as exported) and sorted by attribute key so equivalent series share one interval history.
+    const { sanitizeAttrs } = require("./send_otlp_span.cjs");
+    const canonicalAttrs = sanitizeAttrs(attributes)
+      .map(a => [a.key, a.value])
+      .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+    const seriesKey = JSON.stringify([name, options.type || "gauge", canonicalAttrs]);
     const endMs = Date.now();
     const startMs = Math.min(lastEndBySeries.get(seriesKey) ?? PROCESS_START_MS, endMs);
     const metric = buildOTLPMetric({
