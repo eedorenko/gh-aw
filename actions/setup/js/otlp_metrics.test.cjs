@@ -147,6 +147,23 @@ describe("otlp_metrics.cjs", () => {
       vi.unstubAllGlobals();
     });
 
+    it("emits strictly increasing, non-empty intervals for same-millisecond calls", async () => {
+      const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+      vi.stubGlobal("fetch", fetchMock);
+      delete process.env.GH_AW_OTLP_ENDPOINTS;
+      vi.spyOn(Date, "now").mockReturnValue(1_900_000_000_000);
+      const opts = { type: "counter", attributes: { s: "t" }, endpoint: "http://collector.example:4318/" };
+      await m.logMetric("tick.count", 1, opts);
+      await m.logMetric("tick.count", 1, opts);
+      vi.restoreAllMocks();
+      const dp = i => JSON.parse(fetchMock.mock.calls[i][1].body).resourceMetrics[0].scopeMetrics[0].metrics[0].sum.dataPoints[0];
+      const [a, b] = [dp(0), dp(1)];
+      expect(BigInt(a.startTimeUnixNano)).toBeLessThan(BigInt(a.timeUnixNano));
+      expect(b.startTimeUnixNano).toBe(a.timeUnixNano);
+      expect(BigInt(b.startTimeUnixNano)).toBeLessThan(BigInt(b.timeUnixNano));
+      vi.unstubAllGlobals();
+    });
+
     it("shares interval history across equivalent attribute orderings", async () => {
       const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
       vi.stubGlobal("fetch", fetchMock);

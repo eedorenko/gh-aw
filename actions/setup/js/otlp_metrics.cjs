@@ -323,8 +323,9 @@ async function logMetric(name, value, options = {}) {
       .map(a => [a.key, a.value])
       .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
     const seriesKey = JSON.stringify([name, options.type || "gauge", canonicalAttrs]);
-    const endMs = Date.now();
-    const startMs = Math.min(lastEndBySeries.get(seriesKey) ?? PROCESS_START_MS, endMs);
+    const startMs = lastEndBySeries.get(seriesKey) ?? PROCESS_START_MS;
+    // Keep every interval non-empty so same-millisecond calls never emit zero-length or duplicate-end points.
+    const endMs = Math.max(Date.now(), startMs + 1);
     const metric = buildOTLPMetric({
       name,
       value,
