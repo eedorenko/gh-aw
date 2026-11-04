@@ -96,6 +96,7 @@ describe("otlp_metrics.cjs", () => {
     let saved;
     beforeEach(() => {
       saved = { ...process.env };
+      for (const k of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) delete process.env[k];
       vi.spyOn(console, "warn").mockImplementation(() => {});
     });
     afterEach(() => {
@@ -113,6 +114,83 @@ describe("otlp_metrics.cjs", () => {
       expect(url).toBe("http://collector.example:4318/v1/metrics");
       const body = JSON.parse(init.body);
       expect(body.resourceMetrics[0].scopeMetrics[0].metrics[0].name).toBe("my.count");
+      vi.unstubAllGlobals();
+    });
+
+    it("rejects negative counters and invalid histogram buckets without throwing", async () => {
+      expect(() => m.buildOTLPMetric({ name: "c", value: -1, type: "counter" })).toThrow();
+      expect(() => m.buildOTLPMetric({ name: "h", value: 1, type: "histogram", buckets: [1, 1, 5] })).toThrow();
+      expect(() => m.buildOTLPMetric({ name: "h", value: 1, type: "histogram", buckets: [1, Infinity] })).toThrow();
+      await expect(m.logMetric("c", -1, { type: "counter" })).resolves.toBeUndefined();
+    });
+
+    it("encodes unsafe integers as doubles and sets a real interval start", () => {
+      const big = m.buildOTLPMetric({ name: "g", value: 1e20 });
+      expect(big.gauge.dataPoints[0].asDouble).toBe(1e20);
+      const c = m.buildOTLPMetric({ name: "c", value: 1, type: "counter", endMs: Date.now() + 1000 });
+      const dp = c.sum.dataPoints[0];
+      expect(BigInt(dp.startTimeUnixNano)).toBeLessThan(BigInt(dp.timeUnixNano));
+    });
+
+    it("keeps repeated delta points for a series contiguous and non-overlapping", async () => {
+      const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+      vi.stubGlobal("fetch", fetchMock);
+      delete process.env.GH_AW_OTLP_ENDPOINTS;
+      const opts = { type: "counter", attributes: { k: "v" }, endpoint: "http://collector.example:4318/" };
+      await m.logMetric("series.count", 1, opts);
+      await new Promise(r => setTimeout(r, 5));
+      await m.logMetric("series.count", 1, opts);
+      const dp = i => JSON.parse(fetchMock.mock.calls[i][1].body).resourceMetrics[0].scopeMetrics[0].metrics[0].sum.dataPoints[0];
+      const [a, b] = [dp(0), dp(1)];
+      expect(b.startTimeUnixNano).toBe(a.timeUnixNano);
+      expect(BigInt(b.startTimeUnixNano)).toBeLessThan(BigInt(b.timeUnixNano));
+      vi.unstubAllGlobals();
+    });
+
+    it("keeps real observation time for gauges and sub-millisecond drift for same-tick deltas", async () => {
+      const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+      vi.stubGlobal("fetch", fetchMock);
+      delete process.env.GH_AW_OTLP_ENDPOINTS;
+      vi.spyOn(Date, "now").mockReturnValue(1_900_000_000_000);
+      const endpoint = "http://collector.example:4318/";
+      for (let i = 0; i < 2000; i++) await m.logMetric("burst.count", 1, { type: "counter", endpoint });
+      await m.logMetric("burst.gauge", 5, { endpoint });
+      vi.restoreAllMocks();
+      const calls = fetchMock.mock.calls;
+      const last = JSON.parse(calls[1999][1].body).resourceMetrics[0].scopeMetrics[0].metrics[0].sum.dataPoints[0];
+      expect(BigInt(last.timeUnixNano) - 1_900_000_000_000n * 1000000n).toBeLessThan(3_000_000n);
+      const g = JSON.parse(calls[2000][1].body).resourceMetrics[0].scopeMetrics[0].metrics[0].gauge.dataPoints[0];
+      expect(g.timeUnixNano).toBe((1_900_000_000_000n * 1000000n).toString());
+      vi.unstubAllGlobals();
+    });
+
+    it("emits strictly increasing, non-empty intervals for same-millisecond calls", async () => {
+      const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+      vi.stubGlobal("fetch", fetchMock);
+      delete process.env.GH_AW_OTLP_ENDPOINTS;
+      vi.spyOn(Date, "now").mockReturnValue(1_900_000_000_000);
+      const opts = { type: "counter", attributes: { s: "t" }, endpoint: "http://collector.example:4318/" };
+      await m.logMetric("tick.count", 1, opts);
+      await m.logMetric("tick.count", 1, opts);
+      vi.restoreAllMocks();
+      const dp = i => JSON.parse(fetchMock.mock.calls[i][1].body).resourceMetrics[0].scopeMetrics[0].metrics[0].sum.dataPoints[0];
+      const [a, b] = [dp(0), dp(1)];
+      expect(BigInt(a.startTimeUnixNano)).toBeLessThan(BigInt(a.timeUnixNano));
+      expect(b.startTimeUnixNano).toBe(a.timeUnixNano);
+      expect(BigInt(b.startTimeUnixNano)).toBeLessThan(BigInt(b.timeUnixNano));
+      vi.unstubAllGlobals();
+    });
+
+    it("shares interval history across equivalent attribute orderings", async () => {
+      const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+      vi.stubGlobal("fetch", fetchMock);
+      delete process.env.GH_AW_OTLP_ENDPOINTS;
+      const endpoint = "http://collector.example:4318/";
+      await m.logMetric("order.count", 1, { type: "counter", attributes: { a: "x", b: "y" }, endpoint });
+      await new Promise(r => setTimeout(r, 5));
+      await m.logMetric("order.count", 1, { type: "counter", attributes: { b: "y", a: "x" }, endpoint });
+      const dp = i => JSON.parse(fetchMock.mock.calls[i][1].body).resourceMetrics[0].scopeMetrics[0].metrics[0].sum.dataPoints[0];
+      expect(dp(1).startTimeUnixNano).toBe(dp(0).timeUnixNano);
       vi.unstubAllGlobals();
     });
 

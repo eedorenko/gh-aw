@@ -22,6 +22,12 @@ const AGGREGATION_TEMPORALITY_DELTA = 1;
 /** Default explicit histogram bucket bounds, in seconds. */
 const DEFAULT_HISTOGRAM_BUCKETS = [1, 5, 15, 30, 60, 120, 300, 600, 1800, 3600];
 
+/** Process start, used as the interval start for custom delta points. */
+const PROCESS_START_MS = Date.now();
+
+/** Last end time per series (name, type, attributes) so repeated delta points never overlap. */
+const lastEndBySeries = new Map();
+
 const METRIC_TYPES = ["counter", "gauge", "histogram"];
 
 /**
@@ -29,7 +35,8 @@ const METRIC_TYPES = ["counter", "gauge", "histogram"];
  * @returns {string} nanoseconds since epoch as a decimal string
  */
 function toUnixNano(ms) {
-  return (BigInt(Math.trunc(ms)) * 1000000n).toString();
+  // Microsecond precision: fractional milliseconds are preserved.
+  return (BigInt(Math.round(ms * 1000)) * 1000n).toString();
 }
 
 /**
@@ -38,7 +45,7 @@ function toUnixNano(ms) {
  * @returns {{asInt: string} | {asDouble: number}}
  */
 function buildNumberValue(value) {
-  return Number.isInteger(value) ? { asInt: String(value) } : { asDouble: value };
+  return Number.isSafeInteger(value) ? { asInt: String(value) } : { asDouble: value };
 }
 
 /**
@@ -65,9 +72,12 @@ function buildOTLPMetric({ name, value, type = "gauge", unit = "", description =
     throw new Error(`metric ${name}: value must be a finite number`);
   }
   const end = endMs ?? Date.now();
-  const start = startMs ?? end;
+  const start = Math.min(startMs ?? PROCESS_START_MS, end);
   const base = { name, ...(unit ? { unit } : {}), ...(description ? { description } : {}) };
 
+  if (type === "counter" && value < 0) {
+    throw new Error(`metric ${name}: counter value must not be negative`);
+  }
   if (type === "gauge") {
     return { ...base, gauge: { dataPoints: [{ attributes, timeUnixNano: toUnixNano(end), ...buildNumberValue(value) }] } };
   }
@@ -83,6 +93,9 @@ function buildOTLPMetric({ name, value, type = "gauge", unit = "", description =
   }
   // histogram: a single observation placed into its explicit bucket
   const bounds = [...buckets].sort((a, b) => a - b);
+  if (bounds.some((b, i) => typeof b !== "number" || !Number.isFinite(b) || (i > 0 && b <= bounds[i - 1]))) {
+    throw new Error(`metric ${name}: histogram buckets must be finite and strictly increasing`);
+  }
   const bucketCounts = new Array(bounds.length + 1).fill("0");
   let idx = bounds.findIndex(b => value <= b);
   if (idx === -1) idx = bounds.length;
@@ -304,6 +317,19 @@ async function logMetric(name, value, options = {}) {
       awmgVersion: "",
       staged: awInfo.staged === true,
     });
+    const attributes = Object.entries(options.attributes || {}).map(([k, v]) => buildAttr(k, v));
+    // Canonical key: sanitized (as exported) and sorted by attribute key so equivalent series share one interval history.
+    const { sanitizeAttrs } = require("./send_otlp_span.cjs");
+    const canonicalAttrs = sanitizeAttrs(attributes)
+      .map(a => [a.key, a.value])
+      .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+    const seriesKey = JSON.stringify([name, options.type || "gauge", canonicalAttrs]);
+    const now = Date.now();
+    const isGauge = (options.type || "gauge") === "gauge";
+    // Gauges are instantaneous: keep the real observation time. Delta points keep contiguous, non-empty
+    // intervals; same-millisecond calls advance by 1µs (not 1ms) so drift stays negligible.
+    const startMs = isGauge ? now : (lastEndBySeries.get(seriesKey) ?? PROCESS_START_MS);
+    const endMs = isGauge ? now : Math.max(now, startMs + 0.001);
     const metric = buildOTLPMetric({
       name,
       value,
@@ -311,8 +337,11 @@ async function logMetric(name, value, options = {}) {
       unit: options.unit,
       description: options.description,
       buckets: options.buckets,
-      attributes: Object.entries(options.attributes || {}).map(([k, v]) => buildAttr(k, v)),
+      attributes,
+      startMs,
+      endMs,
     });
+    if (!isGauge) lastEndBySeries.set(seriesKey, endMs);
     const payload = buildOTLPMetricsPayload({ serviceName: process.env.OTEL_SERVICE_NAME || "gh-aw", scopeVersion, resourceAttributes, metrics: [metric] });
     await sendOTLPMetrics(payload, options.endpoint);
   } catch (err) {
