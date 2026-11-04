@@ -25,6 +25,9 @@ const DEFAULT_HISTOGRAM_BUCKETS = [1, 5, 15, 30, 60, 120, 300, 600, 1800, 3600];
 /** Process start, used as the interval start for custom delta points. */
 const PROCESS_START_MS = Date.now();
 
+/** Last end time per series (name, type, attributes) so repeated delta points never overlap. */
+const lastEndBySeries = new Map();
+
 const METRIC_TYPES = ["counter", "gauge", "histogram"];
 
 /**
@@ -313,6 +316,10 @@ async function logMetric(name, value, options = {}) {
       awmgVersion: "",
       staged: awInfo.staged === true,
     });
+    const attributes = Object.entries(options.attributes || {}).map(([k, v]) => buildAttr(k, v));
+    const seriesKey = JSON.stringify([name, options.type || "gauge", attributes]);
+    const endMs = Date.now();
+    const startMs = Math.min(lastEndBySeries.get(seriesKey) ?? PROCESS_START_MS, endMs);
     const metric = buildOTLPMetric({
       name,
       value,
@@ -320,8 +327,11 @@ async function logMetric(name, value, options = {}) {
       unit: options.unit,
       description: options.description,
       buckets: options.buckets,
-      attributes: Object.entries(options.attributes || {}).map(([k, v]) => buildAttr(k, v)),
+      attributes,
+      startMs,
+      endMs,
     });
+    lastEndBySeries.set(seriesKey, endMs);
     const payload = buildOTLPMetricsPayload({ serviceName: process.env.OTEL_SERVICE_NAME || "gh-aw", scopeVersion, resourceAttributes, metrics: [metric] });
     await sendOTLPMetrics(payload, options.endpoint);
   } catch (err) {
