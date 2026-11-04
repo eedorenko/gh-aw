@@ -147,6 +147,23 @@ describe("otlp_metrics.cjs", () => {
       vi.unstubAllGlobals();
     });
 
+    it("keeps real observation time for gauges and sub-millisecond drift for same-tick deltas", async () => {
+      const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+      vi.stubGlobal("fetch", fetchMock);
+      delete process.env.GH_AW_OTLP_ENDPOINTS;
+      vi.spyOn(Date, "now").mockReturnValue(1_900_000_000_000);
+      const endpoint = "http://collector.example:4318/";
+      for (let i = 0; i < 2000; i++) await m.logMetric("burst.count", 1, { type: "counter", endpoint });
+      await m.logMetric("burst.gauge", 5, { endpoint });
+      vi.restoreAllMocks();
+      const calls = fetchMock.mock.calls;
+      const last = JSON.parse(calls[1999][1].body).resourceMetrics[0].scopeMetrics[0].metrics[0].sum.dataPoints[0];
+      expect(BigInt(last.timeUnixNano) - 1_900_000_000_000n * 1000000n).toBeLessThan(3_000_000n);
+      const g = JSON.parse(calls[2000][1].body).resourceMetrics[0].scopeMetrics[0].metrics[0].gauge.dataPoints[0];
+      expect(g.timeUnixNano).toBe((1_900_000_000_000n * 1000000n).toString());
+      vi.unstubAllGlobals();
+    });
+
     it("emits strictly increasing, non-empty intervals for same-millisecond calls", async () => {
       const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
       vi.stubGlobal("fetch", fetchMock);

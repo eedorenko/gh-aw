@@ -35,7 +35,8 @@ const METRIC_TYPES = ["counter", "gauge", "histogram"];
  * @returns {string} nanoseconds since epoch as a decimal string
  */
 function toUnixNano(ms) {
-  return (BigInt(Math.trunc(ms)) * 1000000n).toString();
+  // Microsecond precision: fractional milliseconds are preserved.
+  return (BigInt(Math.round(ms * 1000)) * 1000n).toString();
 }
 
 /**
@@ -323,9 +324,12 @@ async function logMetric(name, value, options = {}) {
       .map(a => [a.key, a.value])
       .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
     const seriesKey = JSON.stringify([name, options.type || "gauge", canonicalAttrs]);
-    const startMs = lastEndBySeries.get(seriesKey) ?? PROCESS_START_MS;
-    // Keep every interval non-empty so same-millisecond calls never emit zero-length or duplicate-end points.
-    const endMs = Math.max(Date.now(), startMs + 1);
+    const now = Date.now();
+    const isGauge = (options.type || "gauge") === "gauge";
+    // Gauges are instantaneous: keep the real observation time. Delta points keep contiguous, non-empty
+    // intervals; same-millisecond calls advance by 1µs (not 1ms) so drift stays negligible.
+    const startMs = isGauge ? now : (lastEndBySeries.get(seriesKey) ?? PROCESS_START_MS);
+    const endMs = isGauge ? now : Math.max(now, startMs + 0.001);
     const metric = buildOTLPMetric({
       name,
       value,
@@ -337,7 +341,7 @@ async function logMetric(name, value, options = {}) {
       startMs,
       endMs,
     });
-    lastEndBySeries.set(seriesKey, endMs);
+    if (!isGauge) lastEndBySeries.set(seriesKey, endMs);
     const payload = buildOTLPMetricsPayload({ serviceName: process.env.OTEL_SERVICE_NAME || "gh-aw", scopeVersion, resourceAttributes, metrics: [metric] });
     await sendOTLPMetrics(payload, options.endpoint);
   } catch (err) {
