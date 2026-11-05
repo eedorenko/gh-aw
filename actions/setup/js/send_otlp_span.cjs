@@ -1150,15 +1150,9 @@ function getOTLPIfMissingMode(value) {
  * Returns an empty array when no endpoint is configured, so callers can skip
  * the export step without additional checks.
  *
- * When `GH_AW_OTLP_IF_MISSING=ignore` (set only for the enterprise-default
- * endpoint/headers fallback — see resolveOTLPEndpointEntries in
- * pkg/workflow/observability_otlp.go), an endpoint with a URL but no headers is
- * dropped rather than exported unauthenticated. This is the single choke point
- * used by every span emitter (job-setup, conclusion, outcome, MCP gateway), so
- * the guard applies uniformly regardless of job ordering — a half-configured
- * default (endpoint set, headers secret unset) can never leak telemetry before
- * the agent job's check_otlp_default_credentials.sh step runs, because that
- * step only runs in one job while this function runs in all of them.
+ * An endpoint with a URL and no headers is valid (unauthenticated collectors),
+ * so every signal (traces, metrics) shares this same endpoint list. Endpoints
+ * whose Authorization header is present but empty are dropped.
  *
  * @returns {OTLPEndpointEntry[]}
  */
@@ -1168,18 +1162,12 @@ function parseOTLPEndpoints() {
   try {
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed) && parsed.length > 0) {
-      const ignoreMissingCredentials = getOTLPIfMissingMode(process.env.GH_AW_OTLP_IF_MISSING) === "ignore";
       /** @type {OTLPEndpointEntry[]} */
       const valid = parsed
         .filter(e => e && typeof e.url === "string" && e.url.trim() !== "")
         .filter(e => {
           const hasHeaders = typeof e.headers === "string" && e.headers !== "";
           if (hasHeaders && hasEmptyOTLPAuthorizationHeader(e.headers)) {
-            return false;
-          }
-          if (ignoreMissingCredentials && !hasHeaders) {
-            // Enterprise-default endpoint configured without matching credentials:
-            // treat as unconfigured instead of exporting unauthenticated telemetry.
             return false;
           }
           return true;
