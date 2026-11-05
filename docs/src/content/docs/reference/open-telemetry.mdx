@@ -327,6 +327,34 @@ await sendOTLPSpan(endpoint, buildOTLPPayload({
 
 </details>
 
+## Metrics
+
+gh-aw can also export OTLP metrics (counters, gauges, histograms) to `{endpoint}/v1/metrics`, using the same endpoints, headers and retry behavior as traces. Backends that do not accept OTLP metrics will log a warning and are otherwise unaffected.
+
+### Custom metrics
+
+```javascript
+const otlp = require(path.join(process.env.RUNNER_TEMP, 'gh-aw', 'actions', 'otlp.cjs'));
+
+await otlp.logMetric('my-tool.items_processed', 42, {
+  type: 'counter',            // 'counter' | 'gauge' (default) | 'histogram'
+  unit: '{item}',
+  attributes: { 'my-tool.result': 'ok' },
+});
+```
+
+`logMetric` is non-fatal and never throws. Counters are monotonic delta sums. Each histogram call records one observation; pass `buckets` for custom explicit bounds (default is in seconds). Attributes are sanitized exactly like span attributes. Every metric is also mirrored to `/tmp/gh-aw/otel-metrics.jsonl`.
+
+### Built-in metrics
+
+Set `GH_AW_OTEL_METRICS=true` to emit these from each job's conclusion step, derived from data already collected for the conclusion span:
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `gh_aw.run.duration` | histogram (`s`) | Job wall-clock duration |
+| `gh_aw.run.errors` | counter | Emitted when the agent concluded with `failure` or `timed_out` |
+| `gh_aw.tokens.input` / `gh_aw.tokens.output` | counter (`{token}`) | Model token usage, only on jobs that run the model |
+
 ## Learn More
 
 - [OpenTelemetry attribute reference](/gh-aw/reference/open-telemetry-attributes/)

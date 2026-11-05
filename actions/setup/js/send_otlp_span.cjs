@@ -1150,15 +1150,9 @@ function getOTLPIfMissingMode(value) {
  * Returns an empty array when no endpoint is configured, so callers can skip
  * the export step without additional checks.
  *
- * When `GH_AW_OTLP_IF_MISSING=ignore` (set only for the enterprise-default
- * endpoint/headers fallback — see resolveOTLPEndpointEntries in
- * pkg/workflow/observability_otlp.go), an endpoint with a URL but no headers is
- * dropped rather than exported unauthenticated. This is the single choke point
- * used by every span emitter (job-setup, conclusion, outcome, MCP gateway), so
- * the guard applies uniformly regardless of job ordering — a half-configured
- * default (endpoint set, headers secret unset) can never leak telemetry before
- * the agent job's check_otlp_default_credentials.sh step runs, because that
- * step only runs in one job while this function runs in all of them.
+ * An endpoint with a URL and no headers is valid (unauthenticated collectors),
+ * so every signal (traces, metrics) shares this same endpoint list. Endpoints
+ * whose Authorization header is present but empty are dropped.
  *
  * @returns {OTLPEndpointEntry[]}
  */
@@ -1168,18 +1162,12 @@ function parseOTLPEndpoints() {
   try {
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed) && parsed.length > 0) {
-      const ignoreMissingCredentials = getOTLPIfMissingMode(process.env.GH_AW_OTLP_IF_MISSING) === "ignore";
       /** @type {OTLPEndpointEntry[]} */
       const valid = parsed
         .filter(e => e && typeof e.url === "string" && e.url.trim() !== "")
         .filter(e => {
           const hasHeaders = typeof e.headers === "string" && e.headers !== "";
           if (hasHeaders && hasEmptyOTLPAuthorizationHeader(e.headers)) {
-            return false;
-          }
-          if (ignoreMissingCredentials && !hasHeaders) {
-            // Enterprise-default endpoint configured without matching credentials:
-            // treat as unconfigured instead of exporting unauthenticated telemetry.
             return false;
           }
           return true;
@@ -1236,10 +1224,11 @@ async function sendOTLPToAllEndpoints(endpoints, payload, opts = {}) {
  *
  * @param {string} endpoint  - OTLP base URL (e.g. https://traces.example.com:4317)
  * @param {any} payload   - Serialisable OTLP JSON object
- * @param {{ maxRetries?: number, baseDelayMs?: number, skipJSONL?: boolean, headersOverride?: string }} [opts]
+ * @param {{ maxRetries?: number, baseDelayMs?: number, skipJSONL?: boolean, headersOverride?: string, urlPath?: string, sanitize?: (p: any) => any }} [opts]
+ * `urlPath` defaults to `/v1/traces`; the metrics signal passes `/v1/metrics` with its own sanitizer.
  * @returns {Promise<void>}
  */
-async function sendOTLPSpan(endpoint, payload, { maxRetries = 2, baseDelayMs = 100, skipJSONL = false, headersOverride = undefined } = {}) {
+async function sendOTLPSpan(endpoint, payload, { maxRetries = 2, baseDelayMs = 100, skipJSONL = false, headersOverride = undefined, urlPath = "/v1/traces", sanitize = sanitizeOTLPPayload } = {}) {
   // Mirror payload locally so it survives even when the collector is unreachable.
   // Callers that already wrote the JSONL mirror pass skipJSONL: true to avoid a
   // duplicate line.
@@ -1247,7 +1236,7 @@ async function sendOTLPSpan(endpoint, payload, { maxRetries = 2, baseDelayMs = 1
     appendToOTLPJSONL(payload);
   }
 
-  const url = endpoint.replace(/\/$/, "") + "/v1/traces";
+  const url = endpoint.replace(/\/$/, "") + urlPath;
   // Use headersOverride when explicitly provided (including empty string, which means
   // "this endpoint has no configured headers" in the multi-endpoint fan-out path).
   // Fall back to OTEL_EXPORTER_OTLP_HEADERS only when headersOverride is absent
@@ -1255,7 +1244,7 @@ async function sendOTLPSpan(endpoint, payload, { maxRetries = 2, baseDelayMs = 1
   const rawHeaders = headersOverride !== undefined ? headersOverride : process.env.OTEL_EXPORTER_OTLP_HEADERS || "";
   const extraHeaders = parseOTLPHeaders(rawHeaders);
   const headers = { "Content-Type": "application/json", ...extraHeaders };
-  const sanitizedBody = JSON.stringify(sanitizeOTLPPayload(payload));
+  const sanitizedBody = JSON.stringify(sanitize(payload));
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     if (attempt > 0) {
       await new Promise(resolve => setTimeout(resolve, baseDelayMs * 2 ** (attempt - 1)));
@@ -2686,6 +2675,33 @@ async function sendJobConclusionSpan(spanName, options = {}) {
     events: spanEvents,
   });
 
+  // Built-in metrics are opt-in (GH_AW_OTEL_METRICS=true) because not every
+  // OTLP backend accepts /v1/metrics. Failures never affect the workflow.
+  if (process.env.GH_AW_OTEL_METRICS === "true") {
+    try {
+      const { buildBuiltinRunMetrics, buildOTLPMetricsPayload, sendOTLPMetrics } = require("./otlp_metrics.cjs");
+      const gateway = readJSONIfExists("/tmp/gh-aw/usage/activity/summary.json")?.gateway;
+      const metrics = buildBuiltinRunMetrics({
+        toolCalls: jobName === "conclusion" ? gateway?.total_calls : undefined,
+        failedToolCalls: jobName === "conclusion" ? gateway?.failed_calls : undefined,
+        outputItemTypes: jobName === "conclusion" ? rawItemTypes : [],
+        jobName,
+        workflow: workflowName,
+        engine: engineId,
+        model,
+        conclusion: agentConclusion || (runStatus === "timeout" ? "timed_out" : runStatus),
+        startMs,
+        endMs,
+        inputTokens: agentUsage.input_tokens,
+        outputTokens: agentUsage.output_tokens,
+        emitsTokenUsage: jobEmitsOwnTokenUsage,
+      });
+      await sendOTLPMetrics(buildOTLPMetricsPayload({ serviceName, scopeVersion: version, resourceAttributes, metrics }));
+    } catch (err) {
+      console.warn(`[otlp] failed to emit built-in metrics: ${getErrorMessage(err)}`);
+    }
+  }
+
   // Always mirror to JSONL — the artifact is useful even without a live collector.
   appendToOTLPJSONL(payload);
 
@@ -2717,6 +2733,8 @@ module.exports = {
   buildOTLPBatchPayload,
   buildOTLPBatchPayloads,
   buildOTLPPayload,
+  buildOTLPResourceAttributes,
+  sanitizeAttrs,
   sanitizeOTLPPayload,
   parseOTLPHeaders,
   parseOTLPEndpoints,

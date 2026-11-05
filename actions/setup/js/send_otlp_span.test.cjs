@@ -7380,11 +7380,11 @@ describe("parseOTLPEndpoints", () => {
       delete process.env.GH_AW_OTLP_ENDPOINTS;
     });
 
-    it("drops an endpoint with a URL but no headers to avoid unauthenticated export", () => {
+    it("keeps an endpoint with a URL but no headers (unauthenticated collector)", () => {
       process.env.GH_AW_OTLP_IF_MISSING = "ignore";
       process.env.GH_AW_OTLP_ENDPOINTS = JSON.stringify([{ url: "https://traces.example.com:4317" }]);
       const result = parseOTLPEndpoints();
-      expect(result).toEqual([]);
+      expect(result).toEqual([{ url: "https://traces.example.com:4317" }]);
     });
 
     it("keeps an endpoint when both URL and headers are set", () => {
