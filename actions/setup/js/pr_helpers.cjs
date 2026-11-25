@@ -2,6 +2,8 @@
 
 const { getErrorMessage } = require("./error_helpers.cjs");
 
+const MAX_BRANCH_RULE_PAGES = 50;
+
 /**
  * Detect if a pull request is from a fork repository.
  *
@@ -108,12 +110,45 @@ function buildBranchInstruction(effectiveBaseBranch, resolvedDefaultBranch) {
 }
 
 /**
+ * @param {import("@actions/github-script").AsyncFunctionArguments["github"]} githubClient
+ * @param {string} owner
+ * @param {string} repo
+ * @param {string} branch
+ * @param {{signedCommits?: boolean}} [options]
+ * @returns {Promise<boolean>}
+ */
+async function hasOnlyNonBlockingRules(githubClient, owner, repo, branch, { signedCommits } = {}) {
+  const allowedRuleTypes = new Set([
+    "copilot_code_review",
+    "branch_name_pattern",
+    "commit_message_pattern",
+    "commit_author_email_pattern",
+    "committer_email_pattern",
+    "file_path_restriction",
+    "file_extension_restriction",
+    "max_file_path_length",
+    "max_file_size",
+  ]);
+  if (signedCommits === true) allowedRuleTypes.add("required_signatures");
+
+  // Read pages directly: Octokit's paginator can swallow a later-page HTTP 409.
+  for (let page = 1; page <= MAX_BRANCH_RULE_PAGES; page++) {
+    const { data: rules } = await githubClient.rest.repos.getBranchRules({ owner, repo, branch, per_page: 100, page });
+    if (!Array.isArray(rules) || (page === 1 && rules.length === 0) || !rules.every(rule => allowedRuleTypes.has(rule?.type))) {
+      return false;
+    }
+    if (rules.length < 100) return true;
+  }
+  return false;
+}
+
+/**
  * Check whether a branch is safe to push to.
  *
  * Performs two security checks:
  * 1. Ensures the branch is not the repository's default branch.
- * 2. When `checkBranchProtection` is true, queries the branch protection API to
- *    verify the branch has no protection rules.
+ * 2. When `checkBranchProtection` is true, queries the branch API to
+ *    verify the branch has no blocking protection rules.
  *
  * Returns null when the push is safe to proceed, or a string error message that
  * should be surfaced as a hard failure when the push must be blocked.
@@ -122,10 +157,11 @@ function buildBranchInstruction(effectiveBaseBranch, resolvedDefaultBranch) {
  * @param {string} owner - Repository owner
  * @param {string} repo - Repository name
  * @param {string} branchName - Target branch to validate
- * @param {boolean} checkBranchProtection - Whether to call the branch protection API
+ * @param {boolean} checkBranchProtection - Whether to call the branch API to check protection
+ * @param {{signedCommits?: boolean, onProtectionException?: () => void}} [options] - Signed push configuration and callback when a protected branch is allowed
  * @returns {Promise<string|null>} Error message if push is blocked, null if safe
  */
-async function checkBranchPushable(githubClient, owner, repo, branchName, checkBranchProtection) {
+async function checkBranchPushable(githubClient, owner, repo, branchName, checkBranchProtection, options = {}) {
   // Check whether the branch is the repository default branch
   /** @type {any} */
   let defaultBranch = null;
@@ -144,14 +180,42 @@ async function checkBranchPushable(githubClient, owner, repo, branchName, checkB
   if (checkBranchProtection) {
     let isBranchProtected = false;
     try {
-      await githubClient.rest.repos.getBranchProtection({ owner, repo, branch: branchName });
-      // Successful response means branch protection rules exist
-      isBranchProtected = true;
+      const { data: branchData } = await githubClient.rest.repos.getBranch({ owner, repo, branch: branchName });
+      isBranchProtected = branchData.protected;
+      // The protected flag includes non-blocking rulesets. Confirm classic protection separately.
+      if (isBranchProtected && typeof defaultBranch === "string" && defaultBranch.length > 0 && branchName !== defaultBranch && branchData.protection?.enabled === false) {
+        try {
+          if (await hasOnlyNonBlockingRules(githubClient, owner, repo, branchName, options)) {
+            // refUpdateRule exposes classic protection to non-admins.
+            const result = await githubClient.graphql(
+              `query($owner: String!, $repo: String!, $ref: String!) {
+                repository(owner: $owner, name: $repo) {
+                  ref(qualifiedName: $ref) {
+                    refUpdateRule { pattern }
+                  }
+                }
+              }`,
+              { owner, repo, ref: `refs/heads/${branchName}` }
+            );
+            const classicRule = result?.repository?.ref?.refUpdateRule;
+            if (classicRule === undefined) {
+              throw new Error("Classic branch protection query did not return a ref update rule");
+            }
+            if (classicRule === null) {
+              options.onProtectionException?.();
+              core.info(`Branch "${branchName}" only has non-blocking rules and no classic protection; proceeding to push`);
+              isBranchProtected = false;
+            }
+          }
+        } catch (rulesError) {
+          return `Cannot verify branch protection rules for "${branchName}": ${getErrorMessage(rulesError)}. Push blocked to prevent accidental writes to protected branches.`;
+        }
+      }
     } catch (protectionError) {
       const protectionStatus = protectionError && typeof protectionError === "object" && "status" in protectionError ? protectionError.status : undefined;
       if (protectionStatus === 404) {
-        // 404 means no protection rules – safe to proceed
-        core.info(`Branch "${branchName}" has no protection rules`);
+        // 404 means the branch does not exist – safe to proceed
+        core.info(`Branch "${branchName}" not found; proceeding to push`);
       } else if (protectionStatus === 403) {
         // 403 means the token lacks permission to read branch protection rules.
         // The GitHub platform will still enforce branch protection at push time,

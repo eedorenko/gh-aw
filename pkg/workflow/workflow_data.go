@@ -42,31 +42,33 @@ type WorkflowData struct {
 	workQueueRepoIssuesConfigured  bool
 	DryRun                         bool // Disable compiler-managed GitHub mutations while retaining local diagnostics
 	Name                           string
-	WorkflowID                     string           // workflow identifier derived from markdown filename (basename without extension)
-	CompiledVersion                string           // gh-aw compiler version emitted to generated install steps as GH_AW_COMPILED_VERSION (release tag for releases, "dev" for non-release builds) so the install script can resolve a compat.json window at runtime without churn
-	TrialMode                      bool             // whether the workflow is running in trial mode
-	TrialLogicalRepo               string           // target repository slug for trial mode (owner/repo)
-	UseSamples                     bool             // whether the agentic step should be replaced by a deterministic samples replay driver (hidden feature)
-	FrontmatterName                string           // name field from frontmatter (for code scanning alert driver default)
-	FrontmatterEmoji               string           // emoji field from frontmatter (for display in footers and UI)
-	FrontmatterYAML                string           // raw frontmatter YAML content (rendered as comment in lock file for reference)
-	FrontmatterHash                string           // SHA-256 hash of frontmatter (computed before job building, used to derive stable heredoc delimiters)
-	BodyHash                       string           // SHA-256 hash of the markdown body (computed before job building)
-	FrontmatterFieldLines          map[string]int   // absolute 1-based line numbers of top-level frontmatter keys in the source file (populated by parser)
-	RawMarkdown                    string           // raw markdown body before include expansion, used for frontmatter hash computation without re-reading the file
-	Description                    string           // optional description rendered as comment in lock file
-	Intent                         string           // optional intent (durable outcome the workflow exists to achieve) rendered as comment in lock file
-	Docs                           string           // optional human-facing documentation URL preserved in lock metadata
-	Source                         string           // optional source field (owner/repo@ref/path) rendered as comment in lock file
-	Redirect                       string           // optional redirect field describing a moved workflow location
-	TrackerID                      string           // optional tracker identifier for created assets (min 8 chars, alphanumeric + hyphens/underscores)
-	MaxDailyAICredits              *string          // optional 24-hour per-workflow AIC threshold (numeric string or GitHub Actions expression)
-	MaxDailyAICreditsExplicit      bool             // daily limit came from workflow/import configuration rather than the runtime default
-	MaxDailyAICBackend             string           // optional backend for the daily AIC guardrail ("repo-memory" for git-backed JSONL ledger)
-	MaxDailyAICreditsGitHubApp     *GitHubAppConfig // optional GitHub App for minting the token used by the daily AIC guardrail
-	MaxDailyAICContinueOnError     bool             // when true, unknown/unverifiable daily AIC accounting is a warning instead of failing closed
-	ImportedFiles                  []string         // list of files imported via imports field (rendered as comment in lock file)
-	Skills                         []string         // skill specs from frontmatter (owner/repo@sha or owner/repo/skill/path@sha)
+	WorkflowID                     string            // workflow identifier derived from markdown filename (basename without extension)
+	CompiledVersion                string            // gh-aw compiler version emitted to generated install steps as GH_AW_COMPILED_VERSION (release tag for releases, "dev" for non-release builds) so the install script can resolve a compat.json window at runtime without churn
+	TrialMode                      bool              // whether the workflow is running in trial mode
+	TrialLogicalRepo               string            // target repository slug for trial mode (owner/repo)
+	UseSamples                     bool              // whether the agentic step should be replaced by a deterministic samples replay driver (hidden feature)
+	FrontmatterName                string            // name field from frontmatter (for code scanning alert driver default)
+	FrontmatterEmoji               string            // emoji field from frontmatter (for display in footers and UI)
+	FrontmatterYAML                string            // raw frontmatter YAML content (rendered as comment in lock file for reference)
+	FrontmatterHash                string            // SHA-256 hash of frontmatter (computed before job building, used to derive stable heredoc delimiters)
+	BodyHash                       string            // SHA-256 hash of the markdown body (computed before job building)
+	FrontmatterFieldLines          map[string]int    // absolute 1-based line numbers of top-level frontmatter keys in the source file (populated by parser)
+	RawMarkdown                    string            // raw markdown body before include expansion, used for frontmatter hash computation without re-reading the file
+	Description                    string            // optional description rendered as comment in lock file
+	Intent                         string            // optional intent (durable outcome the workflow exists to achieve) rendered as comment in lock file
+	Docs                           string            // optional human-facing documentation URL preserved in lock metadata
+	Source                         string            // optional source field (owner/repo@ref/path) rendered as comment in lock file
+	Redirect                       string            // optional redirect field describing a moved workflow location
+	TrackerID                      string            // optional tracker identifier for created assets (min 8 chars, alphanumeric + hyphens/underscores)
+	MaxDailyAICredits              *string           // optional 24-hour per-workflow AIC threshold (numeric string or GitHub Actions expression)
+	MaxDailyAICreditsExplicit      bool              // daily limit came from workflow/import configuration rather than the runtime default
+	MaxDailyAICBackend             string            // optional backend for the daily AIC guardrail ("repo-memory" for git-backed JSONL ledger)
+	MaxDailyAICreditsGitHubApp     *GitHubAppConfig  // optional GitHub App for minting the token used by the daily AIC guardrail
+	MaxDailyAICContinueOnError     bool              // when true, unknown/unverifiable daily AIC accounting is a warning instead of failing closed
+	ImportedFiles                  []string          // list of files imported via imports field (rendered as comment in lock file)
+	ResolvedDependencyFiles        []string          // canonical local dependency paths captured during protected verification
+	ImportedMetadataDocuments      map[string]string // compiler-resolved raw imports for JSON metadata generation
+	Skills                         []string          // skill specs from frontmatter (owner/repo@sha or owner/repo/skill/path@sha)
 	SkillReferences                []SkillReference
 	Plugins                        []string
 	PluginReferences               []PluginReference
@@ -74,16 +76,19 @@ type WorkflowData struct {
 	ImportPaths                    []string // Import file paths for runtime-import macro generation (imports without inputs)
 	PromptImports                  []parser.PromptImportEntry
 	MainWorkflowMarkdown           string               // main workflow markdown without imports (for runtime-import)
+	PromptMarkdown                 string               // expanded main body preserving inline definitions for embedding
 	MainWorkflowPromptPath         string               // compiler-selected author source, not a runtime-import fragment
 	DeferredPromptExpressions      []*ExpressionMapping // prompt values resolved after activation in the agent job
 	IncludedFiles                  []string             // list of files included via @include directives (rendered as comment in lock file)
 	ImportInputs                   map[string]any       // input values from imports with inputs (for github.aw.inputs.* substitution)
 	On                             string
-	AdmissionEnabled               bool // Opt-in from on.admission or repository admission configuration
+	pullRequestTargetWarned        bool // Per-workflow CTR-008 validation warning used to deduplicate compiler lint
+	AdmissionEnabled               bool // Effective compile-time setting for admission steps
 	TokenBrokerEnabled             bool // True when at least one token-broker capability is enabled
 	TokenBrokerCopilotRequest      bool // Use the broker for Copilot inference authentication in supported jobs
 	TokenBrokerCopilotTask         bool // Use the broker for Copilot task creation and assignment
 	WebhookSubscriptions           []WebhookSubscription
+	Connectors                     map[string]*WorkflowConnector
 	Permissions                    string
 	Network                        string // top-level network permissions configuration
 	Concurrency                    string // workflow-level concurrency configuration
@@ -109,12 +114,16 @@ type WorkflowData struct {
 	ExplicitlyDisabledTools        map[string]struct{}        // tool names explicitly set to false before default resolution mutates/removes their map entries
 	BashDisabled                   bool                       // true when tools.bash was fully and explicitly refused (bash: false, or bash: []) after default-tool resolution; used by engines that can fully disable shell execution (e.g. Codex's features.shell_tool=false), see EngineCapabilities.BashDisable
 	MarkdownContent                string
+	CompiledPromptMarkdown         []string // Actual compiler-substituted prompt templates for runtime metadata provenance
+	compiledMarkdownMetadata       *GHAWMarkdownMetadata
 	SubAgentModels                 []parser.SubAgentModel // models declared by inline and imported sub-agents
 	SubAgents                      []parser.InlineSubAgent
-	AI                             string            // "claude" or "codex" (for backwards compatibility)
-	Model                          string            // Top-level LLM model override (from frontmatter model: field or imports)
-	EngineConfig                   *EngineConfig     // Extended engine configuration
+	AI                             string        // "claude" or "codex" (for backwards compatibility)
+	Model                          string        // Top-level LLM model override (from frontmatter model: field or imports)
+	EngineConfig                   *EngineConfig // Extended engine configuration
+	durableExecutionPlan           *DurableExecutionPlan
 	engineDefinition               *EngineDefinition // Per-workflow metadata, retained across batch compiler registry resets
+	webFetchFallback               bool              // Resolved engine preference for MCP detection and manifest generation
 	AgentFile                      string            // Path to custom agent file (from imports)
 	AgentImportSpec                string            // Original import specification for agent file (e.g., "owner/repo/path@ref")
 	RepositoryImports              []string          // Repository-only imports (format: "owner/repo@ref") for .github folder merging
@@ -144,6 +153,7 @@ type WorkflowData struct {
 	LabelCommandOtherEvents        map[string]any                  // for merging label-command with other events
 	LabelCommandRemoveLabel        bool                            // whether to automatically remove the triggering label (default: true)
 	AIReaction                     ReactionType                    // AI reaction type like "eyes", "heart", etc.
+	ReactionRemoveOnComplete       bool                            // remove the trigger reaction in conclusion
 	ReactionIssues                 *bool                           // whether reactions are allowed on issues/issue_comment triggers (default: true)
 	ReactionPullRequests           *bool                           // whether reactions are allowed on pull_request/pull_request_review_comment triggers (default: true)
 	ReactionDiscussions            *bool                           // whether reactions are allowed on discussion/discussion_comment triggers (default: true)
@@ -174,6 +184,7 @@ type WorkflowData struct {
 	DriveMemoryConfig              *DriveMemoryConfig              // parsed drive-memory configuration
 	CommentMemoryConfig            *CommentMemoryConfig            // parsed tools.comment-memory configuration
 	RepoMemoryConfig               *RepoMemoryConfig               // parsed repo-memory configuration
+	AdaptiveRouting                string                          // "observe" when push_routing_history records the run in the routing history, else ""
 	Runtimes                       map[string]any                  // runtime version overrides from frontmatter
 	ToolsTimeout                   string                          // timeout for tool/MCP operations: numeric string (seconds) or GitHub Actions expression (empty = use engine default)
 	ToolsStartupTimeout            string                          // timeout for MCP server startup: numeric string (seconds) or GitHub Actions expression (empty = use engine default)
@@ -214,7 +225,7 @@ type WorkflowData struct {
 	ReportBlockedVersionDisabled   bool                            // true when on.report-blocked-version: false is set in frontmatter (disables the blocked-version notification issue in activation, independent of check-for-updates and safe-outputs.report-failure-as-issue)
 	EngineConfigSteps              []map[string]any                // steps returned by engine.RenderConfig — prepended before execution steps
 	ServicePortExpressions         string                          // comma-separated ${{ job.services['<id>'].ports['<port>'] }} expressions for AWF --allow-host-service-ports
-	RunInstallScripts              bool                            // true when runtimes.node.run-install-scripts: true is set (main workflow and/or imports); disables --ignore-scripts on generated npm install steps
+	RunInstallScripts              bool                            // true when runtimes.node.run-install-scripts: true is set (main workflow and/or imports); omits script suppression on generated Node.js runtime and engine npm install steps
 	CachedPermissions              *Permissions                    // cached parsed Permissions object (for performance optimization); populated by applyDefaults after all permission mutations
 	CachedPermissionScopeNamesErr  error                           // cached result of ValidatePermissionScopeNames(Permissions); nil = valid; populated by applyDefaults
 	CachedPermissionScopeNamesSet  bool                            // true once CachedPermissionScopeNamesErr has been populated; distinguishes "valid (nil)" from "not yet computed"
@@ -222,26 +233,30 @@ type WorkflowData struct {
 	CachedConcurrencyGroupExprErr  error                           // cached result of validateConcurrencyGroupExpression(ConcurrencyGroupExpr); nil = valid; populated by applyDefaults
 	Experiments                    map[string][]string             // A/B testing experiments: maps experiment name to variant list (from frontmatter)
 	ExperimentConfigs              map[string]*ExperimentConfig    // Full A/B experiment metadata (populated alongside Experiments)
-	ExperimentsStorage             ExperimentStorageMode           // "cache" or "repo" (default "repo"); controls how experiment state is persisted across runs
+	ExperimentsStorage             ExperimentStorageMode           // "cache", "repo" (default), or opt-in "broker"; controls experiment persistence
+	ExperimentsBrokerURL           string                          // Optional literal broker endpoint
 	CachedConcurrencyGroupExprSet  bool                            // true once CachedConcurrencyGroupExprErr has been populated; distinguishes "valid (nil)" from "not yet computed"
 	CachedParsedToolsets           []string                        // cached result of ParseGitHubToolsets for the GitHub tool (for performance optimization); populated by applyDefaults
-	CachedAllowedDomainsStr        string                          // cached allowed-domains string for sanitization (for performance optimization); computed once and reused across multiple compilation steps
+	CachedAllowedDomainsStr        string                          // cached agent firewall policy; sanitization-only domains must not be stored here
 	CachedAllowedDomainsComputed   bool                            // true once CachedAllowedDomainsStr has been set; distinguishes "computed empty" from "not yet computed"
 	CachedRuntimeRequirements      []RuntimeRequirement            // cached runtime requirements derived from DetectRuntimeRequirements; reused by validation and YAML generation within one compilation
 	CachedRuntimeRequirementsSet   bool                            // true once CachedRuntimeRequirements is populated; distinguishes "computed empty" from "not yet computed"
 	KnownActionCredentialEnvVars   map[string]struct{}             // env vars for clean_known_action_credentials.sh; keyed by GH_AW_CLEAN_* names; nil when no known credential-leaking actions are detected
 	ModelMappings                  map[string][]string             // merged model alias map (builtins + imported workflow aliases + main frontmatter overrides, in priority order); emitted to AWF config JSON as apiProxy.models for both agent and detection jobs
-	ModelCosts                     map[string]any                  // model pricing data from frontmatter `models` field (providers structure); merged with built-in models.json at runtime by generate_aw_info.cjs
+	ModelCosts                     map[string]any                  // explicit frontmatter model overlays used for reporting
+	ModelCostOverrides             map[string]any                  // explicit frontmatter/import pricing overlays sent to AWF as apiProxy.providers overrides
 	ModelPolicyAllowed             []string                        // merged models.allowed policy list (union across imports + main frontmatter)
 	ModelPolicyBlocked             []string                        // merged models.blocked policy list (union across imports + main frontmatter)
 	DefaultAiCreditsPricing        *AiCreditsPricingConfig         // fallback per-token pricing from frontmatter models.default-ai-credits-pricing; used by AWF API proxy for unrecognized models
 	ActionPinMappings              map[string]string               // action-pin redirect table from aw.json action_pins: maps "owner/repo@version" → "owner/repo@version"
 	generatedActionRefs            map[string]struct{}             // compiler-owned references, including tag fallbacks when SHA resolution is unavailable
+	dynamicSecretReferences        []string                        // computed secret selectors tracked for redaction and safe updates
 	ActionPinPrefixes              map[string]string               // repository-prefix redirects from aw.json action_pin_prefixes
 	ActionPinSourceVersions        map[string]string               // inline labels for frontmatter steps already pinned by SHA
 	ContainerPinMappings           map[string]string               // container-pin redirect table from aw.json container_pins: maps source image → replacement image
 	GHES                           bool                            // select action versions compatible with GitHub Enterprise Server
 	Evals                          *EvalsConfig                    // BinEval evaluation configuration parsed from frontmatter evals field
+	SkipIfDecision                 []string                        // Advisory skip questions evaluated before eligible sandboxed agent invocations
 	Graders                        *GradersConfig                  // Deterministic graders configuration parsed from frontmatter graders field
 	ExcludedEnv                    []string                        // additional env var names to exclude from agent container via AWF --exclude-env (from frontmatter excluded-env field)
 }

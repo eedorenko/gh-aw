@@ -22,7 +22,6 @@ set +o histexpand
 # Security features:
 #   - Downloads directly from GitHub releases
 #   - Authenticates checksums.txt against a digest bundled in the trusted action
-#   - Helper-capable releases require workflow attestations and signed release identity
 #   - Fails fast if checksum verification fails
 #   - Eliminates trust dependency on installer scripts
 
@@ -94,14 +93,6 @@ if [[ ! "$AWF_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 1
 fi
 CHECKSUMS_SHA256="$(release_artifact_sha256 "$AWF_REPO" "$AWF_VERSION" checksums.txt "$AWF_CHECKSUMS_SHA256")"
-# Releases before the authenticated helper contract remain supported by their
-# independently reviewed manifest pins. Helper-capable releases also require
-# signed identity metadata because the release workflow runs on a dispatch branch.
-REQUIRE_ATTESTATION=false
-IFS=. read -r version_major version_minor version_patch <<< "${AWF_VERSION#v}"
-if (( 10#$version_major > 0 || 10#$version_minor > 29 || (10#$version_minor == 29 && 10#$version_patch >= 5) )); then
-  REQUIRE_ATTESTATION=true
-fi
 
 # Detect OS and architecture
 OS="$(uname -s)"
@@ -121,19 +112,8 @@ if [ "$ROOTLESS" = "true" ]; then
   fi
 fi
 
-# Clean up any stale AWF chroot directories left by previous runs before we
-# execute awf. Rootless AWF can fail its writeConfigs startup path with EACCES
-# when stale /tmp/awf-*-chroot-home or /tmp/awf-chroot-* directories remain
-# from earlier jobs on the same runner. Limit cleanup to directories owned by
-# root or the current runner user so we do not delete unrelated /tmp entries
-# that happen to match the name pattern.
-echo "Cleaning up stale AWF chroot directories..."
-if command -v sudo >/dev/null 2>&1; then
-  sudo find /tmp -maxdepth 1 -name 'awf-*-chroot-home' -type d \( -user root -o -user "$(id -un)" \) -exec rm -rf -- {} + || true
-  sudo find /tmp -maxdepth 1 -name 'awf-chroot-*' -type d \( -user root -o -user "$(id -un)" \) -exec rm -rf -- {} + || true
-else
-  echo "Warning: sudo is unavailable; skipping stale AWF chroot cleanup" >&2
-fi
+# Other invocations can share both /tmp and the runner UID. Neither a filename
+# pattern nor the filesystem owner proves that a chroot belongs to this install.
 
 # Download URLs
 BASE_URL="https://github.com/${AWF_REPO}/releases/download/${AWF_VERSION}"
@@ -166,10 +146,12 @@ sha256_hash() {
   fi
 }
 
+# The AWF CLI uses TMPDIR for its chroot scratch directories. Persist a private
+# directory for subsequent workflow steps and leave cleanup to the scoped post step.
+create_awf_runtime_tmp
+
 # Create a private staging directory on the runner's job-owned filesystem.
-TEMP_DIR="${RUNNER_TEMP:-$PWD}/awf-install-$$-${RANDOM}"
-mkdir -m 700 "$TEMP_DIR"
-trap 'rm -rf "$TEMP_DIR"' EXIT
+create_release_staging awf
 
 download_release_asset() {
   local asset="$1"
@@ -200,11 +182,6 @@ download_release_asset() {
 echo "Downloading checksums from ${CHECKSUMS_URL@Q}..."
 download_release_asset checksums.txt
 verify_release_digest "${TEMP_DIR}/checksums.txt" "$CHECKSUMS_SHA256"
-if [ "$REQUIRE_ATTESTATION" = true ]; then
-  download_release_asset release-identity.txt
-  verify_release_identity "${TEMP_DIR}/checksums.txt" "${TEMP_DIR}/release-identity.txt" \
-    "$AWF_REPO" "$AWF_VERSION" "$CHECKSUMS_SHA256"
-fi
 
 verify_checksum() {
   local file="$1"
@@ -229,9 +206,6 @@ verify_checksum() {
   fi
 
   echo "✓ Checksum verification passed for ${fname}"
-  if [ "$REQUIRE_ATTESTATION" = true ]; then
-    verify_release_attestation "$file" "$AWF_REPO"
-  fi
 }
 
 # Check if Node.js >= 20 is available

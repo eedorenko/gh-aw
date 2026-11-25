@@ -23,7 +23,7 @@ func piSessionSettings(data *WorkflowData) piSessionConfig {
 		Session piSessionConfig `json:"session"`
 	}
 	if data != nil && data.EngineConfig != nil && data.EngineConfig.Config != "" {
-		if err := json.Unmarshal([]byte(data.EngineConfig.Config), &parsed); err != nil {
+		if err := json.Unmarshal([]byte(data.EngineConfig.Config), &parsed); err != nil { //nolint:jsonunmarshalbytesconversion // Small configuration requires whole-document validation.
 			panic(fmt.Sprintf("BUG: invalid validated Pi configuration: %v", err))
 		}
 	}
@@ -33,8 +33,11 @@ func piSessionSettings(data *WorkflowData) piSessionConfig {
 func piToolPolicyJSON(data *WorkflowData) string {
 	policy := make(map[string]any)
 	if data != nil {
+		// Mounted MCP CLIs (for example github and safeoutputs) must stay executable
+		// under a restricted bash allowlist, matching the other engines.
+		tools := withMountedCLIShellCommandsInRestrictedBash(data)
 		for _, name := range []string{"bash", "edit"} {
-			if value, ok := data.Tools[name]; ok {
+			if value, ok := tools[name]; ok {
 				policy[name] = value
 			}
 		}
@@ -81,7 +84,7 @@ func validatePiJSONConfig(raw string) error {
 		return nil
 	}
 	var parsed map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil { //nolint:jsonunmarshalbytesconversion // Small configuration requires whole-document validation.
 		return fmt.Errorf("engine.config for Pi must be a JSON object: %w", err)
 	}
 	if parsed == nil {
@@ -137,7 +140,7 @@ func validatePiSessionConfig(raw json.RawMessage) error {
 func piRuntimeConfigJSON(data *WorkflowData) string {
 	config := make(map[string]json.RawMessage)
 	if data.EngineConfig != nil && data.EngineConfig.Config != "" {
-		if err := json.Unmarshal([]byte(data.EngineConfig.Config), &config); err != nil || config == nil {
+		if err := json.Unmarshal([]byte(data.EngineConfig.Config), &config); err != nil || config == nil { //nolint:jsonunmarshalbytesconversion // Small configuration requires whole-document validation.
 			panic(fmt.Sprintf("BUG: invalid validated Pi configuration: %v", err))
 		}
 	}
@@ -165,11 +168,13 @@ func piRuntimeConfigJSON(data *WorkflowData) string {
 func (e *PiEngine) applyPiConfigEnv(env map[string]string, data *WorkflowData) {
 	env["GH_AW_PI_CONFIG"] = piRuntimeConfigJSON(data)
 	applyModelAliasOverridesEnv(env, "GH_AW_PI_MODEL_ALIASES", data)
+	applyModelCatalogEnv(env, data)
 	childData := *data
 	if data.EngineConfig != nil {
 		childConfig := *data.EngineConfig
 		childConfig.Config = ""
 		childConfig.Args = nil
+		childConfig.Durable = nil
 		childData.EngineConfig = &childConfig
 	}
 	childArgs, err := json.Marshal(e.buildPiArgs(&childData))

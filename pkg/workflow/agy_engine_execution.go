@@ -41,6 +41,8 @@ func (e *AgyEngine) buildExecutionCommand(workflowData *WorkflowData, logFile, e
 	if cliPath := GetMCPCLIPathSetup(workflowData); cliPath != "" {
 		engineCommand = fmt.Sprintf("%s && %s", cliPath, engineCommand)
 	}
+	allowedDomains := mergeDomainsWithNetworkToolsAndRuntimes(AgyDefaultDomains, workflowData.NetworkPermissions, workflowData.Tools, workflowData.Runtimes)
+	allowedDomains = mergeAPITargetDomains(allowedDomains, explicitGeminiAPITargetHost(workflowData, e.GetID()))
 	return BuildAWFCommand(AWFCommandConfig{
 		EngineName:         e.GetID(),
 		EngineCommand:      engineCommand,
@@ -48,21 +50,22 @@ func (e *AgyEngine) buildExecutionCommand(workflowData *WorkflowData, logFile, e
 		WorkflowData:       workflowData,
 		UsesTTY:            false,
 		PathSetup:          "touch " + AgentStepSummaryPath,
-		AllowedDomains:     mergeDomainsWithNetworkToolsAndRuntimes(AgyDefaultDomains, workflowData.NetworkPermissions, workflowData.Tools, workflowData.Runtimes),
+		AllowedDomains:     allowedDomains,
 		ExcludeEnvVarNames: ComputeAWFExcludeEnvVarNames(workflowData, e.GetRequiredSecretNames(workflowData)),
 	})
 }
 
 func (e *AgyEngine) buildExecutionEnv(workflowData *WorkflowData, firewallEnabled bool) map[string]string {
 	env := map[string]string{
-		"GH_AW_PROMPT":         constants.AwPromptsFile,
-		"GITHUB_WORKSPACE":     "${{ github.workspace }}",
-		"GITHUB_STEP_SUMMARY":  AgentStepSummaryPath,
-		"NO_PROXY":             constants.AWFNoProxyHosts,
-		"RUNNER_TEMP":          "${{ runner.temp }}",
-		"GH_AW_AGY_MODEL":      constants.AgyDefaultModel,
-		"GH_AW_ENGINE_VERSION": string(constants.DefaultAgyVersion),
-		"GEMINI_API_KEY":       "${{ secrets.GEMINI_API_KEY }}",
+		"GH_AW_PROMPT":          constants.AwPromptsFile,
+		"GITHUB_WORKSPACE":      "${{ github.workspace }}",
+		"GITHUB_STEP_SUMMARY":   AgentStepSummaryPath,
+		"GH_AW_TIMEOUT_MINUTES": resolveStepTimeoutValue(workflowData),
+		"NO_PROXY":              constants.AWFNoProxyHosts,
+		"RUNNER_TEMP":           "${{ runner.temp }}",
+		"GH_AW_AGY_MODEL":       constants.AgyDefaultModel,
+		"GH_AW_ENGINE_VERSION":  string(constants.DefaultAgyVersion),
+		"GEMINI_API_KEY":        "${{ secrets.GEMINI_API_KEY }}",
 	}
 	if firewallEnabled {
 		env["AWF_REFLECT_ENABLED"] = "1"
@@ -80,6 +83,7 @@ func (e *AgyEngine) buildExecutionEnv(workflowData *WorkflowData, firewallEnable
 	applyEngineVersionEnv(env, workflowData)
 	applyEngineAndAgentEnv(env, workflowData, agyLog)
 	applyModelAliasesEnv(env, workflowData)
+	applyDurableExecutionEnv(env, workflowData)
 	if workflowData.Model != "" {
 		env[e.GetModelEnvVarName()] = workflowData.Model
 	}

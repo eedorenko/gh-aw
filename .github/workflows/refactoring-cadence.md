@@ -14,8 +14,10 @@ permissions:
 
 
 tracker-id: refactoring-cadence
-engine: pi
-model: copilot/gpt-5.6-terra
+model: router/economy
+engine:
+  id: pi
+  model-provider: github
 imports:
   - uses: shared/skip-if-issue-open.md
     with:

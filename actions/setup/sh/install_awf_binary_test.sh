@@ -113,8 +113,8 @@ test_curl_retry_all_errors() {
   local node_version="${5:-v18.0.0}"
   local platform="${6:-Linux}"
   local release_version="${7:-v0.28.62}"
-  local attestation_failure="${8:-}"
-  local identity_version="${9:-$release_version}"
+  local curl_failure_asset="${8:-}"
+  local expect_download_failure="${9:-false}"
   local test_dir
   local option_index
   local -a actual_options
@@ -149,24 +149,23 @@ while [ "$#" -gt 0 ]; do
   fi
   shift
 done
+case "${output:-}" in
+  */"${AWF_TEST_CURL_FAILURE_ASSET:-__never__}")
+    echo "simulated curl network failure" >&2
+    exit 7
+    ;;
+esac
 if [[ "${output}" == *checksums.txt ]]; then
   printf '%064d awf-linux-x64\n%064d awf-darwin-x64\n%064d awf-bundle.js\n' 0 0 0 > "${output}"
-elif [[ "${output}" == *release-identity.txt ]]; then
-  printf '%s  refs/tags/%s\n' "$AWF_TEST_MANIFEST_SHA256" "$AWF_TEST_IDENTITY_VERSION" > "$output"
 else
   printf '#!/usr/bin/env bash\nexit 0\n' > "${output}"
 fi
 EOF
   cat > "${test_dir}/bin/gh" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "$*" >> "$AWF_TEST_ATTESTATION_LOG"
-test "$1" = attestation && test "$2" = verify || exit 91
-test "$4" = --hostname && test "$5" = github.com || exit 92
-test "$6" = --repo && test "$7" = github/gh-aw-firewall || exit 93
-test "$8" = --signer-workflow && test "$9" = github/gh-aw-firewall/.github/workflows/release.yml || exit 94
-test "${10}" = --cert-oidc-issuer && test "${11}" = https://token.actions.githubusercontent.com || exit 95
-test "${12}" = --deny-self-hosted-runners || exit 96
-test "${3##*/}" != "${AWF_TEST_ATTESTATION_FAILURE:-}"
+printf '%s\n' "$*" >> "$AWF_TEST_GH_LOG"
+echo "HTTP 401: Bad credentials (https://api.github.com)" >&2
+exit 1
 EOF
   cat > "${test_dir}/bin/node" <<'EOF'
 #!/usr/bin/env bash
@@ -193,23 +192,21 @@ EOF
   local installer_exit=0
   AWF_TEST_MANIFEST_SHA256="$(release_artifact_sha256 github/gh-aw-firewall "$release_version" checksums.txt)" \
     CURL_HELP_ALL_OUTPUT="${curl_help_all}" CURL_HELP_OUTPUT="${curl_help}" CURL_HELP_ALL_FAILS="${help_all_fails}" CURL_ARGS_FILE="${test_dir}/curl-args" \
-    AWF_TEST_ATTESTATION_LOG="${test_dir}/attestations" AWF_TEST_ATTESTATION_FAILURE="$attestation_failure" AWF_TEST_IDENTITY_VERSION="$identity_version" \
+    AWF_TEST_GH_LOG="${test_dir}/gh-calls" GH_HOST=example.ghe.com GH_TOKEN=enterprise-test-token \
+    AWF_TEST_CURL_FAILURE_ASSET="$curl_failure_asset" \
     AWF_TEST_NODE_VERSION="$node_version" AWF_TEST_OS="$platform" HOME="${test_dir}/home" GITHUB_PATH="${test_dir}/github-path" \
     RUNNER_TEMP="$test_dir" PATH="${test_dir}/bin:${PATH}" bash "${SCRIPT_DIR}/install_awf_binary.sh" "$release_version" --rootless >"${test_dir}/output" 2>&1 || installer_exit=$?
-  if [ -n "$attestation_failure" ] || [ "$identity_version" != "$release_version" ]; then
-    if [ "$installer_exit" -eq 0 ] || [ -e "${test_dir}/home/.local/bin/awf" ]; then
-      TEST_FAILURE_REASON="unattested or version-mismatched release was installed"
+  if [ "$expect_download_failure" = true ]; then
+    if [ "$installer_exit" -eq 0 ]; then
+      TEST_FAILURE_REASON="installer succeeded after a required download failed"
       rm -rf "$test_dir"
       return 1
     fi
-    if [ "$attestation_failure" = awf-bundle.js ] && grep -q '/awf-linux-' "${test_dir}"/curl-args.[0-9]*; then
-      TEST_FAILURE_REASON="bundle attestation failure attempted a platform fallback"
-      rm -rf "$test_dir"
-      return 1
-    fi
-    if { [ "$attestation_failure" = checksums.txt ] || [ "$attestation_failure" = release-identity.txt ] || [ "$identity_version" != "$release_version" ]; } &&
-      grep -qE '/awf-(bundle|linux|darwin)' "${test_dir}"/curl-args.[0-9]*; then
-      TEST_FAILURE_REASON="payload was downloaded before authenticating release metadata"
+    if ! grep -qF "simulated curl network failure" "${test_dir}/output" ||
+      ! grep -qF "ERROR: Failed to download ${curl_failure_asset}" "${test_dir}/output" ||
+      ! grep -qF "(HTTP 000, curl exit 7)." "${test_dir}/output"; then
+      TEST_FAILURE_REASON="required download failure diagnostics did not include the curl error, asset, HTTP status, and exit code"
+      cat "${test_dir}/output"
       rm -rf "$test_dir"
       return 1
     fi
@@ -222,22 +219,23 @@ EOF
     rm -rf "${test_dir}"
     return 1
   fi
+  if [ -e "${test_dir}/gh-calls" ] || [ ! -x "${test_dir}/home/.local/bin/awf" ]; then
+    TEST_FAILURE_REASON="checksum-verified installation must succeed without invoking gh"
+    rm -rf "$test_dir"
+    return 1
+  fi
   local curl_args
   local -a curl_args_files
   shopt -s nullglob
   curl_args_files=("${test_dir}"/curl-args.[0-9]*)
   shopt -u nullglob
   local expected_downloads=2
-  if [ "$release_version" = v0.29.5 ] || [ "$release_version" = v0.29.6 ]; then
-    expected_downloads=3
-    if [ "$(wc -l < "${test_dir}/attestations")" -ne 3 ]; then
-      TEST_FAILURE_REASON="expected identity, checksums, and payload attestations"
-      rm -rf "$test_dir"
-      return 1
-    fi
-    if ! head -n 1 "${test_dir}/attestations" | grep -q release-identity.txt ||
-      ! sed -n '2p' "${test_dir}/attestations" | grep -q checksums.txt; then
-      TEST_FAILURE_REASON="release identity and manifest must be authenticated before the payload"
+  if [ -n "$curl_failure_asset" ]; then
+    expected_downloads=$((expected_downloads + 1))
+    if ! grep -qF "simulated curl network failure" "${test_dir}/output" ||
+      ! grep -qF "ERROR: Failed to download ${curl_failure_asset}" "${test_dir}/output" ||
+      ! grep -qF "(HTTP 000, curl exit 7)." "${test_dir}/output"; then
+      TEST_FAILURE_REASON="failed curl output was not included in the installer diagnostics"
       rm -rf "$test_dir"
       return 1
     fi
@@ -312,35 +310,33 @@ else
   fail "macOS binary timeout options were incorrect" "${TEST_FAILURE_REASON}"
 fi
 if test_curl_retry_all_errors '--retry-all-errors' true false '--retry-all-errors' v24.0.0 Linux v0.29.5; then
-  pass "helper-capable bundle authenticates release identity, checksums, and payload"
+  pass "helper-capable bundle installs using checksums without github.com API access"
 else
   fail "modern release bundle verification failed" "$TEST_FAILURE_REASON"
 fi
 if test_curl_retry_all_errors '--retry-all-errors' true false '--retry-all-errors' v18.0.0 Linux v0.29.5; then
-  pass "helper-capable binary authenticates release identity, checksums, and payload"
+  pass "helper-capable binary installs using checksums without github.com API access"
 else
   fail "modern release binary verification failed" "$TEST_FAILURE_REASON"
 fi
-for node_version in v24.0.0 v18.0.0; do
-  if test_curl_retry_all_errors '--retry-all-errors' true false '--retry-all-errors' "$node_version" Linux v0.29.6; then
-    pass "default release authenticates release identity, checksums, and payload with $node_version"
-  else
-    fail "default release verification failed" "$TEST_FAILURE_REASON"
-  fi
+for release_version in v0.29.11 v0.29.14; do
+  for node_version in v24.0.0 v18.0.0; do
+    if test_curl_retry_all_errors '--retry-all-errors' true false '--retry-all-errors' "$node_version" Linux "$release_version"; then
+      pass "$release_version installs on ghe.com without github.com API access with $node_version"
+    else
+      fail "Enterprise release installation failed" "$TEST_FAILURE_REASON"
+    fi
+  done
 done
-for rejected_asset in checksums.txt release-identity.txt awf-bundle.js awf-linux-x64; do
-  node_version=v24.0.0
-  if [ "$rejected_asset" = awf-linux-x64 ]; then node_version=v18.0.0; fi
-  if test_curl_retry_all_errors '--retry-all-errors' true false '--retry-all-errors' "$node_version" Linux v0.29.5 "$rejected_asset"; then
-    pass "failed $rejected_asset attestation prevents installation"
-  else
-    fail "unattested $rejected_asset was accepted" "$TEST_FAILURE_REASON"
-  fi
-done
-if test_curl_retry_all_errors '--retry-all-errors' true false '--retry-all-errors' v24.0.0 Linux v0.29.5 '' v0.29.4; then
-  pass "attested identity for another tag prevents installation"
+if test_curl_retry_all_errors '--retry-all-errors' true false '--retry-all-errors' v24.0.0 Linux v0.29.5 awf-bundle.js; then
+  pass "optional bundle failure diagnostics are retained before fallback"
 else
-  fail "mismatched release identity was accepted" "$TEST_FAILURE_REASON"
+  fail "optional bundle failure diagnostics were not preserved" "$TEST_FAILURE_REASON"
+fi
+if test_curl_retry_all_errors '--retry-all-errors' true false '--retry-all-errors' v24.0.0 Linux v0.28.62 checksums.txt true; then
+  pass "required download failure diagnostics include the curl error and exit status"
+else
+  fail "required download failure diagnostics were incomplete" "$TEST_FAILURE_REASON"
 fi
 
 # Test 7: warning emitted when GITHUB_PATH is unset in rootless mode

@@ -14,12 +14,10 @@ permissions:
 
 
 tracker-id: linter-miner
+model: router/economy
 engine:
   id: copilot
   copilot-sdk: true
-  model-routing:
-    goal: cost
-    mode: economy
 max-tool-denials: 3
 network:
   allowed:
@@ -36,11 +34,12 @@ tools:
     - "*"
   edit:
 imports:
+  - shared/pr-safe-output-defaults.md
   - shared/mcp/serena-go.md
   - shared/otlp.md
   - shared/reporting.md
 pre-agent-steps:
-  - name: Preload linter source and cache context
+  - name: Pre-load linter source and cache context
     run: |
       set -euo pipefail
       mkdir -p /tmp/gh-aw/agent
@@ -65,10 +64,10 @@ pre-agent-steps:
         echo "[]" > /tmp/gh-aw/agent/prior-linters.json
       fi
 safe-outputs:
-  steer: true
   create-pull-request:
     title-prefix: "[linter-miner] "
     labels: [automation, go-linters, cookie]
+    fallback-labels: ["backlog:engineering-quality", automation, go-linters, cookie]
     reviewers: [copilot]
     draft: true
     expires: 7d

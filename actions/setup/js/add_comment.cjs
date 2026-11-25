@@ -11,11 +11,11 @@ const { stripExecutionProvenance } = require("./execution_provenance.cjs");
 const { generateWorkflowCallIdMarker, matchesWorkflowId } = require("./generate_footer.cjs");
 const { getRepositoryUrl } = require("./get_repository_url.cjs");
 const { replaceTemporaryIdReferences, resolveSafeOutputIssueTarget } = require("./temporary_id.cjs");
-const { getErrorMessage } = require("./error_helpers.cjs");
+const { getErrorMessage, getErrorStatus } = require("./error_helpers.cjs");
 const { parseBoolTemplatable, parseIntTemplatable } = require("./templatable.cjs");
 const { resolveTarget, isStagedMode } = require("./safe_output_helpers.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
-const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
+const { createAuthenticatedGitHubClient, createAuthenticatedLoginResolver } = require("./handler_auth.cjs");
 const { getMessages } = require("./messages_core.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { MAX_COMMENT_LENGTH, MAX_COMMENT_INPUT_LENGTH, MAX_MENTIONS, MAX_LINKS, enforceCommentLimits } = require("./comment_limit_helpers.cjs");
@@ -551,20 +551,7 @@ async function main(config = {}) {
   // Get workflow ID for hiding older comments
   const workflowId = process.env.GH_AW_WORKFLOW_ID || "";
   const callerWorkflowId = process.env.GH_AW_CALLER_WORKFLOW_ID || "";
-  /** @type {Promise<string | null> | undefined} */
-  let authenticatedLoginPromise;
-  const getAuthenticatedLogin = () => {
-    if (!authenticatedLoginPromise) {
-      authenticatedLoginPromise = Promise.resolve()
-        .then(() => githubClient.rest.users.getAuthenticated())
-        .then(({ data }) => data.login || null)
-        .catch(() => {
-          core.info("Could not resolve the authenticated comment author; considering bot-authored comments only");
-          return null;
-        });
-    }
-    return authenticatedLoginPromise;
-  };
+  const getAuthenticatedLogin = createAuthenticatedLoginResolver(githubClient, core);
 
   /**
    * Message handler function
@@ -594,10 +581,8 @@ async function main(config = {}) {
 
     processedCount++;
 
-    // Merge resolved temp IDs
-    Object.entries(resolvedTemporaryIds ?? {}).forEach(([tempId, resolved]) => {
-      if (!temporaryIdMap.has(tempId)) temporaryIdMap.set(tempId, resolved);
-    });
+    // The current invocation's resolutions replace cached entries from earlier invocations.
+    Object.entries(resolvedTemporaryIds ?? {}).forEach(([tempId, resolved]) => temporaryIdMap.set(tempId, resolved));
 
     // Resolve and validate target repository
     const repoResult = resolveAndValidateRepo(message, defaultTargetRepo, allowedRepos, "comment");
@@ -996,16 +981,17 @@ async function main(config = {}) {
       return recordComment(comment, isDiscussion);
     } catch (error) {
       const errorMessage = getErrorMessage(error);
+      const errorStatus = getErrorStatus(error);
       const normalizedErrorMessage = errorMessage.toLowerCase();
       // Known GitHub lock-related message fragments observed from REST/GraphQL comment APIs.
       const lockPhrases = ["issue is locked", "conversation is locked", "resource is locked", "resource locked"];
       const hasKnownLockPhrase = lockPhrases.some(phrase => normalizedErrorMessage.includes(phrase));
 
       // Check if this is a 404 error (discussion/issue was deleted or wrong type)
-      const is404 = error?.status === 404 || errorMessage.includes("404") || normalizedErrorMessage.includes("not found");
-      const isHttp423Locked = error?.status === 423;
-      const isHttp403WithLockedMessage = error?.status === 403 && normalizedErrorMessage.includes("locked");
-      const isLockedByKnownMessageWithoutStatus = error?.status == null && hasKnownLockPhrase;
+      const is404 = errorStatus === 404 || (errorStatus == null && normalizedErrorMessage.includes("not found"));
+      const isHttp423Locked = errorStatus === 423;
+      const isHttp403WithLockedMessage = errorStatus === 403 && normalizedErrorMessage.includes("locked");
+      const isLockedByKnownMessageWithoutStatus = errorStatus == null && hasKnownLockPhrase;
       const isLocked = isHttp423Locked || isHttp403WithLockedMessage || isLockedByKnownMessageWithoutStatus;
 
       // If 404 and item_number was explicitly provided and we tried as issue/PR,
@@ -1027,7 +1013,8 @@ async function main(config = {}) {
           return recordComment(comment, true);
         } catch (discussionError) {
           const discussionErrorMessage = getErrorMessage(discussionError);
-          const isDiscussion404 = discussionError?.status === 404 || discussionErrorMessage.toLowerCase().includes("not found");
+          const discussionErrorStatus = getErrorStatus(discussionError);
+          const isDiscussion404 = discussionErrorStatus === 404 || (discussionErrorStatus == null && discussionErrorMessage.toLowerCase().includes("not found"));
           const isIntegrationAccessError = isDiscussionIntegrationAccessError(discussionError);
 
           if (isDiscussion404) {

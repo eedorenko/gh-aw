@@ -4,6 +4,7 @@ package workflow
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,7 +15,28 @@ import (
 	"github.com/github/gh-aw/pkg/constants"
 )
 
-func TestAWFInstallerAuthenticationIsStepLocal(t *testing.T) {
+func TestDefaultFirewallReleaseHasReviewedPin(t *testing.T) {
+	t.Parallel()
+
+	script := filepath.Join("..", "..", "actions", "setup", "sh", "release_integrity.sh")
+	for _, version := range []string{string(constants.DefaultFirewallVersion), strings.TrimPrefix(string(constants.DefaultFirewallVersion), "v")} {
+		t.Run(version, func(t *testing.T) {
+			t.Parallel()
+			cmd := exec.Command("bash", "-c", `source "$1"; release_artifact_sha256 github/gh-aw-firewall "$2" checksums.txt`, "--", script, version)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("default firewall %s has no reviewed manifest pin: %v: %s", version, err, output)
+			}
+			digest := strings.TrimSpace(string(output))
+			decoded, err := hex.DecodeString(digest)
+			if err != nil || len(decoded) != sha256.Size || digest != strings.ToLower(digest) {
+				t.Fatalf("default firewall %s has an invalid SHA256 pin: %q", version, digest)
+			}
+		})
+	}
+}
+
+func TestAWFInstallerDoesNotReceiveGitHubToken(t *testing.T) {
 	t.Parallel()
 	data := &WorkflowData{SandboxConfig: &SandboxConfig{Agent: &AgentSandboxConfig{Type: SandboxTypeAWF}}}
 	steps := map[string]string{
@@ -24,7 +46,6 @@ func TestAWFInstallerAuthenticationIsStepLocal(t *testing.T) {
 	for name, step := range steps {
 		t.Run(name, func(t *testing.T) {
 			for _, required := range []string{
-				"        env:\n          GH_TOKEN: ${{ github.token }}\n          GH_HOST: github.com\n",
 				"install_awf_binary.sh",
 				"--rootless",
 			} {
@@ -32,8 +53,97 @@ func TestAWFInstallerAuthenticationIsStepLocal(t *testing.T) {
 					t.Errorf("installer lacks %q:\n%s", required, step)
 				}
 			}
-			if strings.Contains(step, "secrets.") || strings.Contains(step, "sudo -E") {
-				t.Fatal("installer must use only its own public GitHub Actions token")
+			for _, forbidden := range []string{"secrets.", "sudo -E", "github.token", "GH_TOKEN", "GH_HOST"} {
+				if strings.Contains(step, forbidden) {
+					t.Errorf("installer must not receive credentials or gh CLI configuration, found %q:\n%s", forbidden, step)
+				}
+			}
+		})
+	}
+}
+
+func TestAWFInstallerLockUsesBashOnLinuxAndWindows(t *testing.T) {
+	t.Parallel()
+	for _, runner := range []string{"ubuntu-latest", "windows-latest"} {
+		t.Run(runner, func(t *testing.T) {
+			t.Parallel()
+			checksum := strings.Repeat("b", 64)
+			path := filepath.Join(t.TempDir(), "awf-install.md")
+			content := fmt.Sprintf(`---
+on: workflow_dispatch
+strict: false
+runs-on: %s
+sandbox:
+  agent:
+    version: v0.28.62
+    checksums-sha256: "%s"
+---
+Inspect the repository.
+`, runner, checksum)
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := NewCompiler(WithSkipValidation(true)).CompileWorkflow(path); err != nil {
+				t.Fatal(err)
+			}
+			lock, err := os.ReadFile(strings.TrimSuffix(path, ".md") + ".lock.yml")
+			if err != nil {
+				t.Fatal(err)
+			}
+			lockText := string(lock)
+			const installStepMarker = "      - name: Install AWF binary\n"
+			installStepStart := strings.Index(lockText, installStepMarker)
+			if installStepStart < 0 {
+				t.Fatalf("generated %s lock file lacks the AWF install step:\n%s", runner, lock)
+			}
+			installStep := lockText[installStepStart:]
+			stepLines := strings.Split(installStep, "\n")
+			boundary := -1
+			for i, line := range stepLines[1:] {
+				if strings.HasPrefix(line, "      - ") {
+					boundary = i + 1
+					break
+				}
+				if strings.TrimSpace(line) == "" {
+					continue
+				}
+				if len(line)-len(strings.TrimLeft(line, " ")) <= 4 {
+					boundary = i + 1
+					break
+				}
+			}
+			if boundary < 0 {
+				if !strings.HasSuffix(installStep, "\n") {
+					t.Fatalf("generated %s lock file lacks a boundary after the AWF install step:\n%s", runner, installStep)
+				}
+				// The AWF step is the final step in the lock file.
+				boundary = len(stepLines) - 1
+			}
+			installStep = strings.Join(stepLines[:boundary], "\n")
+			expectedCommand := `        run: bash "${RUNNER_TEMP}/gh-aw/actions/install_awf_binary.sh" v0.28.62 --checksums-sha256 ` + checksum + ` --rootless`
+			if runner == "windows-latest" {
+				if !strings.Contains(installStep, "shell: pwsh") ||
+					!strings.Contains(installStep, "wsl.exe --distribution Ubuntu --user root --exec bash --noprofile --norc -e -o pipefail") {
+					t.Errorf("generated Windows install step does not launch Bash in WSL:\n%s", installStep)
+				}
+				windowsCommand := strings.ReplaceAll(expectedCommand, "/gh-aw/actions/", "/gh-aw-setup/actions/")
+				if script := decodeWindowsWSLRunScript(t, installStep); !strings.Contains(script, strings.TrimPrefix(windowsCommand, "        run: ")) {
+					t.Errorf("generated Windows WSL payload lacks the pinned installer command:\n%s", script)
+				}
+			} else {
+				commandFound := false
+				for line := range strings.SplitSeq(installStep, "\n") {
+					if strings.HasPrefix(line, "        run:") && line == expectedCommand {
+						commandFound = true
+						break
+					}
+				}
+				if !commandFound {
+					t.Errorf("generated %s lock file lacks the pinned installer command:\n%s", runner, installStep)
+				}
+				if strings.Contains(installStep, "shell: bash") {
+					t.Errorf("generated Linux install step unexpectedly overrides its default shell:\n%s", installStep)
+				}
 			}
 		})
 	}
@@ -41,18 +151,15 @@ func TestAWFInstallerAuthenticationIsStepLocal(t *testing.T) {
 
 func TestDockerEnclaveHelperInstallerContract(t *testing.T) {
 	t.Parallel()
-	for _, version := range []string{"", "v0.29.5", "0.29.5", "v0.29.6", "0.29.6"} {
+	for _, version := range []string{"", "v0.29.5", "0.29.5", "v0.29.6", "0.29.6", "v0.29.7", "0.29.7"} {
 		t.Run(version, func(t *testing.T) {
 			pin := strings.Repeat("a", 64)
 			step := generateDockerEnclaveStorageHelperInstallStep(version, &AgentSandboxConfig{ChecksumsSHA256: pin})
 			text := strings.Join(step, "\n")
 			for _, required := range []string{
-				"GH_TOKEN: ${{ github.token }}", "GH_HOST: github.com",
 				"AWF_HELPER_CHECKSUMS_SHA256: " + pin,
-				`verify_release_identity "$install_dir/checksums.txt" "$install_dir/release-identity.txt"`,
-				`"$AWF_HELPER_VERSION" "$checksums_sha256"`,
+				`verify_release_digest "$install_dir/checksums.txt" "$checksums_sha256"`,
 				`$2 == "enclave-storage-helper.py"`,
-				`verify_release_attestation "$install_dir/enclave-storage-helper.py" github/gh-aw-firewall`,
 				`verify_release_digest "$install_dir/enclave-storage-helper.py" "$helper_sha256"`,
 				`/usr/bin/sudo -n /usr/bin/mktemp -d /var/lib/awf-helper-install.XXXXXX`,
 				`/usr/bin/sudo -n /usr/bin/install -o root -g root -m 0500 -- "${RUNNER_TEMP}/gh-aw/actions/install_awf_enclave_helper.py"`,
@@ -79,12 +186,14 @@ func TestDockerEnclaveHelperInstallerContract(t *testing.T) {
 				"sudo -E", "sudo mount", "sudo chown", "NOPASSWD: ALL",
 				"curl |", "| bash", "--rootless", "install.sh", "AWF_FORCE_BINARY",
 				"<<'PY'",
+				"verify_release_attestation", "verify_release_identity", "release-identity.txt",
+				"gh attestation", "gh api", "github.token", "GH_TOKEN", "GH_HOST",
 			} {
 				if strings.Contains(text, forbidden) {
 					t.Errorf("helper setup must not grant broad privileges: %s", forbidden)
 				}
 			}
-			manifestCheck := strings.Index(text, `"$install_dir/checksums.txt" "$install_dir/release-identity.txt"`)
+			manifestCheck := strings.Index(text, `verify_release_digest "$install_dir/checksums.txt" "$checksums_sha256"`)
 			privilegedInstall := strings.Index(text, `"$install_dir/checksums.txt" "$install_dir/enclave-storage-helper.py" "$checksums_sha256" "$helper_sha256"`)
 			protectedDigest := strings.Index(text, `[[ "${installer_sha256%% *}" == "`+dockerEnclaveHelperInstallerSHA+`" ]]`)
 			if manifestCheck < 0 || privilegedInstall < 0 || manifestCheck > privilegedInstall {
@@ -134,7 +243,7 @@ func TestDockerEnclaveHelperInstallerContract(t *testing.T) {
 
 func TestDockerEnclaveInstallerWrapperKeepsOrchestratorRootless(t *testing.T) {
 	t.Parallel()
-	for _, version := range []string{"", "v0.29.4", "v0.29.5", "v0.29.6"} {
+	for _, version := range []string{"", "v0.29.4", "v0.29.5", "v0.29.6", "v0.29.7"} {
 		t.Run(version, func(t *testing.T) {
 			data := enclaveWorkflowData(true, false, 30, 0)
 			data.NetworkPermissions.Firewall.Version = version

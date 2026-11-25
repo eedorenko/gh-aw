@@ -43,7 +43,7 @@ Trial results are saved both locally (in the trials/ directory) and in the host 
   ` + string(constants.CLIExtensionPrefix) + ` trial githubnext/agentics/my-workflow --trigger-context https://github.com/owner/repo/issues/123 # Provide issue context for issue-triggered workflows`,
 		Args: func(cmd *cobra.Command, args []string) error {
 			if len(args) < 1 {
-				return fmt.Errorf("missing workflow specification\n\nUsage:\n  %s <workflow-spec>...\n\nExample:\n  %[1]s githubnext/agentics/daily-plan             Trial a workflow from a repository\n  %[1]s ./local-workflow.md                         Trial a local workflow\n\nRun '%[1]s --help' for more information", cmd.CommandPath())
+				return fmt.Errorf("missing workflow specification\n\nUsage:\n  %s <workflow-spec>...\n\nExample:\n  %[1]s githubnext/agentics/daily-plan             Trial a workflow from a repository\n  %[1]s ./local-workflow.md                         Trial a local workflow\n\nRun '%[1]s --help' for more information", cliCommandPath(cmd))
 			}
 			return nil
 		},
@@ -114,7 +114,7 @@ Trial results are saved both locally (in the trials/ directory) and in the host 
 	_ = cmd.Flags().MarkDeprecated("force-delete-host-repo-before", "use --delete-host-repo-before instead")
 	cmd.Flags().BoolP("yes", "y", false, "Auto-accept trial confirmations (required in CI)")
 	cmd.Flags().Bool("dry-run", false, "Preview trial execution without creating repos or running workflows")
-	cmd.Flags().Int("timeout", 30, "Execution timeout in minutes (0 = no timeout)")
+	addMinuteTimeoutFlag(cmd, 30, "Execution timeout in minutes or a whole-minute duration (e.g. 10 or 10m; 0 = no timeout)")
 	cmd.Flags().String("trigger-context", "", "Trigger context URL (e.g., GitHub issue URL) for issue-triggered workflows")
 	cmd.Flags().Int("repeat", 0, "Number of additional times to run after the initial execution (e.g., --repeat 3 runs 4 times total)")
 	cmd.Flags().Bool("auto-merge-prs", false, "Auto-merge any pull requests created during trial execution")

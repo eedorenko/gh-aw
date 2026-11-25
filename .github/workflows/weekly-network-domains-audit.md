@@ -8,11 +8,9 @@ permissions:
   copilot-requests: write
   contents: read
   issues: read
+model: router/balanced
 engine:
   id: pi
-  model-routing:
-    goal: cost
-    mode: balanced
 network: defaults
 strict: true
 tracker-id: weekly-network-domains-audit
@@ -24,8 +22,9 @@ tools:
   bash: ["*"]
 safe-outputs:
   create-issue:
+    expires: 2d
     title-prefix: "[domains-audit] "
-    labels: [cookie, security]
+    labels: [cookie, security, "backlog:security"]
     close-older-issues: false
     max: 3
   noop:

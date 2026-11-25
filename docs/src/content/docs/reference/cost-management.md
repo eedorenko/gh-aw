@@ -11,14 +11,26 @@ The cost of running an agentic workflow is the sum of two components: **GitHub A
 
 ## AI Credits (AIC)
 
-**AI Credits (AIC)** are the primary metric for monitoring and budgeting inference costs in gh-aw. One AIC equals $0.01 USD. AIC values are computed from pricing data sourced from the [models.dev](https://models.dev/) catalog and appear in `gh aw logs`, `gh aw audit`, and run footer messages.
+**AI Credits (AIC)** are the primary metric for monitoring and budgeting inference costs in gh-aw. One AIC equals $0.01 USD. AWF manages the model pricing catalog and reports inference costs used by `gh aw logs`, `gh aw audit`, and run footer messages.
 
 AIC is shown in the `gh aw logs` output table under the **AIC** column, in audit reports alongside raw token counts, and as `{ai_credits_suffix}` in workflow footer templates. For structured output, each run under `.runs[]` includes an `aic` field and each episode under `.episodes[]` includes `total_aic`.
 
-For a concrete model present in gh-aw's embedded pricing catalog, `gh aw compile` includes its provider-specific rates in the firewall configuration. Model parameters such as `?effort=high` are removed for pricing lookup and configuration keys. This keeps AI-credit limits working even when the firewall's built-in pricing table does not yet include the model. Frontmatter `models.providers` pricing takes precedence; compilation does not fetch pricing or infer rates from a related model.
+gh-aw does not bundle or refresh a model pricing catalog, and compilation does not inject catalog rates into the firewall configuration. Explicit frontmatter `models.providers` pricing overrides are still passed to AWF.
 
 > [!NOTE]
-> AIC values are computed on a best-effort basis using pricing data sourced from the [models.dev](https://models.dev/) catalog and may not exactly match your provider's actual billing. Always verify charges in your provider's billing dashboard.
+> AIC values are computed on a best-effort basis using AWF pricing data and may not exactly match your provider's actual billing. Always verify charges in your provider's billing dashboard.
+
+### Native Copilot session credits
+
+Copilot `session.shutdown` records in the unified session expose `data.aiCreditsStatus` alongside `data.totalNanoAiu`. These native Copilot credits are separate from AWF AIC and the `gh aw logs` `aic` field. One billion nano-AIU equals one Copilot credit.
+
+| `aiCreditsStatus` | Meaning |
+|---|---|
+| `complete` | Every observed call has a reported charge. The session total includes delegated work; an explicit zero is valid. |
+| `partial` | `totalNanoAiu` is a reported subtotal; final session cost remains unknown. |
+| `unavailable` | Native terminal accounting is missing, invalid, or contradictory; `totalNanoAiu` is omitted. |
+
+The total already includes child-agent charges, so adding per-agent breakdowns would count them twice. It excludes work outside the session, such as routing classification and a separate threat-detection job. Fallback logs and legacy totals without a status cannot establish complete native accounting. See the [unified session contract](/gh-aw/specs/unified-agent-session-specification/#72-copilot).
 
 ## Cost Components
 
@@ -60,10 +72,11 @@ gh aw logs --start-date -30d --json | \
 # AIC spend grouped by workflow over the past 30 days
 gh aw logs --start-date -30d --json | \
   jq '[.runs[]] | group_by(.workflow_name) |
-  map({workflow: .[0].workflow_name, runs: length, total_aic: (map(.aic // 0) | add)})'
+  map({workflow: .[0].workflow_name, runs: length,
+       total_aic: (if any(.[]; .aic == null) then null else (map(.aic) | add) end)})'
 ```
 
-Each run under `.runs[]` includes `duration`, `token_usage`, `aic`, `workflow_name`, and `agent`. For orchestrated workflows, the same JSON includes deterministic lineage under `.episodes[]` and `.edges[]` â€” see the next section.
+Each run under `.runs[]` includes `duration`, `token_usage`, `aic`, `workflow_name`, and `agent`. Unknown run costs are `null`; the grouped total above is also `null` if any run in the group has unknown cost. For orchestrated workflows, the same JSON includes deterministic lineage under `.episodes[]` and `.edges[]` â€” see the next section.
 
 ### Interpret Episode-Level Usage
 
@@ -189,21 +202,25 @@ steps:
 Use `skip-if-match` / `skip-if-no-match` whenever possible because they also avoid scheduling the agent job. Use `noop` when you need arbitrary shell logic. See [Triggers](/gh-aw/reference/triggers/) for the full syntax.
 ### Choose a Cheaper Model
 
-The `engine.model` field selects the AI model. Smaller or faster models cost significantly less per token while still handling many routine tasks:
+Unless a task needs a particular model, let [model routing](/gh-aw/reference/model-routing/) right-size the model and reasoning effort for each run instead of pinning one. An [eligible workflow](/gh-aw/reference/model-routing/#default-routing-for-workflows-without-a-model) that omits `model` already behaves like `model: router`. For routine, low-risk work such as triage, labeling, and summaries, set `router/economy` explicitly:
 
 ```aw wrap
-engine:
-  id: copilot
-  model: gpt-4.1-mini
+engine: copilot
+model: router/economy
 ```
+
+`router/economy` sets the lowest success target, so the router prefers the cheapest model and effort likely to meet it. It is not a guaranteed spending cap, and it doesn't make any particular model available; combine it with [`max-ai-credits`](#cap-ai-credits-per-run) for a hard stop.
+
+When a task requires a particular model or its capabilities, select one explicitly. An alias such as `small` skips per-task routing, but it resolves against the models available at run time and can map to a different model over time:
 
 ```aw wrap
-engine:
-  id: claude
-  model: claude-haiku-4-5
+engine: copilot
+model: small
 ```
 
-Reserve frontier models (GPT-5, Claude Sonnet, etc.) for complex tasks. Use lighter models for triage, labeling, summarization, and other structured outputs.
+Use an exact model ID instead when the workflow must run on one concrete model.
+
+Reserve frontier models for complex tasks, and prefer lighter models or `router/economy` for triage, labeling, summarization, and other structured outputs.
 
 ### Limit Context Size
 
@@ -215,13 +232,13 @@ GitHub Agentic Workflows includes default guardrails: a 20-minute timeout on the
 
 ### Cap AI Credits per Run
 
-Use the top-level `max-ai-credits` frontmatter field to cap the AI Credits (AIC) budget for a single workflow run. It provides a hard stop for unusually expensive runs and a consistent guardrail across all supported engines. The field accepts plain integers or `K`/`M` suffixes such as `100M`.
+Use the top-level `max-ai-credits` frontmatter field to cap the AI Credits (AIC) budget for a single workflow run. It provides a hard stop for unusually expensive runs and a consistent guardrail across all supported engines. The field accepts plain integers or `K`/`M` suffixes such as `5K`. AWF clamps any budget above its hard cap, 10,000 AI credits by default.
 
 ```aw wrap
 max-ai-credits: 500
 ```
 
-When the budget is approached, gh-aw emits steering warnings before the run reaches the limit. Set a negative value only to disable budget enforcement explicitly.
+As the budget is approached, AWF sends the agent budget notices before the run reaches the limit. A negative value disables only budget enforcement; with AWF releases after v0.29.11, notices continue unless [`sandbox.agent.token-steering: false`](/gh-aw/reference/sandbox/#token-steering-sandboxagenttoken-steering) is set.
 
 > [!NOTE]
 > Threat-detection runs have their own AI Credits cap, separate
@@ -240,6 +257,8 @@ model: auto
 max-ai-credits: 500
 ```
 
+Here `auto` is the engine or provider's own selector (Copilot's server-side selector in this example), not gh-aw's per-task router; to route each task with gh-aw, use `model: router` instead (see [Model Routing](/gh-aw/reference/model-routing/)).
+
 gh-aw does not compile a synthetic price for the selector itself. Requests are accounted against the concrete model reported by the response, so each model is charged at its own catalog rate. When a response omits model metadata, the proxy falls back to its conservative rate rather than undercounting.
 
 The same rule applies to `apiProxy.maxModelMultiplierCap`: the cap is evaluated against the multiplier of the *resolved* concrete model, not against the dynamic selector. A selector such as `auto` therefore never bypasses the cap â€” a request routed to a model whose multiplier exceeds the cap is rejected with HTTP 400 (`model_multiplier_cap_exceeded`). Models without an explicit multiplier use `defaultModelMultiplier` when configured, otherwise the highest configured multiplier.
@@ -255,6 +274,8 @@ max-turns: 20
 ```
 
 `max-turns` works across Claude, Codex, Copilot, Gemini, and Pi. When set, gh-aw exports the compiled value as `GH_AW_MAX_TURNS` for the engine runtime, so you do not need to set `CLAUDE_CODE_MAX_TURNS` or an equivalent variable separately.
+
+With AWF, the invocation budget is shared with sub-agents. Parallel workers do not receive independent budgets; reserve capacity for the orchestrator's validation and final outputs. When Codex exposes a generic terminal HTTP 429, the harness checks fresh AWF reflection before retrying. A confirmed exhausted invocation budget stops retries because resuming cannot restore it. Missing or unavailable counter evidence does not turn an ordinary rate limit into a terminal budget error.
 
 The field accepts integer literals or GitHub Actions expressions, making it composable with `workflow_call` inputs:
 
@@ -292,6 +313,12 @@ Scan snapshots are optional accelerators, not authoritative daily totals. Each r
 An incomplete history, permanent API failure, or quota restriction stops activation rather than reporting an under-budget result from partial data. Transient reads receive bounded retries; unresolved accounting uses the per-run maximum when available. Respect any logged reset or `Retry-After` deadline before retrying. A missing usage artifact is not zero usage unless complete job metadata confirms that all generated AI-powered jobs were skipped or never assigned a runner, with no executed jobs carried forward from earlier attempts.
 
 Activation logs identify artifact discovery and accounting failures with the underlying error and guidance to check Actions read permissions, artifact retention, and accounting coverage. The activation summary separates recorded usage, confirmed-zero runs, and conservative estimates. The exceeded-guardrail log also reports measured and assumed AIC separately. These totals are guardrail accounting, not provider billing; reconcile charges with the provider.
+
+When **Restore daily AIC scan observations** is blocked, its summary identifies the failed operation, observed response count, and the same retry-not-before deadline used by recovery when available. A `current_run` failure occurs before snapshot discovery in the failed restore phase attempt, so it does not establish a cache miss or expensive cold scan; an earlier attempt may already have queried history or artifacts. The response count belongs to this restore across phase attempts; `used` belongs to the credential's shared quota.
+
+Trace the restore step's `github-token` reference in the compiled workflow to the dedicated daily-AIC app, activation credential, or `github.token`. Compare concurrent consumers using the same user or app installation, including other workflows and repositories; separately minted tokens for the same installation do not isolate its quota. Record only credential reference names and validated quota metadata, never token values. Matching quota limits and reset times alone do not identify the credential or the consumer that depleted it.
+
+Before retrying, inspect existing scheduled runs after the reported retry-not-before deadline for a successful restore and complete guardrail check. For exhausted quota or a protective reserve stop, this deadline is the later of the quota reset and `Retry-After`; for a secondary limit above the reserve, only `Retry-After` applies. An unknown deadline does not permit an immediate retry, and an expired deadline alone does not establish recovery. Avoid simultaneous reruns, preserve the fail-closed guard, and investigate snapshot reuse and API response counts before changing scan behavior.
 
 Cold scans check the compiler-owned `agent`, `detection`, and `evals` jobs independently. Every executed component needs valid accounting; empty collector placeholders and evaluation results alone do not prove zero usage. Raw token usage takes precedence over overlapping summaries. Invalid numeric fields make the accounting unknown. Failed-only reruns retain successful components from earlier attempts, but a rerun component needs a producer artifact from its own job execution. Missing carried-forward usage remains unknown. Older snapshots without component-coverage validation are not reused.
 
@@ -340,20 +367,9 @@ Use an admission authority when static per-run and daily limits are not enoughâ€
 
 #### Enable the Admission Gate
 
-1. Opt in for an individual workflow by adding `admission: true` alongside its existing triggers:
+1. Set `"admission": true` in the existing `.github/workflows/aw.json` object, preserving its other settings. Admission code is omitted by default, and an explicit repository setting overrides `on.admission` in workflow frontmatter without changing job permissions.
 
-   ```aw wrap
-   on:
-     workflow_dispatch:
-     admission: true
-   ```
-
-   Alternatively, set `"admission": true` in the existing `.github/workflows/aw.json` object to opt in repository-wide. Preserve other settings.
-
-   > [!IMPORTANT]
-   > A workflow-level `false` cannot override repository-level `true`.
-
-2. Recompile affected workflows with `gh aw compile` and commit the updated Markdown or repository configuration and generated `.lock.yml` files. Admission jobs are omitted by default; setting an endpoint alone does not add them.
+2. Recompile affected workflows with `gh aw compile` if their lock files don't already contain the admission steps, and commit the generated `.lock.yml` files.
 
 3. Export existing managed defaults before editing them:
 
@@ -379,9 +395,9 @@ Use an admission authority when static per-run and daily limits are not enoughâ€
 
 The settings map to Actions variables `GH_AW_DEFAULT_ADMISSION_URL`, `GH_AW_DEFAULT_ADMISSION_AUDIENCE`, and `GH_AW_DEFAULT_ADMISSION_ON_OUTAGE`. Repository variables override organization variables. For enterprise rollout, provision each enrolled organization. The URL must be an absolute HTTPS `/api/admission` URL without credentials, query parameters, or fragments. The audience defaults to that URL when unset.
 
-For opted-in workflows, changes to these runtime variables do not require recompilation. An empty URL skips admission and retains existing local guardrails. `block` stops activation after an exhausted transient outage; the default, `ignore`, continues with existing local controls. Explicit denial and invalid approval block under either policy.
+For workflows compiled with admission, changes to these runtime variables do not require recompilation. An empty URL skips admission and retains existing local guardrails. `block` stops activation after an exhausted transient outage; the default, `ignore`, continues with existing local controls. Explicit denial and invalid approval block under either policy.
 
-The compiler grants `id-token: write` only to the admission-related jobs for this feature. Hand-authored reusable-workflow callers must also allow that permission. Authentication uses GitHub Actions OIDC; do not send PATs, provider tokens, or GitHub App private keys to the authority. The completion callback uses `/api/conclusion` on the same origin.
+Activation and conclusion retain job-wide `id-token: write` even when admission code is omitted. Admission runs as a step inside activation, and the completion callback runs inside conclusion; activation hooks and conclusion actions retain token-minting capability even when an empty endpoint skips those steps. The endpoint gate does not skip either job's runner or bootstrap. The agent does not gain this permission merely because admission is enabled. Hand-authored reusable-workflow callers must also allow that permission. Authentication uses GitHub Actions OIDC; do not send PATs, provider tokens, or GitHub App private keys to the authority. The completion callback uses `/api/conclusion` on the same origin.
 
 #### Assign AIC Allowances by Server Size
 
@@ -416,7 +432,7 @@ For advanced controls without native gh-aw settings, use this admission integrat
 
 ### Roll Out Shared Defaults
 
-For large installations, set baseline model and token guardrails once and let individual workflows override them only when needed:
+For large installations, set baseline credit guardrails once and let individual workflows override them only when needed:
 
 1. Export current defaults:
 
@@ -424,21 +440,20 @@ For large installations, set baseline model and token guardrails once and let in
 gh aw env get defaults.yml --scope org --org MY_ORG
 ```
 
-2. Update and apply shared defaults:
+2. Update the exported file, retaining any other defaults you want to keep. For example:
 
 ```yaml
 default_max_ai_credits: "5M"
 default_max_daily_ai_credits: "15M"
-default_model_copilot: "gpt-5-mini"
-default_model_claude: "claude-haiku-4-5"
-default_model_codex: "gpt-5.4-mini"
 ```
+
+`default_model_*` variables are explicit model overrides: when set, they opt out of [default routing](/gh-aw/reference/model-routing/#default-routing-for-workflows-without-a-model). Leave them unset to preserve default routing for eligible workflows. They cannot enable routing, so do not set them to `router` or `router/*` values; a router value in these variables stops the run before the agent starts. To route workflows explicitly, write the router value in the workflow.
 
 ```bash
 gh aw env update defaults.yml --scope org --org MY_ORG
 ```
 
-`gh aw env update` previews changes before applying them. Use `--yes` to skip confirmation in automation or `--dry-run` to preview only. Set a field to `null` to delete the corresponding variable. Unknown YAML keys are rejected. `default_max_turns`, `default_timeout_minutes`, `default_agent_job_timeout_minutes`, and `default_detection_job_timeout_minutes` must be positive integers; `default_max_ai_credits` and `default_max_daily_ai_credits` must be non-zero integers. Negative values disable the corresponding guardrail.
+`gh aw env update` previews changes before applying them. Use `--yes` to skip confirmation in automation or `--dry-run` to preview only. Set a field to `null` or omit it to delete the corresponding variable. Unknown YAML keys are rejected. `default_max_turns`, `default_timeout_minutes`, `default_agent_job_timeout_minutes`, and `default_detection_job_timeout_minutes` must be positive integers; `default_max_ai_credits` and `default_max_daily_ai_credits` must be non-zero integers. Negative values disable the corresponding guardrail.
 
 3. If you compile workflows in CI, pass compiler-read defaults into the compiler process environment, for example via `${{ vars.* }}`: `GH_AW_DEFAULT_MAX_TURNS`, `GH_AW_DEFAULT_MAX_TURN_CACHE_MISSES`, and `GH_AW_DEFAULT_DETECTION_MODEL`.
 
@@ -491,9 +506,8 @@ on:
 
 permissions:
   issues: read
-engine:
-  id: copilot
-  model: gpt-4.1-mini
+engine: copilot
+model: router/economy
 tools:
   github:
     toolsets: [issues]

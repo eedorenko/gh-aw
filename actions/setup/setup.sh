@@ -20,7 +20,15 @@ set -e
 
 # Capture start time immediately so the OTLP setup span reflects actual setup duration.
 # Falls back to 0 when node is unavailable.
-SETUP_START_MS=$(node -e "process.stdout.write(String(Date.now()))" 2>/dev/null || echo "0")
+GH_AW_NODE="${GH_AW_NODE:-$(command -v node 2>/dev/null || true)}"
+if [[ "${GH_AW_NODE}" == *$'\n'* || "${GH_AW_NODE}" == *$'\r'* ]]; then
+  echo "::error::Node.js executable path contains unsupported control characters."
+  exit 1
+fi
+if [[ -n "${GH_AW_NODE}" && -n "${GITHUB_ENV:-}" ]]; then
+  printf 'GH_AW_NODE=%s\n' "${GH_AW_NODE}" >> "${GITHUB_ENV}"
+fi
+SETUP_START_MS=$("${GH_AW_NODE:-node}" -e "process.stdout.write(String(Date.now()))" 2>/dev/null || echo "0")
 
 # Log a message only when GitHub Actions debug mode is active.
 # Handles both RUNNER_DEBUG=1 and RUNNER_DEBUG=true (GitHub Actions sets 'true').
@@ -85,6 +93,15 @@ if [ "${RESOLVED_RUNNER_TEMP%/}" = "/tmp" ]; then
 fi
 
 debug_log "Using RUNNER_TEMP: ${RUNNER_TEMP_BASH} (resolved: ${RESOLVED_RUNNER_TEMP}, writable: yes)"
+
+# Acquire before touching shared paths, containers, or listeners. Kept until always/post.
+if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" ]]; then
+  if [[ -z "${GH_AW_NODE}" || ! -x "${GH_AW_NODE}" ]]; then
+    echo "::error::Node.js is required before acquiring the shared-daemon lease."
+    exit 1
+  fi
+  "${GH_AW_NODE}" "$(dirname "${BASH_SOURCE[0]}")/js/docker_lease.cjs" acquire
+fi
 
 # Get destination from input or use default
 DESTINATION="${INPUT_DESTINATION:-${GH_AW_ROOT}/actions}"
@@ -185,6 +202,9 @@ done
 for file in "${JS_SOURCE_DIR}"/*.json; do
   if [ -f "$file" ]; then
     filename=$(basename "$file")
+    if [[ "${filename}" == "package.json" || "${filename}" == "package-lock.json" ]]; then
+      continue
+    fi
     cp "$file" "${DESTINATION}/${filename}"
     debug_log "Copied: ${filename}"
     FILE_COUNT=$((FILE_COUNT + 1))
@@ -208,7 +228,23 @@ else
   debug_log "No shell scripts directory found at ${SH_SOURCE_DIR}"
 fi
 
+# Stage only the locked npm project, not the maintainer's registry settings.
+create_dir "${DESTINATION}/typescript-lsp"
+for filename in package.json package-lock.json; do
+  cp "${SCRIPT_DIR}/typescript-lsp/${filename}" "${DESTINATION}/typescript-lsp/${filename}"
+  FILE_COUNT=$((FILE_COUNT + 1))
+done
+
 echo "Successfully copied ${FILE_COUNT} files to ${DESTINATION}"
+
+# Keep the locked SDK projects beside their installer; runner npm configuration
+# still controls the registry, not the development projects' .npmrc files.
+for variant in node typescript; do
+  sdk_project="${DESTINATION}/copilot-sdk/${variant}"
+  mkdir -p "$sdk_project"
+  cp "${SCRIPT_DIR}/copilot-sdk/${variant}/package.json" \
+    "${SCRIPT_DIR}/copilot-sdk/${variant}/package-lock.json" "$sdk_project/"
+done
 
 if ! bash "${DESTINATION}/runtime_trust_inventory.sh"; then
   echo "::warning::Runtime TLS inventory inspection failed; trust status unknown. Continuing setup; artifact-integrity checks remain required."
@@ -248,6 +284,12 @@ MCP_SCRIPTS_FILES=(
   "mcp_scripts_mcp_server_http.cjs"
   "mcp_scripts_tool_factory.cjs"
   "mcp_server_core.cjs"
+  "connector_runtime.cjs"
+  "connector_regex.cjs"
+  "connector_effect_bindings.cjs"
+  "connector_file.cjs"
+  "event_predicate.cjs"
+  "symlink_guard.cjs"
   "levenshtein_distance.cjs"
   "safe_output_names.cjs"
   "mcp_dependencies_manager.cjs"
@@ -286,12 +328,16 @@ MCP_SCRIPTS_FILES=(
   "aw_context.cjs"
   "webhook_context.cjs"
   "webhook_resource.cjs"
+  "connector_webhook.cjs"
   "gateway_command_webhook.cjs"
   "github_notification_webhook.cjs"
   "github_notification_webhooks.json"
   "diagnostic_sanitization.cjs"
   "experiment_helpers.cjs"
   "finish_work_queue_claim.cjs"
+  "work_queue_continuation.cjs"
+  "request_continuation_routes.cjs"
+  "check_permissions_utils.cjs"
   "git_auth_env.cjs"
   "glob_pattern_helpers.cjs"
   "handler_auth.cjs"
@@ -300,64 +346,67 @@ MCP_SCRIPTS_FILES=(
   "messages_core.cjs"
   "pi_session_redaction.cjs"
   "otlp_header_helpers.cjs"
+  "otlp.cjs"
   "provider_issue_webhook.cjs"
   "redact_secrets.cjs"
+  "durable_files.cjs"
   "safe_output_redaction.cjs"
   "safe_outputs_tools.json"
   "safe_outputs_config_redact.cjs"
   "repo_helpers.cjs"
   "safe_output_helpers.cjs"
   "safe_output_manifest.cjs"
-  "safe_output_outcomes.cjs"
+  "safe_output_execution.cjs"
   "safe_outputs_status.cjs"
   "sanitize_content.cjs"
   "sanitize_content_core.cjs"
   "slash_command_matcher.cjs"
   "staged_preview.cjs"
-  "work_queue_auth_cache.cjs"
   "work_queue_binding.cjs"
-  "work_queue_checked_transport.cjs"
+  "work_queue_convert_v3.cjs"
   "work_queue_claim_adapters.cjs"
   "work_queue_claim_scope.cjs"
   "work_queue_codec.cjs"
+  "lock_file_headers.cjs"
   "work_queue_control_receipts.cjs"
-  "work_queue_declared_verification.cjs"
-  "work_queue_delivery.cjs"
-  "work_queue_deployment.cjs"
-  "work_queue_deployment_control.cjs"
   "work_queue_dependency_resolver.cjs"
   "work_queue_dispatch.cjs"
-  "work_queue_dispatch_credential.cjs"
   "dispatch_workflow_transport.cjs"
   "work_queue_effect_client.cjs"
   "work_queue_effect_resource.cjs"
-  "work_queue_expiration.cjs"
+  "work_queue_git_objects.cjs"
   "work_queue_git_transport.cjs"
   "work_queue_git_tree_adapter.cjs"
   "work_queue_graph.cjs"
   "work_queue_graphql_adapter.cjs"
-  "work_queue_indexes.cjs"
   "work_queue_intents.cjs"
-  "work_queue_issue_contract.cjs"
+  "work_queue_issue_api.cjs"
+  "issue_report.cjs"
+  "report_ast.cjs"
+  "report_markdown.cjs"
+  "report_redaction.cjs"
+  "report_size.cjs"
+  "temporary_id.cjs"
+  "ephemerals.cjs"
+  "project_timezone.cjs"
+  "missing_info_formatter.cjs"
+  "work_queue_issue_messages.cjs"
+  "work_queue_issues.cjs"
   "work_queue_limits.cjs"
   "work_queue_logging.cjs"
   "work_queue_mcp_server.cjs"
   "work_queue_native.cjs"
-  "work_queue_native_creation_delivery.cjs"
   "work_queue_policy.cjs"
   "work_queue_policy_config.cjs"
-  "work_queue_pool_install.cjs"
-  "work_queue_provisioning.cjs"
-  "work_queue_read_retry.cjs"
   "work_queue_reconciler.cjs"
   "work_queue_replay.cjs"
   "work_queue_resource_scope.cjs"
   "work_queue_rest_adapter.cjs"
   "work_queue_scheduler.cjs"
   "work_queue_store.cjs"
+  "work_queue_telemetry.cjs"
   "work_queue_summary_renderer.cjs"
   "work_queue_host.cjs"
-  "work_queue_yaml.cjs"
 )
 
 MCP_SCRIPTS_COUNT=0
@@ -392,6 +441,14 @@ create_dir "${SAFE_OUTPUTS_DEST}"
 create_dir "${SAFE_OUTPUTS_DEST}/work-queue"
 
 SAFE_OUTPUTS_FILES=(
+  "connector_runtime.cjs"
+  "connector_regex.cjs"
+  "connector_effect_bindings.cjs"
+  "connector_file.cjs"
+  "event_predicate.cjs"
+  "connector_content.cjs"
+  "workflow_metadata_helpers.cjs"
+  "templatable.cjs"
   "safe_outputs_mcp_server.cjs"
   "safe_outputs_mcp_server_http.cjs"
   "safe_outputs_mcp_arguments.cjs"
@@ -403,6 +460,9 @@ SAFE_OUTPUTS_FILES=(
   "safe_output_redaction.cjs"
   "safe_outputs_config_redact.cjs"
   "safe_outputs_handlers.cjs"
+  "staging_conflicts.cjs"
+  "issue_artifacts.cjs"
+  "safe_output_submission.cjs"
   "ledger_append.cjs"
   "ledger_transactions.cjs"
   "ledger_builtin.cjs"
@@ -436,7 +496,8 @@ SAFE_OUTPUTS_FILES=(
   "diagnostic_sanitization.cjs"
   "ephemerals.cjs"
   "safe_output_manifest.cjs"
-  "safe_output_outcomes.cjs"
+  "safe_output_type_validator.cjs"
+  "safe_output_execution.cjs"
   "safe_outputs_status.cjs"
   "project_timezone.cjs"
   "compact_numbers.cjs"
@@ -493,23 +554,28 @@ SAFE_OUTPUTS_FILES=(
   "missing_info_formatter.cjs"
   "sanitize_content.cjs"
   "sanitize_content_core.cjs"
+  "sanitize_label_content.cjs"
   "slash_command_matcher.cjs"
   "sanitize_title.cjs"
   "issue_title_dedup.cjs"
   "levenshtein_distance.cjs"
   "markdown_code_region_balancer.cjs"
+  "markdown_unfencing.cjs"
   "temporary_id.cjs"
   "invocation_context_helpers.cjs"
   "data_schema_normalizer.cjs"
   "aw_context.cjs"
   "webhook_context.cjs"
   "webhook_resource.cjs"
+  "connector_webhook.cjs"
   "gateway_command_webhook.cjs"
   "github_notification_webhook.cjs"
   "github_notification_webhooks.json"
   "otlp_header_helpers.cjs"
+  "otlp.cjs"
   "provider_issue_webhook.cjs"
   "redact_secrets.cjs"
+  "durable_files.cjs"
   "experiment_helpers.cjs"
   "safe_output_helpers.cjs"
   "add_mask_redaction.cjs"
@@ -522,50 +588,47 @@ SAFE_OUTPUTS_FILES=(
   "pi_session_redaction.cjs"
   "staged_preview.cjs"
   "finish_work_queue_claim.cjs"
-  "work_queue_auth_cache.cjs"
+  "work_queue_continuation.cjs"
+  "request_continuation_routes.cjs"
+  "check_permissions_utils.cjs"
   "work_queue_binding.cjs"
-  "work_queue_checked_transport.cjs"
+  "work_queue_convert_v3.cjs"
   "work_queue_claim_adapters.cjs"
   "work_queue_claim_scope.cjs"
   "work_queue_codec.cjs"
+  "lock_file_headers.cjs"
   "work_queue_control_receipts.cjs"
-  "work_queue_declared_verification.cjs"
-  "work_queue_delivery.cjs"
   "work_queue_dependency_resolver.cjs"
   "work_queue_host.cjs"
-  "work_queue_deployment.cjs"
-  "work_queue_deployment_control.cjs"
   "work_queue_dispatch.cjs"
-  "work_queue_dispatch_credential.cjs"
   "dispatch_workflow_transport.cjs"
   "work_queue_effect_client.cjs"
   "work_queue_effect_resource.cjs"
-  "work_queue_expiration.cjs"
+  "work_queue_git_objects.cjs"
   "work_queue_git_transport.cjs"
   "work_queue_git_tree_adapter.cjs"
   "work_queue_graph.cjs"
   "work_queue_graphql_adapter.cjs"
-  "work_queue_indexes.cjs"
   "work_queue_intents.cjs"
-  "work_queue_issue_contract.cjs"
+  "work_queue_issue_api.cjs"
+  "issue_report.cjs"
+  "report_redaction.cjs"
+  "work_queue_issue_messages.cjs"
+  "work_queue_issues.cjs"
   "work_queue_limits.cjs"
   "work_queue_logging.cjs"
   "work_queue_mcp_server.cjs"
   "work_queue_native.cjs"
-  "work_queue_native_creation_delivery.cjs"
   "work_queue_policy.cjs"
   "work_queue_policy_config.cjs"
-  "work_queue_pool_install.cjs"
-  "work_queue_provisioning.cjs"
-  "work_queue_read_retry.cjs"
   "work_queue_reconciler.cjs"
   "work_queue_replay.cjs"
   "work_queue_resource_scope.cjs"
   "work_queue_rest_adapter.cjs"
   "work_queue_scheduler.cjs"
   "work_queue_store.cjs"
+  "work_queue_telemetry.cjs"
   "work_queue_summary_renderer.cjs"
-  "work_queue_yaml.cjs"
 )
 
 SAFE_OUTPUTS_COUNT=0

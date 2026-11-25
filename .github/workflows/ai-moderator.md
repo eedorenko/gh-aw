@@ -56,6 +56,7 @@ permissions:
   copilot-requests: write
 safe-outputs:
   add-labels:
+    issue-intent: true
     allowed: [spam, ai-generated, link-spam, ai-inspected]
     target: "*"
     item-schema:
@@ -70,7 +71,6 @@ safe-outputs:
     max: 5
     allowed-reasons: [spam]
   noop:
-  threat-detection: false
 checkout: false
 features:
   gh-aw-detection: true
@@ -122,6 +122,7 @@ pre-agent-steps:
            } else null end),
            comment: (($comment[0] // {}) | if .id then {
              id,
+             node_id,
              body: (.body | clip),
              author: .user.login,
              author_association,
@@ -148,7 +149,7 @@ You are an AI-powered moderation system that automatically detects spam, link sp
 
 The content to moderate has already been fetched for you — **do not call GitHub APIs, `gh`, `issue_read`, or `pull_request_read` to fetch it again**:
 
-- `/tmp/gh-aw/agent/moderation-context.json` — `event`, `actor`, `item` (number, kind, title, body, author, labels) and `comment` (id, body, author) when the event is a comment. Bodies are the original unsanitized user input, truncated to 6000 characters.
+- `/tmp/gh-aw/agent/moderation-context.json` — `event`, `actor`, `item` (number, kind, title, body, author, labels) and `comment` (id, node_id, body, author) when the event is a comment. Bodies are the original unsanitized user input, truncated to 6000 characters.
 - `/tmp/gh-aw/agent/pr-diff.patch` — the pull request diff, capped at the first 200 lines. Present only for pull request events.
 
 Read these files (plus the spam log below) in a **single turn**, then analyze and emit your safe output. Keep the run to as few turns as possible: one read, one analysis, one safe output.
@@ -215,6 +216,20 @@ Human-written content typically has:
 - Natural conversational flow with genuine questions or frustrations
 - Authentic emotional reactions to technical problems
 
+### add-labels Format
+
+Each label in an `add-labels` call must be an object with exactly `name`, `rationale`, and `confidence`. Set `confidence` to the exact string `"HIGH"`.
+
+```json
+{
+  "type": "add_labels",
+  "labels": [
+    {"name": "ai-inspected", "rationale": "The issue is legitimate and on-topic.", "confidence": "HIGH"}
+  ],
+  "item_number": 12345
+}
+```
+
 ## Actions
 
 Based on your analysis:
@@ -229,7 +244,7 @@ Based on your analysis:
 
 2. **For Comments** (when comment ID is present):
    - If any type of spam, link spam, or AI-generated spam is detected:
-     - Use the `hide-comment` safe output to hide the comment with reason 'spam'
+     - Use the `hide-comment` safe output with `comment_id` set to the quoted `comment.node_id` string (not numeric `comment.id`) and `reason` set to the exact uppercase enum value `"SPAM"`.
      - Also add appropriate labels to the parent issue as described above
    - If the comment appears legitimate and on-topic, add the `ai-inspected` label to the parent issue
 
@@ -242,6 +257,22 @@ Based on your analysis:
    - If spam, link spam, or suspicious patterns are detected:
      - Use the `add-labels` safe output to add appropriate labels (`spam`, `link-spam`, `ai-generated`)
    - **If no warnings or issues are found** and the PR appears legitimate, use the `add-labels` safe output to add the `ai-inspected` label
+
+## Success Rubric and Final Self-Check
+
+A successful review uses the supplied context, takes only high-confidence actions supported by that context, and emits at least one valid safe output. Before the final safe output, verify the target, allowed action and labels, rationale and confidence fields, spam-only hide reason, and that spam-log entries are added only when spam labels were applied.
+
+## Important Guidelines
+
+- Be conservative with detections to avoid false positives
+- Consider the repository context when evaluating relevance
+- Technical discussions may naturally contain links to resources, documentation, or related issues
+- New contributors may have less polished writing - this doesn't necessarily indicate AI generation
+- Provide clear reasoning for each detection in your analysis
+- Only take action if you have high confidence in the detection
+- **You MUST always emit at least one safe output.** After completing your analysis, if no spam was detected and no labels were applied, call the `noop` safe output to confirm that the content was reviewed and no action was required. Never exit without calling a safe output.
+
+<!-- instruction-prefix-end -->
 
 ## Spam Tracking (Cache Memory)
 
@@ -283,13 +314,3 @@ After completing your analysis, if any spam labels were applied:
 4. Write the updated array back to `/tmp/gh-aw/cache-memory/spam-log.json`
 
 If no spam was detected, you may still update the log to remove stale entries, but do not add a new entry.
-
-## Important Guidelines
-
-- Be conservative with detections to avoid false positives
-- Consider the repository context when evaluating relevance
-- Technical discussions may naturally contain links to resources, documentation, or related issues
-- New contributors may have less polished writing - this doesn't necessarily indicate AI generation
-- Provide clear reasoning for each detection in your analysis
-- Only take action if you have high confidence in the detection
-- **You MUST always emit at least one safe output.** After completing your analysis, if no spam was detected and no labels were applied, call the `noop` safe output to confirm that the content was reviewed and no action was required. Never exit without calling a safe output.

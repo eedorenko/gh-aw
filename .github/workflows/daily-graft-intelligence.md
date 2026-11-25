@@ -12,9 +12,18 @@ permissions:
   issues: read
   pull-requests: read
   copilot-requests: write
+checkout:
+  fetch-depth: 0
 engine:
   id: copilot
   copilot-sdk: true
+skip-if-decision:
+  - >-
+    Do @/tmp/gh-aw/agent/graft-recent-activity.txt and
+    @/tmp/gh-aw/agent/graft-changed-files.txt conclusively establish that the
+    last 24 hours contain only trivial housekeeping with no meaningful
+    architectural or operational signal to report? Abstain if change summaries
+    are insufficient or any change requires Graft analysis to assess its impact.
 strict: true
 tracker-id: daily-graft-intelligence
 timeout-minutes: 20
@@ -28,7 +37,7 @@ imports:
       expires: 2d
       labels: [automated-analysis, cookie]
   - shared/gh.md
-  - shared/mcp/graft.md
+  - shared/graft.md
   - shared/noop-reminder.md
 safe-outputs:
   mentions: false
@@ -45,20 +54,23 @@ steps:
       mkdir -p /tmp/gh-aw/agent
       git log --since="24 hours ago" --date=iso-strict \
         --format='commit %H%nAuthor: %an <%ae>%nDate: %ad%nSubject: %s%n' \
-        --name-status > /tmp/gh-aw/agent/graft-recent-activity.txt || true
+        --name-status > /tmp/gh-aw/agent/graft-recent-activity.txt
       git log --since="24 hours ago" --name-only --pretty=format: \
         | sed '/^$/d' \
-        | sort -u > /tmp/gh-aw/agent/graft-changed-files.txt || true
+        | sort -u > /tmp/gh-aw/agent/graft-changed-files.txt
 features:
   gh-aw-detection: true
 evals:
   - id: graph_built_and_checked
-    question: Did the workflow build a fresh Graft graph and verify it before analysis?
+    question: Did the workflow build a fresh Graft graph and verify it before analysis? Return UNKNOWN when the output records a skip-if-decision no-op before agent execution.
   - id: report_or_noop_produced
     question: Was a daily intelligence issue created when there were meaningful repository changes, or was noop used appropriately when there was nothing to report?
 ---
 
 # Daily Graft Intelligence
+
+The AWF decision gate may skip clearly report-free housekeeping before invoking
+the analyst. Ambiguous changes still receive the full Graft analysis.
 
 You are a repository intelligence analyst. Produce a concise daily report for the last 24 full hours ending at workflow start (UTC) using the pre-built Graft graph as your primary context source.
 
@@ -66,23 +78,23 @@ You are a repository intelligence analyst. Produce a concise daily report for th
 
 1. `/tmp/gh-aw/agent/graft-changed-files.txt` — unique files changed in the last 24 hours
 2. `/tmp/gh-aw/agent/graft-recent-activity.txt` — commit metadata and file status lines for the same window
-3. Graft MCP tools — repository map, subsystem summaries, call/dependency relationships, and targeted structural search
+3. Graft CLI — repository map, subsystem summaries, call/dependency relationships, and targeted structural search
 
 ## Required workflow
 
 1. Run `cat /tmp/gh-aw/agent/graft-changed-files.txt` as a separate bash call.
 2. If the file is empty, call `noop` with a message that no repository files changed in the last 24 full hours.
-3. Run `graft graft_check` through bash to confirm the graph is current.
-4. Run `graft graft_map` through bash to identify the most connected directories, symbols, and hotspots.
+3. The setup step already runs `graft check` against the wiring graph. The optional deep layer may report `NO GRAPH`; it is not required, and do not repeat the check. If any Graft query reports the wiring graph missing, stale, or unusable at runtime, call `safeoutputs report_incomplete` and stop without creating a daily report.
+4. Run `graft --dir=/tmp/gh-aw/graft map` through bash to identify the most connected directories, symbols, and hotspots. If it fails, call `safeoutputs report_incomplete` and stop without creating a daily report.
 5. Run `cat /tmp/gh-aw/agent/graft-recent-activity.txt` as a separate bash call and identify the most meaningful changed files or subsystems.
-6. Use Graft tools to explain those changes:
-   - `graft_ask` for high-level subsystem understanding
-   - `graft_callers` for blast-radius analysis around the most important changed symbols or files
-   - `graft_skeleton` when you need quick API-surface context for a changed file
-   - `graft_grep` only for targeted confirmation of a pattern or term
+6. Use Graft CLI commands with `--dir=/tmp/gh-aw/graft` to explain those changes:
+   - `ask "question" --source` for high-level subsystem understanding
+   - `callers "symbol"` for blast-radius analysis around the most important changed symbols or files
+   - `skeleton "file"` when you need quick API-surface context for a changed file
+   - `grep "pattern"` only for targeted confirmation of a pattern or term
 7. Synthesize one report issue with the highest-signal findings only.
 
-Graft and safe outputs are CLI-mounted in this workflow. Invoke every Graft tool as `graft <tool> [--param value...]` through bash, and emit the report or noop with `safeoutputs create_issue` or `safeoutputs noop`. Do not call CLI-mounted servers as native MCP tools.
+Graft is a native CLI; invoke each query as a separate bash call using `graft --dir=/tmp/gh-aw/graft <command> [arguments...]`, without pipes or redirections such as `2>&1 | head`. Safe outputs remain CLI-mounted: emit the report or noop with `safeoutputs create_issue` or `safeoutputs noop`, not native MCP calls. Do not run Graft `check`, `build`, or `mcp` during analysis.
 
 ## Analysis goals
 

@@ -5,6 +5,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -102,7 +103,7 @@ func updateActionsInWorkflowFiles(ctx context.Context, deps actionUpdateDeps, op
 	if conflictedWorkflow, err := findWorkflowWithMergeConflictMarkers(opts.workflowsDir); err != nil {
 		return fmt.Errorf("unable to scan workflows for merge conflicts: %w", err)
 	} else if conflictedWorkflow != "" {
-		message := fmt.Sprintf("Skipping action, skill, and plugin updates because merge conflict markers are present in %s", conflictedWorkflow)
+		message := "Skipping action, skill, and plugin updates because merge conflict markers are present in " + conflictedWorkflow
 		updateLog.Print(message)
 		if opts.verbose {
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(message))
@@ -148,7 +149,7 @@ func updateActionsInWorkflowFiles(ctx context.Context, deps actionUpdateDeps, op
 }
 
 func containsMergeConflictMarkers(content string) bool {
-	for _, line := range strings.Split(content, "\n") {
+	for line := range strings.SplitSeq(content, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "<<<<<<<") ||
 			strings.HasPrefix(trimmed, "|||||||") ||
@@ -160,9 +161,15 @@ func containsMergeConflictMarkers(content string) bool {
 }
 
 func findWorkflowWithMergeConflictMarkers(workflowsDir string) (string, error) {
+	if workflowsDir == "" {
+		workflowsDir = getWorkflowsDir()
+	}
 	var conflictedWorkflow string
 	err := filepath.WalkDir(workflowsDir, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
+			if path == workflowsDir && errors.Is(walkErr, os.ErrNotExist) {
+				return nil
+			}
 			return walkErr
 		}
 		if d.IsDir() || !strings.HasSuffix(d.Name(), ".md") {
@@ -171,7 +178,7 @@ func findWorkflowWithMergeConflictMarkers(workflowsDir string) (string, error) {
 
 		content, err := os.ReadFile(path)
 		if err != nil {
-			return nil
+			return err
 		}
 		if containsMergeConflictMarkers(string(content)) && conflictedWorkflow == "" {
 			conflictedWorkflow = path

@@ -492,6 +492,7 @@ safe-outputs:
     title-prefix: "[windows-defender] "
     labels: [security, automation]
     deduplicate-by-title: true
+    deduplicate-by-labels: [security, automation]
   create-pull-request:
     title-prefix: "[windows-defender] "
     labels: [security, automation]
@@ -509,6 +510,8 @@ safe-outputs:
   noop:
 features:
   gh-aw-detection: true
+imports:
+  - shared/reporting.md
 ---
 
 # Daily Windows Defender Release Scan
@@ -552,3 +555,12 @@ copied from the report.
 7. If the evidence is transient, unactionable, already tracked, or cannot justify either a tracking issue or
   a safe source change, call
    `noop` with a concise reason and do not create a pull request.
+
+## Report formatting
+
+For any issue or pull request body, use `###` (h3) or lower headers only. Keep the
+summary and decisions visible; put long findings, logs, and evidence in
+`<details><summary><b>...</b></summary>...</details>` blocks. Structure the report
+as overview → key findings/metrics → detailed findings → next actions. Use `- [ ]`
+for follow-up work and format workflow run references as
+`[§12345](https://github.com/github/gh-aw/actions/runs/12345)`.

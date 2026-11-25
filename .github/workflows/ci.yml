@@ -24,6 +24,12 @@ on:
       - '.github/aw/compat.json'
       - '.github/aw/compat.schema.json'
       - 'install-gh-aw.sh'
+      - 'specs/github-mcp-access-control-compliance/**'
+      - '**/*.tsp'
+      - 'specs/otel/build_specs.mjs'
+      - 'specs/otel/.npmrc'
+      - 'specs/otel/package*.json'
+      - 'scratchpad/github-mcp-access-control-specification.md'
   schedule:
   - cron: 0 * * * *
   workflow_dispatch: {}
@@ -44,6 +50,28 @@ jobs:
       run: "if [ \"${{ github.event_name }}\" != \"schedule\" ]; then\n  echo \"has_changes=true\" >> \"$GITHUB_OUTPUT\"\n  echo \"✅ Non-scheduled run: integration tests enabled\" >> \"$GITHUB_STEP_SUMMARY\"\n  exit 0\nfi\n\nCHANGES_IN_LAST_HOUR=$(git log --since='1 hour ago' --pretty=format:'%H' | wc -l | tr -d ' ')\nif [ \"$CHANGES_IN_LAST_HOUR\" -gt 0 ]; then\n  echo \"has_changes=true\" >> \"$GITHUB_OUTPUT\"\n  echo \"✅ Detected $CHANGES_IN_LAST_HOUR commit(s) in the last hour\" >> \"$GITHUB_STEP_SUMMARY\"\nelse\n  echo \"has_changes=false\" >> \"$GITHUB_OUTPUT\"\n  echo \"ℹ️ No commits in the last hour; skipping integration jobs\" >> \"$GITHUB_STEP_SUMMARY\"\nfi"
     outputs:
       has_changes: ${{ steps.detect.outputs.has_changes }}
+  spec-build:
+    name: Build TypeSpec contracts
+    needs: changes
+    if: needs.changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+    - name: Set up Node.js
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+      with:
+        node-version: "24"
+        package-manager-cache: false
+    - name: Install TypeSpec dependencies
+      run: npm ci --prefix specs/otel --ignore-scripts
+    - name: Compile specifications
+      run: make spec-build
   validate-latest-releases:
     name: Validate latest release alignment
     if: ${{ !github.event.repository.fork }}
@@ -173,6 +201,33 @@ jobs:
         fi
 
         echo "validated $checked_images container pins across $checked_files workflow lock files"
+  validate-mcp-access-control-spec-pin:
+    name: Validate GitHub MCP access-control spec pin
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Compare pinned specification commit
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        pinned="444ac7e1c72c0f04f749db57e00dc1cc89cd2308"
+        current="$(git log -n1 --format=%H -- scratchpad/github-mcp-access-control-specification.md)"
+        if [ -z "$current" ]; then
+          echo "No commit found for scratchpad/github-mcp-access-control-specification.md"
+          exit 1
+        fi
+        if [ "$current" != "$pinned" ]; then
+          echo "Spec pin drift: README pin=$pinned current=$current"
+          exit 1
+        fi
   test-race:
     name: Race detector
     if: ${{ github.event_name == 'schedule' && needs.changes.outputs.has_changes == 'true' }}
@@ -195,7 +250,14 @@ jobs:
         go-version-file: go.mod
         cache: true
 
+    - name: Set up Python 3.12 for mini-SWE-agent lock tests
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version: "3.12"
+
     - name: Run race detector
+      env:
+        GH_AW_REQUIRE_MINI_PY312: "1"
       run: make test-race
   shellcheck-setup-sh:
     name: ShellCheck actions/setup/sh
@@ -343,6 +405,7 @@ jobs:
         - name: "Workflow Actions & Containers"
           packages: "./pkg/workflow"
           pattern: "^TestAction[^P]|Container"
+          github_token: true
         - name: "CMD Tests"    # All cmd/gh-aw integration tests
           packages: "./cmd/gh-aw"
           pattern: ""
@@ -454,6 +517,12 @@ jobs:
 
     - name: Build gh-aw binary for integration tests
       run: make build
+
+    - name: Install actions-lock for compiler parity integration test
+      if: ${{ matrix.test-group.name == 'Workflow Actions & Containers' }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh extension install github/gh-actions-lock --pin v0.2.0
 
     - name: Test model-routing golden capture tooling
       if: ${{ matrix.test-group.name == 'CLI Audit Logs & Firewall' }}
@@ -604,14 +673,22 @@ jobs:
         path: gh-aw
         retention-days: 1
 
-    - name: Test update command (dry-run)
+    - name: Test upstream update command
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
         echo "Testing update command to ensure it runs successfully..."
-        # Run update with verbose flag to check for and apply workflow updates from source repositories
-        # The command may modify workflow files if upstream updates are available
-        ./gh-aw update --verbose
+        # Exercise a real upstream update without unrelated installed packages or
+        # repository-local imports. Merge behavior is covered by the update tests.
+        GH_AW_BINARY="$PWD/gh-aw"
+        TEST_WORKSPACE="$(mktemp -d "$RUNNER_TEMP/gh-aw-update.XXXXXX")"
+        trap 'rm -rf "$TEST_WORKSPACE"' EXIT
+        mkdir -p "$TEST_WORKSPACE/.github/workflows"
+        cp .github/workflows/daily-team-status.md "$TEST_WORKSPACE/.github/workflows/"
+        cd "$TEST_WORKSPACE"
+        git init -q
+        "$GH_AW_BINARY" update --verbose --no-merge --force
+        test -s .github/workflows/daily-team-status.lock.yml
         echo "✅ Update command executed successfully" >> $GITHUB_STEP_SUMMARY
 
   compile-cli-workflows:

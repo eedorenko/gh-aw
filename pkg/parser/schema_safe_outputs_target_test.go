@@ -6,6 +6,45 @@ import (
 	"testing"
 )
 
+func TestMainWorkflowSchema_RequireAgentSuccess(t *testing.T) {
+	t.Parallel()
+	keys, err := GetSafeOutputTypeKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range keys {
+		if key == "require-agent-success" {
+			t.Fatal("require-agent-success must not be classified as an output operation")
+		}
+	}
+	for _, tc := range []struct {
+		name  string
+		value any
+		valid bool
+	}{
+		{"enabled", true, true},
+		{"disabled", false, true},
+		{"string", "true", false},
+		{"expression", "${{ inputs.publish }}", false},
+		{"number", 1, false},
+		{"null", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			frontmatter := map[string]any{
+				"on": "push",
+				"safe-outputs": map[string]any{
+					"require-agent-success": tc.value,
+					"add-comment":           nil,
+				},
+			}
+			err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/require-agent-success.md")
+			if (err == nil) != tc.valid {
+				t.Fatalf("schema validity = %v, want %v: %v", err == nil, tc.valid, err)
+			}
+		})
+	}
+}
+
 func TestMainWorkflowSchema_CreateIssueOptOut(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -175,25 +214,6 @@ func TestMainWorkflowSchema_UpdatePullRequestSupportsReplaceIsland(t *testing.T)
 
 	if err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/update-pull-request-replace-island-test.md"); err != nil {
 		t.Fatalf("expected update-pull-request replace-island operation to pass schema validation, got: %v", err)
-	}
-}
-
-func TestMainWorkflowSchema_AzureDevOpsUpdateWorkItemSupportsStatus(t *testing.T) {
-	t.Parallel()
-
-	frontmatter := map[string]any{
-		"on":     "push",
-		"engine": "copilot",
-		"safe-outputs": map[string]any{
-			"ado-update-work-item": map[string]any{
-				"target": 42,
-				"status": true,
-			},
-		},
-	}
-
-	if err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/ado-update-work-item-status-test.md"); err != nil {
-		t.Fatalf("expected ado-update-work-item status to pass schema validation, got: %v", err)
 	}
 }
 
@@ -484,9 +504,10 @@ func TestMainWorkflowSchema_SafeOutputsTargetProperties(t *testing.T) {
 			name: "merge-pull-request with target, target-repo, and samples",
 			safeOutputs: map[string]any{
 				"merge-pull-request": map[string]any{
-					"target":        "*",
-					"target-repo":   "github/github",
-					"allowed-repos": []any{"github/docs"},
+					"allowed-base-branches": []any{"agent-work/*"},
+					"target":                "*",
+					"target-repo":           "github/github",
+					"allowed-repos":         []any{"github/docs"},
 					"samples": []any{
 						map[string]any{
 							"merge_method": "squash",

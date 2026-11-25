@@ -75,11 +75,12 @@ func (c *Compiler) buildDetectionJob(data *WorkflowData) (*Job, error) { //nolin
 
 	// Build job outputs
 	outputs := map[string]string{
-		"detection_success":    "${{ steps.detection_conclusion.outputs.success }}",
-		"detection_conclusion": "${{ steps.detection_conclusion.outputs.conclusion }}",
-		"detection_reason":     "${{ steps.detection_conclusion.outputs.reason }}",
-		"run_detection":        "${{ steps.detection_guard.outputs.run_detection }}",
-		"aic":                  "${{ steps.parse_detection_token_usage.outputs.aic }}",
+		"detection_success":      "${{ steps.detection_conclusion.outputs.success }}",
+		"detection_conclusion":   "${{ steps.detection_conclusion.outputs.conclusion }}",
+		"detection_reason":       "${{ steps.detection_conclusion.outputs.reason }}",
+		"detection_threat_kinds": "${{ steps.detection_conclusion.outputs.threat_kinds }}",
+		"run_detection":          "${{ steps.detection_guard.outputs.run_detection }}",
+		"aic":                    "${{ steps.parse_detection_token_usage.outputs.aic }}",
 	}
 
 	// Detection job depends on agent job and activation job (for trace ID)
@@ -177,6 +178,7 @@ func (c *Compiler) buildDetectionJob(data *WorkflowData) (*Job, error) { //nolin
 		BuildStringLiteral("skipped"),
 	)
 	jobConditionNode := BuildAnd(alwaysFunc, agentNotSkipped)
+	jobConditionNode = requireSafeOutputsAgentSuccess(jobConditionNode, data.SafeOutputs)
 
 	// When detection is expression-controlled, add the caller expression to the condition so
 	// GitHub Actions skips the detection job at runtime when the expression evaluates to false.
@@ -217,7 +219,16 @@ func (c *Compiler) buildDetectionJob(data *WorkflowData) (*Job, error) { //nolin
 	if brokeredInference {
 		perms.Set(PermissionIdToken, PermissionWrite)
 	}
-	if data.EngineConfig != nil && data.EngineConfig.Auth != nil && data.EngineConfig.Auth.Type == "github-oidc" {
+	if detectionAuthData.EngineConfig != nil &&
+		detectionAuthData.EngineConfig.Auth != nil &&
+		detectionAuthData.EngineConfig.Auth.Type == "github-oidc" {
+		if !awfSupportsExcludeEnv(getFirewallConfig(detectionAuthData)) {
+			return nil, fmt.Errorf(
+				"safe-outputs.threat-detection.engine.auth.type: github-oidc requires AWF %s or newer to keep Actions OIDC credentials out of the agent container. Set sandbox.agent.version to %s or newer",
+				constants.AWFExcludeEnvMinVersion,
+				constants.AWFExcludeEnvMinVersion,
+			)
+		}
 		perms.Set(PermissionIdToken, PermissionWrite)
 	}
 	if hasOTLPGitHubOIDCAuth(data.ParsedFrontmatter, data.RawFrontmatter) {

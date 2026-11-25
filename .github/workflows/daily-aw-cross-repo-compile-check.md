@@ -12,10 +12,13 @@ permissions:
   issues: read
   pull-requests: read
   actions: read
+  copilot-requests: write
 tracker-id: daily-aw-cross-repo-compile-check
 max-turns: 140
+model: router/economy
 engine:
   id: claude
+  model-provider: github
 sandbox:
   agent:
     id: awf
@@ -35,7 +38,7 @@ safe-outputs:
     create-issue: true
   create-issue:
     title-prefix: "[aw-compat] "
-    labels: [automation, compatibility, gh-aw]
+    labels: [automation, compatibility, gh-aw, "backlog:reports"]
     close-older-issues: true
     max: 6
     expires: 7d

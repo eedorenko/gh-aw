@@ -12,6 +12,7 @@ on:
     paths:
       - 'docs/**'
       - '!docs/adr/**'
+      - '.github/skills/cracktro/slides.md'
       - '.github/workflows/docs.yml'
   push:
     branches:
@@ -21,6 +22,7 @@ on:
       - '!docs/adr/**'
       - 'cmd/gh-aw-wasm/**'
       - 'scripts/bundle-wasm-docs.sh'
+      - '.github/skills/cracktro/slides.md'
       - '.github/workflows/docs.yml'
       - 'Makefile'
 
@@ -72,6 +74,9 @@ jobs:
       - name: Install dependencies
         working-directory: ./docs
         run: npm ci --legacy-peer-deps
+
+      - name: Test redirect fragment rewriting
+        run: make test-docs-redirect-fragments
 
       - name: Build documentation
         working-directory: ./docs

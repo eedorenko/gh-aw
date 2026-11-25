@@ -1,13 +1,13 @@
 ---
 name: agentic-workflows
-description: Route gh-aw design, creation, diagnosis, patching, active debugging, and upgrade requests to the right strategies.
+description: Route gh-aw design, creation, diagnosis, patching, active debugging, upgrades, and local SDLC issue requests to the right strategies.
 ---
 
 # Agentic Workflows Router
 
-Use this skill when a user asks to design, create, update, debug, or upgrade GitHub Agentic Workflows in this repository.
+Use this skill when a user asks to design, create, update, debug, or upgrade GitHub Agentic Workflows in this repository, or prepare a substantial issue for a local, self-contained SDLC.
 
-This skill is a dispatcher: identify the task type, load the matching workflow prompt/skill file, and follow it directly. Keep responses concise and ask a clarifying question if the correct prompt is unclear.
+Load and follow the matching prompt or skill. Keep responses concise; ask if the route is unclear.
 
 For debugging sessions needing CLI setup or run-URL scoping, first load
 `https://raw.githubusercontent.com/github/gh-aw/main/.github/aw/debug-bootstrap.md`; it bootstraps
@@ -25,14 +25,20 @@ Repository overlay (optional):
 - Load the target repository's `.github/aw/instructions.md`, if present, after the matched prompt/skill. Use `@.github/aw/instructions.md` only in a matching checkout; do not substitute a guidance-repository overlay.
 - Precedence: repository overlay instructions override upstream defaults when they conflict.
 
-Read only the files you need:
+## Load and route
+
+Read only the files needed for the selected task.
 Use a local guidance checkout only when its repository/ref matches the requested guidance; otherwise use the resolved guidance repository/ref (default `github/gh-aw`).
 If GitHub API, `gh api`, or GitHub MCP downloads return HTTP 403 (including a token SAML-authorized for a different organization), do not retry with the same token. Fetch the public file without authentication from `https://raw.githubusercontent.com/github/gh-aw/main/<path>` instead, preserving its repository-relative path (including `.github/`). For example: `curl --fail --silent --show-error --location 'https://raw.githubusercontent.com/github/gh-aw/main/.github/aw/create-agentic-workflow.md'`. Use the same fallback for referenced instructions and `SKILL.md` files; never send an Authorization header or token to the raw URL. If the public download fails, report that error rather than proceeding without the required instructions. This fallback is for public `github/gh-aw` content only, not private or enterprise repositories.
-{{AW_FILE_LIST}}
 After loading the matching workflow prompt or skill, follow it directly:
 - Design workflows from scratch via interview: `.github/aw/designer.md`
+- Repo Factory: `.github/aw/repo-factory.md`
 - Create new workflows: `.github/aw/create-agentic-workflow.md`
-- Configure or add declarative engines: `.github/aw/configure-agentic-engine.md`
+- Configure scheduled dreaming or consolidate persistent memory: `.github/aw/create-agentic-workflow.md`, then `.github/aw/memory.md#scheduled-dreaming`; load `.github/aw/dreaming.md` only when the decision and input scope justify implementation
+- Select engine and inference: `.github/aw/agentic-engine.md`
+- Define a custom engine: `.github/aw/custom-declarative-agentic-engine.md`
+- Consume, author, or document third-party connectors: `.github/aw/connectors.md`
+- Create a new connector: `.github/aw/connectors.md#author-or-extend-a-declaration`, then the repository's `.github/skills/create-connector/SKILL.md` when available
 - Update existing workflows: `.github/aw/update-agentic-workflow.md`
 - Diagnose, patch, audit, or actively debug workflows: `.github/aw/debug-agentic-workflow.md` (local-first strategy, evidence triage and live gates)
 - Analyze existing runs, logs, or recurring failures: `.github/aw/analyzing-runs.md`. General repository-wide debugging or optimization requests start here with failure clustering before selecting a workflow.
@@ -50,7 +56,37 @@ After loading the matching workflow prompt or skill, follow it directly:
 - Advanced cost controls without native settings (custom AIC allowances by server size or shared organization budget policies): read `docs/src/content/docs/reference/cost-management.md#configure-advanced-cost-controls-with-admission` ([published guidance](https://github.github.com/gh-aw/reference/cost-management/#configure-advanced-cost-controls-with-admission)). Explain the external authority requirement and cooperative limits; do not invent frontmatter fields or promise hard caps, reservations, or mid-run cancellation.
 - Design long-running multi-agent research workflows: `.github/aw/multi-agent-research.md`
 - Add skills or agent plugins requested by the user (`skills:` / `plugins:` frontmatter, never on-the-fly installs): `.github/aw/skills.md`
+- Local SDLC issue bootstrap: `.github/aw/squad.md`
 
 When the task involves OTEL, OTLP, traces, observability backends, or telemetry-driven analysis, also read and follow `skills/otel-queries/SKILL.md` after loading the matching workflow prompt or skill.
 
 When creating, updating, diagnosing or upgrading a workflow that uses `tools.work-queue`, also load `.github/aw/work-queue.md` after the primary prompt. Load deployment docs, operator reference or specification only when that task needs them.
+
+For repository initialization or configuration involving third-party integrations,
+use `.github/aw/connectors.md` and the selected editable declaration's
+`import-schema` and `connector-documentation` metadata. Discover local declarations,
+normal local/pinned imports and matching `*-golden.md` consumers; do not invent a
+built-in provider catalog. Use `gh aw connector <id> setup --file PATH` for
+phase-specific credential names/scopes and acquisition/renewal guidance.
+Bind exact approved resources through `with`; secret NAMES only, never values.
+Select reads/native methods and staged safe outputs independently. Importing must
+not enable capabilities, write credentials, broad grants or live webhook ingress.
+Derive network hosts from the selected contract, not provider-name guesses.
+Token acquisition/refresh, consent and real provider permissions remain external.
+
+When editing instructions, skills or their generators, keep the complete task
+contract within the first 7,500 UTF-8 bytes (8,000-byte query limit). Front-load
+constraints, routes, verification and stop conditions; defer examples and
+inventories. Preserve safety and exact schema/command names.
+
+<!-- instruction-prefix-end -->
+
+## Optional reference inventory
+
+<details>
+<summary>Guidance file catalog</summary>
+
+Use the task routes above first. This inventory is not required startup context.
+
+{{AW_FILE_LIST}}
+</details>

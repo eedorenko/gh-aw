@@ -86,10 +86,12 @@ type sessionModelRoutingEvent struct {
 
 type sessionModelRoutingAttribution struct {
 	WorkflowInfo              *sessionWorkflowInfo
+	ModelConfig               *AwInfoModelConfig
 	Outcome                   *sessionModelRoutingOutcome
 	Mismatches                []ModelEndpointMismatch
 	UnavailableSubagentModels []sessionSubagentModelUnavailable
 	RetryEvents               []sessionModelRoutingEvent
+	Observation               *RoutingObservation
 }
 
 // ModelEndpointMismatch describes a model/API incompatibility reported by the unified session.
@@ -105,6 +107,16 @@ type ModelEndpointMismatch struct {
 	Fix                string   `json:"fix"`
 	Model              string   `json:"model,omitempty"`
 	Endpoint           string   `json:"endpoint,omitempty"`
+}
+
+// isTrustedWorkflowInfo reports whether a workflow metadata event comes from a
+// runner-written aw_info.json rather than from agent-writable files.
+func (event sessionModelRoutingEvent) isTrustedWorkflowInfo() bool {
+	return event.Provenance.Component == "workflow" &&
+		(event.Provenance.Path == "aw_info.json" ||
+			(event.Provenance.Path == "runtime/aw_info.json" && event.Provenance.Phase == "agent") ||
+			event.Provenance.Path == "activation/aw_info.json" ||
+			event.Provenance.Path == "usage/aw_info.json")
 }
 
 func readSessionModelEndpointMismatches(runDir string) []ModelEndpointMismatch {
@@ -186,7 +198,7 @@ func decodeSessionModelRoutingEvent(line []byte, lineNumber int, attribution *se
 		return fmt.Errorf("invalid session event on line %d: %w", lineNumber, err)
 	}
 	switch {
-	case (event.Type == "harness.attempt" || event.Type == "harness.retry") && event.Provenance.Component == "harness":
+	case (event.Type == "harness.attempt" || event.Type == "harness.retry" || event.Type == "harness.decision") && event.Provenance.Component == "harness":
 		attribution.RetryEvents = append(attribution.RetryEvents, event)
 	case event.Type == "engine.retry" && event.Provenance.Component == "agent":
 		attribution.RetryEvents = append(attribution.RetryEvents, event)
@@ -197,16 +209,20 @@ func decodeSessionModelRoutingEvent(line []byte, lineNumber int, attribution *se
 		if json.Unmarshal(event.Data, &payload) == nil && len(payload.EngineRetry) > 0 {
 			attribution.RetryEvents = append(attribution.RetryEvents, event)
 		}
-	case event.Type == "workflow.info" && event.Provenance.Component == "workflow" &&
-		(event.Provenance.Path == "aw_info.json" ||
-			(event.Provenance.Path == "runtime/aw_info.json" && event.Provenance.Phase == "agent") ||
-			event.Provenance.Path == "activation/aw_info.json" ||
-			event.Provenance.Path == "usage/aw_info.json"):
+	case event.Type == "workflow.info" && event.isTrustedWorkflowInfo():
 		var info sessionWorkflowInfo
 		if err := json.Unmarshal(event.Data, &info); err != nil {
 			return fmt.Errorf("invalid workflow.info on line %d: %w", lineNumber, err)
 		}
 		attribution.WorkflowInfo = &info
+	case event.Type == "model.config" && event.isTrustedWorkflowInfo():
+		// The collector projects aw_info.model_config next to workflow.info with the
+		// same provenance; it records the requested router value, such as router/economy.
+		var config AwInfoModelConfig
+		if err := json.Unmarshal(event.Data, &config); err != nil {
+			return fmt.Errorf("invalid model.config on line %d: %w", lineNumber, err)
+		}
+		attribution.ModelConfig = &config
 	case event.Type == "model_routing.outcome" && event.Provenance.Component == "agent" && event.Provenance.Phase == "agent":
 		var outcome sessionModelRoutingOutcome
 		if err := json.Unmarshal(event.Data, &outcome); err != nil {
@@ -232,7 +248,30 @@ func decodeSessionModelRoutingEvent(line []byte, lineNumber int, attribution *se
 			unavailable.AgentName != "" && unavailable.DeclaredModel != "" && unavailable.Model != "" {
 			attribution.UnavailableSubagentModels = append(attribution.UnavailableSubagentModels, unavailable)
 		}
+	case event.Type == "routing.observation" && event.Provenance.Component == "collector" && event.Provenance.Phase == "conclusion":
+		attribution.Observation = parseRoutingObservation(event.Data, lineNumber)
 	}
+	return nil
+}
+
+// parseRoutingObservation returns the verdict when it uses T-UAS-094's
+// vocabulary: a known reason, and only with skip.
+func parseRoutingObservation(data json.RawMessage, lineNumber int) *RoutingObservation {
+	var observation RoutingObservation
+	if json.Unmarshal(data, &observation) == nil {
+		switch observation.Outcome {
+		case "success", "failure":
+			if observation.Reason == "" {
+				return &observation
+			}
+		case "skip":
+			switch observation.Reason {
+			case "cancelled", "infrastructure", "rate_limited", "pair_mismatch", "unknown_evidence":
+				return &observation
+			}
+		}
+	}
+	auditReportLog.Printf("Ignoring invalid routing.observation on line %d", lineNumber)
 	return nil
 }
 
@@ -326,5 +365,6 @@ func (attribution *sessionModelRoutingAttribution) awInfo() *AwInfo {
 		EventName:      workflow.TriggerType,
 		ModelRouting:   attribution.modelRouting(),
 		ModelSelection: workflow.ModelSelection.awInfo(),
+		ModelConfig:    attribution.ModelConfig,
 	}
 }

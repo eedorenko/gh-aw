@@ -91,11 +91,11 @@ for (const field of ["status", "labels", "assignees", "milestone"]) {
     assert.equal(validateArgumentsAgainstSchema(normalized, updateTool.inputSchema), null);
     assert.throws(() => handlers.updateIssueHandler(normalized), {
       code: -32602,
-      message: "ERR_VALIDATION: update_issue requires at least one of: status, title, body, labels, assignees, milestone fields"
+      message: "ERR_VALIDATION: update_issue requires at least one of: status, title, body, labels, assignees, milestone, artifacts fields"
     });
     assert.deepEqual(validateItem({ type: "update_issue", ...raw }, "update_issue", 1), {
       isValid: false,
-      error: "Line 1: update_issue requires at least one of: 'status', 'title', 'body', 'labels', 'assignees', 'milestone' fields"
+      error: "Line 1: update_issue requires at least one of: 'status', 'title', 'body', 'labels', 'assignees', 'milestone', 'artifacts' fields"
     });
     assert.equal(recorded.length, 0, "blank-only updates must not be recorded");
   }
@@ -106,11 +106,13 @@ for (const milestone of [null, 1, "1"]) {
   assert.equal(validateArgumentsAgainstSchema(normalized, updateTool.inputSchema), null);
   const result = handlers.updateIssueHandler(normalized);
   assert.equal(result.isError, undefined);
-  assert.deepEqual(recorded.at(-1), { type: "update_issue", issue_number: 42, milestone });
+  const { output_id: outputId, ...recordedEntry } = recorded.at(-1);
+  assert.match(outputId, /^so_[A-Za-z0-9_-]{12}$/);
+  assert.deepEqual(recordedEntry, { type: "update_issue", issue_number: 42, milestone });
   const entry = JSON.parse(JSON.stringify(recorded.at(-1)));
   assert.deepEqual(validateItem(entry, entry.type, 1), {
     isValid: true,
-    normalizedItem: { type: "update_issue", issue_number: 42, milestone: milestone === null ? null : 1 }
+    normalizedItem: { type: "update_issue", issue_number: 42, milestone: milestone === null ? null : 1, output_id: outputId }
   });
 }
 const clearedIssueType = validateItem({ type: "set_issue_type", issue_type: "" }, "set_issue_type", 1);

@@ -15,6 +15,7 @@ const { overridePersistedExtraheader, restorePersistedExtraheader } = require(".
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { redactSecrets, redactBuiltInPatterns } = require("./redact_secrets.cjs");
 const { withGitClaimEffects } = require("./work_queue_git_effects.cjs");
+const { createClaimEffectBatch, withClaimEffectBatch, discardClaimEffectBatch } = require("./work_queue_claim_scope.cjs");
 const ERROR_CODE_PREFIX_RE = /^(?:ERR_[A-Z_]+|E\d{3}):\s*/;
 
 /**
@@ -117,6 +118,23 @@ class PushSignedCommitsPolicyViolation extends Error {
   constructor(message) {
     super(message);
     this.name = "PushSignedCommitsPolicyViolation";
+  }
+}
+
+/**
+ * Sentinel error class for a remote branch that moved away from `baseRef` when
+ * `requireBaseRefMatch` is set. The caller must rebuild the commit on the new
+ * head, so neither the replay rebase nor the unsigned `git push` fallback runs.
+ */
+class PushSignedCommitsBaseMoved extends Error {
+  /**
+   * @param {string} branch
+   * @param {string | undefined} baseRefOid
+   * @param {string | undefined} remoteHeadOid
+   */
+  constructor(branch, baseRefOid, remoteHeadOid) {
+    super(`${ERR_API}: branch ${branch} moved from ${baseRefOid || "an unresolved base"} to ${remoteHeadOid || "no readable head"} after this commit was prepared`);
+    this.name = "PushSignedCommitsBaseMoved";
   }
 }
 
@@ -305,12 +323,15 @@ async function lsRemoteHeadOid(branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken
  * @param {string} [opts.pushToken]
  * @param {() => void} [opts.assertTransportUnchanged]
  * @param {boolean} [opts.requireExistingBranch]
+ * @param {string} [opts.expectedRemoteHead] - Push only while the remote branch is exactly this commit
  * @returns {Promise<string>}
  */
-async function pushBranchAndResolveHead({ branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken, assertTransportUnchanged, requireExistingBranch }) {
+async function pushBranchAndResolveHead({ branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken, assertTransportUnchanged, requireExistingBranch, expectedRemoteHead }) {
   const pushOnce = async () => {
     const pushArgs = ["push"];
-    if (requireExistingBranch) {
+    if (expectedRemoteHead) {
+      pushArgs.push(`--force-with-lease=refs/heads/${branch}:${expectedRemoteHead}`);
+    } else if (requireExistingBranch) {
       const expectedHead = await lsRemoteHeadOid(branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken);
       if (!expectedHead) throw new Error(`${ERR_API}: Branch ${branch} no longer exists; refusing to recreate it`);
       const ancestor = await getGitExecOutput(["merge-base", "--is-ancestor", expectedHead, "HEAD"], { cwd, ignoreReturnCode: true });
@@ -421,7 +442,7 @@ async function resolveLocalHeadSha(cwd) {
  * @param {string} [opts.pushToken] - Optional token used when pushing to pushRemoteUrl
  * @param {boolean} [opts.signedCommits=true] - When false, skip GraphQL signed commits and use git push directly
  * @param {boolean} [opts.allowGitPushFallback=true] - When false, refuse any fallback path that would use direct git push
- * @param {boolean} [opts.requireBaseRefMatch=false] - Refuse a signed commit against a remote head other than baseRef
+ * @param {boolean} [opts.requireBaseRefMatch=false] - Commit only while the remote head is still baseRef; a moved head is reported without rebasing or falling back to git push
  * @param {boolean} [opts.requireExistingBranch=false] - Never recreate a deleted target branch
  * @param {Record<string, any>} [opts.resolvedTemporaryIds] - Resolved temporary IDs map
  * @param {string} [opts.currentRepo] - Repository slug used for same-repo temporary ID resolution
@@ -544,6 +565,9 @@ async function pushSignedCommits({
     remoteHeadOid = await lsRemoteHeadOid(branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken);
   } catch {
     // Non-fatal. The existing branch-creation logic handles missing remote refs.
+  }
+  if (requireBaseRefMatch && remoteHeadOid !== baseRefOid) {
+    throw new PushSignedCommitsBaseMoved(branch, baseRefOid, remoteHeadOid);
   }
   const firstReplayParentOid = revListEntries[0] && revListEntries[0].fields.length > 1 ? revListEntries[0].fields[1] : undefined;
   const firstGraphqlParentOid = remoteHeadOid || baseRefOid;
@@ -823,6 +847,13 @@ async function pushSignedCommits({
       const paths = [...additions, ...deletions].map(file => file.path);
       core.info(`pushSignedCommits: processing commit ${i + 1}/${shas.length} sha=${sha}`);
 
+      // Full commit message (subject + body)
+      const { stdout: msgOut } = await getGitExecOutput(["log", "-1", "--format=%B", sha], { cwd });
+      const message = msgOut.trim();
+      const headline = message.split("\n")[0];
+      const body = message.split("\n").slice(1).join("\n").trim();
+      core.info(`pushSignedCommits: commit message headline: "${headline}"`);
+
       // Determine the expected HEAD OID for this commit.
       // After the first signed commit, reuse the OID returned by the previous GraphQL
       // mutation instead of re-querying ls-remote (works even if the branch is new).
@@ -836,10 +867,11 @@ async function pushSignedCommits({
         expectedHeadOid = oidResult || "";
         if (!expectedHeadOid) {
           if (requireExistingBranch) throw new Error(`${ERR_API}: Branch ${branch} no longer exists; refusing to recreate it`);
+          if (requireBaseRefMatch) throw new PushSignedCommitsBaseMoved(branch, baseRefOid, undefined);
           // Branch does not exist on the remote yet.
           // createCommitOnBranch requires the branch to already exist – it does NOT auto-create branches.
-          // Resolve the parent OID, create the branch on the remote via the REST API,
-          // then proceed with the signed-commit mutation as normal.
+          // Create the first commit before publishing the ref, so branch-push CI
+          // never sees a new branch pointing at the base commit.
           core.info(`pushSignedCommits: branch ${branch} not yet on the remote, resolving parent OID for first commit`);
           if (baseRefOid !== undefined) {
             expectedHeadOid = baseRefOid;
@@ -851,7 +883,44 @@ async function pushSignedCommits({
           if (!expectedHeadOid) {
             throw new Error(`${ERR_API}: Could not resolve OID for new branch ${branch}`);
           }
-          core.info(`pushSignedCommits: creating remote branch ${branch} at parent OID ${expectedHeadOid}`);
+          assertTransportUnchanged?.();
+          const parent = await githubClient.rest.git.getCommit({ owner, repo, commit_sha: expectedHeadOid });
+          const objectBatch = createClaimEffectBatch();
+          const createInitialObject = callback => withClaimEffectBatch(objectBatch, callback);
+          let createdCommit;
+          try {
+            createdCommit = await createInitialObject(async () => {
+              /** @type {Array<{path: string, mode: "100644", type: "blob", sha: string | null}>} */
+              const tree = [];
+              for (const addition of additions) {
+                assertTransportUnchanged?.();
+                const blob = await withGitClaimEffects({ github: githubClient, repository: `${owner}/${repo}`, branch, paths: [addition.path] }, () =>
+                  githubClient.rest.git.createBlob({ owner, repo, content: addition.contents, encoding: "base64" })
+                );
+                tree.push({ path: addition.path, mode: "100644", type: "blob", sha: blob.data.sha });
+              }
+              for (const deletion of deletions) tree.push({ path: deletion.path, mode: "100644", type: "blob", sha: null });
+              assertTransportUnchanged?.();
+              const treeOid = tree.length
+                ? (await withGitClaimEffects({ github: githubClient, repository: `${owner}/${repo}`, branch, paths }, () => githubClient.rest.git.createTree({ owner, repo, base_tree: parent.data.tree.sha, tree }))).data.sha
+                : parent.data.tree.sha;
+              assertTransportUnchanged?.();
+              return withGitClaimEffects({ github: githubClient, repository: `${owner}/${repo}`, branch, paths }, () => githubClient.rest.git.createCommit({ owner, repo, message, tree: treeOid, parents: [expectedHeadOid] }));
+            });
+          } catch (error) {
+            discardClaimEffectBatch(objectBatch);
+            throw error;
+          }
+          const firstOid = createdCommit?.data?.sha;
+          if (typeof firstOid !== "string" || firstOid.length === 0) {
+            discardClaimEffectBatch(objectBatch);
+            throw new Error(`${ERR_API}: REST createCommit did not return a valid commit OID`);
+          }
+          if (createdCommit?.data?.verification?.verified !== true) {
+            discardClaimEffectBatch(objectBatch);
+            throw new PushSignedCommitsPolicyViolation(`${ERR_VALIDATION}: GitHub did not verify the initial commit signature; refusing to publish branch '${branch}'`);
+          }
+          core.info(`pushSignedCommits: creating remote branch ${branch} at first signed commit ${firstOid}`);
           try {
             assertTransportUnchanged?.();
             await withGitClaimEffects({ github: githubClient, repository: `${owner}/${repo}`, branch, paths }, () =>
@@ -859,12 +928,19 @@ async function pushSignedCommits({
                 owner,
                 repo,
                 ref: `refs/heads/${branch}`,
-                sha: expectedHeadOid,
+                sha: firstOid,
               })
             );
             core.info(`pushSignedCommits: remote branch ${branch} created successfully`);
+            lastOid = firstOid;
+            continue;
           } catch (createRefError) {
-            assertTransportUnchanged?.();
+            try {
+              assertTransportUnchanged?.();
+            } catch (error) {
+              discardClaimEffectBatch(objectBatch);
+              throw error;
+            }
             /** @type {any} */
             const err = createRefError;
             const status = err && typeof err === "object" ? err.status : undefined;
@@ -873,12 +949,25 @@ async function pushSignedCommits({
             // GitHub returns 422 "Reference refs/heads/<branch> already exists". Treat that as success and continue.
             if (status === 422 && /reference.*already exists/i.test(message)) {
               core.info(`pushSignedCommits: remote branch ${branch} was created concurrently (422 Reference already exists); continuing with signed commits`);
-              const refreshedOid = await lsRemoteHeadOid(branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken);
+              let refreshedOid;
+              try {
+                refreshedOid = await lsRemoteHeadOid(branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken);
+              } catch (error) {
+                discardClaimEffectBatch(objectBatch);
+                throw error;
+              }
               if (!refreshedOid) {
+                discardClaimEffectBatch(objectBatch);
                 throw new Error(`${ERR_API}: Could not resolve remote branch OID for ${branch} after concurrent creation`);
               }
               expectedHeadOid = refreshedOid;
+              if (refreshedOid === firstOid) {
+                lastOid = firstOid;
+                continue;
+              }
+              discardClaimEffectBatch(objectBatch);
             } else {
+              discardClaimEffectBatch(objectBatch);
               throw createRefError;
             }
           }
@@ -886,16 +975,9 @@ async function pushSignedCommits({
           core.info(`pushSignedCommits: using remote HEAD OID from ls-remote: ${expectedHeadOid}`);
         }
         if (requireBaseRefMatch && expectedHeadOid !== baseRefOid) {
-          throw new Error(`${ERR_API}: ledger branch moved after transition validation`);
+          throw new PushSignedCommitsBaseMoved(branch, baseRefOid, expectedHeadOid);
         }
       }
-
-      // Full commit message (subject + body)
-      const { stdout: msgOut } = await getGitExecOutput(["log", "-1", "--format=%B", sha], { cwd });
-      const message = msgOut.trim();
-      const headline = message.split("\n")[0];
-      const body = message.split("\n").slice(1).join("\n").trim();
-      core.info(`pushSignedCommits: commit message headline: "${headline}"`);
 
       core.info(`pushSignedCommits: file changes: ${additions.length} addition(s), ${deletions.length} deletion(s)`);
 
@@ -941,12 +1023,25 @@ async function pushSignedCommits({
     if (err instanceof PushSignedCommitsPolicyViolation) {
       throw new Error(`${ERR_VALIDATION}: pushSignedCommits: refusing unsigned push for branch '${branch}': ${stripLeadingErrorCode(getErrorMessage(err))}`, { cause: err });
     }
+    if (err instanceof PushSignedCommitsBaseMoved) {
+      throw err;
+    }
     if (allowGitPushFallback === false) {
       const detail = getErrorMessage(err);
       throw new Error(`${ERR_API}: pushSignedCommits: signed commit push failed for branch '${branch}' and git push fallback is disabled: ${detail}${getWorkflowPermissionHint(detail)}`, { cause: err });
     }
     core.warning(`pushSignedCommits: GraphQL signed push failed, falling back to git push: ${getErrorMessage(err)}`);
-    const fallbackSha = await pushBranchAndResolveHead({ branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken, assertTransportUnchanged, requireExistingBranch });
+    const fallbackSha = await pushBranchAndResolveHead({
+      branch,
+      cwd,
+      gitAuthEnv,
+      pushRemoteUrl,
+      pushToken,
+      assertTransportUnchanged,
+      requireExistingBranch,
+      // The unsigned fallback may only replace the head this commit was prepared on.
+      expectedRemoteHead: requireBaseRefMatch ? baseRefOid : undefined,
+    });
     core.info(`pushSignedCommits: git push fallback completed, using pushed SHA ${fallbackSha}`);
     return fallbackSha;
   }

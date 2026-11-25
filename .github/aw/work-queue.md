@@ -4,25 +4,24 @@ description: Git-backed work queue agent instructions.
 
 # Work Queue
 
-`tools.work-queue` schedules immutable DAGs and Claim-scoped effects.
-`work-queue.jsonl` is authoritative; V3 omits storage selectors. Issues/PRs are dependencies.
-For issue-backed WorkQueueOps: [WorkQueueOps](../../docs/src/content/docs/patterns/workqueue-ops.md).
+`tools.work-queue` schedules Work DAGs and Claim-scoped effects (protocol v4).
+`work-queue.jsonl` on branch `work-queue` is authoritative; there is no storage selector.
+Issues/PRs are dependencies or mirrors, never storage.
+For issue-backed WorkQueueOps and the minimal deployment: [deployment](../../docs/src/content/docs/patterns/workqueue-ops.md).
 
 ## Select the role
 
-- **Observer:** read/explain only; never submit, dispatch or finish Work.
-- **Producer/dispatcher:** submit trusted plans/request bounded pool work;
-  queue authority grants no arbitrary resource writes.
-- **Worker:** require compiler-supplied version-3 `claims`; never override
-  reserved `work_queue_assignment` or caller context.
+- **Observer:** read and explain only; never submit, dispatch or finish Work.
+- **Producer/dispatcher:** submit bounded, secret-free plans; request pool work
+  with `work_queue_dispatch_next`; no arbitrary resource writes.
+- **Worker:** process only the Claims of its `work_queue_assignment`
+  (`{"version":4,"dispatch_id":…}`); never override that input or caller context.
 
-Trust runtime roles, not snapshots: AW authenticates native run/workflow/revision;
-reruns cannot inherit attempt 1. Absent branches are empty;
-reject malformed/unsupported logs.
+Absent branches are empty; reject malformed/unsupported logs.
+A v3 head is converted by the next dispatcher/producer/maintenance run;
+workers and observers fail with `unsupported_protocol` until then.
 
 ## Configure deployment
-
-Declare workers:
 
 ```yaml
 tools:
@@ -31,111 +30,86 @@ tools:
     worker: true
 ```
 
-Dispatchers require `tools.work-queue: true`, worker allowlist, bounded
-`dispatch-workflow.max`. Approved AW routes/credentials bind Claims to immutable
-native runs; ignore moved `target-ref`.
+- Dispatchers: `tools.work-queue: true`, worker allowlist in
+  `safe-outputs.dispatch-workflow.workflows`, bounded `dispatch-workflow.max`.
+- `aw.json` `work_queue`: `concurrency` (default 16), `pending_limit` (4,096),
+  `retry.max_attempts` (3), `pools.<name>` (`concurrency`, `per_account_limit`,
+  `retry`), `issues`. Unknown keys fail compilation.
+- The compiler emits pool limits as `GH_AW_WORK_QUEUE_POLICY` on every run.
+  Config edits apply on the next run after recompilation; nothing is installed
+  in the ledger and no drain is needed.
+- Every pool routes to every `worker: true` workflow; profile = workflow ID.
+- Standalone seeding is unsupported: the first submission creates the queue.
+- Never expose queue-write credentials to agents or snapshot MCP.
+  Repository access rules are GitHub's responsibility: branch write access is
+  the only queue authority.
 
-`aw.json` `work_queue`: concurrency, pending limits, retries, pools, fairness,
-Issues. Defaults: weighted-priority, concurrency 16,
-pending 4,096, singleton assignments, three attempts, 30-second backoff.
-Submission initializes Policy/Work. Trusted submit/dispatch install pools/profiles;
-workers, observers, previews and accepted-request recovery never install.
-New workers require default-revision
-AW source/contract verification and active registration.
-`PoolInstall.config_ref` records provenance, not authority.
-Preserve installed profiles/limits/epoch.
-Standalone seeding is unsupported; AW/Actions authorize submissions.
-Economic/installed-authority changes require quiescence and
-`policy --from-config --epoch EPOCH`; config edits never rewrite active state.
-Compatible deployments need no drain. Never expose queue-write credentials to
-agents/snapshot MCP. Repository access rules are GitHub's responsibility.
-See [deployment](../../docs/src/content/docs/patterns/workqueue-ops.md#deploy-a-native-queue).
+## Mirror Work with Issues
 
-## Mirror admitted Work with Issues
-
-`aw.json` `work_queue.issues: true` mirrors admitted Work with purple `work` /
-`work:<status>` labels. `label` customizes both prefixes; `title_prefix` defaults
-to `[work queue]`. Titles/summaries show 12-character Work IDs; bodies use full IDs.
-No per-workflow overrides. Only protected AW hooks project admissions/original Claims.
-Immutable `backing_issue` binds one Work per Issue. Agents never write
-mirrors; human edits never establish Result. Pre-existing Issues require exact
-installed `backing_issues` grants. Only trusted admission-time `completion_policy`
-permits closure, never payload. Keep uncertain writes pending; never recreate or
-globally repair. Maintenance: exact-run sync; recovery: `work-queue sync-issues --request-id ID`.
-Upgrade closed-schema readers. See
-[backing Issue reference](../../docs/src/content/docs/reference/work-queue.md#backing-issues).
-Mirroring generates `.github/workflows/agentic-workqueue.yml` for Issue lifecycle
-events; disabling removes it.
+`aw.json` `work_queue.issues: true` (or `{label, title_prefix}`) mirrors Work:
+create/adopt one labelled Issue per pending Work (immutable `IssueLink`),
+comment when a Claim binds, comment and close on completion/cancellation, close
+labelled Issues whose Work is absent. Projection is best-effort (≤50 Work/run),
+never fails a job, and is idempotent via markers in Issues and comments authored
+by the projector's own token principal; other authors' markers are ignored.
+Backing Issues of another repository are not projected.
+Closing a backing Issue cancels its `available` Work (`related_issue_closed`)
+through generated `.github/workflows/agentic-workqueue.yml`.
+See [backing Issue reference](../../docs/src/content/docs/reference/work-queue.md#backing-issues).
 
 ## Plan and dispatch
 
-- Read immutable snapshots; stale predictions cannot override Policy.
-  Submit bounded, secret-free plans within scheduling limits.
-- Request a pool prefix with `work_queue_dispatch_next` (`pool`, `max_claims`,
-  `max_dispatches`). Never choose winners/targets or use scalar dispatch.
-- Trusted processing refreshes the ledger and commits a compatible fair prefix.
-  CAS losers discard tentative choices/charges and recompute.
+- Read immutable snapshots; predictions are hints, never grants.
+- Request work with `work_queue_dispatch_next` (`pool`, `max_claims`,
+  `max_dispatches`). Never choose Work, targets, or call `dispatch_workflow`.
+- The scheduler takes eligible Work by priority (1 first), then FIFO, while
+  non-closed pool Dispatches < `concurrency` and the fairness key is under
+  `per_account_limit`. One Claim per Dispatch.
+- Trusted controls launch each Dispatch once. Success → `started`; failure →
+  `launch_failed` release, Work back in the pool (step still succeeds).
 
 ESLint/daily-report/conformance agents only explain staged plans.
-Trusted controls validate batches; empty dispatcher intents fail.
-Unassigned dispatchers cannot emit `noop` or `report_incomplete`.
+Empty dispatcher intents fail the controls step; only `blocked` receipts fail it otherwise.
+`status: "staged"` grants nothing.
 
-## Execute original Claims
+## Execute Claims
 
-- Process only the assignment's original Claims and stored plans. Scope every
-  safe output and finish intent to one original Claim.
-- Omit `claim_handle` only for an originally single-Claim assignment.
-  Multi-Claim assignments require it on every message even after others
-  close. Reject malformed, null, foreign or conflicting selectors.
-- Finish members with `work_queue_claim_finish`, using
-  `outcome: "completed"` or `"cancelled"`. Missing finish authorizes no effects;
-  valid siblings settle independently.
-- Retain Work with `outcome: "completed", keep_open: true` (default: false;
-  invalid with cancellation). Preserve both on retries. Verified delivery permits
-  another fair Claim, not successor release/backing Issue closure.
-  Pending/failed delivery blocks Claims; never rerun uncertain effects.
-- Default to one Claim; batch compatible Work with reusable setup. Native
-  batch conclusions are not per-Work Results.
-- Treat finish as an intent: trusted processing publishes Completion before
-  scoped effects and Result only after independently verified delivery.
-- Beyond built-in safe outputs, declare `safe-outputs.claim-adapters`
-  ([reference](safe-outputs-runtime.md)); each adapter binds one effect-type to
-  an independently verified result, never job success alone.
-
-`<mcp-clis>` takes one JSON argument. `uninitialized` plus null SHA is empty.
-Submit before dispatch.
-Policyless ledgers fail; workers require Policy; `status: "staged"` is no grant.
+- Scope every safe output and finish intent to one Claim `claim_handle`;
+  only a one-Claim assignment may omit it. Reject foreign or conflicting handles.
+- Finish each Claim with `work_queue_claim_finish`, `outcome: "completed"` or
+  `"failed"`. A missing outcome counts as failed.
+- Effects apply only for `completed` Claims whose Dispatch is bound to this run
+  and whose targets match the profile `effect_scope`; else `E004`.
+- Trusted steps apply effects, then publish Completion (or `worker_failed`).
+  Effects are at-least-once: a crash between them reruns the Work. Write
+  idempotent workers (check before acting).
+- Beyond built-ins, declare `safe-outputs.claim-adapters`
+  ([reference](safe-outputs-runtime.md)).
 
 ## Dependencies and recovery
 
-Require fresh Issue completed-state/PR merge evidence. Predecessors consume no
-Claims; successors wait for predecessor Results.
-
-Lost responses, dispatcher cancellation/deadlines never prove nonlaunch/termination.
-Retain reservations until exact evidence. Never rerun uncertain effects after
-Completion; bounded verification yields Result/DeliveryFailure. Compatible
-deployments preserve obligations, debt, Results, frozen assignments and explicit
-`execution_ref` pins. Unavailable/incompatible workers pause affected Work only.
-Quiesce economic Policy changes. Reject unsupported protocols/scalar assignments.
-Retries/checkpoints preserve submission identity; never delete queues to retry admission.
+- Work edges wait for predecessor Completion; Issue edges for `completed`/`closed`,
+  PR edges for `merged` observations refreshed by the dispatcher.
+- No clocks: no expiry, backoff or deadlines. Recovery uses run state only.
+- Worker conclusion releases its open Claims (`worker_terminated`).
+  Maintenance releases Dispatches whose bound or launched run completed
+  (`run_terminal`) or is missing (`run_missing`), and a Dispatch with no
+  recorded launch once the dispatcher attempt that reserved it (`reserved_by`)
+  completed or is missing; it also checkpoints logs over 512 lines.
+- A worker whose Dispatch has no recorded launch fails activation at once.
+- Each cancelled Claim adds one attempt; at `max_attempts` the Work is
+  cancelled `attempts_exhausted`. Do not raise limits to hide failing Work.
 
 ## Load details only when needed
 
-- Operator commands, TUI and diagnostic artifacts:
+- Commands, diagnostics, receipts:
   [queue reference](../../docs/src/content/docs/reference/work-queue.md).
-  Cancellation terminates Work, not workers; reconcile separately.
-  `gh aw work-queue --repo OWNER/REPO stats --json`. `dispatch-next` grants
-  reservations, never launches; use the authorized dispatcher.
-- Destructive: `gh aw work-queue clear --reason CODE [--dry-run | --hard]`
-  requires repo maintain/admin, forbids CI, and requires interactive confirmation
-  of the exact snapshot preview; no bypass. `--hard` replaces the ledger,
-  forgetting Work/Claim identities, retry history and fairness debt. Admission/grants
-  must already be paused, without open Claims/pending deliveries.
-  See [hard reset](../../docs/src/content/docs/reference/work-queue.md#hard-reset).
-- Daily report rotation and Claims:
+  `gh aw work-queue --repo OWNER/REPO stats --json`; `inspect --work-id ID`;
+  `release --dispatch-id ID`; `cancel-work --work-id ID`.
+- Destructive: `gh aw work-queue clear [--dry-run]` releases all open Dispatches
+  and cancels available Work; interactive confirmation, refuses CI.
+- Daily-report rotation/Claims:
   [portfolio example](../../docs/src/content/docs/gallery/daily-report-portfolio.md)
-  and [shared worker instructions](../workflows/shared/daily-report-worker.md).
-- Contracts: [specification](../../docs/src/content/docs/specs/work-queue-specification.md#91-implementation-coverage-and-remaining-requirements).
-- Models/fixtures/bounded verification: [formal reference](../../specs/work-queue/README.md).
-
-Tests prove neither Result nor live deployment.
+  and [worker instructions](../workflows/shared/daily-report-worker.md).
+- Ledger contract: [specification](../../docs/src/content/docs/specs/work-queue-specification.md).
+- [Formal model](../../specs/work-queue/README.md).

@@ -8,8 +8,12 @@ on:
 permissions:
   contents: read
   issues: read
+  copilot-requests: write
 tracker-id: safe-outputs-conformance
-engine: claude
+model: router/balanced
+engine:
+  id: claude
+  model-provider: github
 strict: true
 tools:
   cli-proxy: true

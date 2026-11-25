@@ -9,13 +9,16 @@ const { default: extension, subagentArgs, runPiSubagent } = await import("./pi_s
 const { writeInlineSubAgents } = await import("./extract_inline_sub_agents.cjs");
 const { stagePiArtifacts } = await import("./pi_runtime.cjs");
 const { preparePiSubagents } = await import("./pi_subagent_config.cjs");
+const { prepareMarkdownFixtures } = await import("../../../scripts/markdown_metadata_test_adapter.cjs");
 let dir;
 const agent = { name: "reader", description: "Read facts", prompt: "Read only.", declaredModel: "small", modelId: "claude-haiku-4.5", model: "aw-gateway/claude-haiku-4.5", tools: ["read"] };
 
 beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-delegate-"));
+  fs.writeFileSync(path.join(dir, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
   vi.stubEnv("PI_CODING_AGENT_DIR", dir);
   vi.stubEnv("RUNNER_TEMP", dir);
+  vi.stubEnv("PATH", `${dir}${path.delimiter}${process.env.PATH || ""}`);
   vi.stubEnv("GH_AW_PI_SUBAGENT_ARGS", '["--print","--mode","json","--no-session","--no-approve","--exclude-tools","bash","--exclude-tools","edit,write"]');
   vi.stubEnv("GH_AW_PI_TOOL_POLICY", '{"bash":false,"edit":false}');
   vi.spyOn(process.stdout, "write").mockImplementation(() => true);
@@ -49,6 +52,15 @@ describe("Pi managed delegation", () => {
     expect(registerTool).toHaveBeenCalledWith(expect.objectContaining({ name: "subagent", parameters: expect.objectContaining({ required: ["agent", "task"] }) }));
   });
 
+  it("advertises agent names without including their descriptions", () => {
+    fs.writeFileSync(path.join(dir, "subagents.json"), JSON.stringify([agent, { ...agent, name: "writer", description: "Write facts" }]));
+    const registerTool = vi.fn();
+    extension({ registerTool });
+    const tool = registerTool.mock.calls[0][0];
+    expect(tool.description).toBe("Delegate a task to a declared agent in an isolated Pi session. Available agents: reader; writer");
+    expect(tool.parameters.properties.agent.enum).toEqual(["reader", "writer"]);
+  });
+
   it("does not expose delegation without declarations or inside a child", () => {
     const registerTool = vi.fn();
     extension({ registerTool });
@@ -58,7 +70,7 @@ describe("Pi managed delegation", () => {
     expect(registerTool).not.toHaveBeenCalled();
   });
 
-  it.each([null, [], { agent: "unknown", task: "Read." }, { agent: "reader", task: "   " }])("rejects malformed or undeclared invocation parameters: %j", async params => {
+  it.each([null, [], { agent: "unknown", task: "Read." }, { agent: "reader", task: "   " }, { agent: "reader", task: "Read.", command: "/tmp/attacker" }])("rejects malformed or undeclared invocation parameters: %j", async params => {
     fs.writeFileSync(path.join(dir, "subagents.json"), JSON.stringify([agent]));
     const registerTool = vi.fn();
     extension({ registerTool });
@@ -115,6 +127,9 @@ describe("Pi managed delegation", () => {
 
   it("passes shell-looking tasks only through stdin without changing executable or arguments", async () => {
     const task = "--extension malicious.cjs\n$(touch /tmp/gh-aw-injected); ' \" `whoami`";
+    const executable = path.join(dir, "custom-pi");
+    fs.writeFileSync(executable, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    vi.stubEnv("GH_AW_PI_COMMAND", executable);
     const launch = launcher();
     let input = "";
     await runPiSubagent(agent, task, { cwd: dir }, undefined, (...args) => {
@@ -125,11 +140,35 @@ describe("Pi managed delegation", () => {
       return child;
     });
     const [command, args, options] = launch.mock.calls[0];
-    expect(command).toBe(process.env.GH_AW_PI_COMMAND || "pi");
+    expect(command).toBe(fs.realpathSync(executable));
     expect(options.shell).toBe(false);
     expect(args).not.toContain(task);
     expect(args).not.toContain("malicious.cjs");
     expect(input).toBe(task);
+  });
+
+  it("keeps the configured executable when the environment changes after extension setup", async () => {
+    const configured = path.join(dir, "configured-pi");
+    const attackerDir = path.join(dir, "attacker");
+    const pathPi = path.join(attackerDir, "pi");
+    const originalPath = process.env.PATH;
+    const makePi = answer => `#!/usr/bin/env node
+process.stdin.resume();
+process.stdin.on("end", () => {
+  process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: ${JSON.stringify(answer)} }], stopReason: "stop" } }) + "\\n");
+});
+`;
+    fs.mkdirSync(attackerDir);
+    fs.writeFileSync(configured, makePi("configured Pi"), { mode: 0o700 });
+    fs.writeFileSync(pathPi, makePi("PATH Pi"), { mode: 0o700 });
+    fs.writeFileSync(path.join(dir, "subagents.json"), JSON.stringify([agent]));
+    vi.stubEnv("GH_AW_PI_COMMAND", configured);
+    const registerTool = vi.fn();
+    extension({ registerTool });
+    vi.stubEnv("GH_AW_PI_COMMAND", pathPi);
+    vi.stubEnv("PATH", `${attackerDir}${path.delimiter}${originalPath}`);
+    const result = await registerTool.mock.calls[0][0].execute("id", { agent: agent.name, task: "Read." }, undefined, undefined, { cwd: dir });
+    expect(result.content[0].text).toBe("configured Pi");
   });
 
   it("does not claim success when inference ends with an error and CLI exits zero", async () => {
@@ -241,7 +280,7 @@ describe("Pi managed delegation", () => {
   });
 
   it("runs a real isolated child process with stdin instructions and preserved UTF-8", async () => {
-    const executable = path.join(dir, "fake-pi");
+    const executable = path.join(dir, "pi");
     fs.writeFileSync(
       executable,
       `#!/usr/bin/env node
@@ -259,7 +298,7 @@ process.stdin.on("end", () => {
 `,
       { mode: 0o700 }
     );
-    vi.stubEnv("GH_AW_PI_COMMAND", executable);
+    vi.stubEnv("PATH", `${dir}${path.delimiter}${process.env.PATH || ""}`);
     const result = await runPiSubagent(agent, "Summarize README.md", { cwd: dir });
     expect(result.content[0].text).toBe("R\u00e9sum\u00e9");
   });
@@ -280,25 +319,12 @@ process.stdin.on("end", () => {
       };
       vi.stubGlobal("core", { info: vi.fn() });
       const source = fs.readFileSync(new URL("../../../.github/workflows/smoke-pi-sub-agents.md", import.meta.url), "utf8");
+      prepareMarkdownFixtures(source);
       const parentPrompt = writeInlineSubAgents(source, dir, dir, "pi");
       expect(parentPrompt).not.toContain("## agent:");
       stagePiArtifacts(process.env.PI_CODING_AGENT_DIR);
       const expected = ["claude-haiku-4.5", "gpt-5.6-luna", "gpt-4o-mini"];
-      const sdk = {
-        parseFrontmatter: content => {
-          const [, header, body] = content.split("---");
-          const frontmatter = Object.fromEntries(
-            header
-              .trim()
-              .split("\n")
-              .map(line => {
-                const colon = line.indexOf(":");
-                return [line.slice(0, colon), line.slice(colon + 1).trim()];
-              })
-          );
-          return { frontmatter, body };
-        },
-      };
+      const sdk = {};
       const agents = preparePiSubagents({
         agentDir: process.env.PI_CODING_AGENT_DIR,
         sdk,
@@ -308,7 +334,7 @@ process.stdin.on("end", () => {
         parentModel: "github-copilot/gpt-5.3-codex",
       });
       expect(agents.map(agent => agent.modelId).sort()).toEqual([...expected].sort());
-      const executable = path.join(dir, "fixture-pi");
+      const executable = path.join(dir, "pi");
       fs.writeFileSync(
         executable,
         `#!/usr/bin/env node
@@ -324,7 +350,7 @@ process.stdin.on("end", () => {
 `,
         { mode: 0o700 }
       );
-      process.env.GH_AW_PI_COMMAND = executable;
+      process.env.PATH = `${dir}${path.delimiter}${originalEnv.PATH || ""}`;
       for (const agent of agents) {
         const result = await runPiSubagent(agent, "who am i?", { cwd: dir });
         expect(result.content[0].text).toBe(agent.modelId);

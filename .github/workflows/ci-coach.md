@@ -19,9 +19,8 @@ network:
     - node
     - go
 engine:
-  id: copilot
-  copilot-sdk: true
-max-tool-denials: 3
+  id: claude
+  model-provider: github
 tools:
   cli-proxy: true
   github:
@@ -29,13 +28,13 @@ tools:
     toolsets: [issues, pull_requests]
   edit:
 safe-outputs:
-  steer: true
   create-pull-request:
-    expires: 2d
+    draft: true
     title-prefix: "[ci-coach] "
     protected-files: fallback-to-issue
 timeout-minutes: 30
 imports:
+  - shared/pr-safe-output-defaults.md
   - shared/ci-data-analysis.md
   - shared/ci-optimization-strategies.md
   - shared/reporting.md
@@ -109,6 +108,13 @@ The `ci-data-analysis` shared module has pre-downloaded CI run data and attempte
 8. **Fuzz Results**: `/tmp/gh-aw/agent/ci-artifacts/*/fuzz-results/` - Fuzz test output and corpus data
 
 Start by reading `validation-status.json`. If any step failed, jump to the **Pre-flight Repair** path below. Otherwise read `ci-summary.json` and only touch raw files when a summary metric needs verification.
+
+Before either path, read `/tmp/gh-aw/cache-memory/ci-coach/last-analysis.json`.
+Report `Cache hit` after successfully reading prior analysis, or `Cache miss`
+if missing. Use it to avoid repeating unchanged proposals, but verify current
+CI data and GitHub status before relying on it. Before any PR or `noop`, merge
+this run's date, input revision, outcome, and proposal identifiers into the same
+file and read it back to verify the write, including in the concise variant.
 
 ## Pre-flight Repair Path (takes precedence)
 

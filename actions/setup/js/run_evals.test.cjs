@@ -1,11 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "fs";
+import os from "os";
+import path from "path";
 import { createRequire } from "module";
+import { createServer } from "node:http";
 
 const require = createRequire(import.meta.url);
+const realFetch = globalThis.fetch;
 const { executeMain, parseMain, summarizeUsageMain, recordUsage, classifyJudgeExecution } = require("./run_evals.cjs");
 const { findModelPricing } = require("./model_costs.cjs");
+const { useModelOverrides } = require("./fixtures/model_overrides.cjs");
 const { sumAICFromUsageJSONLFiles } = require("./daily_aic_workflow_helpers.cjs");
+const { readEvalsNotEvaluatedStatus, EVALS_REASON_CODES } = require("./evals_status.cjs");
 const dir = "/tmp/gh-aw/evals";
 const output = "/tmp/gh-aw/evals.jsonl";
 const status = "/tmp/gh-aw/evals_status.json";
@@ -19,8 +25,16 @@ const core = { info: vi.fn(), warning: vi.fn(), setFailed: vi.fn(), setOutput: v
 global.core = core;
 
 describe("Decisions BinEval harness", () => {
+  let restoreModels;
+  let root;
   beforeEach(() => {
     vi.clearAllMocks();
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-evals-"));
+    for (const method of ["mkdirSync", "rmSync", "writeFileSync", "readFileSync", "existsSync"]) {
+      const original = fs[method].bind(fs);
+      vi.spyOn(fs, method).mockImplementation((file, ...args) => original(typeof file === "string" && file.startsWith("/tmp/gh-aw/") ? path.join(root, file.slice("/tmp/gh-aw/".length)) : file, ...args));
+    }
+    restoreModels = useModelOverrides({ "github-copilot": { models: { "gpt-6-luna": { cost: { input: "0.000002", output: "0.000004", cache_read: "0.0000002", cache_write: "0.0000025" } } } } });
     fs.mkdirSync(dir, { recursive: true });
     for (const file of files) fs.rmSync(file, { force: true });
     vi.stubEnv("GH_AW_EVALS_QUESTIONS", JSON.stringify(questions));
@@ -50,6 +64,9 @@ describe("Decisions BinEval harness", () => {
     for (const file of files) fs.rmSync(file, { force: true });
     vi.unstubAllEnvs();
     vi.unstubAllGlobals();
+    restoreModels();
+    vi.restoreAllMocks();
+    fs.rmSync(root, { recursive: true, force: true });
   });
 
   it("batches all questions as BinEval choices and matches reordered answers by ID", async () => {
@@ -58,6 +75,7 @@ describe("Decisions BinEval harness", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
     const [url, request] = fetch.mock.calls[0];
     expect(url).toBe("https://api.githubcopilot.com/v1/decisions");
+    expect(request.headers["Copilot-Integration-Id"]).toBe("agentic-workflows");
     expect(request.headers.Authorization).toBe("Bearer test-token");
     const body = JSON.parse(request.body);
     expect(body.model).toBe("gpt-6-luna-decisions");
@@ -89,6 +107,17 @@ describe("Decisions BinEval harness", () => {
     const records = fs.readFileSync(output, "utf8").trim().split("\n").map(JSON.parse);
     expect(records.map(record => record.answer)).toEqual(["UNKNOWN", "UNKNOWN"]);
     expect(core.warning).toHaveBeenCalledWith(expect.stringContaining("refused"));
+  });
+
+  it.each(["github-copilot", "copilot", "github"])("retains the Copilot integration identity and usage accounting for provider %s", async provider => {
+    vi.stubEnv("GH_AW_DECISIONS_PROVIDER", provider);
+    await executeMain();
+    expect(fetch.mock.calls[0][1].headers["Copilot-Integration-Id"]).toBe("agentic-workflows");
+    expect(fetch.mock.calls[0][1].headers.Authorization).toBe(`Bearer ${process.env.GH_AW_DECISIONS_API_KEY}`);
+    const usage = JSON.parse(fs.readFileSync(usagePath, "utf8"));
+    expect(usage.provider).toBe(provider);
+    expect(usage.ai_credits).toBeGreaterThan(0);
+    expect(findModelPricing(provider, usage.model)).toEqual(findModelPricing("github-copilot", usage.model));
   });
 
   it("preserves experiment assignments", async () => {
@@ -139,6 +168,78 @@ describe("Decisions BinEval harness", () => {
     await expect(executeMain()).rejects.toThrow("HTTP 401");
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(fs.existsSync(`${dir}/decisions.json`)).toBe(false);
+  });
+
+  it.each([
+    [400, { error: { code: "model_not_supported" } }],
+    [400, { error: { code: "model_not_found" } }],
+    [422, { code: "unsupported_model" }],
+  ])("gracefully records unavailable Decisions models without answers or costs (HTTP %s)", async (httpStatus, body) => {
+    fs.writeFileSync(`${dir}/decisions.json`, "{}");
+    fs.writeFileSync(output, "stale answers");
+    fs.writeFileSync(status, "{}");
+    fs.writeFileSync(usagePath, '{"ai_credits":42}');
+    fetch.mockResolvedValue({ ok: false, status: httpStatus, json: async () => ({ ...body, message: "sensitive provider message" }) });
+    await expect(executeMain()).resolves.toBeUndefined();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(readEvalsNotEvaluatedStatus()).toMatchObject({ status: "not_evaluated", reason_code: EVALS_REASON_CODES.MODEL_UNAVAILABLE, model: "copilot/gpt-6-luna-decisions", run_id: "123", run_attempt: "1" });
+    await parseMain();
+    expect(readEvalsNotEvaluatedStatus()).toMatchObject({ reason_code: EVALS_REASON_CODES.MODEL_UNAVAILABLE, execution_outcome: "success", execution_state: EVALS_REASON_CODES.MODEL_UNAVAILABLE });
+    for (const file of [output, usagePath, `${dir}/decisions.json`]) expect(fs.existsSync(file)).toBe(false);
+    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining("Decisions-compatible evals.model"));
+    expect(JSON.stringify(core.warning.mock.calls)).not.toContain("sensitive");
+  });
+
+  it("does not reuse unavailable-model evidence from another attempt", async () => {
+    fetch.mockResolvedValue({ ok: false, status: 400, json: async () => ({ error: { code: "model_not_supported" } }) });
+    await executeMain();
+    vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+    await parseMain();
+    expect(readEvalsNotEvaluatedStatus().reason_code).toBe("no_assistant_response");
+  });
+
+  it.each(["cancelled", "skipped"])("preserves %s outcomes over unavailable-model evidence", async outcome => {
+    fetch.mockResolvedValue({ ok: false, status: 400, json: async () => ({ error: { code: "model_not_supported" } }) });
+    await executeMain();
+    vi.stubEnv("GH_AW_EVALS_EXECUTION_OUTCOME", outcome);
+    await parseMain();
+    expect(readEvalsNotEvaluatedStatus().reason_code).toBe(outcome === "skipped" ? "judge_not_started" : "judge_failed");
+  });
+
+  it.each([400, 404, 422])("still fails ordinary HTTP %s errors instead of skipping evals", async httpStatus => {
+    fetch.mockResolvedValue({ ok: false, status: httpStatus, json: async () => ({ error: { code: "invalid_request_error" } }) });
+    await expect(executeMain()).rejects.toThrow(`HTTP ${httpStatus}`);
+    vi.stubEnv("GH_AW_EVALS_EXECUTION_OUTCOME", "failure");
+    await parseMain();
+    expect(readEvalsNotEvaluatedStatus().reason_code).toBe("judge_failed");
+  });
+
+  it("preserves a route-level 404 with a model code as a failed request through execute and parse", async () => {
+    const requests = [];
+    const server = createServer((request, response) => {
+      requests.push(request.url);
+      request.resume();
+      response.writeHead(404, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: { code: "model_not_found", message: "sensitive routing response" } }));
+    });
+    await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+    try {
+      vi.stubGlobal("fetch", vi.fn(realFetch));
+      vi.stubEnv("GH_AW_DECISIONS_BASE_URL", `http://127.0.0.1:${server.address().port}/removed-route`);
+      for (const file of [output, status, usagePath, `${dir}/decisions.json`]) fs.writeFileSync(file, "stale");
+      await expect(executeMain()).rejects.toThrow("Decisions request failed (HTTP 404)");
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(requests).toEqual(["/removed-route/decisions"]);
+      expect(fs.existsSync(status)).toBe(false);
+      expect(JSON.parse(fs.readFileSync(`${dir}/execution.json`, "utf8")).state).toBe("started");
+      vi.stubEnv("GH_AW_EVALS_EXECUTION_OUTCOME", "failure");
+      await parseMain();
+      expect(readEvalsNotEvaluatedStatus()).toMatchObject({ reason_code: "judge_failed", execution_outcome: "failure", execution_state: "started" });
+      for (const file of [output, usagePath, `${dir}/decisions.json`]) expect(fs.existsSync(file)).toBe(false);
+      expect(JSON.stringify(core.warning.mock.calls)).not.toContain("sensitive");
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+    }
   });
 
   it("classifies skipped execution as not started", () => {
@@ -243,6 +344,7 @@ describe("Decisions BinEval harness", () => {
     vi.stubEnv("GH_AW_DECISIONS_PROVIDER", provider);
     await executeMain();
     expect(JSON.parse(fetch.mock.calls[0][1].body).model).toBe(expected);
+    expect(fetch.mock.calls[0][1].headers["Copilot-Integration-Id"]).toBe(provider === "github-copilot" ? "agentic-workflows" : undefined);
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 });

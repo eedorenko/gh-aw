@@ -29,6 +29,8 @@ func TestNewDeployCommand_RequiresWorkflowArg(t *testing.T) {
 	err := cmd.Args(cmd, []string{})
 	require.Error(t, err)
 	require.ErrorContains(t, err, "missing workflow specification")
+	require.ErrorContains(t, err, "Usage:\n  gh aw deploy")
+	require.ErrorContains(t, err, "Run 'gh aw deploy --help'")
 }
 
 func TestNewDeployCommand_RegistersCoreFlags(t *testing.T) {
@@ -146,7 +148,7 @@ func TestRunDeployCommandAutoMergeRequiresPR(t *testing.T) {
 	cmd := NewDeployCommand(validateEngineStub)
 	require.NoError(t, cmd.Flags().Set("auto-merge", "true"))
 	err := cmd.RunE(cmd, []string{"owner/source/workflow"})
-	require.ErrorContains(t, err, "--auto-merge requires --pr or --create-pull-request")
+	require.ErrorContains(t, err, "--auto-merge requires --create-pull-request")
 }
 
 func TestRunDeployCommandAutoMergePropagation(t *testing.T) {

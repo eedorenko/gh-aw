@@ -368,7 +368,7 @@ Test workflow`
 		t.Fatal("Detection job not found in compiled workflow")
 	}
 
-	// The external detector path must emit threat-detect conclude, not the .cjs module
+	// The external detector path uses the host reader, not the legacy inline parser.
 	if strings.Contains(detectionSection, "parse_threat_detection_results.cjs") {
 		t.Error("External detector path must NOT emit parse_threat_detection_results.cjs")
 	}
@@ -377,6 +377,14 @@ Test workflow`
 	}
 	if !strings.Contains(detectionSection, "GH_AW_DETECTION_CONTINUE_ON_ERROR") {
 		t.Error("External detector path must pass GH_AW_DETECTION_CONTINUE_ON_ERROR to conclude_threat_detection.sh")
+	}
+	_, afterConclude, found := strings.Cut(detectionSection, "- name: Conclude threat detection\n")
+	if !found {
+		t.Fatal("External conclusion step not found")
+	}
+	concludeStep, _, _ := strings.Cut(afterConclude, "\n      - ")
+	if strings.Contains(concludeStep, "continue-on-error:") {
+		t.Error("External conclude must not suppress failures to record the conclusion")
 	}
 
 	// The install step must reference the pinned version
@@ -398,6 +406,13 @@ Test workflow`
 	}
 	if !strings.Contains(detectionSection, "THREAT_DETECT_INSTALL_OUTCOME: ${{ steps.threat_detect_install.outcome }}") {
 		t.Error("External detector conclude step must receive the install outcome so it can fail closed without invoking a detector")
+	}
+	if !strings.Contains(detectionSection, "id: detection_awf_install") ||
+		!strings.Contains(detectionSection, "steps.detection_awf_install.outcome == 'success'") {
+		t.Error("External detector execution must require a successful verified AWF installation")
+	}
+	if !strings.Contains(detectionSection, "AWF_INSTALL_OUTCOME: ${{ steps.detection_awf_install.outcome }}") {
+		t.Error("External detector conclude step must receive the AWF install outcome so a quota stop is reported explicitly")
 	}
 	if !strings.Contains(detectionSection, "install_copilot_cli.sh") {
 		t.Error("External detector path must emit engine installation step for copilot")
@@ -1118,8 +1133,8 @@ Test workflow`, tt.provider, network, tt.provider)
 			if got := strings.Contains(allowDomainsLine, strconv.Quote("api.openai.com")); got != (tt.provider == "openai") {
 				t.Errorf("OpenAI API transport allowed=%t for provider %q", got, tt.provider)
 			}
-			if tt.provider == "github" && !strings.Contains(allowDomainsLine, strconv.Quote("api.githubcopilot.com")) {
-				t.Error("GitHub-hosted detector must retain Copilot routing transport")
+			if tt.provider == "github" && strings.Contains(allowDomainsLine, strconv.Quote("api.githubcopilot.com")) {
+				t.Error("GitHub-hosted detector must not grant direct Copilot API egress")
 			}
 			for _, domain := range []string{"auth.openai.com", "ab.chatgpt.com"} {
 				if got := strings.Contains(allowDomainsLine, strconv.Quote(domain)); got != tt.vendorOptIn {
@@ -1141,6 +1156,117 @@ Test workflow`, tt.provider, network, tt.provider)
 				}
 			}
 		})
+	}
+}
+
+func TestCompiledCopilotDetectionNpmRegistryOptIn(t *testing.T) {
+	for _, optIn := range []bool{false, true} {
+		t.Run(fmt.Sprintf("opt-in=%t", optIn), func(t *testing.T) {
+			network := "  allowed: []\n"
+			if optIn {
+				network = "  allowed: [node]\n  blocked: [npmjs.org]\n"
+			}
+			content := fmt.Sprintf(`---
+on: push
+engine: copilot
+network:
+%spermissions:
+  contents: read
+  copilot-requests: write
+safe-outputs:
+  create-issue:
+features:
+  gh-aw-detection: false
+---
+Test workflow
+`, network)
+			path := filepath.Join(testutil.TempDir(t, "detection-registry-*"), "test.md")
+			if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if err := NewCompiler().CompileWorkflow(path); err != nil {
+				t.Fatal(err)
+			}
+			lock, err := os.ReadFile(stringutil.MarkdownToLockFile(path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			job := extractJobSection(string(lock), "detection")
+			if job == "" {
+				t.Fatal("missing detection job")
+			}
+			var rules []string
+			if strings.Contains(job, "allowDomains") {
+				rules = firewallDomainRules(t, job, "allowDomains")
+			}
+			allowed := false
+			for _, rule := range rules {
+				allowed = allowed || awfDomainAllowsHost(rule, "registry.npmjs.org")
+			}
+			if allowed != optIn {
+				t.Fatalf("registry allowed = %t, want %t; rules: %v", allowed, optIn, rules)
+			}
+			if optIn && !slices.Contains(firewallDomainRules(t, job, "blockDomains"), "npmjs.org") {
+				t.Fatal("expected registry parent block in detection AWF config")
+			}
+		})
+	}
+}
+
+func TestCompiledExternalCopilotDetectionDoesNotInheritNpmRegistryOptIn(t *testing.T) {
+	content := `---
+on: push
+engine: copilot
+network:
+  allowed: [node]
+permissions:
+  contents: read
+  copilot-requests: write
+safe-outputs:
+  create-issue:
+features:
+  gh-aw-detection: true
+---
+Test workflow
+`
+	path := filepath.Join(testutil.TempDir(t, "external-detection-registry-*"), "test.md")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewCompiler().CompileWorkflow(path); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.ReadFile(stringutil.MarkdownToLockFile(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := extractJobSection(string(lock), "detection")
+	if job == "" {
+		t.Fatal("missing external detection job")
+	}
+	if strings.Contains(job, "registry.npm.org") {
+		t.Fatal("external detection must not inherit the node registry opt-in")
+	}
+}
+
+func TestCommittedDefaultCopilotDetectionLockfileDoesNotAllowNpmRegistry(t *testing.T) {
+	repoRoot, err := findRepoRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.ReadFile(filepath.Join(repoRoot, ".github", "workflows", "smoke-copilot-small.lock.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := extractJobSection(string(lock), "detection")
+	if job == "" {
+		t.Fatal("missing committed detection job")
+	}
+	rules := firewallDomainRules(t, job, "allowDomains")
+	for _, rule := range rules {
+		if awfDomainAllowsHost(rule, "registry.npmjs.org") {
+			t.Fatalf("committed default-network detection job allows registry.npmjs.org: %v", rules)
+		}
 	}
 }
 
@@ -1195,7 +1321,7 @@ func TestDetectionAndEvalsSidecarOutputUnchanged(t *testing.T) {
           GITHUB_GRAPHQL_URL: ${{ env.GITHUB_GRAPHQL_URL }}
           GITHUB_COPILOT_BASE_URL: ${{ env.GITHUB_COPILOT_BASE_URL }}
           CLI_PROXY_POLICY: '{"allow-only":{"repos":"${{ steps.determine-automatic-lockdown.outputs.repos }}","min-integrity":"${{ steps.determine-automatic-lockdown.outputs.min_integrity }}"}}'
-          CLI_PROXY_IMAGE: '` + resolveProxyContainerImage(tt.data.SandboxConfig.MCP) + `'
+          CLI_PROXY_IMAGE: '` + resolveProxyContainerImage(tt.data.SandboxConfig.MCP, tt.data) + `'
         run: |
           bash "${RUNNER_TEMP}/gh-aw/actions/start_cli_proxy.sh"
 `

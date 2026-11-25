@@ -33,6 +33,16 @@ describe("buildAwContext PR revision evidence", () => {
     expect(buildAwContext().comment_updated_at).toBe("2026-10-27T12:00:00Z");
     expect(buildAwContext().pr_head_sha).toBe("");
   });
+
+  it("does not relay an inbound continuation_run_id to dispatched children", () => {
+    global.context = {
+      repo: { owner: "owner", repo: "repo" },
+      runId: 200,
+      eventName: "workflow_dispatch",
+      payload: { inputs: { aw_context: JSON.stringify({ run_id: "100", continuation_run_id: "100" }) } },
+    };
+    expect(buildAwContext()).not.toHaveProperty("continuation_run_id");
+  });
 });
 
 describe("resolveItemContext", () => {
@@ -172,8 +182,11 @@ describe("buildAwContext episode lineage", () => {
     const child = buildHop(200, "child", root);
     const grandchild = buildHop(300, "grandchild", child);
     expect(root.parent_hop_id).toBe("");
+    expect(root.parent_run_id).toBe("");
     expect(child.parent_hop_id).toBe(root.hop_id);
+    expect(child.parent_run_id).toBe("100");
     expect(grandchild.parent_hop_id).toBe(child.hop_id);
+    expect(grandchild.parent_run_id).toBe("200");
     for (const hop of [child, grandchild]) {
       expect(hop.episode_id).toBe(root.episode_id);
       expect(hop.root_run_id).toBe("100");

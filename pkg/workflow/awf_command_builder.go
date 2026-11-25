@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"slices"
 	"sort"
 	"strconv"
@@ -22,6 +23,16 @@ var otlpSandboxExcludedEnvVarNames = []string{
 	"OTEL_EXPORTER_OTLP_HEADERS",
 	"GH_AW_OTLP_ENDPOINTS",
 	"GH_AW_OTLP_ALL_HEADERS",
+}
+
+// awfHostRuntimeTmpEnvVarNames are host-only temp-dir variables exported by
+// install_awf_binary.sh. The private host runtime directory is not writable inside
+// the AWF sandbox (whose /tmp is a private tmpfs sharing only /tmp/gh-aw), so the
+// agent must fall back to its own /tmp instead of inheriting them via --env-all.
+var awfHostRuntimeTmpEnvVarNames = []string{
+	"GH_AW_RUNTIME_TMP_DIR",
+	"GH_AW_RUNTIME_TMP_ID",
+	"TMPDIR",
 }
 
 // BuildAWFCommand builds a complete AWF command with all arguments.
@@ -56,6 +67,9 @@ func BuildAWFCommand(config AWFCommandConfig) string {
 		awfHelpersLog.Printf("Warning: failed to build AWF config JSON: %v", err)
 	} else {
 		configFileSetup = buildAWFConfigFileSetup(config, awfConfigJSON)
+		if isModelRoutingRuntimeGuarded(config.WorkflowData) {
+			configFileSetup = buildGuardedAWFConfigFileSetup(config, awfConfigJSON)
+		}
 		expandableArgs = fmt.Sprintf("--config %q ", awfConfigRuntimePathExpr) + expandableArgs
 		awfHelpersLog.Print("Using AWF config file (--config flag)")
 	}
@@ -64,6 +78,10 @@ func BuildAWFCommand(config AWFCommandConfig) string {
 	if isNVXRuntime(config.WorkflowData) {
 		engineCommand = rewriteNVXEngineCommand(engineCommand)
 		modelsJSONPathExport += "\n" + buildNVXAssetSetup()
+	}
+	if !awfSupportsExcludeEnv(firewallConfig) {
+		// Older AWF needs the host environment itself, but must not pass these paths to the engine.
+		engineCommand = "unset TMPDIR GH_AW_RUNTIME_TMP_DIR GH_AW_RUNTIME_TMP_ID; " + engineCommand
 	}
 	shellWrappedCommand := WrapCommandInShell(engineCommand)
 	preCreateLog := fmt.Sprintf("(umask 177 && touch %s)", shellEscapeArg(config.LogFile))
@@ -142,6 +160,17 @@ func buildExpandableAWFArgs(config AWFCommandConfig, isCloudHypervisor, isArcDin
 		expandableArgs += fmt.Sprintf(` --mount "%s:%s:ro" --mount "%s:/host%s:ro"`, ghAwDir, ghAwDir, ghAwDir, ghAwDir)
 	}
 	expandableArgs, arcDindDockerHostProbe = appendArcDindMountSettings(expandableArgs, arcDindDockerHostProbe, isArcDind)
+	if isArcDind && config.WorkflowData != nil && config.WorkflowData.EngineConfig != nil && config.WorkflowData.EngineConfig.CopilotSDK {
+		var probe, mounts strings.Builder
+		probe.WriteString(arcDindDockerHostProbe)
+		mounts.WriteString(expandableArgs)
+		for _, dir := range []string{"base/copilot-agents", activationSymlinkAgentDir, activationSymlinkSkillDir} {
+			source := path.Join(awfArcDindRootPathExpr, dir)
+			fmt.Fprintf(&probe, "\nrm -rf \"%s\" && mkdir -p \"%s\" || exit 1\nif [ -d \"/tmp/gh-aw/%s\" ]; then cp -a \"/tmp/gh-aw/%s/.\" \"%s/\" || exit 1; fi", source, source, dir, dir, source) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+			fmt.Fprintf(&mounts, ` --mount "%s:/tmp/gh-aw/%s:ro"`, source, dir)                                                                                                                      //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+		}
+		arcDindDockerHostProbe, expandableArgs = probe.String(), mounts.String()
+	}
 	if usesArcDindDetectionMount(config.WorkflowData) {
 		detectionDir := rewriteArcDindPath(constants.ThreatDetectionDir)
 		expandableArgs += fmt.Sprintf(` --mount "%s:%s:rw"`, detectionDir, detectionDir)
@@ -263,7 +292,38 @@ func appendArcDindMountSettings(expandableArgs, arcDindDockerHostProbe string, i
 func buildAWFConfigFileSetup(config AWFCommandConfig, awfConfigJSON string) string {
 	maxAICreditsExportLine, updatedAWFConfigJSON := buildMaxAICreditsExport(config, awfConfigJSON)
 	printfArg := buildAWFConfigPrintfArg(updatedAWFConfigJSON, maxAICreditsExportLine != "")
-	configFileSetup := buildConfigFilePrintfLine(printfArg)
+	return finishAWFConfigFileSetup(config, maxAICreditsExportLine, buildConfigFilePrintfLine(printfArg))
+}
+
+// buildGuardedAWFConfigFileSetup writes the routed AWF config when the activation
+// job selected routing for this run (GH_AW_MODEL_ROUTING=1), and otherwise the
+// non-routed config, so AWF never starts the router for a bypassed run.
+func buildGuardedAWFConfigFileSetup(config AWFCommandConfig, routedJSON string) string {
+	plainConfig := config
+	plainConfig.WorkflowData = withoutModelRouting(config.WorkflowData)
+	plainJSON, err := BuildAWFConfigJSON(plainConfig)
+	if err != nil {
+		awfHelpersLog.Printf("Warning: failed to build non-routed AWF config JSON: %v", err)
+		return buildAWFConfigFileSetup(config, routedJSON)
+	}
+	maxAICreditsExportLine, updatedRoutedJSON := buildMaxAICreditsExport(config, routedJSON)
+	_, updatedPlainJSON := buildMaxAICreditsExport(plainConfig, plainJSON)
+	hasExport := maxAICreditsExportLine != ""
+	routedLines := []string{`if [ "${GH_AW_MODEL_ROUTING:-}" = "1" ]; then`}
+	if isModelRoutingDynamic(config.WorkflowData) {
+		updatedRoutedJSON = injectDynamicModelRoutingMode(updatedRoutedJSON)
+		routedLines = append(routedLines, dynamicModelRoutingModeCheck())
+	}
+	printfLines := strings.Join(append(routedLines,
+		buildConfigFilePrintfLine(buildAWFConfigPrintfArg(updatedRoutedJSON, hasExport)),
+		"else",
+		buildConfigFilePrintfLine(buildAWFConfigPrintfArg(updatedPlainJSON, hasExport)),
+		"fi",
+	), "\n")
+	return finishAWFConfigFileSetup(config, maxAICreditsExportLine, printfLines)
+}
+
+func finishAWFConfigFileSetup(config AWFCommandConfig, maxAICreditsExportLine, configFileSetup string) string {
 	if maxAICreditsExportLine != "" {
 		configFileSetup = maxAICreditsExportLine + "\n" + configFileSetup
 	}
@@ -377,7 +437,7 @@ fi
 `
 	}
 	return fmt.Sprintf(`%s
-if [[ ! "$%s" =~ ^[0-9]+$ ]]; then
+if [[ ! "$%s" =~ ^(-1|[0-9]+)$ ]]; then
   %s="%s"
 fi
 %s
@@ -403,6 +463,7 @@ func buildAWFConfigPrintfArg(awfConfigJSON string, hasMaxAICreditsExport bool) s
 		preservedVars = append(preservedVars, "RUNNER_TEMP")
 	}
 	for _, name := range []string{
+		modelRoutingModeEnvVar,
 		"GH_AW_CLOUD_HYPERVISOR_BINARY",
 		"GH_AW_CLOUD_HYPERVISOR_KERNEL",
 		"GH_AW_CLOUD_HYPERVISOR_ROOTFS",
@@ -626,7 +687,12 @@ func appendEnvAndMountArgs(config AWFCommandConfig, firewallConfig *FirewallConf
 				}
 			}
 		}
-		sort.Strings(sortedExclude)
+		for _, name := range awfHostRuntimeTmpEnvVarNames {
+			if !slices.Contains(sortedExclude, name) {
+				sortedExclude = append(sortedExclude, name)
+			}
+		}
+		slices.Sort(sortedExclude)
 		for _, excludedVar := range sortedExclude {
 			awfArgs = append(awfArgs, "--exclude-env", excludedVar)
 		}

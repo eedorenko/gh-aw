@@ -23,6 +23,22 @@ func TestCodexEngine_ResolveLLMProvider_DefaultOpenAI(t *testing.T) {
 	}
 }
 
+func TestCodexDefaultDomainsForProvider(t *testing.T) {
+	engine := NewCodexEngine()
+
+	githubDomains := engine.defaultDomains(&WorkflowData{
+		Model:        "copilot/auto",
+		EngineConfig: &EngineConfig{ID: "codex"},
+	})
+	assert.NotContains(t, githubDomains, "api.githubcopilot.com")
+
+	openAIDomains := engine.defaultDomains(&WorkflowData{
+		Model:        "openai/gpt-5.4",
+		EngineConfig: &EngineConfig{ID: "codex"},
+	})
+	assert.Contains(t, openAIDomains, "api.openai.com")
+}
+
 func TestCodexEngine_ResolveLLMProviderFromModel(t *testing.T) {
 	engine := NewCodexEngine()
 
@@ -316,7 +332,8 @@ func TestCodexEngineStableReleaseInstallation(t *testing.T) {
 			steps := NewCodexEngine().GetInstallationSteps(data)
 			require.Len(t, steps, 2)
 			assert.Contains(t, strings.Join(steps[0], "\n"), "Setup Node.js")
-			assert.Contains(t, strings.Join(steps[1], "\n"), "npm install --ignore-scripts -g @openai/codex@"+version)
+			assert.Contains(t, strings.Join(steps[1], "\n"), "npm install -g @openai/codex@"+version)
+			assert.Contains(t, strings.Join(steps[1], "\n"), "NPM_CONFIG_IGNORE_SCRIPTS: 'true'")
 			assert.Contains(t, strings.Join(steps[1], "\n"), "NPM_CONFIG_MIN_RELEASE_AGE: '3'")
 
 			microVM := strings.Join(generateCodexMicroVMCLIInstallStep(data), "\n")
@@ -445,7 +462,7 @@ func TestCodexEngineRenderMCPConfig(t *testing.T) {
 		`"container": "ghcr.io/github/github-mcp-server:` + string(constants.DefaultGitHubMCPServerVersion),
 		`"GITHUB_PERSONAL_ACCESS_TOKEN": "$GITHUB_MCP_SERVER_TOKEN"`,
 		`"guard-policies"`, `"allow-only"`, `"startupTimeout": 120`,
-		`start_mcp_gateway.cjs`, `GH_AW_CODEX_CONFIG=`, `cp "${RUNNER_TEMP}/gh-aw/mcp-config/config.toml" "${CODEX_HOME}/config.toml"`,
+		`start_mcp_gateway.cjs`, `GH_AW_CODEX_CONFIG=`, `convert_gateway_config_codex.cjs" --copy-config`,
 	} {
 		assert.Contains(t, generated.String(), fragment)
 	}

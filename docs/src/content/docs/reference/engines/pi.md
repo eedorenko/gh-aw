@@ -16,6 +16,8 @@ For first-time setup, see [Using Pi](/gh-aw/engines/pi/). Shared options are in 
 
 The default Pi version is `1.3.0`. Copilot defaults to `copilot/auto` with the gateway; native execution without the gateway retains `copilot/gpt-5.4`. `auto` delegates selection to the gateway and need not appear in its concrete-model inventory. OpenAI/Codex routes use the Responses API, not Chat Completions.
 
+Without a `model`, `engine.model`, or `engine.model-routing`, Pi on GitHub Copilot inference uses [model routing](/gh-aw/reference/model-routing/#default-routing-for-workflows-without-a-model) with `goal: cost` and `mode: auto` for its main agent. Pi has no model variables, so this default isn't bypassed at run time; set top-level `model-routing: false` to opt out, or set a model.
+
 Threat detection defaults to Copilot regardless of Pi's provider. Supply its separate Copilot credential or [configure another detection engine](/gh-aw/reference/threat-detection/).
 
 ## Capabilities and limitations
@@ -27,6 +29,8 @@ Safe-output instructions use native MCP by default. Workflows with `tools.bash: 
 Codemode batches tool calls and reduces results before they enter model context. Its classifier and image-generation APIs are available when the configured provider route supports those model types. Custom providers still need a compatible API-proxy target and credentials; enabling codemode does not grant additional credentials or network access.
 
 For Copilot models using the Responses API, gh-aw disables grammar-based custom tools (`model.compat.supportsOpenAIGrammarTools: false`) so Pi sends codemode as a JSON-schema function tool. Codemode remains enabled; the Copilot compatibility adapter does not accept its custom-tool format. Other provider routes retain their configured compatibility settings.
+
+Pi's OpenAI-compatible requests omit `uniqueItems` from provider-facing function tool schemas, including deferred tools, because strict inference schema compilation rejects that keyword. The original Pi and MCP argument schemas remain unchanged; duplicate safe-output dependency IDs are still rejected before handler execution.
 
 | Option | Pi behavior |
 |---|---|
@@ -53,6 +57,115 @@ The integration runs Pi headlessly; terminal UI controls, interactive authentica
 The built-in `tools.playwright` integration uses `playwright-cli`; omit its `mode` field. Native `tools.web-search`, `max-continuations`, native `engine.agent` selection, and custom `engine.harness` scripts remain unsupported. Custom drivers must implement their own policies and cannot opt into the built-in aggregate tool budgets.
 
 Pi resolves [model aliases](/gh-aw/reference/engines/#model-aliases) for the main model and for sub-agents with the same rules as Copilot: `model: copilot/opus` runs on the newest live Opus. Exact ids are checked against AWF `/reflect` before Pi starts, and an unlisted id fails with `model_unavailable`, producing the same unavailable-model failure issue as Copilot. When AWF's model discovery is incomplete, exact ids pass through and aliases fail with `catalog_unavailable`; sub-agents no longer fall back to Pi's built-in model list.
+
+## Session artifacts
+
+The agent artifact contains native `pi-streaming.jsonl` evidence and the
+normalized `agent-session.jsonl`. Conclusion publishes the essential event
+projection in `usage/aw_session.jsonl`. Pi's observed message timestamps are
+retained on canonical messages, reasoning and tool calls when no source-event
+clock is present. Collection also recognizes clocks stored only in
+`data.messageMetadata.timestamp` in older canonical artifacts. Collection
+promotes only finite, in-range milliseconds or calendar-valid timezone-qualified
+ISO strings from archival message metadata. Invalid archival clocks are not
+promoted; missing clocks are not filled with collection time.
+
+Unified tool lifecycle events retain supplied `messageId` and `model` alongside
+`toolCallId`, allowing a tool call to be correlated with its originating model
+response. Full native message metadata, provider envelopes and signatures remain
+in the archival agent evidence rather than the unified projection. Child
+messages remain scoped to their invocation, and child usage is not added to
+parent session totals.
+
+## Durable runs
+
+> [!WARNING]
+> Pi session continuation is experimental. Enabling `engine.pi.durable` or
+> `engine.durable` emits a compile-time warning. Configuration and behavior may
+> change without deprecation.
+
+Pi chains its native coding-agent sessions across workflow runs using the same
+GitHub Actions artifact restoration and publication as other engines:
+
+```aw wrap
+on: workflow_dispatch
+engine:
+  pi:
+    durable:
+      retention-days: 7
+```
+
+`durable: {}` enables the default retention of seven days. `retention-days`
+accepts an integer from 1 to 90, subject to repository and organization artifact
+retention policy and gh-aw's global artifact retention overrides. Durable storage
+does not use or require `tools.repo-memory` or `tools.cache-memory`.
+
+The ordinary Pi CLI, SDK (`pi_agent_core_driver.cjs`) and RPC
+(`pi_rpc_driver.cjs`) modes persist a native JSONL session at
+`/tmp/gh-aw/agent/durable-sessions/pi/session.jsonl`. No separate durable library
+or additional runtime dependencies are installed. The normal MCP, codemode,
+compaction, extensions, sub-agents and tool policies remain available. Sub-agents
+remain isolated and ephemeral.
+
+The compiler owns session selection. Custom commands, drivers and harnesses,
+`engine.config.session`, and CLI arguments that select sessions or disable
+persistence cannot override it. The two built-in SDK and RPC drivers are supported.
+
+Before execution, a trusted host step selects the parent run identified by
+inbound `aw_context.run_id` (or `parent_run_id` when the context describes the
+current run). Without an explicit parent, it selects the last successful run of the same workflow on the same
+branch, considering the latest 100 successful matching runs. Artifacts are scoped
+to the repository, workflow and branch. Fork-originated runs and other
+in-progress runs are excluded. An explicit parent must belong to that same
+workflow and branch; it may have failed or been cancelled if it published a
+checkpoint. Missing or expired explicit-parent checkpoints fail rather than
+silently switching lineage. Without an explicit parent, a missing or expired
+artifact on the last successful run starts a fresh session.
+When retrying a run, an unexpired checkpoint published by an earlier attempt of
+that same run takes precedence over the original parent.
+
+Each run opens the exact restored native session and submits the current
+workflow prompt with freshly configured models, credentials and tool policy.
+Without history, the first run creates a new session. Missing or corrupt restored
+transcripts fail instead of silently starting an unrelated conversation. Historical
+session content is untrusted; current workflow instructions take precedence.
+
+This is conversation continuation, not recovery of an exact pending submission
+or tool phase. A retry also submits the current prompt into the restored session.
+Tool budgets apply to the current run, not the entire chain. Continuation does not
+provide exactly-once external side effects; reconcile uncertain prior actions
+before repeating them.
+
+Artifacts from the former experimental Pi Durable task runtime are incompatible
+with native sessions and are not migrated. Restoration rejects those artifacts
+rather than interpreting task journals as conversation history.
+
+To reset a chain blocked by a legacy artifact, remove the configured `durable`
+block, recompile and publish the workflow, and let a new run complete successfully
+without durable mode. Then re-enable durable mode, recompile and publish on the
+same workflow and branch. With that reset run as the latest successful run, the
+next new run starts fresh because its parent has no durable checkpoint; older
+artifacts are not searched. Omit explicit `aw_context.run_id` and `parent_run_id`
+lineage for that next run, especially references to legacy history. This discards
+continuation history rather than migrating it; integrity validation remains
+unchanged for artifacts that are restored.
+
+Workflow-level concurrency serializes execution and artifact publication without
+cancelling the previous writer. Explicit concurrency, reusable workflow calls and
+work-queue workers are not supported. The compiler grants `actions: read` only
+to the job that restores state; GitHub credentials are not passed to the harness.
+The host validates checkpoint integrity after secret redaction, then publishes
+the artifact without treating upload failures as successful persistence.
+
+The ordinary Pi streaming events feed the existing unified agentic session
+parser. Current-run session capture and gh-aw trace propagation remain enabled;
+the restored transcript is not replayed into the current streaming log.
+
+> [!IMPORTANT]
+> Checkpoints preserve conversation history, not the checkout or arbitrary workspace
+> edits. A hard job timeout, cancellation, runner loss or artifact upload failure
+> can prevent publication. Start a later run to continue from the last published
+> checkpoint; durable mode does not dispatch continuation runs automatically.
 
 ## Sub-agents
 
@@ -97,6 +210,10 @@ network:
 ```
 
 Compatible provider catalogs, including classifier and image models, retain their native identities but route through the same credential-isolated gateway. Requests must be supported by that gateway and upstream endpoint. Providers requiring different protocols or ambient cloud authentication can run natively only when the agent sandbox is explicitly disabled; this removes credential isolation and is not the recommended deployment mode. Unsupported sandboxed provider routes fail compilation instead of silently switching to Copilot.
+
+For OpenRouter, the first slash separates the provider; the remaining `anthropic/claude-sonnet-4` is the exact upstream model ID. Use the full catalog ID (for example `openrouter/moonshotai/kimi-k3`), not a bare `openrouter/kimi-k3` shorthand. Pi does not infer a vendor namespace: when AWF model discovery completes, the ID must exactly match the configured endpoint's `/reflect` catalog.
+
+Sandboxed OpenRouter requires the explicit `model-provider: openai`, endpoint, and `OPENAI_API_KEY` mapping shown above. The native `openrouter` provider's `OPENROUTER_API_KEY` mapping applies only when the agent sandbox is explicitly disabled; it does not supply a credential-isolated AWF route.
 
 ## Pi runtime configuration
 

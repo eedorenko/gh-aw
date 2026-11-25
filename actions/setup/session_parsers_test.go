@@ -35,7 +35,7 @@ func TestSessionParserSourcesIncludeLocalDependencies(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestSessionParserSourcesLoadNativeCreationVerifier(t *testing.T) {
+func TestSessionParserSourcesLoadQueueGitTransport(t *testing.T) {
 	t.Parallel()
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -47,10 +47,10 @@ func TestSessionParserSourcesLoadNativeCreationVerifier(t *testing.T) {
 
 	cmd := exec.Command(node, "-e", `
 		const assert = require("node:assert/strict");
-		const { MAX_CLOSE_COUNT } = require("./js/constants.cjs");
-		const delivery = require("./js/work_queue_native_creation_delivery.cjs");
-		assert.equal(MAX_CLOSE_COUNT, 10);
-		assert.equal(typeof delivery.captureDiscussionDelivery, "function");
+		const transport = require("./js/work_queue_git_transport.cjs");
+		const objects = require("./js/work_queue_git_objects.cjs");
+		assert.equal(typeof transport.createGitLedgerClient, "function");
+		assert.equal(typeof objects.createQueueGitObjectReader, "function");
 	`)
 	cmd.Dir = bundleDir
 	output, err := cmd.CombinedOutput()

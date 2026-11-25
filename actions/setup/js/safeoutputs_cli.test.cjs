@@ -105,6 +105,35 @@ describe("safeoutputs_cli.cjs", () => {
       expect(logs.some(m => m.includes("skipped"))).toBe(true);
     });
 
+    it("uses trusted SDK denial state for workflow allowlist guidance through CLI emission", () => {
+      const calls = [];
+      emitMissingToolPermissionIssue({
+        safeOutputsPath: "/tmp/safeoutputs.jsonl",
+        deniedCommands: ["shell(node --test scripts/pr-sous-chef.test.mjs)"],
+        workflowToolPermissionDenied: true,
+        runSafeOutputsCLI: (toolName, args) => calls.push({ toolName, args }),
+        logger: () => {},
+      });
+      expect(calls).toHaveLength(1);
+      expect(calls[0].args.alternatives).toContain("workflow tools configuration");
+      expect(calls[0].args.alternatives).toContain("Denied commands: shell(node --test scripts/pr-sous-chef.test.mjs)");
+      expect(calls[0].args.alternatives).not.toContain("Verify token scopes");
+      expect(calls[0].args.alternatives.length).toBeLessThanOrEqual(512);
+    });
+
+    it("does not infer workflow allowlist guidance from output text", () => {
+      const calls = [];
+      emitMissingToolPermissionIssue({
+        safeOutputsPath: "/tmp/safeoutputs.jsonl",
+        deniedCommands: ["shell(ls)"],
+        permissionOutput: "[sdk-driver] permission denied by workflow tool permissions: shell(ls)",
+        runSafeOutputsCLI: (toolName, args) => calls.push({ toolName, args }),
+        logger: () => {},
+      });
+      expect(calls[0].args.alternatives).not.toContain("workflow tools configuration");
+      expect(calls[0].args.alternatives).toContain("Verify token scopes");
+    });
+
     it("logs error when CLI invocation fails", () => {
       const logs = [];
       emitMissingToolPermissionIssue({
@@ -296,6 +325,20 @@ describe("safeoutputs_cli.cjs", () => {
   });
 
   describe("hasTerminalSafeOutput", () => {
+    it.each(["create_pull_request_review_comment", "create-pull-request-review-comment"])("excludes %s only when completed-review semantics are requested", type => {
+      const options = { readFileSync: () => JSON.stringify({ type, body: "Partial finding" }) + "\n" };
+      expect(hasTerminalSafeOutput("/fake/path.jsonl", options)).toBe(true);
+      expect(hasTerminalSafeOutput("/fake/path.jsonl", { ...options, excludePartialReviewComments: true })).toBe(false);
+    });
+
+    it.each(["submit_pull_request_review", "add_comment"])("accepts %s after partial findings with completed-review semantics", type => {
+      const options = {
+        excludePartialReviewComments: true,
+        readFileSync: () => [JSON.stringify({ type: "create_pull_request_review_comment", body: "Partial finding" }), JSON.stringify({ type, body: "Complete" })].join("\n") + "\n",
+      };
+      expect(hasTerminalSafeOutput("/fake/path.jsonl", options)).toBe(true);
+    });
+
     function makeTempFile(content) {
       const p = path.join(os.tmpdir(), `safeoutputs-terminal-test-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
       fs.writeFileSync(p, content, "utf8");

@@ -66,11 +66,12 @@ assert() {
 run_script() {
   local memory_dir="$1"
   local ls_remote_mode="${2:-missing}"
+  local branch_name="${3:-repo-memory-test}"
   local output_file="${memory_dir}.output"
   rm -f "${output_file}"
   GITHUB_OUTPUT="${output_file}" \
   GH_TOKEN="test-token" \
-  BRANCH_NAME="repo-memory-test" \
+  BRANCH_NAME="${branch_name}" \
   TARGET_REPO="octo/test" \
   MEMORY_DIR="${memory_dir}" \
   CREATE_ORPHAN="true" \
@@ -95,6 +96,7 @@ mkdir -p "${D}"
 OUTPUT="$(run_script "${D}")"
 assert "orphan branch message emitted" "printf '%s' \"${OUTPUT}\" | grep -q 'creating orphan branch'"
 assert "missing branch is not trusted" "grep -q '^cloned=false$' '${D}.output'"
+assert "missing branch records an empty start" "grep -qx 'head=empty' '${D}.output'"
 assert "git metadata exists" "[ -d '${D}/.git' ]"
 assert "hooks path hardened" "[ \"\$(git -C '${D}' config --default '' core.hooksPath)\" = '/dev/null' ]"
 assert "fsmonitor hardened" "[ \"\$(git -C '${D}' config --default '' core.fsmonitor)\" = 'false' ]"
@@ -190,6 +192,7 @@ D="${WORKSPACE}/test7"
 OUTPUT="$(run_script "${D}" exists)"
 assert "existing branch cloned" "[ -f '${D}/ledger.jsonl' ]"
 assert "successful clone is trusted" "grep -q '^cloned=true$' '${D}.output'"
+assert "successful clone records its starting commit" "grep -qx \"head=\$(git --git-dir '${SOURCE_REPO}' rev-parse repo-memory-test)\" '${D}.output'"
 echo ""
 
 echo "Test 8: Failed clone after branch verification does not create an orphan"
@@ -214,6 +217,18 @@ fi
 assert "remote verification failure exits unsuccessfully" "[ '${REMOTE_STATUS}' -ne 0 ]"
 assert "remote verification failure does not create git metadata" "[ ! -e '${D}/.git' ]"
 assert "remote verification failure remains untrusted" "grep -q '^cloned=false$' '${D}.output'"
+echo ""
+
+echo "Test 10: Adaptive routing history branches are refused"
+D="${WORKSPACE}/test10"
+if OUTPUT="$(run_script "${D}" exists memory/adaptive-routing/triage)"; then
+  RESERVED_STATUS=0
+else
+  RESERVED_STATUS=$?
+fi
+assert "reserved branch exits unsuccessfully" "[ '${RESERVED_STATUS}' -ne 0 ]"
+assert "reserved branch is named in the error" "printf '%s' \"${OUTPUT}\" | grep -q 'reserved for adaptive routing histories'"
+assert "reserved branch is not cloned" "[ ! -e '${D}/.git' ]"
 echo ""
 
 echo "Tests passed: ${TESTS_PASSED}"

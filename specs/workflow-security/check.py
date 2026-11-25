@@ -14,7 +14,7 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parent
-JAR_SHA256 = "011267fca25d0752cf18894dd585cd28b96960c112ea8a20b823ea770e7e10cd"
+JAR_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 MUTATIONS = {
     "agent-write": "JobIsolation",
     "persist-credentials": "NoCredentialPersistence",
@@ -124,8 +124,8 @@ MCP_COMPILE_WITNESSES = {
     "trusted-no-emit-import-refresh": "NoTrustedNoEmitImportRefresh",
 }
 ADMISSION_MUTATIONS = {
-    "shared-activation-oidc": "AdmissionJobIsolation",
-    "admission-dependency-bypass": "AdmissionDependency",
+    "shared-agent-oidc": "AdmissionOIDCScope",
+    "admission-step-bypass": "AdmissionStepGate",
     "endpoint-bypass": "NoEndpointNoRequest",
     "credential-delegation": "OIDCOnly",
     "identity-bypass": "IdentityVerified",
@@ -159,7 +159,7 @@ ADMISSION_MUTATION_SETTINGS = {
     "force-export": {"otel_enabled": False},
 }
 ADMISSION_WITNESSES = {
-    "failed-admission-job-block": "NoFailedAdmissionJobBlock",
+    "failed-admission-step-block": "NoFailedAdmissionStepBlock",
     "admitted-start": "NoAdmittedStart",
     "skipped-start": "NoSkippedStart",
     "outage-start": "NoOutageStart",
@@ -234,6 +234,39 @@ DELTAS = {
 }
 
 
+def check_p1_backlog_modules():
+    readme = (ROOT / "README.md").read_text()
+    p1_rows = [
+        (line_number, line)
+        for line_number, line in enumerate(readme.splitlines(), start=1)
+        if re.search(r"\|\s*P1\s*\|", line)
+    ]
+    if not p1_rows:
+        raise RuntimeError("No P1 refinement backlog module targets found in README.md")
+
+    targets = []
+    for line_number, row in p1_rows:
+        row = row.strip()
+        if not row.startswith("|"):
+            raise RuntimeError(
+                f"P1 refinement backlog row at line {line_number} must be a "
+                "pipe-delimited table row"
+            )
+        cells = [cell.strip() for cell in row.strip("|").split("|")]
+        target_cell = cells[3] if len(cells) > 3 else ""
+        match = re.fullmatch(r"`([^`/\\]+\.tla)`", target_cell)
+        if not match:
+            raise RuntimeError(
+                f"P1 refinement backlog row at line {line_number} must have a "
+                "backticked .tla module target"
+            )
+        targets.append(match.group(1))
+
+    missing = [target for target in targets if not (ROOT / target).is_file()]
+    if missing:
+        raise RuntimeError(f"P1 refinement backlog references missing TLA+ modules: {', '.join(missing)}")
+
+
 def check_result(status, text, invariant=None):
     if invariant is None:
         if status != 0 or "Model checking completed. No error has been found." not in text:
@@ -246,19 +279,91 @@ def check_result(status, text, invariant=None):
     return {"generated": int(match[1]), "distinct": int(match[2])}
 
 
-def normalize_trace(raw):
-    if not isinstance(raw, dict) or not isinstance(raw.get("counterexample"), dict):
-        raise RuntimeError("Expected TLC counterexample object")
-    states = raw["counterexample"].get("state")
-    if not isinstance(states, list) or len(states) < 2:
+def normalize_trace(text):
+    """Parse the full state records printed by the pinned TLC 2.19."""
+    header = "Error: The behavior up to this point is:\n"
+    if header not in text:
+        raise RuntimeError("TLC did not print a counterexample")
+    trace_text = text.split(header, 1)[1]
+    matches = list(re.finditer(r"(?m)^State (\d+): <([^\n]+)>\n", trace_text))
+    if len(matches) < 2:
         raise RuntimeError("Counterexample has no transition")
-    normalized = []
-    for entry in states:
-        if (not isinstance(entry, list) or len(entry) != 2
-                or not isinstance(entry[1], dict) or "s" not in entry[1]):
+    states, actions = [], []
+    for i, match in enumerate(matches):
+        if int(match.group(1)) != i + 1:
+            raise RuntimeError("Unexpected TLC state numbering")
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(trace_text)
+        body = trace_text[match.end():end]
+        if not body.startswith("s = "):
             raise RuntimeError("Unexpected TLC state encoding")
-        normalized.append({"index": entry[0], **entry[1]})
-    return {"states": normalized, "actions": raw["counterexample"].get("action", [])}
+        tokens = re.compile(r'\s*("(?:\\.|[^"\\])*"|-?\d+|'
+                            r'[A-Za-z_][A-Za-z_0-9]*|\|->|<<|>>|:>|@@|[\[\]{}(),])')
+        pos = 4
+
+        def token():
+            nonlocal pos
+            found = tokens.match(body, pos)
+            if not found:
+                raise RuntimeError("Unexpected TLC value encoding")
+            pos = found.end()
+            return found.group(1)
+
+        def peek():
+            found = tokens.match(body, pos)
+            if not found:
+                raise RuntimeError("Unexpected end of TLC value")
+            return found.group(1)
+
+        def value():
+            item = token()
+            if item.startswith('"'):
+                return json.loads(item)
+            if item in ("TRUE", "FALSE"):
+                return item == "TRUE"
+            if re.fullmatch(r"-?\d+", item):
+                return int(item)
+            if item == "(":
+                entries = []
+                while True:
+                    key = value()
+                    if token() != ":>":
+                        raise RuntimeError("Expected TLC function mapping")
+                    entries.append([key, value()])
+                    separator = token()
+                    if separator == ")":
+                        return entries
+                    if separator != "@@":
+                        raise RuntimeError("Expected TLC function separator")
+            if item in ("{", "<<", "["):
+                closing = {"{": "}", "<<": ">>", "[": "]"}[item]
+                values = {} if item == "[" else []
+                while peek() != closing:
+                    if values:
+                        if token() != ",":
+                            raise RuntimeError("Expected comma in TLC value")
+                    if item == "[":
+                        key = token()
+                        if not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", key) or key in values or token() != "|->":
+                            raise RuntimeError("Unexpected TLC record field")
+                        values[key] = value()
+                    else:
+                        values.append(value())
+                token()
+                return values
+            raise RuntimeError("Unexpected TLC value encoding")
+
+        state = value()
+        if not isinstance(state, dict) or not isinstance(state.get("lastEvent"), str):
+            raise RuntimeError("TLC state is missing lastEvent")
+        remaining = body[pos:]
+        if i + 1 < len(matches):
+            if remaining.strip():
+                raise RuntimeError("Unexpected text after TLC state")
+        elif not re.match(r"\s*\d+ states generated, \d+ distinct states found", remaining):
+            raise RuntimeError("Unexpected text after final TLC state")
+        states.append({"index": i + 1, "s": state})
+        actions.append(match.group(2))
+    return {"states": states, "actions": actions}
 
 
 def concretize(fault, invariant, destination, trace):
@@ -325,8 +430,6 @@ def run_case(java, jar, results, name, fault="none", profile="sparse",
         "-workers", "1", "-seed", "1", "-fp", "0",
         "-config", "model.cfg", "-metadir", "states",
     ]
-    if invariant:
-        command += ["-dumpTrace", "json", str(destination / "tlc-trace.json")]
     command += [f"{model}.tla"]
     (destination / "command.json").write_text(
         json.dumps({"cwd": str(destination), "argv": command}, indent=2) + "\n"
@@ -345,7 +448,7 @@ def run_case(java, jar, results, name, fault="none", profile="sparse",
     try:
         counts = check_result(result.returncode, text, invariant)
         if invariant:
-            trace = normalize_trace(json.loads((destination / "tlc-trace.json").read_text()))
+            trace = normalize_trace(text)
             (destination / "trace.json").write_text(json.dumps(trace, indent=2) + "\n")
             (destination / "events.txt").write_text(
                 "\n".join(state["s"]["lastEvent"] for state in trace["states"]) + "\n"
@@ -376,38 +479,117 @@ def run_case(java, jar, results, name, fault="none", profile="sparse",
 
 
 def check_sources(compiler, results):
-    command = [str(compiler.resolve()), "compile",
-               str(ROOT / "fixtures" / "cross-repo.md"),
-               str(results / "agent-write" / "source.md"),
-               "--no-emit", "--approve", "--json"]
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=120)
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError("Source compilation exceeded 120 seconds") from error
-    (results / "source-compilation.log").write_text(result.stdout + result.stderr)
-    try:
-        reports = json.loads(result.stdout)
-        if not isinstance(reports, list) or len(reports) != 2:
-            raise RuntimeError("Expected two compiler reports")
-        by_name = {report["workflow"]: report for report in reports}
-        rejected = by_name["source.md"]
-        messages = " ".join(error["message"] for error in rejected["errors"])
-        if (result.returncode != 1 or not by_name["cross-repo.md"]["valid"]
-                or rejected["valid"]
-                or "strict mode: write permission 'contents: write' is not allowed" not in messages):
-            raise RuntimeError("Source seed must compile; strict write-grant mutation must be rejected")
-    except (ValueError, KeyError, TypeError) as error:
-        raise RuntimeError("Malformed compiler JSON; see source-compilation.log") from error
-    version = subprocess.run([str(compiler.resolve()), "version"],
-                             capture_output=True, text=True, timeout=30, check=True)
-    (results / "source-compilation.json").write_text(json.dumps(
-        {"command": command, "compiler_version": version.stdout.strip(),
-         "compiler_sha256": hashlib.sha256(compiler.read_bytes()).hexdigest(),
-         "seed_sha256": hashlib.sha256((ROOT / "fixtures" / "cross-repo.md").read_bytes()).hexdigest(),
-         "mutation_sha256": hashlib.sha256((results / "agent-write" / "source.md").read_bytes()).hexdigest(),
-         "reports": reports}, indent=2
-    ) + "\n")
-    print("Source seed compiled; concrete agent-write source rejected by strict compiler.")
+    seed_path = ROOT / "fixtures" / "cross-repo.md"
+    seed = seed_path.read_text()
+    compilations = []
+    with tempfile.TemporaryDirectory(prefix=".check-cross-repo-", dir=ROOT) as temp_dir:
+        compile_source = Path(temp_dir) / "cross-repo.md"
+        compile_source.write_text(seed)
+        mutation_source = Path(temp_dir) / "source.md"
+        mutation_source.write_text((results / "agent-write" / "source.md").read_text())
+
+        command = [str(compiler.resolve()), "compile", str(compile_source), str(mutation_source),
+                   "--no-emit", "--approve", "--json", "--no-check-update"]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("Source compilation exceeded 120 seconds") from error
+        (results / "source-compilation.log").write_text(result.stdout + result.stderr)
+        compilations.append({"command": command, "returncode": result.returncode})
+        try:
+            reports = json.loads(result.stdout)
+            if not isinstance(reports, list) or len(reports) != 2:
+                raise RuntimeError("Expected two compiler reports")
+            by_name = {report["workflow"]: report for report in reports}
+            rejected = by_name["source.md"]
+            messages = " ".join(error["message"] for error in rejected["errors"])
+            if (result.returncode != 1 or not by_name["cross-repo.md"]["valid"]
+                    or rejected["valid"]
+                    or "strict mode: write permission 'contents: write' is not allowed" not in messages):
+                raise RuntimeError("Source seed must compile; strict write-grant mutation must be rejected")
+        except (ValueError, KeyError, TypeError) as error:
+            raise RuntimeError("Malformed compiler JSON; see source-compilation.log") from error
+
+        lock_command = [str(compiler.resolve()), "compile", str(compile_source),
+                        "--action-mode", "dev", "--approve", "--no-check-update"]
+        compile_result = subprocess.run(
+            lock_command,
+            capture_output=True, text=True, timeout=120
+        )
+        (results / "source-compilation-lock.log").write_text(
+            compile_result.stdout + compile_result.stderr
+        )
+        compilations.append({"command": lock_command, "returncode": compile_result.returncode})
+        version = subprocess.run([str(compiler.resolve()), "version"],
+                                 capture_output=True, text=True, timeout=30, check=True)
+        (results / "source-compilation.json").write_text(json.dumps(
+            {"compilations": compilations, "compiler_version": version.stdout.strip(),
+             "compiler_sha256": hashlib.sha256(compiler.read_bytes()).hexdigest(),
+             "seed_sha256": hashlib.sha256(seed_path.read_bytes()).hexdigest(),
+             "mutation_sha256": hashlib.sha256(
+                 (results / "agent-write" / "source.md").read_bytes()
+             ).hexdigest(),
+             "reports": reports}, indent=2
+        ) + "\n")
+        lock_path = compile_source.with_suffix(".lock.yml")
+        if compile_result.returncode != 0 or not lock_path.is_file():
+            raise RuntimeError(
+                "Cross-repo fixture did not emit a compile-only lock; "
+                f"see compiler output: {compile_result.stdout}{compile_result.stderr}"
+            )
+        lock_contents = lock_path.read_text()
+        expected_counts = re.search(
+            r"<!-- Expected compile-only lock properties:\s*"
+            r"checkout-token-count:\s*(\d+)\s*"
+            r"github-app-safe-output-count:\s*(\d+)\s*-->",
+            seed,
+        )
+        if not expected_counts:
+            raise RuntimeError("Cross-repo fixture is missing its expected compile-only counts")
+        expected_checkout_count = int(expected_counts.group(1))
+        expected_app_safe_output_count = int(expected_counts.group(2))
+        manifest_count = re.search(
+            r'(?m)^[ \t]+GH_AW_CHECKOUT_MANIFEST_COUNT: "(\d+)"$', lock_contents
+        )
+        if not manifest_count or int(manifest_count.group(1)) != expected_checkout_count:
+            actual_count = manifest_count.group(1) if manifest_count else "missing"
+            raise RuntimeError(
+                f"Cross-repo lock has {actual_count} checkout tokens; "
+                f"fixture expects {expected_checkout_count}"
+            )
+        expected_lock_properties = [
+            f'GH_AW_CHECKOUT_MANIFEST_COUNT: "{expected_checkout_count}"',
+            'GH_AW_CHECKOUT_REPO_0: "github/gh-aw"',
+            'GH_AW_CHECKOUT_REPO_1: "example/private-dependency"',
+            "GH_AW_CHECKOUT_TOKEN_1: ${{ secrets.MODEL_DEPENDENCY_READ_TOKEN }}",
+            "client-id: ${{ vars.MODEL_APP_ID }}",
+            "private-key: ${{ secrets.MODEL_APP_PRIVATE_KEY }}",
+            "repositories: gh-aw",
+            "create_issue",
+        ]
+        if any(property_text not in lock_contents for property_text in expected_lock_properties):
+            raise RuntimeError("Cross-repo lock does not match the expected checkout/app properties")
+        app_token_count = len(re.findall(
+            r"(?m)^[ \t]+uses: actions/create-github-app-token@", lock_contents
+        ))
+        expected_app_token_count = expected_app_safe_output_count * 2
+        if app_token_count != expected_app_token_count:
+            raise RuntimeError(
+                f"Cross-repo lock has {app_token_count} GitHub App token steps; "
+                f"expected {expected_app_token_count} for "
+                f"{expected_app_safe_output_count} GitHub App safe-output binding(s)"
+            )
+        for property_text in [
+            "client-id: ${{ vars.MODEL_APP_ID }}",
+            "private-key: ${{ secrets.MODEL_APP_PRIVATE_KEY }}",
+        ]:
+            if lock_contents.count(property_text) != app_token_count:
+                raise RuntimeError(
+                    f"Cross-repo lock does not wire {property_text} to every App token step"
+                )
+
+    print("Source seed compiled; emitted lock has two checkouts and two GitHub App token steps; "
+          "strict agent-write mutation rejected.")
 
 
 def check_mcp_compile(java, jar, results):
@@ -575,13 +757,14 @@ def main():
     parser.add_argument("--verifier", type=Path, help="Built gh-aw-security-model binary")
     parser.add_argument("--compiled-workflows", type=Path, help="Directory of existing lock files to verify")
     args = parser.parse_args()
+    check_p1_backlog_modules()
     if bool(args.verifier) != bool(args.compiled_workflows):
         parser.error("--verifier and --compiled-workflows must be supplied together")
     if args.model != "all" and (args.compiler or args.verifier or args.write_examples):
         parser.error("--compiler, --verifier, and --write-examples require --model all")
     jar_env = os.environ.get("TLA2TOOLS_JAR")
     if not jar_env:
-        parser.error("Set TLA2TOOLS_JAR to the official v1.8.0 tla2tools.jar")
+        parser.error("Set TLA2TOOLS_JAR to the official v1.7.4 tla2tools.jar")
     jar = Path(jar_env).resolve()
     if not jar.is_file() or hashlib.sha256(jar.read_bytes()).hexdigest() != JAR_SHA256:
         parser.error("TLA2TOOLS_JAR is missing or does not match the pinned SHA-256")

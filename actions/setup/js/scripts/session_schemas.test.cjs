@@ -99,6 +99,51 @@ describe("Generated session schemas", () => {
     expect(validateSession(jsonl([header, unified({ type: "vendor.progress", data: { arbitrary: { body: false } } })]))).toBe(2);
   });
 
+  it.each(["harness", "startup"])("validates normalized transient_error reasons in %s attempts and retry summaries", layer => {
+    const attempt = { attempt: 1, exitCode: 1, failureClasses: ["transient_error"], reason: "transient_error" };
+    const event = normalizeUnifiedSessionEvent({ type: "harness.attempt", data: { ...attempt, layer } });
+    const retry = normalizeUnifiedSessionEvent({
+      type: "harness.retry",
+      data: { attempts: layer === "harness" ? 1 : 0, exitCode: 1, attemptResults: layer === "harness" ? [attempt] : [], ...(layer === "startup" ? { startupAttemptResults: [attempt] } : {}) },
+    });
+    expect(event.data.reason).toBe("transient_error");
+    expect(validateSession(jsonl([header, unified(event), unified(retry)]))).toBe(3);
+    expect(() => validateSession(jsonl([header, unified({ ...event, data: { ...event.data, reason: "unrecognized_error" } })]))).toThrow("Invalid session event");
+  });
+
+  it("requires boolean output truncation in canonical and unified completions", () => {
+    for (const outputTruncated of [true, false]) {
+      const event = { type: "tool.execution_complete", data: { output: "preview\n", outputTruncated } };
+      expect(validateSession(jsonl([event]), "agent")).toBe(1);
+      expect(validateSession(jsonl([header, unified(normalizeUnifiedSessionEvent(event))]))).toBe(2);
+    }
+    for (const outputTruncated of ["false", 0, null]) {
+      const event = { type: "tool.execution_complete", data: { outputTruncated } };
+      expect(() => validateSession(jsonl([event]), "agent")).toThrow("Invalid session event");
+      expect(() => validateSession(jsonl([header, unified(event)]))).toThrow("Invalid session event");
+    }
+  });
+
+  it("pairs AWF steering delivery triggers with their thresholds", () => {
+    const usage = steeringDelivery => unified({ type: "firewall.token_usage", data: { requestId: "req", steeringDelivery } });
+    const delivery = { type: "ai_credit", conversation: "0123456789ab", first: true };
+    for (const valid of [
+      { ...delivery, trigger: "threshold", threshold: 80 },
+      { ...delivery, trigger: "threshold", threshold: 99 },
+      { ...delivery, trigger: "little_left", threshold: null, conversation: null },
+    ]) {
+      expect(validateSession(jsonl([header, usage(valid)]))).toBe(2);
+    }
+    for (const invalid of [
+      { ...delivery, trigger: "threshold", threshold: null },
+      { ...delivery, trigger: "threshold", threshold: 85 },
+      { ...delivery, trigger: "little_left", threshold: 80 },
+      { ...delivery, trigger: "unknown", threshold: null },
+    ]) {
+      expect(() => validateSession(jsonl([header, usage(invalid)]))).toThrow("Invalid session event");
+    }
+  });
+
   it("validates dependency job results with required IDs and native Actions outcomes", () => {
     for (const result of ["success", "failure", "cancelled", "skipped"]) {
       expect(validateSession(jsonl([header, unified({ type: "workflow.job_result", data: { jobId: "custom-job", result, durationMs: 0 } })]))).toBe(2);

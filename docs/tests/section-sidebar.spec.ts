@@ -20,7 +20,7 @@ const sections = [
     preview: ["FAQ", "AI Engines", "Cost Management", "Safe Outputs", "Workflows", "More..."],
     more: "/gh-aw/reference/workflow-structure/",
     other: "/gh-aw/reference/engines/copilot/",
-    count: 77,
+    count: 79,
   },
 ];
 
@@ -29,6 +29,27 @@ function sidebarGroup(page: Page, label: string) {
     has: page.locator("summary", { hasText: new RegExp(`^${label}$`) }),
   });
 }
+
+test("specification links show only their titles in the desktop sidebar and mobile menu", async ({ page }) => {
+  const specRoute = "/gh-aw/specs/unified-agent-session-specification/";
+  await page.goto("/gh-aw/introduction/overview/");
+  const specs = sidebarGroup(page, "Specs");
+  await specs.locator("summary").click();
+  const specLink = specs.getByRole("link", { name: "Unified Agent Session Specification", exact: true });
+  await expect(specLink).toHaveAttribute("href", specRoute);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(specRoute);
+  const menu = page.getByRole("button", { name: "Menu", exact: true });
+  const toc = page.locator("mobile-starlight-toc nav");
+  await expect(menu).toBeHidden();
+  await expect(toc).toBeHidden();
+  await page.getByRole("button", { name: "Zen mode" }).click();
+  await expect(toc).toBeVisible();
+  await menu.click();
+  await expect(specLink).toHaveAttribute("aria-current", "page");
+  await expect(specLink).toBeVisible();
+});
 
 for (const section of sections) {
   test(`${section.label} shows its preview and More outside its section`, async ({ page }) => {
@@ -155,6 +176,17 @@ test("the old Workshop URL redirects to Guides and preserves bookmarks", async (
   await page.goto("/gh-aw/workshop/#j=terminal&s=daily-status&t=00-welcome");
   await expect(page).toHaveURL(/\/gh-aw\/guides\/workshop\/#j=terminal&s=daily-status&t=00-welcome$/);
   await expect(page.getByRole("heading", { name: "Workshop", exact: true })).toBeVisible();
+});
+
+test("redirects preserve a simple incoming fragment", async ({ page }) => {
+  await page.goto("/gh-aw/workshop/#x");
+  await expect(page).toHaveURL(/\/gh-aw\/guides\/workshop\/#x$/);
+});
+
+test("a redirect's own fragment wins over the requested one", async ({ page }) => {
+  await page.goto("/gh-aw/reference/servicenow-connector/#other");
+  await expect(page).toHaveURL(/\/gh-aw\/reference\/connectors\/#servicenow$/);
+  await expect(page.locator("#servicenow")).toBeVisible();
 });
 
 for (const guide of [

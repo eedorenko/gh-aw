@@ -19,7 +19,7 @@ func TemplateInjectionRule() Rule {
 	return Rule{
 		ID:           "template-injection",
 		ThreatRuleID: "CTR-006",
-		Description:  "Detect attacker-controlled Actions expressions interpolated into run or github-script code",
+		Description:  "Detect attacker-controlled Actions expressions interpolated into run or known executable action inputs",
 		Severity:     Error,
 		Targets:      ActionsAST | AWAST,
 		Check:        checkTemplateInjection,
@@ -63,8 +63,9 @@ func checkTemplateInjection(ctx context.Context, input Input) ([]Diagnostic, err
 			}
 		}
 	}
-	sortDiagnostics(checker.diagnostics)
-	return checker.diagnostics, nil
+	diagnostics, err := templateInjectionOutputFlows(ctx, input, checker.diagnostics)
+	sortDiagnostics(diagnostics)
+	return diagnostics, err
 }
 
 type templateInjectionChecker struct {
@@ -80,6 +81,7 @@ func (c *templateInjectionChecker) step(ctx context.Context, step actions.Step, 
 	var env map[string][]taint.Source
 	var err error
 	javascript := false
+	scriptPath := path + ".run"
 	switch value := step.(type) {
 	case actions.RunStep:
 		script = value.Run
@@ -87,54 +89,61 @@ func (c *templateInjectionChecker) step(ctx context.Context, step actions.Step, 
 	case actions.RawStep:
 		return c.rawStep(ctx, value.Fields, path, bindings)
 	case actions.ActionStep:
-		if actionName(value.Uses) != "actions/github-script" {
+		keys, javascript := executableActionInputKeys(value.Uses, value.With)
+		if len(keys) == 0 {
 			return nil
-		}
-		expression, exists := value.With["script"]
-		if !exists {
-			return nil
-		}
-		javascript = true
-		script, err = actions.RenderExpression(expression, job, workflow, true)
-		if err != nil {
-			return fmt.Errorf("cannot render executable script at %s.with.script; correct the action input before linting", path)
 		}
 		env, err = c.environment(ctx, value.Env, path+".env", job, workflow, bindings)
+		if err != nil {
+			return err
+		}
+		for _, key := range keys {
+			scriptPath := path + ".with." + key
+			script, err := actions.RenderExpression(value.With[key], job, workflow, true)
+			if err != nil {
+				return fmt.Errorf("cannot render executable script at %s; correct the action input before linting", scriptPath)
+			}
+			if err := c.checkScript(ctx, script, scriptPath, javascript, env); err != nil {
+				return err
+			}
+		}
+		return nil
 	default:
 		return fmt.Errorf("unsupported step at %s", path)
 	}
 	if err != nil {
 		return err
 	}
-	scriptPath := path + ".run"
-	if javascript {
-		scriptPath = path + ".with.script"
-	}
 	return c.checkScript(ctx, script, scriptPath, javascript, env)
 }
 
 func (c *templateInjectionChecker) rawStep(ctx context.Context, fields map[string]any, path string, bindings map[string][]taint.Source) error {
-	raw, exists := fields["run"]
-	scriptPath, javascript, kind := path+".run", false, "run script"
-	if !exists {
-		if actionName(fields["uses"]) != "actions/github-script" {
-			return nil
-		}
-		with, err := policyMapping(fields["with"], path+".with")
-		if err != nil {
+	if raw, exists := fields["run"]; exists {
+		return c.rawScript(ctx, raw, fields["env"], path+".run", path+".env", "run script", false, bindings)
+	}
+	key, _ := executableActionInput(fields["uses"])
+	if key == "" {
+		return nil
+	}
+	with, err := policyMapping(fields["with"], path+".with")
+	if err != nil {
+		return err
+	}
+	keys, javascript := executableActionInputKeys(fields["uses"], with)
+	for _, key := range keys {
+		if err := c.rawScript(ctx, with[key], fields["env"], path+".with."+key, path+".env", "executable action input", javascript, bindings); err != nil {
 			return err
 		}
-		raw, exists = with["script"]
-		if !exists {
-			return nil
-		}
-		scriptPath, javascript, kind = path+".with.script", true, "github-script code"
 	}
+	return nil
+}
+
+func (c *templateInjectionChecker) rawScript(ctx context.Context, raw, environment any, scriptPath, envPath, kind string, javascript bool, bindings map[string][]taint.Source) error {
 	script, ok := raw.(string)
 	if !ok {
 		return fmt.Errorf("%s must be a string at %s", kind, scriptPath)
 	}
-	env, err := c.rawEnvironment(ctx, fields["env"], path+".env", bindings)
+	env, err := c.rawEnvironment(ctx, environment, envPath, bindings)
 	if err != nil {
 		return err
 	}
@@ -248,17 +257,19 @@ func templateInjectionSource(reference string) bool {
 	// Match known string-bearing fields, their aggregate parents, and computed
 	// indexes. Numeric IDs and arbitrary compiler step/job outputs are not sources.
 	sources := []string{
-		"inputs", "github.head_ref", "github.ref", "github.ref_name",
+		"inputs", "github.actor", "github.triggering_actor", "github.head_ref", "github.ref", "github.ref_name",
 		"github.event.inputs", "github.event.client_payload",
-		"github.event.issue.title", "github.event.issue.body",
+		"github.event.issue.title", "github.event.issue.body", "github.event.issue.user.login",
 		"github.event.issue.labels.*.name", "github.event.issue.labels.*.description",
 		"github.event.pull_request.title", "github.event.pull_request.body",
-		"github.event.pull_request.head.ref", "github.event.pull_request.head.label",
-		"github.event.pull_request.head.repo.default_branch",
+		"github.event.pull_request.user.login", "github.event.pull_request.head.ref",
+		"github.event.pull_request.head.label", "github.event.pull_request.head.repo.default_branch",
 		"github.event.pull_request.labels.*.name", "github.event.pull_request.labels.*.description",
-		"github.event.comment.body", "github.event.review.body", "github.event.review_comment.body",
-		"github.event.discussion.title", "github.event.discussion.body",
-		"github.event.label.name", "github.event.label.description", "github.event.pages.*.page_name",
+		"github.event.comment.body", "github.event.comment.user.login",
+		"github.event.review.body", "github.event.review.user.login",
+		"github.event.review_comment.body", "github.event.review_comment.user.login",
+		"github.event.discussion.title", "github.event.discussion.body", "github.event.discussion.user.login",
+		"github.event.sender.login", "github.event.label.name", "github.event.label.description", "github.event.pages.*.page_name",
 		"github.event.milestone.title", "github.event.milestone.description",
 		"github.event.head_commit.message", "github.event.head_commit.author.name",
 		"github.event.head_commit.author.email", "github.event.head_commit.committer.name",

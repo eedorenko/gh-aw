@@ -2,7 +2,7 @@
 /**
  * Site header (overrides Starlight's Header). One layout for landing and docs:
  * [logo] Docs  Workflow examples  Blog ............ [Search ⌘K] (GitHub) (theme) [Get started]
- * Below 50rem: [logo] ...... (search) (menu); the menu opens a sheet.
+ * Below 50rem: [logo] ...... (search) (homepage slides) (menu); the menu opens a sheet.
  * Search, SiteTitle and ThemeSelect come from Starlight's virtual modules so
  * their overrides and the Pagefind dialog keep working.
  */
@@ -14,7 +14,6 @@ import ThemeSelect from 'virtual:starlight/components/ThemeSelect';
 import MobileMenuFooter from 'virtual:starlight/components/MobileMenuFooter';
 import MobileNav from './MobileNav.astro';
 import SiteMenuToggle from './SiteMenuToggle.astro';
-import LandingSlideshow from './landing/LandingSlideshow.astro';
 import { getAriaCurrent, getNavLinks, getSection } from './site-nav';
 
 const base = import.meta.env.BASE_URL;
@@ -49,7 +48,14 @@ const githubIcon = octicons['mark-github'].toSVG({ width: 18, height: 18, 'aria-
 	</div>
 	<div class="site-header-end print:hidden">
 		<Search />
-		{id === '' && <LandingSlideshow />}
+		{id === '' && (
+			<a class="site-header-icon site-header-slides" href="https://gh.io/gh-aw-slides" aria-label="Slides" title="Slides">
+				<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+					<path d="M3 3h18M4 3v13h16V3M12 16v5M7 21l5-5 5 5" />
+					<path d="m10 7 5 3-5 3Z" />
+				</svg>
+			</a>
+		)}
 		<a class="site-header-icon" href="https://github.com/github/gh-aw" aria-label="GitHub repository">
 			<Fragment set:html={githubIcon} />
 		</a>
@@ -265,6 +271,10 @@ const githubIcon = octicons['mark-github'].toSVG({ width: 18, height: 18, 'aria-
 		fill: currentColor;
 	}
 
+	.site-header-slides :global(svg) {
+		fill: none;
+	}
+
 	.site-header-cta {
 		display: inline-flex;
 		align-items: center;
@@ -311,12 +321,12 @@ const githubIcon = octicons['mark-github'].toSVG({ width: 18, height: 18, 'aria-
 		}
 	}
 
-	/* Mobile: logo, search, menu. Nav, GitHub, theme and CTA move into the sheet.
+	/* Mobile: logo, search, homepage slides, menu. Other controls move into the sheet.
 	   50rem matches Starlight's sidebar/popover breakpoint. */
 	@media (max-width: 49.99rem) {
 		.site-header-nav,
 		.site-header-cta,
-		.site-header-icon,
+		.site-header-icon:not(.site-header-slides),
 		.site-header-end > :global(starlight-theme-select) {
 			display: none;
 		}
@@ -326,20 +336,28 @@ const githubIcon = octicons['mark-github'].toSVG({ width: 18, height: 18, 'aria-
 			margin-inline-end: -0.625rem;
 		}
 
+		.site-header-slides,
 		.site-header-end :global(button[data-open-modal]) {
 			width: 44px;
 			height: 44px;
 			margin: 0;
 		}
 
-		/* Only two icons on the right now, so the wordmark fits again */
+		/* Restore the wordmark when the mobile controls leave room for it. */
 		.site-header-start :global(.site-title span) {
 			display: inline;
 			white-space: nowrap;
 		}
 	}
 
-	/* Wordmark needs ~22rem with logo, search and menu; below that, logo only */
+	/* The homepage's extra Slides control needs another 44px beside the wordmark. */
+	@media (max-width: 24.74rem) {
+		.site-header:has(.site-header-slides) .site-header-start :global(.site-title span) {
+			display: none;
+		}
+	}
+
+	/* Other pages need ~22rem with logo, search and menu; below that, logo only. */
 	@media (max-width: 21.99rem) {
 		.site-header-start :global(.site-title span) {
 			display: none;

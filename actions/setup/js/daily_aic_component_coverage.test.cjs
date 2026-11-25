@@ -8,11 +8,16 @@ const require = createRequire(import.meta.url);
 const { getRunAIC } = require("./check_daily_aic_workflow_guardrail.cjs");
 const { sumAICFromUsageJSONLFiles } = require("./daily_aic_workflow_helpers.cjs");
 const { createAPIBudget } = require("./daily_aic_api_budget.cjs");
+const { loadBillableJobs, sumCoveredComponents } = require("./daily_aic_component_coverage.cjs");
 const { captureExecutionEvidenceConfiguration, shouldSkipForNoopSafeOutputs } = require("./harness_retry_runner.cjs");
 const time = "2025-01-01T12:00:00Z";
 const later = "2025-01-01T12:30:00Z";
+const componentName = name => {
+  const last = name.split(" / ").pop().toLowerCase();
+  return last === "evaluations" ? "evals" : last;
+};
 const job = (name, overrides = {}) => ({
-  id: name === "agent" ? 1 : name === "detection" ? 2 : 3,
+  id: componentName(name) === "agent" ? 1 : componentName(name) === "detection" ? 2 : 3,
   name,
   status: "completed",
   conclusion: "success",
@@ -21,6 +26,7 @@ const job = (name, overrides = {}) => ({
   completed_at: time,
   ...overrides,
 });
+const callerJobs = prefix => [job(`${prefix}activation`, { id: 90 }), job(`${prefix}conclusion`, { id: 91 })];
 let directory;
 beforeEach(() => {
   directory = fs.mkdtempSync(path.join(os.tmpdir(), "aic-components-"));
@@ -36,16 +42,16 @@ function evaluate(files, jobs, overrides = {}) {
   const list = vi.fn(async () => ({ status: 200, headers: {}, data: { jobs } }));
   const client = {
     listArtifacts: vi.fn(async () => ({
-      artifacts: [
+      artifacts: overrides.artifacts || [
         { id: 10, name: "usage", createdAt: new Date(overrides.artifactTime || later) },
         ...["agent", "detection", "evals"].map(name => {
-          const latest = jobs.filter(item => (item.name.toLowerCase() === "evaluations" ? "evals" : item.name.toLowerCase()) === name && item.conclusion !== "skipped").sort((a, b) => b.run_attempt - a.run_attempt)[0];
+          const latest = jobs.filter(item => componentName(item.name) === name && item.conclusion !== "skipped").sort((a, b) => b.run_attempt - a.run_attempt)[0];
           return { id: latest?.id, name, createdAt: new Date(overrides.producerTime || latest?.completed_at || time) };
         }),
       ],
     })),
     downloadArtifact: vi.fn(async (_id, options) => {
-      const artifactFiles = _id === 1 && overrides.agentFiles ? overrides.agentFiles : files;
+      const artifactFiles = overrides.filesById?.[_id] ?? (_id === 1 && overrides.agentFiles ? overrides.agentFiles : files);
       for (const [name, value] of Object.entries(artifactFiles)) {
         const file = path.join(options.path, ...name.split("/"));
         fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -101,6 +107,125 @@ const failedDecisionsStatus = {
   execution_state: "started",
 };
 
+const unavailableDecisionsStatus = {
+  ...failedDecisionsStatus,
+  reason_code: "model_unavailable",
+  reason: "The Decisions model is unavailable; no answers were recorded.",
+  execution_outcome: "success",
+  execution_state: "model_unavailable",
+};
+
+it.each([undefined, ""])("T-AIC-DG-028 preserves other component usage when a successful Decisions job skips an unavailable model with usage %j", async usage => {
+  const f = evaluate(
+    {
+      "agent/token_usage.jsonl": '{"aic":51.5}',
+      "detection/token_usage.jsonl": '{"aic":6.5}',
+      "evals/evals_status.json": JSON.stringify(unavailableDecisionsStatus),
+      ...(usage === undefined ? {} : { "evals/token_usage.jsonl": usage }),
+      ...(usage === undefined ? {} : { "evals.jsonl": "", "evals/evals.jsonl": "" }),
+    },
+    [job("agent"), job("detection"), job("evals")]
+  );
+  await expect(f.result).resolves.toBe(58);
+  expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("provider billing remains unverified"));
+  expect(global.core.info).toHaveBeenCalledWith(expect.stringContaining('"aic":0,"reason":"model_unavailable"'));
+});
+
+it.each([
+  ["another run", { run_id: "2" }],
+  ["another attempt", { run_attempt: "2" }],
+  ["missing run identity", { run_id: undefined }],
+  ["missing attempt identity", { run_attempt: undefined }],
+  ["another engine", { engine: "copilot" }],
+  ["missing engine", { engine: undefined }],
+  ["failed request", { execution_outcome: "failure" }],
+  ["cancelled request", { execution_outcome: "cancelled" }],
+  ["missing outcome", { execution_outcome: undefined }],
+  ["started state", { execution_state: "started" }],
+  ["missing state", { execution_state: undefined }],
+  ["failed judge reason", { reason_code: "judge_failed" }],
+  ["no assistant response reason", { reason_code: "no_assistant_response" }],
+  ["unknown reason", { reason_code: "unknown" }],
+  ["missing reason text", { reason: undefined }],
+  ["evaluated status", { status: "evaluated" }],
+  ["missing status", { status: undefined }],
+])("does not accept unavailable-model evidence with %s", async (_description, overrides) => {
+  const f = evaluate({ "agent/token_usage.jsonl": '{"aic":2}', "evals/evals_status.json": JSON.stringify({ ...unavailableDecisionsStatus, ...overrides }) }, [job("agent"), job("evals")]);
+  await expect(f.result).rejects.toThrow("Missing accounting for executed evals component");
+  expect(global.core.warning).not.toHaveBeenCalled();
+});
+
+it.each(["cancelled", "timed_out"])("does not apply unavailable-model evidence to a %s evals job", async conclusion => {
+  const f = evaluate({ "agent/token_usage.jsonl": '{"aic":2}', "evals/evals_status.json": JSON.stringify(unavailableDecisionsStatus) }, [job("agent"), job("evals", { conclusion })]);
+  await expect(f.result).rejects.toThrow("Missing accounting for executed evals component");
+});
+
+it.each(["evals.jsonl", "evals/evals.jsonl"])("does not accept unavailable-model evidence alongside answer records in %s", async answerFile => {
+  const f = evaluate(
+    {
+      "agent/token_usage.jsonl": '{"aic":2}',
+      "evals/evals_status.json": JSON.stringify(unavailableDecisionsStatus),
+      [answerFile]: '{"question":"Is the result valid?","answer":"YES"}',
+    },
+    [job("agent"), job("evals")]
+  );
+  await expect(f.result).rejects.toThrow("Missing accounting for executed evals component");
+});
+
+it.each(["", "{invalid", "null"])("does not accept corrupt unavailable-model evidence (%j)", async status => {
+  const f = evaluate({ "agent/token_usage.jsonl": '{"aic":2}', "evals/evals_status.json": status }, [job("agent"), job("evals")]);
+  await expect(f.result).rejects.toThrow("Missing accounting for executed evals component");
+});
+
+it.each(["evals/token_usage.jsonl", "evals.jsonl", "evals/evals.jsonl", "evals/evals_status.json"])("does not accept unavailable-model evidence with unreadable %s", async unreadableFile => {
+  const f = evaluate({}, [job("agent"), job("evals")]);
+  f.client.downloadArtifact.mockImplementation(async (_id, options) => {
+    fs.mkdirSync(path.join(options.path, "agent"), { recursive: true });
+    fs.writeFileSync(path.join(options.path, "agent/token_usage.jsonl"), '{"aic":2}');
+    fs.mkdirSync(path.join(options.path, "evals"), { recursive: true });
+    if (unreadableFile !== "evals/evals_status.json") fs.writeFileSync(path.join(options.path, "evals/evals_status.json"), JSON.stringify(unavailableDecisionsStatus));
+    fs.mkdirSync(path.join(options.path, unreadableFile), { recursive: true });
+    return { downloadPath: options.path };
+  });
+  await expect(f.result).rejects.toThrow("Missing accounting for executed evals component");
+  expect(global.core.warning).not.toHaveBeenCalled();
+});
+
+it.each([
+  ["aggregate", { artifactTime: time }, "Usage artifact does not cover the evals component attempt"],
+  ["producer", { attempt: 2, producerTime: time }, "Cannot verify the evals producer artifact for its job attempt"],
+])("does not accept unavailable-model evidence without verified %s coverage", async (_description, overrides, error) => {
+  const attempt = overrides.attempt || 1;
+  const f = evaluate(
+    { "agent/token_usage.jsonl": '{"aic":2}', "evals/evals_status.json": JSON.stringify({ ...unavailableDecisionsStatus, run_attempt: String(attempt) }) },
+    [job("agent", { run_attempt: attempt }), job("evals", { run_attempt: attempt, started_at: later, completed_at: later })],
+    overrides
+  );
+  await expect(f.result).rejects.toThrow(error);
+  expect(global.core.warning).not.toHaveBeenCalled();
+});
+
+it("accepts unavailable-model evidence bound to the selected earlier successful attempt", async () => {
+  const f = evaluate({ "agent/token_usage.jsonl": '{"aic":2}', "evals/evals_status.json": JSON.stringify(unavailableDecisionsStatus) }, [job("agent", { run_attempt: 2 }), job("evals")], { attempt: 2 });
+  await expect(f.result).resolves.toBe(2);
+});
+
+it("rejects unavailable-model evidence bound to the run attempt rather than the selected job attempt", async () => {
+  const f = evaluate({ "agent/token_usage.jsonl": '{"aic":2}', "evals/evals_status.json": JSON.stringify({ ...unavailableDecisionsStatus, run_attempt: "2" }) }, [job("agent", { run_attempt: 2 }), job("evals")], { attempt: 2 });
+  await expect(f.result).rejects.toThrow("Missing accounting for executed evals component");
+});
+
+it.each([
+  ['{"aic":3}', 5],
+  ["{invalid", null],
+  ['{"input_tokens":2,"model":"unknown"}', null],
+])("does not replace recorded evals usage %j with an unavailable-model fallback", async (usage, total) => {
+  const f = evaluate({ "agent/token_usage.jsonl": '{"aic":2}', "evals/token_usage.jsonl": usage, "evals/evals_status.json": JSON.stringify(unavailableDecisionsStatus) }, [job("agent"), job("evals")]);
+  if (total === null) await expect(f.result).rejects.toThrow();
+  else await expect(f.result).resolves.toBe(total);
+  expect(global.core.warning).not.toHaveBeenCalled();
+});
+
 it("preserves other component usage when an advisory Decisions judge fails in a successful job", async () => {
   const f = evaluate(
     {
@@ -127,6 +252,7 @@ it.each([
   ["successful judge", { execution_outcome: "success" }],
   ["unknown judge outcome", { execution_outcome: undefined }],
   ["unknown execution state", { execution_state: undefined }],
+  ["unavailable model state", { execution_state: "model_unavailable" }],
   ["no assistant response", { reason_code: "no_assistant_response" }],
   ["not evaluated status missing", { status: undefined }],
 ])("does not accept failed-judge evidence with %s", async (_description, overrides) => {
@@ -192,18 +318,119 @@ it("counts an empty detection accounting file as zero AIC", async () => {
   expect(global.core.info).toHaveBeenCalledWith(expect.stringContaining('"source":"detection/token_usage.jsonl"'));
 });
 
-it("counts compiler-generated Agent, Detection and Evaluations jobs using their lowercase accounting paths", async () => {
+it.each(
+  [
+    ["", ["agent", "detection", "evals"]],
+    ["caller / ", ["agent", "detection", "evals"]],
+    ["outer / caller / ", ["agent", "detection", "evals"]],
+    ["", ["Agent", "Detection", "Evaluations"]],
+    ["caller / ", ["Agent", "Detection", "Evaluations"]],
+    ["outer / caller / ", ["Agent", "Detection", "Evaluations"]],
+  ].flatMap(([prefix, names]) => [1, 2].map(attempt => [prefix, names, attempt]))
+)("counts %j-prefixed %j jobs using their lowercase accounting paths (attempt %i)", async (prefix, names, attempt) => {
   const f = evaluate(
     {
       "agent/token_usage.jsonl": '{"aic":18.02604}',
       "detection/token_usage.jsonl": '{"aic":30.08748}',
       "evals/token_usage.jsonl": '{"aic":1}',
     },
-    [job("Agent"), job("Detection"), job("Evaluations")]
+    [...names.map(name => job(`${prefix}${name}`, { run_attempt: attempt })), ...callerJobs(prefix)],
+    { attempt }
   );
   await expect(f.result).resolves.toBeCloseTo(49.11352);
   expect(f.client.listArtifacts).toHaveBeenCalledOnce();
   expect(global.core.info).not.toHaveBeenCalledWith(expect.stringContaining('"reason":"no_billable_jobs"'));
+  for (const [index, component] of ["agent", "detection", "evals"].entries()) {
+    expect(global.core.info).toHaveBeenCalledWith(expect.stringContaining(`"component":"${component}","jobId":${index + 1},"runAttempt":${attempt}`));
+  }
+});
+
+it.each(["caller / ", "outer / caller / "])("rejects a stale producer for %j-prefixed jobs on rerun", async prefix => {
+  const f = evaluate({ "agent/token_usage.jsonl": '{"aic":2}' }, [job(`${prefix}agent`, { run_attempt: 2, started_at: later, completed_at: later }), ...callerJobs(prefix)], { attempt: 2, producerTime: time });
+  await expect(f.result).rejects.toThrow("Cannot verify the agent producer artifact for its job attempt");
+});
+
+function repeatedCalls() {
+  const jobs = [101, 102].flatMap((id, index) => {
+    const prefix = index === 0 ? "worker-a / " : "outer / worker-b / ";
+    return [job(`${prefix}activation`, { id, check_run_url: `https://api.github.com/repos/example/project/check-runs/${id}` }), job(`${prefix}conclusion`, { id: id + 200 }), job(`${prefix}Agent`, { job_id: "agent", id: id + 100 })];
+  });
+  const artifacts = [102, 999, 101].map(id => ({ id, name: `call-${id}-usage`, createdAt: new Date(later) }));
+  const filesById = { 101: { "agent/token_usage.jsonl": '{"aic":2}' }, 102: { "agent/token_usage.jsonl": '{"aic":3}' }, 999: { "agent/token_usage.jsonl": '{"aic":99}' } };
+  return { jobs, artifacts, filesById };
+}
+
+it("counts each reusable invocation's own usage once even when job times overlap", async () => {
+  const { jobs, artifacts, filesById } = repeatedCalls();
+  const f = evaluate({}, jobs, { artifacts, filesById });
+  await expect(f.result).resolves.toBe(5);
+  expect(f.client.listArtifacts).toHaveBeenCalledOnce();
+  expect(f.client.downloadArtifact.mock.calls.map(([id]) => id)).toEqual([101, 102]);
+});
+
+it("reports the unresolved caller rather than borrowing another invocation's artifact", async () => {
+  const { jobs, artifacts, filesById } = repeatedCalls();
+  const f = evaluate({}, jobs, { artifacts: artifacts.filter(artifact => artifact.id !== 102), filesById });
+  await expect(f.result).rejects.toThrow("Daily AIC unresolved for outer / worker-b: No usage artifact");
+  expect(f.client.downloadArtifact.mock.calls.map(([id]) => id)).toEqual([101]);
+});
+
+it("does not assign legacy hash artifacts to overlapping callers without a binding", async () => {
+  const { jobs, artifacts, filesById } = repeatedCalls();
+  const legacy = artifacts.slice(0, 2).map((artifact, index) => ({ ...artifact, name: index === 0 ? "aaaaaaaa-usage" : "bbbbbbbb-usage" }));
+  const f = evaluate({}, jobs, { artifacts: legacy, filesById });
+  await expect(f.result).rejects.toThrow("Daily AIC unresolved for worker-a: No usage artifact");
+  expect(f.client.downloadArtifact).not.toHaveBeenCalled();
+});
+
+it("does not require a usage artifact for a skipped reusable invocation", async () => {
+  const { jobs, artifacts, filesById } = repeatedCalls();
+  jobs.find(item => item.id === 202).conclusion = "skipped";
+  const f = evaluate({}, jobs, { artifacts: artifacts.filter(artifact => artifact.id === 101), filesById });
+  await expect(f.result).resolves.toBe(2);
+  expect(f.client.downloadArtifact.mock.calls.map(([id]) => id)).toEqual([101]);
+});
+
+it("matches retained and rerun producers only within their own reusable invocation", async () => {
+  const { jobs, artifacts, filesById } = repeatedCalls();
+  jobs.push(job("outer / worker-b / Agent", { id: 203, run_attempt: 2, started_at: later, completed_at: later }));
+  artifacts.push({ id: 401, name: "call-101-agent", createdAt: new Date(time) }, { id: 402, name: "call-102-agent", createdAt: new Date(later) });
+  const f = evaluate({}, jobs, { artifacts, filesById, attempt: 2 });
+  await expect(f.result).resolves.toBe(5);
+  const stale = artifacts.map(artifact => (artifact.id === 402 ? { ...artifact, createdAt: new Date(time) } : artifact));
+  const g = evaluate({}, jobs, { artifacts: stale, filesById, attempt: 2 });
+  await expect(g.result).rejects.toThrow("Daily AIC unresolved for outer / worker-b: Cannot verify the agent producer artifact");
+});
+
+it.each(["caller / agent-helper", "caller / my-agent", "outer / caller / agent-helper"])("ignores look-alike component %s even in a compiler caller", async name => {
+  const prefix = name.slice(0, name.lastIndexOf(" / ") + 3);
+  const f = evaluate({ "agent/token_usage.jsonl": '{"aic":99}' }, [job(name), ...callerJobs(prefix)]);
+  await expect(f.result).resolves.toBe(0);
+  expect(f.client.listArtifacts).not.toHaveBeenCalled();
+});
+
+it.each(["security / agent", "other / detection", "outer / other / evals"])("ignores unrelated suffix match %s alongside compiler jobs", async name => {
+  const f = evaluate({ "agent/token_usage.jsonl": '{"aic":2}', "detection/token_usage.jsonl": '{"aic":99}', "evals/token_usage.jsonl": '{"aic":99}' }, [job("Agent"), job(name, { id: 99 })]);
+  await expect(f.result).resolves.toBe(2);
+});
+
+it.each(["activation", "conclusion"])("does not infer compiler ownership from %s alone", async sibling => {
+  const f = evaluate({ "agent/token_usage.jsonl": '{"aic":99}' }, [job("security / agent"), job(`security / ${sibling}`)]);
+  await expect(f.result).resolves.toBe(0);
+});
+
+it("requires compiler siblings under the same caller prefix", async () => {
+  const f = evaluate({ "agent/token_usage.jsonl": '{"aic":99}' }, [job("outer / caller / agent"), job("outer / activation"), job("outer / caller / conclusion")]);
+  await expect(f.result).resolves.toBe(0);
+});
+
+it("recognizes compiler siblings on a later job page", async () => {
+  const agent = job("outer / caller / agent");
+  const pages = [[agent, ...Array.from({ length: 99 }, (_, id) => job("unrelated", { id: id + 100 }))], callerJobs("outer / caller / ")];
+  const listJobsForWorkflowRun = vi.fn(async ({ page }) => ({ data: { jobs: pages[page - 1] } }));
+  const [{ components }] = await loadBillableJobs({ github: { rest: { actions: { listJobsForWorkflowRun } } }, budget: createAPIBudget() }, "example", "project", { id: 1, run_attempt: 1 });
+  expect(components.get("agent")).toBe(agent);
+  expect(listJobsForWorkflowRun).toHaveBeenCalledTimes(2);
 });
 
 it("treats differently cased names for the same component as ambiguous", async () => {
@@ -658,6 +885,21 @@ it("counts carried-forward agent usage and rerun detection once after a failed-o
   expect(f.list).toHaveBeenCalledWith(expect.objectContaining({ filter: "all" }));
 });
 
+it("counts measured usage from a successful rerun whose artifacts have lower IDs", async () => {
+  const f = evaluate({ "agent_usage.jsonl": '{"aic":2}' }, [job("agent", { conclusion: "failure" }), job("agent", { id: 10, run_attempt: 2, started_at: later, completed_at: later })], { attempt: 2, runStarted: later });
+  const earlierArtifacts = [
+    { id: 400, name: "usage", createdAt: new Date(time) },
+    { id: 300, name: "agent", createdAt: new Date(time) },
+  ];
+  f.client.listArtifacts.mockImplementation(async ({ latest }) => ({
+    artifacts: latest ? earlierArtifacts : [...earlierArtifacts, { id: 200, name: "usage", createdAt: new Date("2025-01-01T12:31:00Z") }, { id: 100, name: "agent", createdAt: new Date(later) }],
+  }));
+
+  await expect(f.result).resolves.toBe(2);
+  expect(f.client.downloadArtifact).toHaveBeenCalledExactlyOnceWith(200, expect.any(Object));
+  expect(global.core.warning).not.toHaveBeenCalled();
+});
+
 it("T-AIC-DG-026 counts verified prior usage when a runner-assigned agent rerun is cancelled without a producer artifact", async () => {
   const f = evaluate(
     { "agent_usage.jsonl": '{"aic":2}' },
@@ -698,6 +940,71 @@ it.each([
 it("rejects a cancelled rerun when the carried-forward accounting is missing", async () => {
   const f = evaluate({}, [job("agent"), job("agent", { id: 10, run_attempt: 2, conclusion: "cancelled", started_at: later, completed_at: later })], { attempt: 2, runStarted: later, producerTime: time });
   await expect(f.result).rejects.toThrow("Missing accounting for executed agent");
+});
+
+// Boundary cases from specs/daily-aic/CancelledRerunAccounting.tla.
+it.each([
+  ["verified", [job("agent")]],
+  ["ambiguous", [job("agent"), job("Agent", { id: 11 })]],
+])("prefers a cancelled rerun's own verified producer over a %s earlier attempt", async (_prior, earlier) => {
+  const f = evaluate(
+    { "agent_usage.jsonl": '{"aic":2}' },
+    [...earlier, job("agent", { id: 10, run_attempt: 2, conclusion: "cancelled", runner_id: 123, runner_name: "runner", steps: [{ name: "Set up job" }], started_at: later, completed_at: later })],
+    { attempt: 2, runStarted: later, producerTime: later }
+  );
+  await expect(f.result).resolves.toBe(2);
+  expect(global.core.info).toHaveBeenCalledWith(expect.stringContaining('"jobId":10,"runAttempt":2,"conclusion":"cancelled","aic":2,"reason":"accounting_file"'));
+  expect(global.core.warning).not.toHaveBeenCalled();
+});
+
+it.each([
+  ["no producer artifact", []],
+  ["an expired producer bound to the earlier attempt", [{ id: 1, name: "agent", createdAt: new Date(time), expired: true }]],
+  ["an expired producer bound to the cancelled attempt", [{ id: 10, name: "agent", createdAt: new Date(later), expired: true }]],
+])("rejects a cancelled rerun with %s", async (_description, producers) => {
+  const f = evaluate({ "agent_usage.jsonl": '{"aic":2}' }, [job("agent"), job("agent", { id: 10, run_attempt: 2, conclusion: "cancelled", started_at: later, completed_at: later })], { attempt: 2, runStarted: later });
+  f.client.listArtifacts.mockResolvedValue({ artifacts: [{ id: 20, name: "usage", createdAt: new Date(later) }, ...producers] });
+  await expect(f.result).rejects.toThrow("Cannot verify the agent producer artifact");
+  expect(global.core.warning).not.toHaveBeenCalled();
+});
+
+it("rejects a cancelled rerun whose only earlier attempt was skipped", async () => {
+  const f = evaluate({ "agent_usage.jsonl": '{"aic":2}' }, [job("agent", { conclusion: "skipped" }), job("agent", { id: 10, run_attempt: 2, conclusion: "cancelled", started_at: later, completed_at: later })], {
+    attempt: 2,
+    runStarted: later,
+    producerTime: time,
+  });
+  await expect(f.result).rejects.toThrow("Cannot verify the agent producer artifact");
+  expect(global.core.warning).not.toHaveBeenCalled();
+});
+
+it.each(["success", "timed_out"])("does not carry forward verified earlier usage for a %s rerun without its own producer", async conclusion => {
+  const f = evaluate({ "agent_usage.jsonl": '{"aic":2}' }, [job("agent"), job("agent", { id: 10, run_attempt: 2, conclusion, started_at: later, completed_at: later })], {
+    attempt: 2,
+    runStarted: later,
+    producerTime: time,
+  });
+  await expect(f.result).rejects.toThrow("Cannot verify the agent producer artifact");
+  expect(global.core.warning).not.toHaveBeenCalled();
+});
+
+it.each([
+  ["cancelled", 2],
+  ["success", null],
+  ["failure", null],
+  ["timed_out", null],
+])("only carries forward supplied verified prior usage for a cancelled rerun (%s)", (conclusion, expected) => {
+  fs.writeFileSync(path.join(directory, "agent_usage.jsonl"), '{"aic":2}');
+  const rerun = job("agent", { id: 10, run_attempt: 2, conclusion, runner_id: 123, runner_name: "runner", steps: [{ name: "Set up job" }], started_at: later, completed_at: later });
+  const sum = () => sumCoveredComponents(directory, new Map([["agent", rerun]]), Date.parse(later), [{ id: 1, name: "agent", createdAt: new Date(time) }], "usage", 2, 1, null, new Map([["agent", [job("agent")]]]));
+  if (expected === null) {
+    expect(sum).toThrow("Cannot verify the agent producer artifact");
+    expect(global.core.warning).not.toHaveBeenCalled();
+  } else {
+    expect(sum()).toBe(expected);
+    expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("counting carried-forward usage from attempt 1"));
+    expect(global.core.info).toHaveBeenCalledWith(expect.stringContaining('"jobId":1,"runAttempt":1,"conclusion":"success","aic":2,"reason":"accounting_file"'));
+  }
 });
 
 it("accepts an earlier usage artifact when only a nonbillable job was rerun", async () => {
@@ -771,7 +1078,7 @@ it("preserves supported decimal numeric strings and the legacy non-strict parser
   fs.writeFileSync(file, '{"aic":"2.5"}\n{"usage":{"ai_credits":"1e1"}}');
   expect(sumAICFromUsageJSONLFiles([file], { strict: true })).toBe(12.5);
   fs.writeFileSync(file, '{"aic":2}\n{"provider":"openai","model":"gpt-4o","input_tokens":"invalid","output_tokens":500}');
-  expect(sumAICFromUsageJSONLFiles([file])).toBe(2.5);
+  expect(() => sumAICFromUsageJSONLFiles([file])).toThrow("unpriced");
   fs.writeFileSync(file, '{"ai_credits":false}');
   expect(sumAICFromUsageJSONLFiles([file])).toBe(0);
 });

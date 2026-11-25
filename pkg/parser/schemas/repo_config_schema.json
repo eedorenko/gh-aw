@@ -11,12 +11,20 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "max_attempts": { "type": "integer", "minimum": 1, "maximum": 16 },
-        "backoff_seconds": { "type": "integer", "minimum": 1, "maximum": 3600 }
+        "max_attempts": { "type": "integer", "minimum": 1, "maximum": 16 }
       }
     }
   },
   "properties": {
+    "issue_label": {
+      "description": "Label used to create and find gh-aw's own issues. Recompile workflows after changing this setting.",
+      "type": "string",
+      "default": "agentic-workflows",
+      "minLength": 1,
+      "maxLength": 50,
+      "allOf": [{ "pattern": "^[^\\x00-\\x1f\\x7f]+$" }, { "pattern": "\\S" }],
+      "not": { "pattern": "\\$\\{\\{" }
+    },
     "protected_files": {
       "description": "Repository-wide exceptions to safe-output protected-file checks. Does not bypass allowed-files restrictions or change the protected-files policy.",
       "type": "object",
@@ -37,7 +45,26 @@
     "admission": {
       "type": "boolean",
       "default": false,
-      "description": "Enable admission and conclusion_admission jobs for all workflows. Admission is also enabled by on.admission: true in an individual workflow."
+      "description": "Enable the activation admission check and conclusion callback for all workflows without changing job permissions. An explicit setting overrides workflow frontmatter. If unset, workflows use on.admission, which defaults to false."
+    },
+    "adaptive_routing": {
+      "description": "Repository default for adaptive-routing. observe records every eligible routed workflow in its adaptive routing history; a workflow that cannot take part is skipped silently, and a workflow's own adaptive-routing value, or one from an import, wins. Recompile workflows after changing this setting.",
+      "oneOf": [{ "const": "observe" }, { "const": false }]
+    },
+    "safe_output_authorization": {
+      "description": "Require fail-closed authorization for non-diagnostic safe outputs in every workflow. Use true to load GH_AW_DEFAULT_SAFE_OUTPUT_AUTHORIZATION_URL and GH_AW_DEFAULT_SAFE_OUTPUT_AUTHORIZATION_AUDIENCE at runtime, or supply a literal authority. Conflicting workflow/import authorities fail compilation. Recompile workflows after changing this setting.",
+      "oneOf": [
+        { "const": true },
+        {
+          "type": "object",
+          "required": ["endpoint", "audience"],
+          "additionalProperties": false,
+          "properties": {
+            "endpoint": { "type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^https://" },
+            "audience": { "type": "string", "minLength": 1, "maxLength": 2048 }
+          }
+        }
+      ]
     },
     "gateway-dispatch": {
       "type": "boolean",
@@ -45,7 +72,7 @@
       "description": "Experimental. Enable nested on.gateway-dispatch triggers delivered through repository_dispatch by an approved gateway server. Disabled unless explicitly true. This setting does not deploy a server or grant dispatch authority."
     },
     "work_queue": {
-      "description": "Global scheduling and backing Issue/label overrides. AW supplies authorization and approved worker routes. Missing settings use one pool, concurrency 16, pending limit 4096 and three attempts with 30-second backoff.",
+      "description": "Global scheduling and backing Issue/label overrides. AW supplies authorization and approved worker routes. Missing settings use one pool, concurrency 16, pending limit 4096 and three attempts. Pool limits take effect on the next run after recompilation.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -53,19 +80,20 @@
         "pending_limit": { "type": "integer", "minimum": 1, "maximum": 4096 },
         "retry": { "$ref": "#/definitions/workQueueRetry" },
         "issues": {
-          "description": "Global backing Issue projection and label prefix for work-queue participants. Omitted or false disables projection; true uses work and work:<status> labels.",
+          "description": "Best-effort backing Issue projection: one labelled Issue per pending Work, closed when the Work completes or is cancelled. Omitted or false disables projection; true uses label work and title prefix [work queue]. orphaned_after_days is accepted but unused.",
           "oneOf": [
             { "type": "boolean" },
             {
               "type": "object",
               "additionalProperties": false,
-              "properties": { "label": { "type": "string", "minLength": 1, "maxLength": 33, "pattern": "^[^\\x00-\\x1f\\x7f]+$" }, "title_prefix": { "type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[^\\x00-\\x1f\\x7f]+$" } }
+              "properties": {
+                "label": { "type": "string", "minLength": 1, "maxLength": 33, "pattern": "^[^\\x00-\\x1f\\x7f]+$" },
+                "title_prefix": { "type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[^\\x00-\\x1f\\x7f]+$" },
+                "orphaned_after_days": { "type": "integer", "minimum": 1, "maximum": 3650 }
+              }
             }
           ]
         },
-        "mode": { "type": "string", "enum": ["weighted-priority", "strict-priority"] },
-        "class_weights": { "type": "array", "minItems": 5, "maxItems": 5, "items": { "type": "integer", "minimum": 1, "maximum": 1000 } },
-        "accounting_weights": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 1, "maximum": 1000 } },
         "pools": {
           "type": "object",
           "maxProperties": 64,

@@ -14,6 +14,14 @@ engine:
   id: copilot
   copilot-sdk: true
   bare: true
+skip-if-decision:
+  - >-
+    Do @/tmp/gh-aw/agent/dead-code-analysis-status.json,
+    @/tmp/gh-aw/agent/dead-code-analysis.txt, and
+    @/tmp/gh-aw/agent/dead-code-analysis-errors.txt conclusively establish
+    that successful analysis of both ./cmd/... and ./internal/tools/... found
+    no unreachable functions eligible for removal? Abstain if analysis failed,
+    coverage is incomplete, or any candidate still needs caller or WASM checks.
 max-tool-denials: 3
 imports:
   - uses: shared/skip-if-issue-open.md
@@ -24,8 +32,11 @@ imports:
     with:
       title-prefix: "[dead-code] "
       expires: "3d"
-      labels: [chore, dead-code]
+      labels: [chore, dead-code, cookie]
       reviewers: [copilot]
+      protected-files:
+        exclude:
+          - README.md
   - shared/otlp.md
 network:
   allowed:
@@ -47,10 +58,27 @@ timeout-minutes: 30
 steps:
   - name: Install deadcode analyzer
     run: go install golang.org/x/tools/cmd/deadcode@latest
+  - name: Prepare dead code analysis
+    run: |
+      set -euo pipefail
+      mkdir -p /tmp/gh-aw/agent
+      status=0
+      deadcode ./cmd/... ./internal/tools/... \
+        > /tmp/gh-aw/agent/dead-code-analysis.txt \
+        2> /tmp/gh-aw/agent/dead-code-analysis-errors.txt || status=$?
+      printf '{"exit_code":%s,"targets":["./cmd/...","./internal/tools/..."]}\n' \
+        "$status" > /tmp/gh-aw/agent/dead-code-analysis-status.json
+      if [ "$status" -ne 0 ]; then
+        echo "::warning::Dead code analysis failed with exit code $status; agent inspection is required."
+        cat /tmp/gh-aw/agent/dead-code-analysis-errors.txt
+      fi
 
 ---
 
 # Dead Code Removal Agent
+
+The AWF decision gate may skip when successful prepared analysis finds no removal
+work. Failed or incomplete analysis and candidates needing safety checks still run.
 
 You are the Dead Code Removal Agent — a Go code maintenance expert that identifies and safely removes unreachable functions to keep the codebase clean and lean.
 
@@ -60,15 +88,13 @@ Run the `deadcode` static analyzer, select a batch of up to 5 unreachable functi
 
 ## Token Budget Guidelines
 
-**Target**: Complete the full workflow in ≤ 30 turns.
-
 - **After discovery: if `discover-candidates` outputs `"skip": true`**, call `noop` immediately — skip remaining phases.
-- Select **up to 5 functions** per run (not 10) — keeps PRs small and turns bounded.
+- Select **up to 5 functions** per run (not 10) — keeps PRs and safety checks bounded.
+- Batch safety checks for all selected functions in one bash call; scope caller searches to `pkg`, `cmd`, and `internal`.
 - Safety check grep: limit output with `grep -m 5` to avoid large result dumps.
-- Build/test output: pipe through `tail -20` to capture only the relevant tail; do not print full output.
+- Keep verification output concise without suppressing build or vet exit status.
 - PR body: use only the provided template structure — no extra analysis paragraphs.
 - Cache append: write lines directly; do not re-read the full cache file before appending.
-- **Turn circuit breaker**: keep a **soft target** of ≤30 turns. After Phase 5, if the run is already >35 turns (**hard stop**), skip `go test` in Phase 6 (run only `go build ./... && go vet ./...`) and proceed to Phase 7.
 
 ## Context
 
@@ -81,7 +107,11 @@ After it runs, parse its stdout JSON and use `skip` / `candidates` as inputs for
 ## agent: discover-candidates
 model: gpt-6-luna
 task: |
-  Run: deadcode ./cmd/... ./internal/tools/...
+  Read: /tmp/gh-aw/agent/dead-code-analysis-status.json,
+    /tmp/gh-aw/agent/dead-code-analysis.txt, and
+    /tmp/gh-aw/agent/dead-code-analysis-errors.txt.
+  Reuse successful prepared results; run deadcode ./cmd/... ./internal/tools/...
+    only if prepared analysis is missing or failed.
   Read: /tmp/gh-aw/cache-memory/dead-code-processed.jsonl (if present)
   Exclude functions whose "file:FuncName" key appears in the cache.
   Always skip:
@@ -101,43 +131,47 @@ Ignore any "cannot load package" warnings for WASM-gated files (`//go:build js &
 
 ## Phase 3: Select a Batch
 
-From `discover-candidates.candidates`, select **up to 5** functions to remove this run. Prioritise:
+From `discover-candidates.candidates`, select **up to 5** functions to remove this run. Respect the protected-helper list in the sub-agent brief. Prioritise:
 
 1. Functions where `grep` confirms callers exist only in `*_test.go` files
 2. Fully standalone functions with no callers at all
 3. Functions in files that are mostly dead (reduces scattered small functions)
 
-**Always skip** these three functions — they are shared test infrastructure and must never be deleted:
-- `containsInNonCommentLines` (in `pkg/workflow/compiler_test_helpers.go`)
-- `indexInNonCommentLines` (in `pkg/workflow/compiler_test_helpers.go`)
-- `extractJobSection` (in `pkg/workflow/compiler_test_helpers.go`)
-
 ## Phase 4: Safety Checks for Each Selected Function
 
-For every function in the batch, run this **single consolidated bash block** before deleting:
+Run this **single bash block for the full batch** before deleting. Replace the example candidate with each selected `function|file` pair:
 
 ```bash
-func="FunctionName"
-file="pkg/path/file.go"   # normalize by stripping leading "./" before checks
-file="${file#./}"
+candidates=(
+  "FunctionName|pkg/path/file.go"
+)
 
-echo "=== Caller check ==="
-grep -rn -m 5 "$func" --include="*.go" .
+for candidate in "${candidates[@]}"; do
+  IFS='|' read -r func file <<< "$candidate"
+  file="${file#./}"
 
-if [[ "$file" == "pkg/workflow/"* || "$file" == "pkg/console/"* ]]; then
-  echo "=== WASM check ==="
-  grep -n "$func" cmd/gh-aw-wasm/main.go || true
-fi
+  echo "=== $func: callers ==="
+  grep -rn -m 5 --include="*.go" "$func" pkg cmd internal || true
+  echo "=== $func: test callers ==="
+  grep -rn -m 5 --include="*_test.go" "$func" pkg cmd internal || true
 
-if [[ "$file" == "pkg/console/"* ]]; then
-  echo "=== console_wasm check ==="
-  grep -n "$func" pkg/console/console_wasm.go || true
-fi
+  if [[ "$file" == "pkg/workflow/"* || "$file" == "pkg/console/"* ]]; then
+    echo "=== $func: WASM check ==="
+    grep -n "$func" cmd/gh-aw-wasm/main.go || true
+  fi
 
-echo "=== Constant/embed check ==="
-grep -n "//go:embed" "$file" || true
-grep -n "^[[:space:]]*const " "$file" || true
+  if [[ "$file" == "pkg/console/"* ]]; then
+    echo "=== $func: console_wasm check ==="
+    grep -n "$func" pkg/console/console_wasm.go || true
+  fi
+
+  echo "=== $func: constant/embed check ==="
+  grep -n "//go:embed" "$file" || true
+  grep -n "^[[:space:]]*const " "$file" || true
+done
 ```
+
+Review the evidence and record a safe/skip verdict for each candidate before editing.
 
 - Caller matches **only in `*_test.go` files** → proceed with deletion and mark exclusive tests for removal.
 - Caller matches in **any non-test file** → **skip** (possible false positive).
@@ -150,38 +184,18 @@ grep -n "^[[:space:]]*const " "$file" || true
 For each function that cleared all safety checks:
 
 1. **Delete the function body** from the source file using the `edit` tool.
-2. **Find and delete exclusive test functions** — any `Test*` function that calls *only* the deleted function and nothing else. Use `grep` to confirm exclusivity.
-3. **Check for now-unused imports** in every edited file by running a build and looking for import errors:
-
-```bash
-go build ./... 2>&1 | grep "imported and not used" || true
-```
-
-Remove any unused imports reported with `edit`.
+2. **Delete exclusive test functions** identified in Phase 4 — any `Test*` function that calls only the deleted function and nothing else.
+3. Rely on Phase 6's build output to identify unused imports in edited files; remove any reported imports with `edit`.
 
 ## Phase 6: Verification
 
 After all deletions:
 
 ```bash
-go build ./... && \
-go vet ./... && \
-go vet -tags=integration ./... && \
-make fmt && \
-go test ./pkg/... 2>&1 | tail -20
-echo "Exit: $?"
-```
-
-The `&&` chain intentionally short-circuits on first failure.
-
-If the run is already >35 turns after Phase 5 (or clearly over budget), use the circuit-breaker verification instead:
-
-```bash
 go build ./... && go vet ./...
-echo "Exit: $?"
 ```
 
-In circuit-breaker mode, `go vet -tags=integration` and `make fmt` are intentionally skipped to reduce turns; full formatting/check coverage is expected in CI.
+The `&&` chain intentionally short-circuits on first failure. CI covers the remaining checks.
 
 If verification fails on obvious quick fixes (e.g., unused imports or simple compile errors), fix and re-run once. Otherwise, revert deletions tied to the failure (or revert all changes with `git checkout -- .`) and proceed to Phase 7 with `noop`.
 
@@ -190,6 +204,7 @@ If verification fails on obvious quick fixes (e.g., unused imports or simple com
 - **No functions selected or all skipped**: call `noop`.
 - **Build/vet failed and reverted**: call `noop` describing the failure.
 - **Changes verified**: proceed to Phase 8.
+- Use exactly one safe output: `create_pull_request` after verification, or `noop` when no verified change remains.
 
 ## Phase 8: Create Pull Request
 
@@ -203,8 +218,6 @@ Create a PR with this structure:
 - A `Verification` checklist for:
   - `go build ./...`
   - `go vet ./...`
-  - `go vet -tags=integration ./...`
-  - `make fmt`
 - Run URL footer:
   `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`
 
@@ -219,19 +232,8 @@ After successfully calling `create_pull_request`, append one line per removed fu
 ## Rules
 
 1. **Test-only callers do not keep a function live** — a function flagged by `deadcode` is dead even if test files call it. Delete the function *and* the tests that exclusively test it.
-2. **Never delete** `containsInNonCommentLines`, `indexInNonCommentLines`, or `extractJobSection` — they are shared test infrastructure.
+2. **Never delete** the three shared test helpers listed in the sub-agent brief.
 3. **Check WASM** before deleting anything from `pkg/workflow/` or `pkg/console/`.
 4. **Check `console_wasm.go`** before deleting anything from `pkg/console/`.
 5. **Max 5 functions per run** — keeps PRs small and reviewable.
 6. **Build must pass** before creating a PR.
-
-## Important
-
-You **MUST** always end by calling exactly one of these safe output tools before finishing:
-
-- **`create_pull_request`**: When changes were made and the build passes
-- **`noop`**: When no changes were made (nothing to remove, all skipped, or build failure)
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```

@@ -67,6 +67,8 @@ Omitting `runtime` is equivalent to `runtime: docker`, which keeps the secure de
 
 Privileged profiles invoke the system-installed AWF binary and preserve exported runner variables by name, including on `sudo-rs` hosts that ignore `sudo -E`. AWF's agent credential exclusions still apply; preserving the launcher environment does not grant those credentials to the agent.
 
+Prefer `nvx` for workflows that untrusted actors can trigger, such as those with `on.roles: all`. The default Docker runtime runs the agent as the runner's user and shares the runner's `/tmp`, so a sandbox escape can reach runner processes and their tokens. The [`untrusted-roles-detection`](/gh-aw/reference/workflow-linters/) linter recommends `nvx` when such workflows also disable threat detection.
+
 The `nvx` runtime never falls back to another runtime. It requires a workload-specific guest layer, the AWF release's provenance bundle and manifest, and all three security opt-ins. The compiler checks the host and verifies the offline attestation before starting AWF. See [Agent Runtime Selection](/gh-aw/reference/agent-runtimes/#nvx-preview) for the complete configuration and compatibility requirements.
 
 ```yaml wrap
@@ -124,6 +126,12 @@ network:
     - "api.example.com"
 ```
 
+#### Custom CA certificate for the API proxy
+
+Set `sandbox.agent.ca-cert` to a host path containing a PEM CA certificate to trust it when verifying upstream TLS connections through AWF's API proxy. The file is bind-mounted read-only into the API proxy sidecar. This setting requires AWF v0.28.10 or later.
+
+This setting applies to the agent job. The detection job runs separately; see [Private CA certificates in Threat detection](/gh-aw/reference/threat-detection/#private-ca-certificates) for its CA inheritance and provisioning behavior.
+
 #### Filesystem Access
 
 AWF makes the host filesystem visible inside the container with appropriate permissions:
@@ -170,7 +178,7 @@ Use `allow-host-ports` only for ports that cannot be represented by `services:`.
 
 #### Environment Variables
 
-AWF passes all environment variables via `--env-all`. The host `PATH` is captured as `AWF_HOST_PATH` and restored inside the container, preserving setup action tool paths.
+AWF forwards environment variables via `--env-all` with compiler-managed exclusions. Host-only temporary-directory variables (`TMPDIR`, `GH_AW_RUNTIME_TMP_DIR`, and `GH_AW_RUNTIME_TMP_ID`) are excluded from agent and threat-detection sandboxes, allowing each sandbox to use its own temporary directory. Host-side steps retain the private runtime directory. The host `PATH` is captured as `AWF_HOST_PATH` and restored inside the container, preserving setup action tool paths.
 
 > [!NOTE]
 > Go's "trimmed" binaries require `GOROOT` - AWF automatically captures it after `actions/setup-go`.
@@ -243,7 +251,7 @@ This is required for providers whose model identifiers are not in the built-in c
 
 #### Token steering (`sandbox.agent.token-steering`)
 
-AWF enables API proxy token steering by default. To keep the explicitly configured provider and model, disable it for a workflow:
+This setting controls AWF's budget notices, which warn the agent when the run's AI credits or time are nearly spent. Notices are on by default; steering never changes the provider or model. To turn the notices off for a workflow:
 
 ```yaml wrap
 sandbox:
@@ -251,7 +259,9 @@ sandbox:
     token-steering: false
 ```
 
-With steering enabled, AWF adds a notice to the next eligible model request after the run crosses 80, 90, 95 or 99% of its AI-credit budget, its effective-token budget or its runtime deadline. Runtime notices need an agent deadline, which gh-aw sends with AWF v0.28.51 or newer on runtimes other than Cloud Hypervisor and NVX:
+With notices on, AWF adds a notice to the next eligible model request after the run crosses 80, 90, 95 or 99% of its AI-credit budget or its runtime deadline. With AWF releases after v0.29.11, each conversation in the run, sub-agents included, gets the latest notice once rather than every notice: if several thresholds pass before its next request, only the newest is sent. The notice states how much budget or time is left, then says what to do, and a further notice comes when about five requests' worth of credits, or about five minutes, remain. On those releases, notices stay on when [`max-ai-credits: -1`](/gh-aw/reference/frontmatter/#ai-credits-guardrail-max-ai-credits) removes the budget, unless `token-steering: false` is set: time notices use the agent deadline and credit notices use AWF's hard cap. The hard cap is 10,000 AI credits by default; the runner operator can change it with `AWF_AI_CREDITS_HARD_CAP` (gh-aw does not set it), and AWF clamps any larger budget to it. Up to AWF v0.29.11, notices are on only when gh-aw enables them in the AWF config, which it does for every workflow with a credit budget. This setting does not apply to threat-detection runs, whose notices always follow these defaults.
+
+Runtime notices need an agent deadline, which gh-aw sends with AWF v0.28.51 or newer on runtimes other than Cloud Hypervisor and NVX:
 
 - **Literal `timeout-minutes`** (for example `timeout-minutes: 30`): the AWF config gets `container.agentTimeout` set to that value.
 - **Expression timeout**, including the default that workflows without `timeout-minutes` compile to (`${{ fromJSON(vars.GH_AW_DEFAULT_TIMEOUT_MINUTES || '20') }}`): the agent step gets the step timeout in `GH_AW_ENGINE_STEP_TIMEOUT_MINUTES`, and `awf` receives it at run time as `--agent-timeout`. The AWF config has no `agentTimeout`.
@@ -318,22 +328,9 @@ Use this for OpenAI-compatible proxies and gateways that expect additional reque
 
 #### Go cache paths in AWF (`GOMODCACHE` / `GOCACHE`)
 
-When using `actions/setup-go` in AWF, pin Go cache paths explicitly so restore behavior is predictable:
+Runner-home cache directories may not be writable inside AWF. Set `GOMODCACHE` and `GOCACHE` to explicit writable paths in workflow-level `env` or `engine.env`, and make the cache's `path` match. Environment variables written to `$GITHUB_ENV` in a custom setup job do not carry over to the agent job.
 
-```yaml wrap
-jobs:
-  setup:
-    steps:
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
-          cache: false
-      - run: |
-          echo "GOMODCACHE=$HOME/go/pkg/mod" >> "$GITHUB_ENV"
-          echo "GOCACHE=$HOME/.cache/go-build" >> "$GITHUB_ENV"
-```
-
-Then cache those paths via top-level `cache:` (see [Frontmatter cache configuration](/gh-aw/reference/frontmatter/)). Keep cache keys scoped to trusted contexts and avoid sharing writeable keys between untrusted and protected runs.
+See [Go cache configuration](/gh-aw/reference/faq/#how-should-i-configure-go-caches-safely-in-agentic-workflows) for separate module and build caches, checksum verification, trust scopes, and a pre-build artifact handoff.
 
 ## MCP Gateway
 
@@ -464,14 +461,14 @@ Pre-building in a setup job ensures the agent's `timeout-minutes` budget is spen
 
 ### Per-Tool-Call Timeout (`tools.timeout`)
 
-`tools.timeout` controls the maximum time for any single tool invocation (e.g., a `bash` command or MCP server call), in seconds. Increase this when individual commands — such as a full build or a slow test suite — routinely take longer than the engine default:
+`tools.timeout` sets a per-operation timeout in seconds where supported by the engine. For Codex, it controls native MCP tool calls and does not limit shell-command duration. Pi does not apply this setting to shell commands. Use `timeout-minutes` to bound overall execution.
 
 ```yaml wrap
 tools:
-  timeout: 600   # 10 minutes per tool call (seconds)
+  timeout: 600   # 10 minutes per supported tool operation
 ```
 
-Default values vary by engine: Claude uses 60 s, Codex uses 120 s. See [Tool Timeout Configuration](/gh-aw/reference/tools/#tool-timeout-configuration) for details.
+Claude and Codex default to 60 seconds. See [Tool Timeout Configuration](/gh-aw/reference/tools/#tool-timeout-configuration) for details.
 
 ### Self-Hosted Runners for Fast Hardware
 

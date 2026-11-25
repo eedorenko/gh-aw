@@ -14,10 +14,10 @@ permissions:
   discussions: read
   copilot-requests: write
 tracker-id: daily-storify
+model: router/economy
 engine:
   id: codex
-  model-provider: openai
-model: openai/gpt-6-sol
+  model-provider: github
 strict: true
 timeout-minutes: 45
 network:
@@ -44,24 +44,6 @@ imports:
       expires: 2d
 features:
   gh-aw-detection: true
-experiments:
-  deterministic_precondition_v1:
-    variants: [control, candidate]
-    description: "Gate the optional redundant 24h-logs re-fetch behind a deterministic summary.json continuation/stale_warning check instead of the agent's own 'coverage incomplete' judgment."
-    hypothesis: "H0: no meaningful difference between control and candidate in average execution-step-count. H1: candidate reduces average execution-step-count by >=0.5 steps relative to control, without reducing eval:episodes_analyzed or eval:feedback_loops_documented pass rate below 0.9."
-    metric: "grader:execution-step-count"
-    guardrail_metrics:
-      - name: "eval:episodes_analyzed"
-        threshold: ">=0.9"
-      - name: "eval:feedback_loops_documented"
-        threshold: ">=0.9"
-    min_samples: 20
-    analysis_type: mann_whitney
-    decision:
-      minimum_effect: 0.5
-      regression_tolerance: 0.5
-      confidence: 0.95
-    tags: ["harness_dimension:tool interaction", "harness_subtype:deterministic_precondition"]
 evals:
   - id: episodes_analyzed
     question: Did the workflow identify and analyze episode-level activity from the last 24 hours?
@@ -81,7 +63,7 @@ Your mission: transform the last 24 hours of workflow execution into a concise b
 - Repository: `${{ github.repository }}`
 - Primary evidence sources:
   1. pre-fetched workflow logs under `/tmp/gh-aw/aw-mcp/logs/`
-  2. `agentic-workflows` MCP (`logs`, `audit`, optional `status`)
+  2. `agentic-workflows` MCP (`audit`, optional `status`; no fleet log collection)
   3. GitHub MCP search/read tools for issues, PRs, comments, and reviews
 
 ## Required Memory Pattern (repo-memory)
@@ -108,21 +90,7 @@ Never store secrets or credentials.
 
 ### 1) Build the episode candidate set
 
-Use the pre-downloaded 24h logs first.
-
-{{#if experiments.deterministic_precondition_v1 == 'candidate' }}
-Check `/tmp/gh-aw/aw-mcp/logs/summary.json` for a non-null `continuation` field or a `stale_warning` flag — these indicate truncated coverage. Only when one of those fields signals truncation, run one additional `agentic-workflows logs` call with:
-{{#else}}
-If coverage is incomplete, run one additional `agentic-workflows logs` call with:
-{{#endif}}
-
-```json
-{
-  "start_date": "-1d",
-  "count": 3000,
-  "artifacts": ["usage"]
-}
-```
+Use only the pre-downloaded 24h logs for fleet collection. This overrides the shared import's continuation guidance: do not call `agentic-workflows logs` or start another fleet download in the agent. Project `summary`, `failure_investigation`, `continuation`, and `stale_warning` from `summary.json`; when coverage is incomplete, report the analyzed subset and the missing window without refetching.
 
 From logs output and saved summaries, identify episodes and lineage edges. Prioritize episodes that:
 - span multiple workflows,
@@ -131,7 +99,7 @@ From logs output and saved summaries, identify episodes and lineage edges. Prior
 
 ### 2) Deep-audit representative episodes
 
-Select 3-6 representative episodes and audit at least one run per episode using `agentic-workflows audit`.
+Select at most 3 representative episodes. Read their cached audit files first; only when necessary, use one `agentic-workflows audit` call per episode with compact `usage` artifacts and a one-minute timeout. Project the returned file reference and needed fields rather than reading full audit blobs into context. A failed or timed-out call is an evidence gap: record it and continue with the cached subset, without overlapping or retrying it.
 
 For each episode, capture:
 - workflows involved,
@@ -167,21 +135,54 @@ For each loop, include:
 
 Create one discussion entry with a narrative, not a bullet dump.
 
-Required structure:
+Required report sequence:
+
+1. **Overview**: a one- or two-paragraph narrative with the outcome.
+2. **Key metrics and issues**: keep decision-relevant episode counts and the most
+   important intervention or loop visible.
+3. **Detailed findings**: put long episode lists, evidence, and raw diagnostics in
+   `<details><summary><b>...</b></summary>...</details>` blocks.
+4. **Next actions or limitations**: close with concise signals to watch, follow-up
+   actions, or any missing evidence.
+
+Use `###` or lower for every report heading; reserve h1/h2 for the
+platform-rendered title. Use `- [ ]` for follow-up actions. Format run references
+as `[§12345](https://github.com/${{ github.repository }}/actions/runs/12345)` and
+include up to 3 relevant runs under `**References:**`.
 
 ### Storify Daily Entry (YYYY-MM-DD)
 
-- 1-2 paragraph opening narrative.
-- **Episode Highlights**: top episodes with evidence.
-- **Feedback Loops Across Workflows**: emergent loops and trajectory.
-- **Human Interventions That Mattered**: concrete interventions and impact.
-- **Signals to Watch Next**: short forward-looking section.
+### Summary
 
-Formatting rules:
-- Use `###` headers (or lower).
-- Keep key takeaways visible; move long raw evidence to `<details>` blocks.
-- Include run links as `[§run_id](https://github.com/${{ github.repository }}/actions/runs/run_id)`.
-- Include up to 3 most relevant run references under `**References:**`.
+One or two paragraphs with the overall outcome and the key episode or metric.
+
+### Key Metrics and Issues
+
+Keep the most decision-relevant episode count, feedback loop, or intervention visible.
+
+<details>
+<summary><b>Episode Highlights and Evidence</b></summary>
+
+### Episode Highlights
+
+Describe the top episodes with concise evidence.
+
+### Feedback Loops Across Workflows
+
+Describe the strongest emergent loops and their trajectory.
+
+### Human Interventions That Mattered
+
+Connect concrete human decisions to episode outcomes.
+
+Long episode lists, evidence chains, and raw diagnostics belong here.
+
+</details>
+
+### Signals to Watch Next
+
+- [ ] Follow up on the highest-priority signal, if one is warranted.
+- State any missing evidence or analysis limitation.
 
 ### 6) Safe-output behavior
 

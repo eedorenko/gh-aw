@@ -30,6 +30,8 @@ func ParseStaleCheckMode(frontmatter map[string]any) (disabled, full bool) {
 }
 
 // buildInitialWorkflowData creates the initial WorkflowData struct with basic fields populated.
+//
+//nolint:largefunc // Keep the existing workflow-data assembly together when adding metadata inputs.
 func (c *Compiler) buildInitialWorkflowData(
 	result *parser.FrontmatterResult,
 	toolsResult *toolsProcessingResult,
@@ -37,7 +39,10 @@ func (c *Compiler) buildInitialWorkflowData(
 	importsResult *parser.ImportsResult,
 ) (*WorkflowData, error) {
 	workflowBuilderLog.Print("Building initial workflow data")
-	_, subAgents, _ := parser.ExtractInlineSubAgents(result.Markdown)
+	_, subAgents, err := parser.ExtractInlineSubAgents(result.Markdown)
+	if err != nil {
+		return nil, err
+	}
 
 	inlinedImports := resolveInlinedImports(result.Frontmatter)
 
@@ -75,6 +80,7 @@ func (c *Compiler) buildInitialWorkflowData(
 		MaxDailyAICreditsGitHubApp: extractMaxDailyAICGitHubApp(result.Frontmatter),
 		MaxDailyAICContinueOnError: resolveMaxDailyAICContinueOnError(result.Frontmatter, importsResult.MergedMaxDailyAICredits),
 		ImportedFiles:              importsResult.ImportedFiles,
+		ImportedMetadataDocuments:  importsResult.MetadataDocuments,
 		Skills:                     extractFrontmatterSkills(toolsResult.parsedFrontmatter, result.Frontmatter),
 		SkillReferences:            extractFrontmatterSkillReferences(toolsResult.parsedFrontmatter, result.Frontmatter),
 		Plugins:                    mergeFrontmatterPlugins(toolsResult.parsedFrontmatter, result.Frontmatter, importsResult.MergedPlugins, importsResult.MergedPluginObjects),
@@ -83,6 +89,7 @@ func (c *Compiler) buildInitialWorkflowData(
 		ImportPaths:                toolsResult.importPaths,      // Import paths for runtime-import macros (imports without inputs)
 		PromptImports:              toolsResult.promptImports,    // Ordered prompt contributions from imports
 		MainWorkflowMarkdown:       toolsResult.mainWorkflowMarkdown,
+		PromptMarkdown:             toolsResult.promptMarkdown,
 		IncludedFiles:              toolsResult.allIncludedFiles,
 		ImportInputs:               importsResult.ImportInputs,
 		Tools:                      toolsResult.tools,
@@ -125,6 +132,7 @@ func (c *Compiler) buildInitialWorkflowData(
 	}
 	if importsResult.MergedConcurrency != "" && !hasExplicitConcurrencyGroup(result.Frontmatter) {
 		var importedConcurrency any
+		//nolint:jsonunmarshalbytesconversion // Reject trailing data instead of decoding only the first JSON value.
 		if err := json.Unmarshal([]byte(importsResult.MergedConcurrency), &importedConcurrency); err == nil {
 			workflowData.Concurrency = c.extractTopLevelYAMLSection(map[string]any{"concurrency": importedConcurrency}, "concurrency")
 		} else {
@@ -171,6 +179,7 @@ func (c *Compiler) buildInitialWorkflowData(
 				continue
 			}
 			var raw any
+			//nolint:jsonunmarshalbytesconversion // Each imported checkout line must be one complete JSON value.
 			if err := json.Unmarshal([]byte(line), &raw); err != nil {
 				return nil, fmt.Errorf("invalid imported checkout JSON: %w", err)
 			}
@@ -246,13 +255,9 @@ func (c *Compiler) buildInitialWorkflowData(
 	mainModelCosts := extractMainModelCostsOverlay(toolsResult, result.Frontmatter)
 	mergedModelCosts := mergeModelCostOverlays(importsResult.MergedModelCosts, mainModelCosts)
 	if len(mergedModelCosts) > 0 {
+		workflowData.ModelCostOverrides = mergedModelCosts
 		workflowData.ModelCosts = mergedModelCosts
 	}
-	// Attempt to resolve pricing for the workflow model from models.dev when it is absent
-	// from both the frontmatter overlay and the embedded models.json catalog.  The result
-	// is injected into ModelCosts so the runtime receives it via GH_AW_INFO_MODEL_COSTS.
-	workflowData.ModelCosts = c.resolveModelPricingIfMissing(workflowData.ModelCosts, workflowData)
-	workflowData.ModelCosts = c.resolveFallbackModelPricing(workflowData.ModelCosts, workflowData)
 	mainModelPolicy := extractMainModelPolicyOverlay(toolsResult, result.Frontmatter)
 	allowedModels, disallowedModels := mergeModelPolicyOverlays(importsResult.MergedModelPolicies, mainModelPolicy)
 	if len(allowedModels) > 0 {

@@ -1,5 +1,6 @@
 ---
 title: Copilot SDK Driver Specification
+spec: true
 description: Formal W3C-style specification for Copilot SDK driver configuration, environment variables, permission checks, and logging requirements
 sidebar:
   order: 1365
@@ -7,7 +8,7 @@ sidebar:
 
 # Copilot SDK Driver Specification
 
-**Version**: 1.0.2  
+**Version**: 1.0.3<br />
 **Status**: Draft Specification  
 **Latest Version**: [copilot-sdk-driver-specification](/gh-aw/specs/copilot-sdk-driver-specification/)  
 **Editor**: GitHub Agentic Workflows Team
@@ -220,11 +221,11 @@ This counting requirement tightens the specification to match the existing gh-aw
 
 ### 4.6 TypeScript Example (Non-Normative)
 
-Prerequisite: install [`@github/copilot-sdk`](https://www.npmjs.com/package/@github/copilot-sdk) in the runtime where this example executes.
+Prerequisite: install [`@microsoft/copilot-sdk`](https://www.npmjs.com/package/@microsoft/copilot-sdk) in the runtime where this example executes.
 
 ```ts
 import { readFile } from "node:fs/promises";
-import { CopilotClient, RuntimeConnection } from "@github/copilot-sdk";
+import { CopilotClient, RuntimeConnection } from "@microsoft/copilot-sdk";
 
 const promptPath = process.env.GH_AW_PROMPT;
 const sdkUri = process.env.COPILOT_SDK_URI;
@@ -242,18 +243,21 @@ const logLevel = allowedLogLevels.has(rawLogLevel) ? rawLogLevel : "warning";
 const workingDirectory = process.env.GITHUB_WORKSPACE || process.cwd();
 const prompt = await readFile(promptPath, "utf8");
 
+const endpoint = new URL(sdkUri);
+const port = endpoint.port || (endpoint.protocol === "http:" ? "80" : "");
+if (!port || !["http:", "tcp:"].includes(endpoint.protocol)) {
+  throw new Error("COPILOT_SDK_URI must identify a plaintext HTTP endpoint or a TCP endpoint with an explicit port");
+}
 const client = new CopilotClient({
-  connection: RuntimeConnection.forUri(sdkUri, {
-    connectionToken,
-  }),
-  workingDirectory,
-  logLevel,
+  mode: "coding-agent",
+  runtime: RuntimeConnection.forTcp(endpoint.hostname.replace(/^\[|\]$/g, ""), Number(port), { connectionToken }),
+  observability: { logLevel },
 });
 
 await client.start();
 try {
-  const session = await client.createSession({ model });
-  const response = await session.sendAndWait({ prompt }, { timeoutMs: sendTimeoutMs });
+  const session = await client.createSession({ model, workingDirectory });
+  const response = await session.sendAndWait({ prompt }, sendTimeoutMs);
   console.log(response);
   await session.disconnect();
 } finally {
@@ -411,10 +415,29 @@ The session result object SHOULD include:
 - Output-presence indicator
 - Duration in milliseconds
 
+For failed sessions, the built-in driver returns exit code `80` when its SDK
+permission callback recorded a workflow tool denial. This status is distinct
+from model-verification failure (`79`). The harness uses the exit status, not
+human-readable markers or JSON-shaped assistant output, to stop workflow-denial
+retries, classify `permission_denied`, and emit `report_missing_tool`.
+Repeated generic `permission denied`, `EACCES`, or `EPERM` text is diagnostic
+only and does not trigger these decisions in either Copilot SDK or CLI mode;
+without exit status `80`, normal retry rules apply. Permission-denial logs are
+not authenticated control signals. Expected safe-outputs already produced
+still suppress the terminal permission-denial verdict.
+
 The built-in driver treats a main-session content-filter rejection as failure,
-even when `sendAndWait` resolves normally. Copilot's synthesized message requires
-both `rte: true` and the exact runtime content-filter text; quoted text alone is
-not rejection evidence. The rejection is retained as `assistant.refusal` in the
+even when `sendAndWait` resolves normally. A rejection MUST be evidenced by either:
+
+1. Copilot's synthesized `assistant.message` containing both `rte: true` and the
+   exact runtime content-filter text; or
+2. a top-level `session.error` whose `errorType` is `"query"` or `"sdk_driver"`
+   and whose `message` begins exactly with `422 This content was flagged for
+   possible cybersecurity risk.`.
+
+A `session.error` nested under an agent or tool context, an error with another
+`errorType`, a quoted occurrence, or unrelated text MUST NOT establish
+main-session rejection. The rejection is retained as `assistant.refusal` in the
 canonical session, not counted as task output, and cannot qualify for idle-timeout
 success recovery. The harness stops retries, and an absent terminal safe output
 is classified as `request_rejection`, not an intentional noop or task success.
@@ -423,6 +446,10 @@ Nested-agent refusals do not independently establish main-session rejection.
 ### 7.3 Cleanup
 
 The implementation MUST perform best-effort cleanup of event streams, session handles, and client handles regardless of success or failure.
+
+### 7.4 Formal Model
+
+The [TLA+ driver model](https://github.com/github/gh-aw/blob/main/specs/copilot-sdk-driver/CopilotSDKDriver.tla) and [TLC configuration](https://github.com/github/gh-aw/blob/main/specs/copilot-sdk-driver/CopilotSDKDriver.cfg) check one SDK session with a denial limit of two. The model checks startup and dispatch order, result classification from SDK observations, and cleanup attempts for resources acquired before success or failure. It abstracts connection and permission configuration into classified inputs; it does not verify token handling, policy matching, log strings, or actual cleanup success.
 
 ---
 
@@ -462,6 +489,17 @@ Implementations MUST provide automated tests for all Level 1 and Level 2 require
 - **T-CSD-201**: Lifecycle logs include connection, session, prompt, completion, and failure markers.
 - **T-CSD-202**: Permission denial logs include compact request summary.
 
+#### 8.1.4 Content-Filter Evidence Tests
+
+- **T-CSD-301**: A top-level `session.error` with `errorType: "query"` and a message beginning exactly with `422 This content was flagged for possible cybersecurity risk.` establishes main-session content-filter rejection.
+- **T-CSD-302**: The same top-level evidence with `errorType: "sdk_driver"` establishes rejection.
+- **T-CSD-303**: Nested agent/tool errors, quoted messages, unrelated error types, non-matching prefixes, and null messages do not establish rejection.
+
+#### 8.1.5 Content-Filter Retry and Outcome Tests
+
+- **T-CSD-304**: A recognized main-session content-filter rejection stops retries after the first attempt, even when output or noop output exists.
+- **T-CSD-305**: The recognized rejection preserves failure classification and maps an absent terminal safe output to `request_rejection`, rather than success.
+
 ### 8.2 Compliance Checklist
 
 | Requirement                                   | Test ID              | Level | Status      |
@@ -477,6 +515,8 @@ Implementations MUST provide automated tests for all Level 1 and Level 2 require
 | Scoped MCP/shell enforcement                  | T-CSD-108..109       | 2     | Required    |
 | Unknown-kind rejection                        | T-CSD-110            | 2     | Required    |
 | Permission denial diagnostics                 | T-CSD-111, T-CSD-202 | 2     | Required    |
+| Main-session content-filter evidence          | T-CSD-301..303       | 1     | Required    |
+| Content-filter retry and outcome behavior     | T-CSD-304..305       | 1     | Required    |
 | Lifecycle logging coverage                    | T-CSD-201            | 3     | Recommended |
 
 ---
@@ -529,7 +569,7 @@ A conforming implementation SHOULD:
 
 ### Informative References
 
-- **[Copilot SDK (npm)]** https://www.npmjs.com/package/@github/copilot-sdk
+- **[Copilot SDK (npm)]** https://www.npmjs.com/package/@microsoft/copilot-sdk
 - **[Copilot SDK Repository]** https://github.com/github/copilot-sdk
 - **[Copilot SDK Driver Source]** `actions/setup/js/copilot_sdk_driver.cjs`
 - **[Copilot Harness Source]** `actions/setup/js/copilot_harness.cjs`
@@ -557,6 +597,12 @@ This specification MUST be revalidated whenever any of the following occurs:
 
 <a id="change-log"></a>
 ## Change Log
+
+### Version 1.0.3 (Draft Specification) — 2026-11-13
+
+- Clarified Section 7.2 to recognize top-level Copilot `session.error` events with `errorType` `"query"` or `"sdk_driver"` and the exact cybersecurity-risk 422 message prefix as main-session content-filter rejection evidence.
+- Preserved exclusions for nested, quoted, unrelated, and non-matching errors.
+- Added compliance coverage for rejection evidence, one-attempt retry behavior, and failure preservation.
 
 ### Version 1.0.2 (Draft Specification)
 

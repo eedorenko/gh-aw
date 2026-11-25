@@ -240,6 +240,14 @@ func DownloadWorkflowLogsForTargets( //nolint:largefunc // Keeps shared collecti
 	initialErrors []error,
 ) (err error) {
 	opts = normalizeLogsDownloadOptions(opts)
+	if opts.Delivery || opts.Outcomes {
+		var cancel context.CancelFunc
+		ctx, cancel = lifecycleLogsContext(ctx, opts.TimeoutMinutes, opts.TimeoutSeconds, opts.MaxGitHubAPIRateLimit)
+		defer cancelLogsDownload(cancel)
+	}
+	ctx, stream, finish := startLogsJSONL(ctx, opts.Format, opts.Verbose, workQueueEvidenceRequested(opts.ArtifactSets) || len(ResolveArtifactFilter(opts.ArtifactSets)) == 0)
+	defer finish(&err)
+	opts.jsonlStream = stream
 	if len(targets) == 0 {
 		return errors.Join(initialErrors...)
 	}
@@ -275,6 +283,7 @@ func DownloadWorkflowLogsForTargets( //nolint:largefunc // Keeps shared collecti
 	defer func() { err = errors.Join(err, errors.Join(atifErrors...)) }()
 	renderLogsCollectionStats(opts.collectionStats)
 	for _, err := range allErrors {
+		stream.emit(logsJSONLEvent{Type: "warning", Message: err.Error()})
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Skipping workflow target: "+err.Error()))
 	}
 	if ctx.Err() != nil {
@@ -287,9 +296,12 @@ func DownloadWorkflowLogsForTargets( //nolint:largefunc // Keeps shared collecti
 		}
 	}
 	var outcomeReports []OutcomesData
-	if opts.Outcomes {
-		outcomeReports, err = collectLogsOutcomes(ctx, processedRuns, opts.OutcomesDir, opts.Verbose)
+	if opts.Outcomes || opts.Delivery {
+		outcomeReports, err = collectLogsLifecycles(ctx, processedRuns, opts.OutcomesDir, opts.Verbose, opts.Outcomes, opts.cachedJSONLCache)
 		if err != nil {
+			return err
+		}
+		if err := cacheLogsLifecycles(opts.cachedJSONLWriter, outcomeReports); err != nil {
 			return err
 		}
 	}
@@ -309,32 +321,19 @@ func DownloadWorkflowLogsForTargets( //nolint:largefunc // Keeps shared collecti
 	if err != nil {
 		return err
 	}
-	return renderLogsOutput(processedRuns, renderLogsOutputOptions{
-		outputDir:         opts.OutputDir,
-		summaryFile:       opts.SummaryFile,
-		format:            opts.Format,
-		reportFile:        opts.ReportFile,
-		jsonOutput:        opts.JSONOutput,
-		episodes:          opts.Episodes,
-		toolGraph:         opts.ToolGraph,
-		train:             opts.Train,
-		drain3Weights:     opts.Drain3Weights,
-		audit:             opts.Audit,
-		verbose:           opts.Verbose,
-		artifactFilter:    artifactFilter,
-		includeWorkQueue:  workQueueEvidenceRequested(opts.ArtifactSets),
-		startDate:         opts.StartDate,
-		endDate:           opts.EndDate,
-		checkStaleness:    true,
-		countLimitReached: countLimitReached,
-		countLimitTargets: logsCountLimitedTargets(results),
-		suppressRender:    opts.SuppressRender,
-		continuations:     continuations,
-		apiRateLimit:      apiRateLimit,
-		apiRateLimits:     apiRateLimits,
-		cachedJSONLWriter: opts.cachedJSONLWriter,
-		outcomeReports:    outcomeReports,
-	})
+	renderOpts := newRenderLogsOutputOptions(opts, artifactFilter)
+	renderOpts.startDate = opts.StartDate
+	renderOpts.endDate = opts.EndDate
+	renderOpts.checkStaleness = true
+	renderOpts.countLimitReached = countLimitReached
+	renderOpts.countLimitTargets = logsCountLimitedTargets(results)
+	renderOpts.suppressRender = opts.SuppressRender
+	renderOpts.continuations = continuations
+	renderOpts.apiRateLimit = apiRateLimit
+	renderOpts.apiRateLimits = apiRateLimits
+	renderOpts.cachedJSONLWriter = opts.cachedJSONLWriter
+	renderOpts.outcomeReports = outcomeReports
+	return renderLogsOutput(processedRuns, renderOpts)
 }
 
 func logLogsMultiTargetDownloadStart(opts LogsDownloadOptions, targetCount int) {

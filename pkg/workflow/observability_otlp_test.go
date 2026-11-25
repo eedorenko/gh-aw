@@ -4,12 +4,112 @@ package workflow
 
 import (
 	"maps"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/goccy/go-yaml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestCompileOTLPOptOut(t *testing.T) {
+	const source = `---
+on:
+  schedule:
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+engine: claude
+permissions:
+  contents: read
+network:
+  allowed: [defaults]
+env:
+  KEEP: preserved
+`
+	for _, tc := range []struct {
+		name, config string
+		disabled     bool
+		importedOff  bool
+	}{
+		{name: "defaults"},
+		{name: "disabled", config: "observability: { otlp: false }\n", disabled: true},
+		{name: "disabled with import", config: "observability: { otlp: false }\nimports: [shared.md]\n", disabled: true},
+		{name: "imported opt-out has no effect", config: "imports: [shared.md]\n", importedOff: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			importedConfig := `---
+observability:
+  otlp:
+    endpoint: https://imported.example.com
+    headers: ${{ secrets.IMPORTED_OTLP_HEADERS }}
+---
+`
+			if tc.importedOff {
+				importedConfig = `---
+observability:
+  otlp: false
+---
+`
+			}
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "shared.md"), []byte(importedConfig), 0600))
+			path := filepath.Join(dir, "telemetry.md")
+			require.NoError(t, os.WriteFile(path, []byte(source+tc.config+"---\nSay hello.\n"), 0600))
+			require.NoError(t, NewCompiler().CompileWorkflow(path))
+			lock, err := os.ReadFile(filepath.Join(dir, "telemetry.lock.yml"))
+			require.NoError(t, err)
+
+			var workflow struct {
+				Env map[string]string `yaml:"env"`
+			}
+			require.NoError(t, yaml.Unmarshal(lock, &workflow))
+			assert.Equal(t, "preserved", workflow.Env["KEEP"])
+			for _, key := range []string{"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_HEADERS", "GH_AW_OTLP_ENDPOINTS", "GH_AW_OTLP_IF_MISSING"} {
+				if tc.disabled {
+					assert.NotContains(t, workflow.Env, key)
+				} else {
+					assert.Contains(t, workflow.Env, key)
+				}
+			}
+			if tc.disabled {
+				assert.NotContains(t, string(lock), "secrets.GH_AW_DEFAULT_OTLP_")
+				assert.NotContains(t, string(lock), "secrets.IMPORTED_OTLP_HEADERS")
+				assert.NotContains(t, string(lock), "imported.example.com")
+				assert.NotContains(t, string(lock), "Check OTLP telemetry configuration")
+				assert.Contains(t, workflow.Env, "GH_AW_OTEL_METRICS")
+				assert.Contains(t, string(lock), "/tmp/gh-aw/otel.jsonl")
+				assert.Contains(t, string(lock), "otel-metrics.jsonl")
+				assert.Contains(t, string(lock), "Generate observability summary")
+				assert.Contains(t, string(lock), "Emit OTLP job conclusion before artifacts")
+			} else if tc.importedOff {
+				assert.Contains(t, workflow.Env, "OTEL_EXPORTER_OTLP_ENDPOINT")
+				assert.NotContains(t, string(lock), "imported.example.com")
+			}
+		})
+	}
+}
+
+func TestNormalizeFrontmatterConfigOTLPDisabled(t *testing.T) {
+	frontmatter := map[string]any{
+		"observability": map[string]any{
+			"otlp":  false,
+			"other": "preserved",
+		},
+	}
+
+	normalized, err := normalizeFrontmatterConfig(frontmatter)
+	require.NoError(t, err)
+	normalizedObservability := normalized["observability"].(map[string]any)
+	assert.NotContains(t, normalizedObservability, "otlp")
+	assert.Equal(t, "preserved", normalizedObservability["other"])
+
+	config, err := ParseFrontmatterConfig(frontmatter)
+	require.NoError(t, err)
+	require.NotNil(t, config.Observability)
+	assert.Nil(t, config.Observability.OTLP)
+}
 
 // TestExtractOTLPEndpointDomain verifies hostname extraction from OTLP endpoint URLs.
 func TestExtractOTLPEndpointDomain(t *testing.T) {
@@ -342,6 +442,47 @@ func TestGetOTLPGitHubAppTokenConfig(t *testing.T) {
 	assert.Equal(t, "${{ secrets.APP_PRIVATE_KEY }}", got.PrivateKey)
 }
 
+func TestInjectOTLPConfig_Protocol(t *testing.T) {
+	t.Parallel()
+	for _, configuredEnv := range []string{"", "env:\n  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf"} {
+		t.Run(configuredEnv, func(t *testing.T) {
+			compiler := NewCompiler()
+			data := &WorkflowData{Env: configuredEnv}
+			compiler.injectOTLPConfig(data)
+			assert.Equal(t, 1, strings.Count(data.Env, "OTEL_EXPORTER_OTLP_PROTOCOL:"))
+			if configuredEnv == "" {
+				assert.Contains(t, data.Env, "OTEL_EXPORTER_OTLP_PROTOCOL: ${{ vars.OTEL_EXPORTER_OTLP_PROTOCOL }}")
+			} else {
+				assert.Contains(t, data.Env, "OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf")
+				assert.NotContains(t, data.Env, "vars.OTEL_EXPORTER_OTLP_PROTOCOL")
+			}
+		})
+	}
+}
+
+func TestInjectOTLPConfig_MetricsDefaultsOnAndAllowsOverrides(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name        string
+		env         string
+		wantValue   string
+		wantDefault bool
+	}{
+		{name: "default on", wantValue: "GH_AW_OTEL_METRICS: ${{ vars.GH_AW_OTEL_METRICS || 'true' }}", wantDefault: true},
+		{name: "explicit opt out", env: "env:\n  GH_AW_OTEL_METRICS: 'false'", wantValue: "GH_AW_OTEL_METRICS: 'false'"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			data := &WorkflowData{Env: test.env}
+			NewCompiler().injectOTLPConfig(data)
+			assert.Equal(t, 1, strings.Count(data.Env, "GH_AW_OTEL_METRICS:"))
+			assert.Contains(t, data.Env, test.wantValue)
+			if test.wantDefault {
+				assert.NotContains(t, data.Env, "GH_AW_OTEL_METRICS: 'false'")
+			}
+		})
+	}
+}
+
 // TestInjectOTLPConfig verifies that injectOTLPConfig correctly modifies WorkflowData.
 func TestInjectOTLPConfig(t *testing.T) {
 	newCompiler := func() *Compiler { return &Compiler{} }
@@ -357,6 +498,18 @@ func TestInjectOTLPConfig(t *testing.T) {
 		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.GH_AW_DEFAULT_OTLP_ENDPOINT || vars.GH_AW_DEFAULT_OTLP_ENDPOINT }}")
 		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.GH_AW_DEFAULT_OTLP_HEADERS }}")
 		assert.Contains(t, wd.Env, "GH_AW_OTLP_IF_MISSING: ignore", "unset enterprise defaults must be a no-op")
+		assert.Contains(t, wd.Env, "GH_AW_OTLP_LOGS_ENABLED: ${{ vars.GH_AW_OTLP_LOGS_ENABLED }}")
+		assert.Contains(t, wd.Env, "GH_AW_OTLP_LOGS_MAX_BYTES: ${{ vars.GH_AW_OTLP_LOGS_MAX_BYTES }}")
+		assert.Contains(t, wd.Env, "GH_AW_OTEL_METRICS: ${{ vars.GH_AW_OTEL_METRICS || 'true' }}")
+	})
+
+	t.Run("preserves explicit session log opt out without duplicate keys", func(t *testing.T) {
+		wd := &WorkflowData{Env: "env:\n  GH_AW_OTLP_LOGS_ENABLED: 'false'\n  GH_AW_OTLP_LOGS_MAX_BYTES: '4096'"}
+		newCompiler().injectOTLPConfig(wd)
+		assert.Equal(t, 1, strings.Count(wd.Env, "GH_AW_OTLP_LOGS_ENABLED:"))
+		assert.Contains(t, wd.Env, "GH_AW_OTLP_LOGS_ENABLED: 'false'")
+		assert.Equal(t, 1, strings.Count(wd.Env, "GH_AW_OTLP_LOGS_MAX_BYTES:"))
+		assert.Contains(t, wd.Env, "GH_AW_OTLP_LOGS_MAX_BYTES: '4096'")
 	})
 
 	t.Run("falls back to enterprise defaults when ParsedFrontmatter is nil", func(t *testing.T) {

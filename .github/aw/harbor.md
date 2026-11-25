@@ -97,13 +97,12 @@ gh aw graders run --logs-dir ./my-logs \
 Collection mode emits a JSON report and keeps original grader artifacts separate
 from regraded results and their implementation identities and session digests.
 It reads GH-AW logs and unified sessions, not Harbor bundles. Missing sessions
-and grader errors are reported per run. Collection mode and Harbor export support
-in-memory built-in and isolated JavaScript graders, not Bash. Additional JavaScript
-grader code is executed; only select trusted graders.
+and grader errors are reported per run. Collection mode and Harbor export support in-memory built-ins, isolated custom
+JavaScript, and reserved operational-value JavaScript, not Bash. Additional
+JavaScript grader code is executed; only select trusted graders.
 
-The runner supports built-in graders, custom JavaScript, and repository-owned
-operational-value Bash. Only execute trusted grader code; Bash is not
-microVM-isolated. `logs --graders` retrieves recorded grader results and their
+The runner supports built-ins, custom JavaScript, and operational-value
+JavaScript. Only execute trusted grader code. `logs --graders` retrieves recorded grader results and their
 artifacts alongside automatic ATIF exports when sessions are available; it does
 not recompute historical results. Harbor export is separate from trajectory
 conversion: GitHub conclusions and grader pass/fail flags are not task outcomes
@@ -138,6 +137,10 @@ The trial's `gh-aw/evidence/` contains the downloaded evidence, including availa
 unified JSONL, grader results and manifests, and experiment state. Copy the
 `harbor/` directory to another machine to inspect it without GitHub access.
 Original download caches and normal logs reports remain outside that job.
+Missing sessions remain missing; invalid available sessions or export failures
+must be reported and fail the export.
+
+<!-- instruction-prefix-end -->
 
 This is an import of recorded evidence, not a runnable Harbor task or an agent
 replay. Missing sessions remain missing; invalid available sessions fail export.
@@ -155,15 +158,22 @@ unchanged. Ungraded trials keep `verifier_result: null`.
 
 ### Run the conformance test
 
-Compatibility is pinned to the published **Harbor 0.25.0** package (Python 3.12
-or newer). Harbor is needed only for consumption and conformance testing, not
-for Go export.
+Compatibility is pinned to the published **Harbor 0.25.0** package. The conformance
+dependency lock targets Python 3.12 and includes the complete runtime dependency
+graph and artifact hashes. Installation accepts wheels only, without source
+builds. Harbor is needed only for consumption and conformance testing, not for
+Go export.
 
 ```bash
-python3 -m venv /tmp/gh-aw-harbor
-/tmp/gh-aw-harbor/bin/python -m pip install harbor==0.25.0
+python3.12 -m venv /tmp/gh-aw-harbor
+/tmp/gh-aw-harbor/bin/python -m pip install --require-hashes --only-binary=:all: -r .github/workflows/requirements-harbor.txt
 GH_AW_HARBOR_PYTHON=/tmp/gh-aw-harbor/bin/python make test-harbor-conformance
 ```
+
+To refresh the lock with `uv`, run the command recorded in its header. Review
+the version and hash changes, install in a clean Python 3.12 environment, run
+`python -m pip check`, and rerun conformance before committing the lock. CI uses
+the checked-in lock directly; it does not resolve new versions.
 
 The dedicated Harbor conformance workflow runs this test in CI. It generates an
 export from representative GH-AW session fixtures and validates the relocated

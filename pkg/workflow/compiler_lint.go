@@ -24,19 +24,15 @@ func (c *Compiler) lintCompiledWorkflow(data *WorkflowData, content, sourcePath 
 	if err != nil {
 		return formatCompilerError(sourcePath, "error", "cannot parse generated Actions AST for linting", nil)
 	}
-	generatedActionRefs := compilerGeneratedActionRefs(data)
-	// An explicit --action-tag is a caller-selected reference override. Do not
-	// let compiler ownership downgrade mutable fallback refs; callers must opt in
-	// with --allow-action-refs when the override cannot be resolved to a SHA.
-	if c.actionTag != "" {
-		generatedActionRefs = nil
-	}
-	diagnostics, err := workflowlint.Default().Run(c.ctx, workflowlint.Input{
-		Workflow: graph, Document: c.lintPolicyDocument(data), SourcePath: sourcePath,
-		AllowActionRefs:     c.allowActionRefs,
-		SafeOutputJobs:      safeOutputLintJobs(data),
-		GeneratedActionRefs: generatedActionRefs,
+	rules := workflowlint.Default().Rules()
+	rules = slices.DeleteFunc(rules, func(rule workflowlint.Rule) bool {
+		return rule.ID == "safe-output-credentials"
 	})
+	runner, err := workflowlint.New(rules...)
+	if err != nil {
+		return fmt.Errorf("configure compiler workflow linter: %w", err)
+	}
+	diagnostics, err := runner.Run(c.ctx, c.compilerLintInput(data, graph, sourcePath))
 	var failures []error
 	if err != nil {
 		failures = append(failures, fmt.Errorf("workflow lint analysis failed: %w", err))
@@ -46,11 +42,7 @@ func (c *Compiler) lintCompiledWorkflow(data *WorkflowData, content, sourcePath 
 		failures = append(failures, checkoutErr)
 	}
 	for _, diagnostic := range diagnostics {
-		_, exemptCheckout := checkouts[diagnostic.Path]
-		if diagnostic.RuleID == "artipacked" && diagnostic.Severity == workflowlint.Warning && exemptCheckout {
-			continue
-		}
-		if (diagnostic.RuleID == "secret-leak" || diagnostic.RuleID == "grader-file-io") && diagnostic.Severity == workflowlint.Warning {
+		if c.omitCompilerLintWarning(data, diagnostic, checkouts) {
 			continue
 		}
 		message := fmt.Sprintf("[%s] %s at %s (script line %d)",
@@ -61,7 +53,8 @@ func (c *Compiler) lintCompiledWorkflow(data *WorkflowData, content, sourcePath 
 			if data.ParsedFrontmatter != nil {
 				suppressions = data.ParsedFrontmatter.ThreatDetectionSuppressions
 			}
-			if isThreatDetectionRuleSuppressed(suppressions, diagnostic.ThreatRuleID, time.Now()) {
+			if diagnostic.RuleID != "overprovisioned-secrets" &&
+				isThreatDetectionRuleSuppressed(suppressions, diagnostic.ThreatRuleID, time.Now()) {
 				continue
 			}
 		}
@@ -78,6 +71,45 @@ func (c *Compiler) lintCompiledWorkflow(data *WorkflowData, content, sourcePath 
 		return formatCompilerError(sourcePath, "error", err.Error(), err)
 	}
 	return nil
+}
+
+func (c *Compiler) omitCompilerLintWarning(data *WorkflowData, diagnostic workflowlint.Diagnostic, checkouts map[string]struct{}) bool {
+	if diagnostic.Severity != workflowlint.Warning {
+		return false
+	}
+	// Deduplicate CTR-008 only when validation emitted the equivalent warning.
+	if diagnostic.RuleID == "dangerous-triggers" && diagnostic.ThreatRuleID == "CTR-008" &&
+		data.pullRequestTargetWarned {
+		return true
+	}
+	_, exemptCheckout := checkouts[diagnostic.Path]
+	return diagnostic.RuleID == "artipacked" && exemptCheckout ||
+		diagnostic.RuleID == "secret-leak" || diagnostic.RuleID == "grader-file-io" ||
+		diagnostic.RuleID == "environment-file-injection" ||
+		diagnostic.RuleID == "template-injection" && strings.HasPrefix(diagnostic.Message, "Incomplete template-injection output-flow analysis:")
+}
+
+func (c *Compiler) compilerLintInput(data *WorkflowData, graph *actions.Workflow, sourcePath string) workflowlint.Input {
+	resolvedTools := data.Tools
+	if _, disabled := data.ExplicitlyDisabledTools["github"]; disabled {
+		resolvedTools = maps.Clone(resolvedTools)
+		if resolvedTools == nil {
+			resolvedTools = make(map[string]any)
+		}
+		resolvedTools["github"] = false
+	}
+	generatedActionRefs := compilerGeneratedActionRefs(data)
+	// An explicit --action-tag is a caller-selected reference override. Do not
+	// let compiler ownership downgrade mutable fallback refs; callers must opt in
+	// with --allow-action-refs when the override cannot be resolved to a SHA.
+	if c.actionTag != "" {
+		generatedActionRefs = nil
+	}
+	return workflowlint.Input{
+		Workflow: graph, Document: c.lintPolicyDocument(data), AuthoredJobs: data.Jobs, SourcePath: sourcePath,
+		ResolvedTools: resolvedTools, ResolvedRoles: c.dryRunWorkflowData(data).Roles,
+		AllowActionRefs: c.allowActionRefs, SafeOutputJobs: safeOutputLintJobs(data), GeneratedActionRefs: generatedActionRefs,
+	}
 }
 
 func compilerGeneratedActionRefs(data *WorkflowData) map[string]struct{} {

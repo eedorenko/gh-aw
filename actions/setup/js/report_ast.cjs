@@ -4,6 +4,7 @@ const { canonicalizePublicationText, buildAllowedDomains, sanitizeUrlDomains } =
 const { redactDiagnosticText } = require("./diagnostic_sanitization.cjs");
 const { escapeMarkdown } = require("./missing_info_formatter.cjs");
 const { createExpirationLine } = require("./ephemerals.cjs");
+const { TEMPORARY_ID_PATTERN } = require("./temporary_id.cjs");
 
 /**
  * @typedef {{agentTainted?: boolean, sizeProtected?: boolean}} ReportProvenance
@@ -20,13 +21,14 @@ const { createExpirationLine } = require("./ephemerals.cjs");
  *   {type: "list", ordered: boolean, items: ReportBlock[][]} |
  *   {type: "quote", children: ReportBlock[]} |
  *   {type: "alert", kind: string, children: ReportBlock[]} |
- *   {type: "details", summary: string | ReportInline[], children: ReportBlock[]} |
+ *   {type: "details", open?: boolean, summary: string | ReportInline[], children: ReportBlock[]} |
  *   {type: "table", headers: ReportInline[][], rows: ReportInline[][][]} |
  *   {type: "task", checked: boolean, children: ReportInline[]} |
  *   {type: "separator"} |
  *   {type: "structured_data", data: ReportData} |
  *   ReportXMLMarker | ReportJSONMarker |
  *   {type: "review_marker", workflowCallId: string} |
+ *   {type: "reference_definition", value: string} |
  *   {type: "expiration", expiresAt: string} |
  *   {type: "marker", name: "gh-aw-threat-detected" | "gh-aw-threat-engine-error"})} ReportBlock
  * @typedef {ReportXMLMarker & {name: "gh-aw-agentic-workflow" | "gh-aw-failure-issue", value: string, fields: ReportMarkerField[]}} ReportMarker
@@ -35,6 +37,7 @@ const { createExpirationLine } = require("./ephemerals.cjs");
  */
 
 const ALERT_KINDS = new Set(["NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION"]);
+const REPORT_REFERENCE_DEFINITION = /^ {0,3}\[[A-Za-z0-9_.:-]+(?:[ \t]+[A-Za-z0-9_.:-]+)*\]:[ \t]+#[A-Za-z0-9._~!$&'*+,;=:@/?%-]*[ \t]*$/;
 const MAX_DEPTH = 16;
 /** @type {WeakSet<Report>} */
 const redactedReports = new WeakSet();
@@ -156,8 +159,24 @@ function normalizeReportText(value, { redact = true, preserveImageAttributes = f
 }
 
 /** @param {string} value */
+function isReportReferenceDefinition(value) {
+  return REPORT_REFERENCE_DEFINITION.test(value);
+}
+
+/** @param {string} value @returns {string | undefined} */
+function normalizeReportReferenceDefinition(value) {
+  if (!isReportReferenceDefinition(value)) throw new TypeError("Invalid report reference definition");
+  return normalizeReportText(value, { redact: false }) === normalizeReportText(value) ? value : undefined;
+}
+
+/** @param {string} value */
 function normalizeReportTitle(value) {
   return Array.from(normalizeReportText(value).replace(/\s+/g, " ").trim()).slice(0, 256).join("");
+}
+
+/** @param {string} value */
+function isTemporaryIdLink(value) {
+  return /^#aw_[A-Za-z0-9_]{3,12}$/i.test(value);
 }
 
 /** @param {string} value */
@@ -324,7 +343,7 @@ function normalizeInlines(nodes, depth, inLink = false, deferRedaction = false) 
         if (node.type === "link" && inLink) throw new TypeError("Report links cannot contain other links");
         const children = normalizeInlines(node.children, depth + 1, inLink || node.type === "link", true);
         if (!children.length) break;
-        result.push(node.type === "link" ? { type: "link", url: normalizeReportURL(node.url), children } : { type: node.type, children });
+        result.push(node.type === "link" ? { type: "link", url: isTemporaryIdLink(node.url) ? node.url : normalizeReportURL(node.url), children } : { type: node.type, children });
         break;
       }
       default:
@@ -402,7 +421,7 @@ function normalizeBlocks(nodes, depth) {
         if (node.type === "details") {
           const summary = typeof node.summary === "string" ? normalizeReportText(node.summary).replace(/\s+/g, " ").trim() : normalizeInlines(node.summary, depth + 1);
           if (!summary.length) throw new TypeError("Report details must have a summary");
-          result.push({ type: "details", summary, children });
+          result.push({ type: "details", ...(node.open === true ? { open: true } : {}), summary, children });
         } else if (node.type === "alert") result.push({ type: "alert", kind: node.kind, children });
         else result.push({ type: "quote", children });
         break;
@@ -433,6 +452,17 @@ function normalizeBlocks(nodes, depth) {
       case "review_marker":
         if (!node.workflowCallId) throw new TypeError("Review metadata requires a workflow call ID");
         result.push({ type: "review_marker", workflowCallId: normalizeReportText(node.workflowCallId) });
+        break;
+      case "reference_definition":
+        {
+          const value = normalizeReportReferenceDefinition(node.value);
+          if (value === undefined) {
+            result.push({
+              type: "paragraph",
+              children: [{ type: "text", value: normalizeReportText(node.value), ...provenance }],
+            });
+          } else result.push({ type: "reference_definition", value });
+        }
         break;
       case "structured_data": {
         result.push({ type: "structured_data", data: normalizeReportData(node.data, depth + 1) });
@@ -510,6 +540,7 @@ function escapeReportText(value) {
             .replace(/[|#~!]/g, "\\$&")
             .replace(/^([-+])(?= )/, "\\$1")
             .replace(/^(\d+)\.(?= )/, "$1\\.")
+            .replace(TEMPORARY_ID_PATTERN, match => match.replace(/\\([#_])/g, "$1"))
     )
     .join("");
 }
@@ -583,7 +614,9 @@ function renderInlines(nodes, html = false) {
           ];
           return `<img ${attributes.join(" ")}>`;
         }
-        return `![${escapeMarkdown(node.alt.replace(/&/g, "&amp;")).replace(/@/g, "&#64;")}](${escapeURLDestination(node.url)})`;
+        return `![${escapeMarkdown(node.alt.replace(/&/g, "&amp;"))
+          .replace(/@/g, "&#64;")
+          .replace(TEMPORARY_ID_PATTERN, match => (match.startsWith("#") ? match.replace(/\\_/g, "_") : match))}](${escapeURLDestination(node.url)})`;
       }
       case "mention":
         return `@${node.login}`;
@@ -627,8 +660,10 @@ function escapeURLDestination(url) {
 /**
  * @param {ReportBlock[]} nodes
  * @param {boolean} [compactExpiration]
+ * @param {Set<string>} [nestedAlerts]
+ * @param {boolean} [nested]
  */
-function renderBlocks(nodes, compactExpiration = false) {
+function renderBlocks(nodes, compactExpiration = false, nestedAlerts, nested = false) {
   return nodes
     .map(node => {
       switch (node.type) {
@@ -644,6 +679,8 @@ function renderBlocks(nodes, compactExpiration = false) {
           return `<!-- ${node.name}: ${JSON.stringify(node.data).replace(/[<>&]/g, character => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`)} -->`;
         case "review_marker":
           return `[gh-aw-workflow-call-id]: # "${encodeURIComponent(node.workflowCallId)}"`;
+        case "reference_definition":
+          return node.value;
         case "structured_data": {
           const value = JSON.stringify(node.data, null, 2);
           const fence = codeFence(value);
@@ -661,14 +698,18 @@ function renderBlocks(nodes, compactExpiration = false) {
           return node.items
             .map((item, index) => {
               const marker = node.ordered ? `${index + 1}. ` : "- ";
-              return marker + renderBlocks(item).replace(/\n/g, "\n" + " ".repeat(marker.length));
+              return marker + renderBlocks(item, false, nestedAlerts, true).replace(/\n/g, () => "\n" + " ".repeat(marker.length));
             })
             .join("\n");
         case "quote":
-        case "alert":
-          return (node.type === "alert" ? `[!${node.kind}]\n` : "") + renderBlocks(node.children, node.type === "quote");
+          return renderBlocks(node.children, true, nestedAlerts, true);
+        case "alert": {
+          if (nested) nestedAlerts?.add(node.kind);
+          const label = nested ? `**${node.kind[0]}${node.kind.slice(1).toLowerCase()}:**\n\n` : `[!${node.kind}]\n`;
+          return label + renderBlocks(node.children, false, nestedAlerts, true);
+        }
         case "details":
-          return `<details>\n<summary>${typeof node.summary === "string" ? escapeSummaryText(node.summary) : renderInlines(node.summary, true)}</summary>\n\n${renderBlocks(node.children)}\n\n</details>`;
+          return `<details${node.open === true ? " open" : ""}>\n<summary>${typeof node.summary === "string" ? escapeSummaryText(node.summary) : renderInlines(node.summary, true)}</summary>\n\n${renderBlocks(node.children, false, nestedAlerts, true)}\n\n</details>`;
         case "table": {
           const row = cells => `| ${cells.map(cell => renderInlines(cell).replace(/(?<!\\)\|/g, "\\|")).join(" | ")} |`;
           return [row(node.headers), `| ${node.headers.map(() => "---").join(" | ")} |`, ...node.rows.map(row)].join("\n");
@@ -696,9 +737,9 @@ function renderXMLMarker(marker) {
   return `<!-- ${marker.name}${value === undefined ? "" : `${marker.compact ? ":" : ": "}${value}`}${fields} -->`;
 }
 
-/** @param {ReportFooter} footer */
-function renderFooter(footer) {
-  const attribution = renderBlocks(footer.children);
+/** @param {ReportFooter} footer @param {Set<string>} nestedAlerts */
+function renderFooter(footer, nestedAlerts) {
+  const attribution = renderBlocks(footer.children, false, nestedAlerts);
   const expiration = footer.expiresAt ? `> ${createExpirationLine(new Date(footer.expiresAt))}` : "";
   const markers = footer.markers.map(renderXMLMarker).join("\n");
   return [[attribution, expiration].filter(Boolean).join("\n"), markers].filter(Boolean).join("\n\n");
@@ -815,15 +856,35 @@ function redactReportForRendering(report) {
 
 /**
  * @param {Report} report
+ * @param {{warnOnNestedAlerts?: boolean}} [options]
  * @returns {{title: string, body: string}}
  */
-function renderReport(report) {
+function renderReport(report, { warnOnNestedAlerts = true } = {}) {
   const redacted = redactReportForRendering(report);
   assertRedactedReport(redacted);
-  const parts = [redacted.preamble ? renderBlocks(redacted.preamble) : "", renderBlocks(redacted.children), redacted.footer ? renderFooter(redacted.footer) : ""];
+  /** @type {Set<string>} */
+  const nestedAlerts = new Set();
+  const parts = [redacted.preamble ? renderBlocks(redacted.preamble, false, nestedAlerts) : "", renderBlocks(redacted.children, false, nestedAlerts), redacted.footer ? renderFooter(redacted.footer, nestedAlerts) : ""];
   const result = { title: redacted.title, body: parts.filter(Boolean).join("\n\n").trim() + "\n" };
   assertNoTaintedStrings(result);
+  if (warnOnNestedAlerts && nestedAlerts.size) {
+    const message = `GitHub alerts must be top-level blocks. Nested alerts (${[...nestedAlerts].join(", ")}) were rendered as labeled blockquotes.`;
+    if (typeof core !== "undefined") core.warning(message);
+    else console.warn(message);
+  }
   return result;
 }
 
-module.exports = { normalizeReport, normalizeReportText, normalizeReportTitle, normalizeReportURL, normalizeReportAllowedURL, normalizeReportImage, redactReportForRendering, assertRedactedReport, renderReport };
+module.exports = {
+  normalizeReport,
+  normalizeReportText,
+  normalizeReportTitle,
+  normalizeReportURL,
+  normalizeReportAllowedURL,
+  normalizeReportImage,
+  isTemporaryIdLink,
+  isReportReferenceDefinition,
+  redactReportForRendering,
+  assertRedactedReport,
+  renderReport,
+};

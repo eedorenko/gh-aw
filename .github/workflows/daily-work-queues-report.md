@@ -23,7 +23,7 @@ safe-outputs:
   max-bot-mentions: 1
   create-issue:
     title-prefix: "[work-queues] "
-    labels: [automation]
+    labels: [automation, "backlog:reports"]
     close-older-issues: true
     expires: 7d
     max: 1
@@ -63,20 +63,23 @@ event log.
      `work-queue work_queue_read '{}'` from bash; the tool name is a subcommand,
      not a standalone executable. This is an activation-time snapshot, not a
      live view. Count Work by state (available, claimed, completed, cancelled)
-     and Claims by state, and distinguish dependency-blocked Work, native
-     reservations, delivery-pending completions and verified Results when
-     available. State the installed policy mode and that fairness counts durable
-     Claims, not compute time. Completion alone does not mean successful output
-     delivery or a ready DAG successor. Report the oldest eligible Work's age
-     only when a trusted admission time is available; causal FIFO position is
-     not a client timestamp. Do not expose Work/Claim identifiers, payloads, or
-     accounting keys belonging to other principals. Paginate the returned `works`
-     through `next_offset` (up to 100 items), reconcile item totals and states
-     with aggregate counts, and summarize barriers, cancellation reasons, and
-     `worker_profile` from those items. Attribute a delivery problem to a worker
-     profile only when the item-level records support it; if inspection is capped
-     or incomplete, label the breakdown as a sample or unavailable rather than
-     inferring it from workflow names.
+     and Claims by state (open, completed, cancelled), and distinguish
+     dependency-blocked Work and dispatches by state (reserved, started, bound,
+     closed). Report Work `attempts` and cancellation reasons
+     (`attempts_exhausted`, `operator`, `related_issue_closed`,
+     `worker_contract_obsolete`). The scheduler is priority-then-FIFO and pool
+     limits come from the compiled `aw.json` settings; fairness counts open
+     Claims, not compute time. Completion records the effects the worker
+     reported; it is not a ready DAG successor by itself. Causal FIFO position
+     is not a timestamp; do not derive ages from it. Do not expose Work/Claim
+     identifiers, payloads, or accounting keys belonging to other principals.
+     Paginate the returned `works` through `next_offset` (up to 100 items),
+     reconcile item totals and states with aggregate counts, and summarize
+     dispatch states, attempts, cancellation reasons, and `worker_profile` from
+     those items. Attribute a failure to a worker profile only when the
+     item-level records support it; if inspection is capped or incomplete, label
+     the breakdown as a sample or unavailable rather than inferring it from
+     workflow names.
    - The Issue Monster queue: open issues with the `cookie` label, excluding
      labels in `issue-monster.md` that make an item ineligible. Show both the
      total approved backlog and the eligible subset, plus new/closed items in
@@ -106,6 +109,21 @@ event log.
    and whether the native snapshot was available. Do not claim that Work state
    changes happened in the 24-hour window from snapshot data alone.
    Summarize counts rather than copying queue payloads or sensitive contents.
+
+Format the issue body as a reader-facing report:
+
+- Use `###` or lower for all report headings; reserve `#` and `##` for the
+  surrounding GitHub page.
+- Structure it as overview → key metrics and issues → collapsible detail →
+  next actions and/or limitations. Keep decision-relevant metrics, the
+  highest-priority issues, and limitations visible before any collapsible
+  section.
+- Put long tables, item lists, raw evidence, and detailed findings in
+  `<details><summary><b>...</b></summary>...</details>` blocks. Keep the queue
+  summary table and a short list of actionable stuck items visible.
+- When referencing workflow runs, use
+  `[§RUN_ID](https://github.com/owner/repo/actions/runs/RUN_ID)`, replacing the
+  placeholders with the actual owner, repository, and run ID.
 
 If a queue cannot be read, report it as unavailable with the reason and still
 report the others. Never treat a failed query as an empty queue. If all queue

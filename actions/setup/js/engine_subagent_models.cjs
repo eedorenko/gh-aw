@@ -29,11 +29,11 @@ const os = require("os");
 const path = require("path");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { normalizeReflectProviderName, REFLECT_PROVIDER_ALIASES } = require("./awf_reflect.cjs");
-const { isModelAvailableInReflectData } = require("./awf_model_routing.cjs");
+const { isModelAvailableInReflectData, routingEndpointPaths } = require("./awf_model_routing.cjs");
 const { MODEL_NOT_SUPPORTED_PATTERN } = require("./detect_agent_errors.cjs");
 const { inlineArtifactTarget } = require("./inline_artifact_target.cjs");
 const { getEngineSubAgentTarget } = require("./extract_inline_sub_agents.cjs");
-const { loadModelAliasMap, ModelAliasResolutionError, recordModelResolution, resolveConfiguredModel, resolveEngineModel, splitModelIdentifier } = require("./resolve_model_alias.cjs");
+const { isModelCatalogDisabled, loadModelAliasMap, ModelAliasResolutionError, recordModelResolution, resolveConfiguredModel, resolveEngineModel, splitModelIdentifier } = require("./resolve_model_alias.cjs");
 
 /** The `model.resolution` role of the engine's main model; no sub-agent may use it. */
 const RESERVED_SUBAGENT_NAME = "main";
@@ -84,13 +84,8 @@ function reflectProvidersFor(provider) {
  * @returns {Record<string, any>}
  */
 function parseAgentFrontmatter(content) {
-  const { extractFrontmatterAndBody } = require("./frontmatter_hash_pure.cjs");
-  const { parseDocument } = require("./work_queue_yaml.cjs");
-  const { frontmatterText } = extractFrontmatterAndBody(content);
-  /** @type {any} */
-  const document = parseDocument(frontmatterText);
-  if (!document || document.errors.length) throw new Error("cannot parse agent frontmatter");
-  const frontmatter = document.toJS() || {};
+  const { readMarkdownMetadata } = require("./markdown_metadata.cjs");
+  const frontmatter = readMarkdownMetadata("agent", content).value;
   if (typeof frontmatter !== "object" || Array.isArray(frontmatter)) throw new Error("agent frontmatter must be a mapping");
   return frontmatter;
 }
@@ -110,6 +105,7 @@ function parseAgentFrontmatter(content) {
  * @returns {Array<{ fileName: string, path: string, name: string | null, model?: string, invalidModel?: string }>}
  */
 function listMarkdownAgentFiles(directory, logger, options = {}) {
+  const { CompilerMetadataUnavailableError } = require("./markdown_metadata.cjs");
   const invalid = options.onInvalid || ((/** @type {string} */ filePath, /** @type {unknown} */ error) => logger(`warning: cannot read custom agent ${filePath}: ${getErrorMessage(error)}`));
   let entries;
   try {
@@ -129,6 +125,7 @@ function listMarkdownAgentFiles(directory, logger, options = {}) {
       const declared = typeof model === "string" ? { model: model.trim() } : model !== undefined && model !== null ? { invalidModel: JSON.stringify(model) } : {};
       agents.push({ fileName: entry.name, path: agentPath, name, ...declared });
     } catch (error) {
+      if (error instanceof CompilerMetadataUnavailableError) throw error;
       invalid(agentPath, error);
     }
   }
@@ -137,29 +134,18 @@ function listMarkdownAgentFiles(directory, logger, options = {}) {
 
 /**
  * Replace the single top-level frontmatter `model:` scalar of an agent file, including any
- * block-scalar continuation lines.
+ * block-scalar continuation lines, and derive Claude's required description from its name.
  * @param {string} content
  * @param {string} model
  * @returns {string}
  */
 function replaceAgentModel(content, model) {
-  const { extractFrontmatterAndBody } = require("./frontmatter_hash_pure.cjs");
-  const { parseDocument } = require("./work_queue_yaml.cjs");
-  const { frontmatterText } = extractFrontmatterAndBody(content);
-  /** @type {any} */
-  const document = parseDocument(frontmatterText);
-  if (!document || document.errors.length || !document.contents || !Array.isArray(document.contents.items)) {
-    throw new Error("cannot parse agent frontmatter");
-  }
-  const pairs = document.contents.items.filter(pair => pair?.key?.value === "model");
-  if (pairs.length !== 1 || typeof pairs[0].value?.value !== "string" || !Array.isArray(pairs[0].value.range)) {
-    throw new Error("expected exactly one top-level string 'model:' scalar in the frontmatter");
-  }
-  const frontmatterStart = content.indexOf("\n") + 1;
-  const start = frontmatterStart + pairs[0].value.range[0];
-  const end = frontmatterStart + pairs[0].value.range[1];
-  const lineEnding = content.slice(start, end).match(/(?:\r?\n)+$/)?.[0] || "";
-  return content.slice(0, start) + JSON.stringify(model) + lineEnding + content.slice(end);
+  const { editMarkdownMetadata, readMarkdownMetadata } = require("./markdown_metadata.cjs");
+  if (typeof readMarkdownMetadata("agent", content).value.model !== "string") throw new Error("expected exactly one top-level string 'model:' scalar in the frontmatter");
+  return editMarkdownMetadata(content, metadata => {
+    if (typeof metadata.model !== "string") throw new Error("expected exactly one top-level string 'model:' scalar in the frontmatter");
+    return { ...metadata, model, ...(typeof metadata.name === "string" ? { description: metadata.name } : {}) };
+  });
 }
 
 /**
@@ -192,7 +178,8 @@ function routingModelsFor(reflectData, providers) {
 
 /**
  * What the `routing_models` entries of one model say about `wireApi`: "supported" when an
- * entry lists it, "unsupported" when every entry has complete metadata
+ * entry lists it, as a path or as the protocol name AWF uses for native providers
+ * (`responses` for `/responses`), "unsupported" when every entry has complete metadata
  * (`candidate_metadata_complete: true`) without it, otherwise "unknown" (no entry, or
  * incomplete metadata, as `copilot_wire_api.cjs` and `awf_model_routing.cjs` treat it).
  * @param {string} model
@@ -203,7 +190,7 @@ function routingModelsFor(reflectData, providers) {
 function endpointSupportIn(model, routingModels, wireApi) {
   const id = String(model || "").toLowerCase();
   const entries = routingModels.filter(candidate => typeof candidate?.model_id === "string" && candidate.model_id.toLowerCase() === id);
-  if (entries.some(entry => Array.isArray(entry.supported_endpoints) && entry.supported_endpoints.includes(wireApi))) return "supported";
+  if (entries.some(entry => Array.isArray(entry.supported_endpoints) && routingEndpointPaths(entry.supported_endpoints).includes(wireApi))) return "supported";
   const complete =
     entries.length > 0 && entries.every(entry => entry.candidate_metadata_complete === true && Array.isArray(entry.supported_endpoints) && entry.supported_endpoints.every(/** @param {unknown} value */ value => typeof value === "string"));
   return complete ? "unsupported" : "unknown";
@@ -266,6 +253,9 @@ function restrictReflectToEndpoint(reflectData, providers, wireApi) {
  * verified (no routing entry or incomplete metadata, also after one refresh) fails with cause
  * `catalog_unavailable`. Providers without per-model endpoint metadata are not filtered.
  *
+ * With `engine.model-catalog: false` (`GH_AW_MODEL_CATALOG=false`), models are used verbatim
+ * without alias resolution, inventory or endpoint checks; input and provider checks still apply.
+ *
  * @param {{
  *   engine: "claude" | "codex",
  *   agents: Array<{ name: string, model?: string, invalidModel?: string, path?: string, fatal: boolean, origin: string }>,
@@ -315,8 +305,11 @@ async function resolveEngineSubagentModels(options) {
       );
     return refresh;
   };
-  const liveCheck = env.AWF_REFLECT_ENABLED === "1" || Boolean(options.reflectData);
-  const wireApi = options.wireApi || "";
+  // engine.model-catalog: false passes sub-agent models through verbatim: no inventory or
+  // endpoint-metadata check; the provider-prefix and input checks below still apply.
+  const catalogDisabled = isModelCatalogDisabled(env);
+  const liveCheck = !catalogDisabled && (env.AWF_REFLECT_ENABLED === "1" || Boolean(options.reflectData));
+  const wireApi = catalogDisabled ? "" : options.wireApi || "";
   const appliedParams = new Set(options.appliedParams || []);
   // The engine id an alias resolves to without the endpoint constraint, or null; never recorded.
   const resolveUnconstrained = (/** @type {string} */ configuredModel, /** @type {any} */ data, /** @type {(resolution: { resolvedModel: string }) => string} */ engineId) => {
@@ -774,7 +767,7 @@ function prepareCodexRoleDirectory(codexHome, names) {
  * starts. Codex discovers custom agents only from `.toml` role files (verified for Codex
  * 0.163.0), so the Markdown agents staged by the activation job in
  * `<agentsBaseDir>/.codex/agents` are converted into `<codexHome>/agents/<name>.toml` with
- * the declared block name, the frontmatter `description`, the Markdown body as
+ * the declared block name (also used as the required role `description`), the Markdown body as
  * `developer_instructions` and the resolved concrete model. The effective `?effort=` model
  * parameter (the agent's own, else the one its alias carries) becomes
  * `model_reasoning_effort`; an agent without a model (or with `inherit`) inherits the main
@@ -865,14 +858,12 @@ async function applyCodexSubagentModels(options) {
     return { ok: false, agents: names, resolutions: [], failures: [] };
   }
 
-  /** @type {Array<{ name: string, path: string, description: string, instructions: string, configuredModel: string, effort: string | null }>} */
+  /** @type {Array<{ name: string, path: string, instructions: string, configuredModel: string, effort: string | null }>} */
   const definitions = [];
   for (const agent of agents) {
     try {
       const content = fs.readFileSync(agent.path, "utf8");
-      const frontmatter = parseAgentFrontmatter(content);
-      const description = typeof frontmatter.description === "string" ? frontmatter.description.trim() : "";
-      if (!description) throw new Error("the frontmatter has no nonblank 'description', which Codex requires for a custom role");
+      parseAgentFrontmatter(content);
       const instructions = extractFrontmatterAndBody(content).markdown.trim();
       if (!instructions) throw new Error("the agent has no instructions after its frontmatter, which Codex requires for a custom role");
       if (!/^[a-z][a-z0-9_-]*$/.test(agent.name)) throw new Error(`'${agent.name}' is not a valid sub-agent name`);
@@ -880,7 +871,7 @@ async function applyCodexSubagentModels(options) {
       const declaredEffort = configuredModel ? splitModelIdentifier(configuredModel).params.get("effort") : null;
       const mapped = mapAWFRoutingEffort("codex", declaredEffort ? declaredEffort.trim().toLowerCase() : null);
       if (mapped.error) throw new Error(`model '${configuredModel}': ${mapped.error}`);
-      definitions.push({ name: agent.name, path: agent.path, description, instructions, configuredModel, effort: mapped.effort });
+      definitions.push({ name: agent.name, path: agent.path, instructions, configuredModel, effort: mapped.effort });
     } catch (error) {
       logger(`codex sub-agent file ${agent.path}: ${getErrorMessage(error)}. Refusing to start Codex without the declared sub-agent.`);
       return { ok: false, agents: names, resolutions: [], failures: [] };
@@ -930,7 +921,7 @@ async function applyCodexSubagentModels(options) {
   for (const definition of definitions) {
     const resolution = resolutions.find(candidate => candidate.name === definition.name);
     /** @type {Record<string, string>} */
-    const role = { name: definition.name, description: definition.description, developer_instructions: definition.instructions };
+    const role = { name: definition.name, description: definition.name, developer_instructions: definition.instructions };
     if (resolution) role.model = resolution.model;
     if (definition.effort) role.model_reasoning_effort = definition.effort;
     const rolePath = path.join(rolesDir, `${definition.name}.toml`);

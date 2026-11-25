@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -90,15 +91,15 @@ var rootCmd = &cobra.Command{
 	Long: `GitHub Agentic Workflows CLI
 
 Common Tasks:
-  ` + string(constants.CLIExtensionPrefix) + ` init                  		# Set up a new repository
-  ` + string(constants.CLIExtensionPrefix) + ` doctor --repo owner/repo 		# Run diagnostics for authentication and repository setup
-  ` + string(constants.CLIExtensionPrefix) + ` add-wizard            		# Add workflows with interactive guided setup
-  ` + string(constants.CLIExtensionPrefix) + ` new my-workflow       		# Create your first workflow
-  ` + string(constants.CLIExtensionPrefix) + ` compile               		# Compile all workflows
-  ` + string(constants.CLIExtensionPrefix) + ` run my-workflow       		# Execute a workflow
-  ` + string(constants.CLIExtensionPrefix) + ` status                		# Check workflow status
-  ` + string(constants.CLIExtensionPrefix) + ` logs my-workflow      		# Download and analyze execution logs
-  ` + string(constants.CLIExtensionPrefix) + ` audit <run-id-or-url> 		# Audit and compare workflow runs
+  ` + string(constants.CLIExtensionPrefix) + ` init                     # Set up a new repository
+  ` + string(constants.CLIExtensionPrefix) + ` doctor --repo owner/repo # Run diagnostics for authentication and repository setup
+  ` + string(constants.CLIExtensionPrefix) + ` add-wizard               # Add workflows with interactive guided setup
+  ` + string(constants.CLIExtensionPrefix) + ` new my-workflow          # Create your first workflow
+  ` + string(constants.CLIExtensionPrefix) + ` compile                  # Compile all workflows
+  ` + string(constants.CLIExtensionPrefix) + ` run my-workflow          # Execute a workflow
+  ` + string(constants.CLIExtensionPrefix) + ` status                   # Check workflow status
+  ` + string(constants.CLIExtensionPrefix) + ` logs my-workflow         # Download and analyze execution logs
+  ` + string(constants.CLIExtensionPrefix) + ` audit <run-id-or-url>    # Audit and compare workflow runs
 
 For detailed help on any command, use:
   ` + string(constants.CLIExtensionPrefix) + ` [command] --help`,
@@ -609,6 +610,7 @@ func runCompileCmd(cmd *cobra.Command, args []string) error {
 	defer finishCompileUpdateCheck()
 	if opts.fix {
 		if err := cli.RunFix(cli.FixConfig{
+			Ctx:         cmd.Context(),
 			WorkflowIDs: args,
 			Write:       true,
 			Verbose:     opts.verbose,
@@ -629,7 +631,7 @@ type commandSet struct {
 	mcpCmd, logsCmd, auditCmd, sessionsCmd, viewCmd, healthCmd, mcpServerCmd, prCmd, secretsCmd                   *cobra.Command
 	fixCmd, formatCmd, upgradeCmd, completionCmd, hashCmd, projectCmd, doctorCmd, checksCmd, validateCmd, lintCmd *cobra.Command
 	domainsCmd, experimentsCmd, forecastCmd, gradersCmd, modelsCmd, envCmd, jsonSchemaCmd, workCmd                *cobra.Command
-	skillCmd                                                                                                      *cobra.Command
+	skillCmd, connectorsCmd                                                                                       *cobra.Command
 }
 
 func fixPathForCommand(s string) string {
@@ -640,6 +642,24 @@ func fixPathForCommand(s string) string {
 		return "gh aw " + s[3:]
 	}
 	return s
+}
+
+func fixCommandPathInError(message string) string {
+	if !strings.HasPrefix(message, "unknown command ") {
+		return message
+	}
+	const marker = ` for "`
+	start := strings.LastIndex(message, marker)
+	if start < 0 {
+		return message
+	}
+	pathStart := start + len(marker)
+	pathEndOffset := strings.Index(message[pathStart:], `"`)
+	if pathEndOffset < 0 {
+		return message
+	}
+	pathEnd := pathStart + pathEndOffset
+	return message[:pathStart] + fixPathForCommand(message[pathStart:pathEnd]) + message[pathEnd:]
 }
 
 func writeUsageCommands(cmd *cobra.Command) {
@@ -766,11 +786,29 @@ func configureRootCommand() {
 	rootCmd.SetOut(os.Stderr)
 	rootCmd.SilenceUsage = true
 	rootCmd.SilenceErrors = true
+	rootCmd.SuggestionsMinimumDistance = 2
+	rootCmd.Args = rootCommandArgs
 	rootCmd.InitDefaultHelpFlag()
 	if f := rootCmd.Flags().Lookup("help"); f != nil {
 		f.Usage = "Show help for " + string(constants.CLIExtensionPrefix)
 	}
 	rootCmd.SetUsageFunc(rootUsageFunc)
+}
+
+func rootCommandArgs(cmd *cobra.Command, args []string) error {
+	if len(args) > 0 {
+		arg := args[0]
+		suggestion := ""
+		if !cmd.DisableSuggestions {
+			if suggestions := cmd.SuggestionsFor(arg); len(suggestions) > 0 {
+				suggestion = "\n\nDid you mean this?\n\t" + strings.Join(suggestions, "\n\t") + "\n"
+			}
+		}
+
+		return fmt.Errorf("unknown command %q for %q%s", arg, constants.CLIExtensionPrefix, suggestion)
+	}
+
+	return nil
 }
 
 func createCommandSet() commandSet {
@@ -812,6 +850,7 @@ func createCommandSet() commandSet {
 		modelsCmd:      cli.NewModelsCommand(),
 		jsonSchemaCmd:  cli.NewJSONSchemaCommand(),
 		skillCmd:       cli.NewSkillCommand(),
+		connectorsCmd:  cli.NewConnectorsCommand(),
 	}
 	cli.RegisterEngineFlagCompletion(cmds.initCmd)
 	return cmds
@@ -841,7 +880,7 @@ func configureCompileBuildFlags() {
 	compileCmd.Flags().Bool("no-logo", false, "Omit the ASCII logo from generated workflow headers")
 	compileCmd.Flags().Bool("purge", false, "Delete .lock.yml files that were not regenerated during compilation (only when no specific files are provided)")
 	compileCmd.Flags().Bool("strict", false, "Override frontmatter to enforce strict mode validation for all workflows (enforces action pinning, network config, safe-outputs, disallows write permissions and deprecated fields). Note: Workflows default to strict mode unless frontmatter sets strict: false")
-	compileCmd.Flags().Bool("dry-run", false, "Compile with strict validation, shellcheck, and model checks; reject existing and added medium-or-higher scanner findings; ignore low severity and zizmor secrets-outside-env; Docker-based scanners are opt-in; report gate/scanner coverage; disable custom jobs and compiler-managed GitHub mutations, stage safe outputs, and record dry_run in aw_info.json; reject host scripts, custom MCP servers, and authored OIDC permissions; agent shell commands and custom credentials remain unverified; does not authorize execution, upload, or dispatch workflows")
+	compileCmd.Flags().Bool("dry-run", false, "Compile with strict validation, shellcheck, and model checks; reject existing and added medium-or-higher scanner findings; ignore low severity and zizmor secrets-outside-env; Docker-based scanners are opt-in; report gate/scanner coverage; disable custom jobs and compiler-managed GitHub mutations, stage safe outputs, and record dry_run in aw_info.json; omit authored steps and post-steps from emitted locks so separate dispatch cannot execute them; reject pre-steps, pre-agent-steps, on.steps, mcp-scripts, custom MCP servers, and authored OIDC permissions; agent shell commands and custom credentials remain unverified; does not authorize execution, upload, or dispatch workflows")
 	compileCmd.Flags().Bool("allow-experimental", false, "Record explicit acceptance of nonblocking experimental-feature notices during dry-run compilation; validation errors, added actionable findings, and scanner failures remain fatal")
 	compileCmd.Flags().String("environment", "", "Override the environment on every generated job; fails for reusable-workflow caller jobs, which cannot declare an environment")
 	compileCmd.Flags().Bool("require-self-hosted-runners", false, "Fail compilation unless every generated workflow job selects a self-hosted runner")
@@ -946,16 +985,65 @@ func assignCommandGroups(cmds commandSet) {
 	cmds.mcpServerCmd.GroupID, cmds.prCmd.GroupID, cmds.completionCmd.GroupID, cmds.hashCmd.GroupID, cmds.projectCmd.GroupID = "utilities", "utilities", "utilities", "utilities", "utilities"
 	cmds.jsonSchemaCmd.GroupID, cmds.skillCmd.GroupID = "utilities", "utilities"
 	cmds.workCmd.GroupID = "utilities"
+	cmds.connectorsCmd.GroupID = "development"
 }
 
 func addCommandsToRoot(cmds commandSet) {
+	advisoryCmd := cli.NewAdvisoryCommand()
+	advisoryCmd.GroupID = "utilities"
+	for _, subcommand := range advisoryCmd.Commands() {
+		if subcommand.Name() == "inspect" {
+			// Inspect has data output; do not inherit the root's stderr routing.
+			subcommand.SetOut(os.Stdout)
+			break
+		}
+	}
 	rootCmd.AddCommand(
 		compileCmd, cmds.addCmd, cmds.addWizardCmd, cmds.editCmd, cmds.updateCmd, cmds.deployCmd, cmds.upgradeCmd, cmds.trialCmd, newCmd, cmds.initCmd,
 		runCmd, removeCmd, cmds.statusCmd, cmds.listCmd, enableCmd, disableCmd, cmds.logsCmd, cmds.auditCmd, cmds.sessionsCmd, cmds.viewCmd,
-		cmds.healthCmd, cmds.checksCmd, cmds.mcpCmd, cmds.mcpServerCmd, cmds.prCmd, versionCmd, cmds.secretsCmd,
+		cmds.healthCmd, cmds.checksCmd, cmds.mcpCmd, cmds.mcpServerCmd, cmds.prCmd, advisoryCmd, versionCmd, cmds.secretsCmd,
 		cmds.fixCmd, cmds.formatCmd, cmds.validateCmd, cmds.lintCmd, cmds.completionCmd, cmds.hashCmd, cmds.projectCmd, cmds.doctorCmd,
-		cmds.domainsCmd, cmds.experimentsCmd, cmds.forecastCmd, cmds.gradersCmd, cmds.modelsCmd, cmds.envCmd, cmds.jsonSchemaCmd, cmds.workCmd, cmds.skillCmd,
+		cmds.domainsCmd, cmds.experimentsCmd, cmds.forecastCmd, cmds.gradersCmd, cmds.modelsCmd, cmds.envCmd, cmds.jsonSchemaCmd, cmds.workCmd, cmds.skillCmd, cmds.connectorsCmd,
 	)
+}
+
+func commandTreePaths(root *cobra.Command) []string {
+	var paths []string
+	var visit func(*cobra.Command, string)
+	visit = func(parent *cobra.Command, parentPath string) {
+		for _, child := range parent.Commands() {
+			if child.Hidden || child.IsAdditionalHelpTopicCommand() {
+				continue
+			}
+			path := child.Name()
+			if parentPath != "" {
+				path = parentPath + " " + path
+			}
+			paths = append(paths, path)
+			visit(child, path)
+		}
+	}
+	visit(root, "")
+	slices.Sort(paths)
+	return paths
+}
+
+func commandTreeCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:    "__command-tree",
+		Hidden: true,
+		Args:   cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			for _, path := range commandTreePaths(cmd.Root()) {
+				if _, err := fmt.Fprintln(cmd.OutOrStdout(), path); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+	cmd.SetOut(os.Stdout)
+	return cmd
 }
 
 func fixSubCommandHelpFlags() {
@@ -985,6 +1073,7 @@ func init() {
 	configureOtherCommandFlags()
 	assignCommandGroups(cmds)
 	addCommandsToRoot(cmds)
+	rootCmd.AddCommand(commandTreeCommand())
 	fixSubCommandHelpFlags()
 }
 
@@ -1012,7 +1101,7 @@ func main() {
 			os.Exit(exitCodeErr.Code)
 		}
 
-		errMsg := err.Error()
+		errMsg := fixCommandPathInError(err.Error())
 		// Check if error is already formatted to avoid double formatting:
 		// - Contains suggestions (FormatErrorWithSuggestions)
 		// - Starts with ✗ (FormatErrorMessage)
@@ -1023,6 +1112,8 @@ func main() {
 
 		if isAlreadyFormatted {
 			fmt.Fprintln(os.Stderr, errMsg)
+		} else if errMsg != err.Error() {
+			fmt.Fprintln(os.Stderr, console.FormatErrorChain(errors.New(errMsg)))
 		} else {
 			fmt.Fprintln(os.Stderr, console.FormatErrorChain(err))
 		}

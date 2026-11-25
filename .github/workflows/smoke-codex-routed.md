@@ -24,10 +24,9 @@ strict: true
 engine:
   id: codex
   model-provider: github
-  model-routing:
-    goal: cost
-    mode: robust
-    allowed-models: [gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol]
+model: router/robust
+model-routing:
+  allowed-models: [gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol]
 imports:
   - shared/smoke-test-brevity.md
   - shared/reporting.md
@@ -40,7 +39,7 @@ safe-outputs:
     group: true
     close-older-issues: true
     close-older-key: "smoke-codex-routed"
-    labels: [automation, testing]
+    labels: [automation, testing, "backlog:smoke-tests"]
 timeout-minutes: 10
 features:
   gh-aw-detection: false

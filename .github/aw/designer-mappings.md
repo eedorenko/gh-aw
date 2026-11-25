@@ -6,6 +6,16 @@ description: Quick reference mappings from user requirements to agentic workflow
 
 Quick-reference mapping tables for `.github/aw/designer.md`. Load this file during Phase 2–7 of the interview when translating user answers into workflow syntax.
 
+Before tool/network mapping, apply the
+[browser decision](playwright.md#browser-decision-and-readiness). Rendered UI
+evidence needs the built-in CLI and supporting lifecycle permissions; plain-text
+retrieval does not. Load the matching [trigger](#trigger-mapping),
+[output](#safe-output-mapping), [network](#network-mapping), [tool](#tool-mapping),
+[pattern](#pattern-heuristics), [auth](#integration-auth-mapping), and
+[data](#data-strategy-mapping) tables below when translating those requirements.
+
+<!-- instruction-prefix-end -->
+
 ## Trigger Mapping
 
 | User says... | Maps to |
@@ -31,16 +41,16 @@ Quick-reference mapping tables for `.github/aw/designer.md`. Load this file duri
 | "post a comment" | `add-comment` |
 | "create an issue" | `create-issue` |
 | "update issue title/body" | `update-issue` |
-| "create a Jira issue" | `jira-create-issue` |
-| "update Jira issue ENG-123" | `jira-update-issue` |
-| "comment on Jira issue ENG-123" | `jira-add-comment` |
-| "add a Jira label" | `jira-add-label` |
-| "create a Linear issue" | `linear-create-issue` (experimental) |
-| "update Linear issue" | `linear-update-issue` (experimental) |
-| "comment on Linear issue" | `linear-add-comment` (experimental) |
-| "create an Azure DevOps work item" | `ado-create-work-item` (experimental) |
-| "update an Azure DevOps work item" | `ado-update-work-item` (experimental) |
-| "comment/assign/link Azure DevOps work items" | `ado-comment-on-work-item`, `ado-assign-work-item`, `ado-link-work-items` (experimental) |
+| "create a Jira issue" | Import `.github/workflows/connectors/jira.md`, approve project grants, select `jira-create-issue` |
+| "update Jira issue ENG-123" | Imported connector `jira-update-issue` with an exact issue grant or authenticated created reference |
+| "comment on Jira issue ENG-123" | Imported connector `jira-add-comment` with an exact issue grant or authenticated created reference |
+| "add a Jira label" | Imported connector `jira-add-label` (additive) |
+| "create a Linear issue" | Import `.github/workflows/connectors/linear.md`, approve resource arrays, select `linear-create-issue` |
+| "update Linear issue" | Imported connector `linear-update-issue` (requires title and body) |
+| "comment on Linear issue" | Imported connector `linear-add-comment` |
+| "create an Azure DevOps work item" | `azure-devops-create-work-item` via `".github/workflows/connectors/azure-devops.md"` |
+| "update an Azure DevOps work item" | `azure-devops-update-work-item` (title only; imported connector) |
+| "comment/assign/link Azure DevOps work items" | `azure-devops-comment-on-work-item`, `azure-devops-assign-work-item`, `azure-devops-link-work-items` (imported connector) |
 | "close the issue" | `close-issue` |
 | "assign someone", "remove assignment" | `assign-to-user`, `unassign-from-user` |
 | "set issue type/field/milestone" | `set-issue-type`, `set-issue-field`, `assign-milestone` |
@@ -91,7 +101,7 @@ Quick-reference mapping tables for `.github/aw/designer.md`. Load this file duri
 | "runs Playwright browser tests" | include `playwright` in `network.allowed` |
 | "runs apt install / yum / apk" | include `linux-distros` in `network.allowed` |
 | "uses Terraform / HashiCorp registry" | include `terraform` in `network.allowed` |
-| "connects to localhost / loopback / local services" | include `local` in `network.allowed` |
+| "connects to a server inside the same agent sandbox" | loopback is available by default; do not add `local` |
 | "no external access" | `network.allowed: [defaults]` (or `[]` if explicitly zero network) |
 
 For less common ecosystems (Swift, PHP, Dart, Haskell, Perl, fonts, Deno, Elixir, Bazel, Clojure, Julia, Kotlin, Lua, node CDNs, OCaml, PowerShell, R, Scala, Zig, dev-tools, Chrome, LaTeX, Lean, python-native) and the full list of **invalid shorthands** (`npm`, `pypi`, `docker`, etc. — see `.github/aw/network.md#invalid-shorthands`), consult `.github/aw/network.md` before generating.
@@ -105,8 +115,8 @@ For less common ecosystems (Swift, PHP, Dart, Haskell, Perl, fonts, Deno, Elixir
 | "use other MCP servers but keep token cost down" | `tools.cli-proxy: true` (hybrid CLI-proxy mode) |
 | "edit files" | `edit` tool (default unless restricted) |
 | "run commands/tests" | `bash` tool (default unless restricted) |
-| "browse web pages/docs" | `web-fetch` and/or `web-search` |
-| "test UI flows" | `playwright` |
+| "retrieve plain-text web pages/docs" | `web-fetch` and/or `web-search` |
+| "inspect rendered pages, test UI flows, or capture screenshots" | `tools.playwright` plus the [browser readiness contract](playwright.md#browser-decision-and-readiness) |
 
 ## Pattern Heuristics
 

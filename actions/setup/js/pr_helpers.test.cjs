@@ -396,19 +396,23 @@ describe("checkBranchPushable", () => {
     vi.clearAllMocks();
   });
 
-  const makeClient = (defaultBranch, protectionStatus) => ({
+  const makeClient = (defaultBranch, protectionStatus, isProtected = false) => ({
+    graphql: vi.fn().mockResolvedValue({ repository: { ref: { refUpdateRule: null } } }),
     rest: {
       repos: {
         get: vi.fn().mockResolvedValue({ data: { default_branch: defaultBranch } }),
-        getBranchProtection: protectionStatus === null ? vi.fn().mockResolvedValue({}) : vi.fn().mockRejectedValue(Object.assign(new Error("error"), { status: protectionStatus })),
+        getBranch: protectionStatus === null ? vi.fn().mockResolvedValue({ data: { protected: isProtected } }) : vi.fn().mockRejectedValue(Object.assign(new Error("error"), { status: protectionStatus })),
+        getBranchRules: vi.fn().mockResolvedValue({ data: [{ type: "copilot_code_review" }] }),
+        getBranchProtection: vi.fn().mockRejectedValue(new Error("Administration permission must not be required")),
       },
     },
   });
 
-  it("returns null when branch is not default and has no protection rules (404)", async () => {
+  it("returns null when branch does not exist (404)", async () => {
     const client = makeClient("main", 404);
     const result = await checkBranchPushable(client, "owner", "repo", "feature", true);
     expect(result).toBeNull();
+    expect(mockCore.info).toHaveBeenCalledWith('Branch "feature" not found; proceeding to push');
   });
 
   it("blocks push when branch is the default branch", async () => {
@@ -418,16 +422,227 @@ describe("checkBranchPushable", () => {
   });
 
   it("blocks push when branch has protection rules", async () => {
-    const client = makeClient("main", null); // null status = successful getBranchProtection response
+    const client = makeClient("main", null, true);
     const result = await checkBranchPushable(client, "owner", "repo", "feature", true);
     expect(result).toContain("protection rules");
+    expect(client.rest.repos.getBranch).toHaveBeenCalledWith({ owner: "owner", repo: "repo", branch: "feature" });
+  });
+
+  it("returns null when branch is not protected", async () => {
+    const client = makeClient("main", null, false);
+    const result = await checkBranchPushable(client, "owner", "repo", "feature", true);
+    expect(result).toBeNull();
+    expect(client.rest.repos.getBranchRules).not.toHaveBeenCalled();
+  });
+
+  it("allows Copilot-review-only rulesets when classic protection is explicitly disabled", async () => {
+    const client = makeClient("main", null, true);
+    client.rest.repos.getBranch.mockResolvedValue({
+      data: { protected: true, protection: { enabled: false, required_status_checks: { enforcement_level: "off", contexts: [], checks: [] } } },
+    });
+
+    const result = await checkBranchPushable(client, "owner", "repo", "feature", true);
+
+    expect(result).toBeNull();
+    expect(client.rest.repos.getBranchRules).toHaveBeenCalledWith({ owner: "owner", repo: "repo", branch: "feature", per_page: 100, page: 1 });
+    expect(client.graphql).toHaveBeenCalledWith(expect.stringContaining("refUpdateRule { pattern }"), { owner: "owner", repo: "repo", ref: "refs/heads/feature" });
+    expect(client.rest.repos.getBranchProtection).not.toHaveBeenCalled();
+    expect(mockCore.info).toHaveBeenCalledWith('Branch "feature" only has non-blocking rules and no classic protection; proceeding to push');
+  });
+
+  it.each(["copilot_code_review", "branch_name_pattern", "commit_message_pattern", "commit_author_email_pattern", "committer_email_pattern", "file_path_restriction", "file_extension_restriction", "max_file_path_length", "max_file_size"])(
+    "allows non-blocking %s rules without signed commits",
+    async type => {
+      const client = makeClient("main", null, true);
+      client.rest.repos.getBranch.mockResolvedValue({ data: { protected: true, protection: { enabled: false } } });
+      client.rest.repos.getBranchRules.mockResolvedValue({ data: [{ type }] });
+
+      expect(await checkBranchPushable(client, "owner", "repo", "feature", true, { signedCommits: false })).toBeNull();
+      expect(client.graphql).toHaveBeenCalled();
+    }
+  );
+
+  it.each([undefined, false, true])("allows required signatures only when signed commits are enabled: %s", async signedCommits => {
+    const client = makeClient("main", null, true);
+    client.rest.repos.getBranch.mockResolvedValue({ data: { protected: true, protection: { enabled: false } } });
+    client.rest.repos.getBranchRules.mockResolvedValue({ data: [{ type: "required_signatures" }] });
+
+    const result = await checkBranchPushable(client, "owner", "repo", "feature", true, { signedCommits });
+
+    if (signedCommits === true) {
+      expect(result).toBeNull();
+      expect(client.graphql).toHaveBeenCalled();
+    } else {
+      expect(result).toContain("protection rules");
+      expect(client.graphql).not.toHaveBeenCalled();
+    }
+  });
+
+  it("allows signed commits with signature, naming, and content rules", async () => {
+    const client = makeClient("main", null, true);
+    client.rest.repos.getBranch.mockResolvedValue({ data: { protected: true, protection: { enabled: false } } });
+    client.rest.repos.getBranchRules.mockResolvedValue({ data: [{ type: "required_signatures" }, { type: "branch_name_pattern" }, { type: "file_extension_restriction" }] });
+
+    expect(await checkBranchPushable(client, "owner", "repo", "feature", true, { signedCommits: true })).toBeNull();
+  });
+
+  it.each(["pull_request", "update", "required_status_checks", "non_fast_forward", "deletion", "required_deployments", "merge_queue", "required_linear_history", "workflows", "unknown_rule"])(
+    "blocks %s even with signed commits and required signatures",
+    async type => {
+      const client = makeClient("main", null, true);
+      client.rest.repos.getBranch.mockResolvedValue({ data: { protected: true, protection: { enabled: false } } });
+      client.rest.repos.getBranchRules.mockResolvedValue({ data: [{ type: "required_signatures" }, { type }] });
+
+      expect(await checkBranchPushable(client, "owner", "repo", "feature", true, { signedCommits: true })).toContain("protection rules");
+      expect(client.graphql).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([true, false])("blocks classic protection for signed commits when metadata enabled is %s", async enabled => {
+    const client = makeClient("main", null, true);
+    client.rest.repos.getBranch.mockResolvedValue({ data: { protected: true, protection: { enabled } } });
+    client.rest.repos.getBranchRules.mockResolvedValue({ data: [{ type: "required_signatures" }] });
+    client.graphql.mockResolvedValue({ repository: { ref: { refUpdateRule: { pattern: "feature*" } } } });
+
+    expect(await checkBranchPushable(client, "owner", "repo", "feature", true, { signedCommits: true })).toContain("protection rules");
+  });
+
+  it.each([undefined, null, {}, { enabled: true }])("blocks protected branches without explicit absence of classic protection: %j", async protection => {
+    const client = makeClient("main", null, true);
+    client.rest.repos.getBranch.mockResolvedValue({ data: { protected: true, protection } });
+
+    expect(await checkBranchPushable(client, "owner", "repo", "feature", true)).toContain("protection rules");
+    expect(client.rest.repos.getBranchRules).not.toHaveBeenCalled();
+    expect(client.rest.repos.getBranchProtection).not.toHaveBeenCalled();
+  });
+
+  it.each(["pull_request", "update", "required_signatures", "required_status_checks", "non_fast_forward", "deletion", "unknown_rule"])("blocks %s even alongside Copilot code review", async type => {
+    const client = makeClient("main", null, true);
+    client.rest.repos.getBranch.mockResolvedValue({ data: { protected: true, protection: { enabled: false } } });
+    client.rest.repos.getBranchRules.mockResolvedValue({ data: [{ type: "copilot_code_review" }, { type }] });
+
+    expect(await checkBranchPushable(client, "owner", "repo", "feature", true)).toContain("protection rules");
+    expect(client.rest.repos.getBranchProtection).not.toHaveBeenCalled();
+  });
+
+  it("checks all paginated rules, including a restrictive rule after the first page", async () => {
+    const client = makeClient("main", null, true);
+    client.rest.repos.getBranch.mockResolvedValue({ data: { protected: true, protection: { enabled: false } } });
+    client.rest.repos.getBranchRules.mockResolvedValueOnce({ data: Array.from({ length: 100 }, () => ({ type: "copilot_code_review" })) }).mockResolvedValueOnce({ data: [{ type: "pull_request" }] });
+
+    expect(await checkBranchPushable(client, "owner", "repo", "feature", true)).toContain("protection rules");
+    expect(client.rest.repos.getBranchRules).toHaveBeenNthCalledWith(2, { owner: "owner", repo: "repo", branch: "feature", per_page: 100, page: 2 });
+    expect(client.rest.repos.getBranchProtection).not.toHaveBeenCalled();
+  });
+
+  it("allows a complete rules list ending with an empty page", async () => {
+    const client = makeClient("main", null, true);
+    client.rest.repos.getBranch.mockResolvedValue({ data: { protected: true, protection: { enabled: false } } });
+    client.rest.repos.getBranchRules.mockResolvedValueOnce({ data: Array.from({ length: 100 }, () => ({ type: "copilot_code_review" })) }).mockResolvedValueOnce({ data: [] });
+
+    expect(await checkBranchPushable(client, "owner", "repo", "feature", true)).toBeNull();
+    expect(client.rest.repos.getBranchRules).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails closed when the rules endpoint repeats full Copilot-only pages", async () => {
+    const client = makeClient("main", null, true);
+    client.rest.repos.getBranch.mockResolvedValue({ data: { protected: true, protection: { enabled: false } } });
+    client.rest.repos.getBranchRules.mockResolvedValue({ data: Array.from({ length: 100 }, () => ({ type: "copilot_code_review" })) });
+
+    expect(await checkBranchPushable(client, "owner", "repo", "feature", true)).toContain("protection rules");
+    expect(client.rest.repos.getBranchRules).toHaveBeenCalledTimes(50);
+    expect(client.rest.repos.getBranchProtection).not.toHaveBeenCalled();
+  });
+
+  it("fails closed on a later-page HTTP 409 rather than accepting a partial rules list", async () => {
+    const client = makeClient("main", null, true);
+    client.rest.repos.getBranch.mockResolvedValue({ data: { protected: true, protection: { enabled: false } } });
+    client.rest.repos.getBranchRules.mockResolvedValueOnce({ data: Array.from({ length: 100 }, () => ({ type: "copilot_code_review" })) }).mockRejectedValueOnce(Object.assign(new Error("Conflict"), { status: 409 }));
+
+    expect(await checkBranchPushable(client, "owner", "repo", "feature", true)).toContain("Cannot verify branch protection rules");
+    expect(client.rest.repos.getBranchProtection).not.toHaveBeenCalled();
+  });
+
+  it.each([[], null, {}, [null], [{}], [{ type: "copilot_code_review" }, null]])("blocks unexplained protection or malformed rules: %j", async rules => {
+    const client = makeClient("main", null, true);
+    client.rest.repos.getBranch.mockResolvedValue({ data: { protected: true, protection: { enabled: false } } });
+    client.rest.repos.getBranchRules.mockResolvedValue({ data: rules });
+
+    expect(await checkBranchPushable(client, "owner", "repo", "feature", true)).toContain("protection rules");
+  });
+
+  it.each([403, 404, 409, 500, undefined])("fails closed when the rules query fails with status %s", async status => {
+    const client = makeClient("main", null, true);
+    client.rest.repos.getBranch.mockResolvedValue({ data: { protected: true, protection: { enabled: false } } });
+    client.rest.repos.getBranchRules.mockRejectedValue(Object.assign(new Error("Rules unavailable"), { status }));
+
+    expect(await checkBranchPushable(client, "owner", "repo", "feature", true)).toContain("Cannot verify branch protection rules");
+  });
+
+  it("blocks classic protection even if branch metadata says enabled:false", async () => {
+    const client = makeClient("main", null, true);
+    client.rest.repos.getBranch.mockResolvedValue({ data: { protected: true, protection: { enabled: false } } });
+    client.graphql.mockResolvedValue({ repository: { ref: { refUpdateRule: { pattern: "feature*" } } } });
+
+    expect(await checkBranchPushable(client, "owner", "repo", "feature", true)).toContain("protection rules");
+  });
+
+  it.each([403, 409, 500, undefined])("fails closed when classic protection cannot be confirmed absent: %s", async status => {
+    const client = makeClient("main", null, true);
+    client.rest.repos.getBranch.mockResolvedValue({ data: { protected: true, protection: { enabled: false } } });
+    client.graphql.mockRejectedValue(Object.assign(new Error("Classic protection unavailable"), { status }));
+
+    expect(await checkBranchPushable(client, "owner", "repo", "feature", true)).toContain("Cannot verify branch protection rules");
+  });
+
+  it("fails closed on a classic protection 404", async () => {
+    const client = makeClient("main", null, true);
+    client.rest.repos.getBranch.mockResolvedValue({ data: { protected: true, protection: { enabled: false } } });
+    client.graphql.mockRejectedValue(Object.assign(new Error("Not Found"), { status: 404 }));
+
+    expect(await checkBranchPushable(client, "owner", "repo", "feature", true)).toContain("Cannot verify branch protection rules");
+  });
+
+  it.each([undefined, null, {}, { repository: null }, { repository: {} }, { repository: { ref: null } }, { repository: { ref: {} } }])("fails closed on an incomplete classic protection response: %j", async response => {
+    const client = makeClient("main", null, true);
+    client.rest.repos.getBranch.mockResolvedValue({ data: { protected: true, protection: { enabled: false } } });
+    client.graphql.mockResolvedValue(response);
+
+    const result = await checkBranchPushable(client, "owner", "repo", "feature", true);
+
+    expect(result).toContain("Cannot verify branch protection rules");
+    expect(result).toContain("Push blocked");
+  });
+
+  it("still blocks the default branch when its only ruleset is Copilot code review", async () => {
+    const client = makeClient("main", null, true);
+    client.rest.repos.getBranch.mockResolvedValue({ data: { protected: true, protection: { enabled: false } } });
+
+    expect(await checkBranchPushable(client, "owner", "repo", "main", true)).toContain("default branch");
+    expect(client.rest.repos.getBranch).not.toHaveBeenCalled();
+    expect(client.rest.repos.getBranchRules).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["repository metadata unavailable", client => client.rest.repos.get.mockRejectedValue(new Error("API unavailable"))],
+    ["default branch missing", client => client.rest.repos.get.mockResolvedValue({ data: {} })],
+    ["default branch empty", client => client.rest.repos.get.mockResolvedValue({ data: { default_branch: "" } })],
+    ["default branch malformed", client => client.rest.repos.get.mockResolvedValue({ data: { default_branch: 123 } })],
+  ])("blocks a protected branch when %s", async (_scenario, setMetadata) => {
+    const client = makeClient(null, null, true);
+    setMetadata(client);
+    client.rest.repos.getBranch.mockResolvedValue({ data: { protected: true, protection: { enabled: false } } });
+
+    expect(await checkBranchPushable(client, "owner", "repo", "main", true)).toContain("protection rules");
+    expect(client.rest.repos.getBranchRules).not.toHaveBeenCalled();
+    expect(client.rest.repos.getBranchProtection).not.toHaveBeenCalled();
   });
 
   it("returns null and skips protection check when checkBranchProtection is false", async () => {
     const client = makeClient("main", null);
     const result = await checkBranchPushable(client, "owner", "repo", "feature", false);
     expect(result).toBeNull();
-    expect(client.rest.repos.getBranchProtection).not.toHaveBeenCalled();
+    expect(client.rest.repos.getBranch).not.toHaveBeenCalled();
   });
 
   it("returns error on unexpected protection check failure (5xx)", async () => {

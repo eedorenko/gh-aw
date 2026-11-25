@@ -22,7 +22,7 @@ In single-run mode, a job URL without a step anchor extracts the first failing s
 | `-o, --output <dir>` | `./logs` | Directory to write downloaded artifacts and report files |
 | `--json` | off | Output report as JSON to stdout |
 | `--parse` | off | Run JavaScript parsers on agent and firewall logs, writing `log.md` and `firewall.md` (single-run only) |
-| `--repo <owner/repo>` | auto | Specify repository when the run ID is not from a URL |
+| `--repo <owner/repo>` | current repository | Specify repository when the run ID is not from a URL |
 | `--stdin` | off | Read run IDs or URLs from stdin (one per line) instead of positional arguments |
 | `--verbose` | off | Print detailed progress information |
 | `--format <fmt>` | `pretty` | Diff output format: `pretty` or `markdown` (multi-run only) |
@@ -34,6 +34,14 @@ In single-run mode, a job URL without a step anchor extracts the first failing s
 Top-level fields in `--json` output are stable; nested sub-fields may be extended but are not removed without deprecation. Add `--parse` to populate `behavior_fingerprint` and `agentic_assessments`.
 
 By default a single-run audit renders a Comparison section against an earlier run of the same workflow. Use `--no-baseline` when that baseline is unrepresentative or to avoid the extra downloads. A `--no-baseline` result is never written to the audit cache, so it cannot suppress the Comparison section of a later default audit.
+
+### Durable session continuation
+
+For durable workflows, `durable_session` separates checkpoint restoration from observed native startup. It reports `status`, `started`, engine, storage, available parent-run, artifact and native session IDs, and the unified-session evidence path. `resumed` requires matching restoration and native-start records from the audited run and attempt. `restored` without `started` confirms only restoration; `restore_failed` records a restoration error. Missing events, unsupported or invalid session files, and mismatched lineage report `unavailable` with a reason, never a successful continuation.
+
+The `info,usage` artifact selection contains the required evidence. Cached audits re-read it, and `health --logs-dir` reuses the same raw session evidence for its current-revision sample. These records do not establish restored workspace edits, exactly-once effects, or agent task completion.
+
+Health exposes `durable_sessions` with `resumed_runs`, `fresh_runs`, `restored_runs`, `restore_failed_runs`, `unavailable_runs`, and per-run `session` reports. Fresh runs count only observed native starts; restoration without a start is reported separately. Missing or budget-skipped cached evidence stays unavailable, including when every known-durable sample is unavailable. This is a cached evidence inventory, not a continuation rate, and does not change workflow health classifications or download artifacts.
 
 ### Retry history
 
@@ -56,6 +64,45 @@ continuations as retries. See the
 for `harness.attempt` records and
 [Harness Retry Policy](/gh-aw/reference/engines/#harness-retry-and-post-result-watchdog-policy)
 for execution behavior.
+
+### Invocation skip decisions
+
+Invocation skip decisions appear in `retries.decisions` and as searchable `harness.decision` unified-session events. Each records the proposed attempt, question outcomes, sanitized errors, latency, and whether an invocation was avoided. `retries.avoided_invocations` counts denied invocations separately from executed attempts and retries; a skip does not count as an agent retry.
+
+The Actions step summary shows a collapsible `skip-if-decision` section before the unified-session trace, including skipped invocation totals and a per-check table of outcomes, question counts, latency, and sanitized errors. It also appears when the initial invocation is skipped and no agent conversation exists. The section is omitted when no decision events were recorded and respects the existing summary byte limit.
+
+For example, this `--json` excerpt records a denied initial invocation. Question
+1 abstained because its referenced file could not be read, but question 2 was
+evaluated and denied, so no attempt executed:
+
+```json
+{
+  "retries": {
+    "agent_retries": 0,
+    "detection_retries": 0,
+    "attempts": [],
+    "engine_retries": 0,
+    "detection_engine_retries": 0,
+    "decisions": [
+      {
+        "proposedAttempt": 1,
+        "outcome": "deny",
+        "questions": [
+          { "question": 1, "outcome": "unknown", "error": "file_reference_failed" },
+          { "question": 2, "outcome": "deny" }
+        ],
+        "latencyMs": 20,
+        "timestamp": 1794096000000,
+        "avoidedInvocation": true,
+        "phase": "agent",
+        "path": "agent/harness_retry.json",
+        "index": 1
+      }
+    ],
+    "avoided_invocations": 1
+  }
+}
+```
 
 ### Searching session evidence
 
@@ -128,13 +175,13 @@ gh aw audit 1234567890 -o ./audit-reports --repo owner/repo
 
 **Stdin mode:**
 
-Use `--stdin` to pass run IDs or URLs from a file or pipeline (mutually exclusive with positional arguments). Blank lines and `#` lines are ignored. Bare numeric IDs require `--repo owner/repo`.
+Use `--stdin` to pass run IDs or URLs from a file or pipeline (mutually exclusive with positional arguments). Blank lines and `#` lines are ignored. Bare numeric IDs use the current repository unless `--repo owner/repo` is provided. If the current repository cannot be detected, provide `--repo` or a run URL.
 
 ```bash
 echo "1234567890" | gh aw audit --stdin
 echo -e "1234567890\n9876543210" | gh aw audit --stdin   # diff mode: first is base
 cat run-ids.txt | gh aw audit --stdin
-cat run-ids.txt | gh aw audit --stdin --repo owner/repo  # required for bare numeric IDs
+cat run-ids.txt | gh aw audit --stdin  # uses the current repository for bare numeric IDs
 ```
 
 **Multi-run diff examples:**
@@ -153,17 +200,19 @@ When routing data is available, Model Routing summarizes the classifier and sele
 
 The Friction section attributes execution-friction costs by driver and source. In JSON, `friction.drivers[]` provides each driver's `source`, counted and deduplicated occurrences, attribution state, and cost dimensions; `friction.events[]` provides the corresponding event-level source and label. Console output includes the source and available AIC, token, turn, tool-call, and latency costs on each driver and event, so a high-cost source such as `firewall`, `mcp_gateway`, or `agent_session` can be investigated directly. Unavailable dimensions are omitted rather than presented as measured zeroes.
 
-The Gateway Steering Events section reports `token_steering` and `timeout_steering` warnings emitted when a run approaches its AI Credits or time limit. JSON output includes each event's type, message, and timestamp when available.
+The Gateway Steering Events section reports `token_steering`, `timeout_steering` and `ai_credit_steering` warnings emitted when a run approaches its AI Credits or time limit. JSON output includes each event's type, message, and timestamp when available, plus its `threshold`, `trigger` and `conversation` when AWF records them. A "little left" notice, sent when only a few requests' worth of AI credits or a few minutes remain, has `trigger: "little_left"` and no threshold, and is shown as "little left" rather than as a percentage.
 
-The Work Queue section reports the activation-time queue snapshot, the assigned worker's Work and Claim IDs, the agent's finish intent, and timestamped queue operations from workflow job logs. The section is omitted when no queue evidence is available. A finish intent is a request, not evidence of durable Completion or verified delivery.
+`steering_deliveries` lists every delivery of a notice, one per conversation, read from `usage/aw_session.jsonl`: `type`, `trigger`, `threshold` (`null` for "little left"), `conversation` (an opaque key comparable only within the run, or `null`), `first`, `request_id` and `phase`. `steering_notices` keeps one entry per threshold per run. Runs on AWF v0.29.11 or older have no deliveries. See [Artifacts](/gh-aw/reference/artifacts/) for the underlying records.
 
-For version-3 snapshots, `work_queue.snapshot.current.diagnostics` contains the same metadata-only counters as [`work-queue stats`](/gh-aw/reference/work-queue/#structured-diagnostics): Claim outcomes and cancellation reasons, pending/verified/failed delivery and failure reasons, retained reservations versus historical dispatches, per-pool eligibility and compact predictions, trusted admission ages, and 24-hour ledger activity. Its `status` is `captured_snapshot` and `evaluated_at` equals `captured_at`; ages, activity and predictions use that captured time, never the time of the audit. `branch` is empty because activation artifacts do not record its name. No live queue or Actions state is fetched to produce these diagnostics.
+The Work Queue section reports the activation-time queue snapshot, the assigned worker's dispatch, Work, and Claim IDs, the agent's finish intent, and timestamped queue operations from workflow job logs. The section is omitted when no queue evidence is available. A finish intent is a request, not evidence of a committed Completion.
 
-`diagnostics.assigned_claims` adds structured `work` and `claim` metadata for the worker's original assignment, including admission/grant/terminal timestamps, attempts, retry boundaries, and delivery-failure reason and disposition. `work` describes its state at capture; `claim` describes the original Claim, which can be historical. Payloads, Result descriptors, request parameters, receipts, and actor principals are excluded. Dispatcher and observer snapshots have aggregate diagnostics but no assigned Claims; an uninitialized observer has zero counts and no installed pools. Console output bounds pool and Claim detail rows; JSON retains the full metadata.
+For version-4 snapshots, `work_queue.snapshot.current.diagnostics` contains the same metadata-only counters as [`work-queue stats`](/gh-aw/reference/work-queue/#diagnostics): Work, Claims, and dispatches by state, Claim and Work cancellation reasons, and per-pool eligible, blocked, and next eligible Work. Its `status` is `captured_snapshot`. `branch` is empty because activation artifacts do not record its name. No live queue or Actions state is fetched to produce these diagnostics.
 
-An activation snapshot cannot prove the audited run's eventual outcome. Later finish intents and `work_queue.operations` do not advance its counters or delivery barriers. Completion is not verified delivery, released dispatch state is historical rather than live worker status, and unknown effects must not be replayed. Historical version-2 snapshots remain readable in `work_queue.snapshot.transactions`; their summaries are not inferred using version-3 rules.
+`diagnostics.assigned_claims` adds structured `work` and `claim` metadata for the worker's assignment, including state, attempts, dependencies, and cancellation reason. `work` and `claim` describe their state at capture. Payloads, request parameters, and receipts are excluded. Dispatcher and observer snapshots have aggregate diagnostics but no assigned Claims. Console output bounds pool and Claim detail rows; JSON retains the full metadata.
 
-Operations are accepted only from the compiler-owned snapshot, finish-intent-copy, and claim-reconciliation step logs, not from agent stdout or whole-job log copies. Incomplete workflow-log downloads are retried before their operations are reported. Text reports escape control characters in stored identifiers.
+An activation snapshot cannot prove the audited run's eventual outcome. Later finish intents and `work_queue.operations` do not advance its counters, and a released dispatch is historical rather than live worker status. Snapshots from earlier protocol versions report only their `version`.
+
+Operations are accepted only from compiler-owned work-queue step logs (snapshot, intent collection, finish-intent copy, trusted controls, safe-output processing, and claim finish), not from agent stdout or whole-job log copies. Incomplete workflow-log downloads are retried before their operations are reported. Text reports escape control characters in stored identifiers.
 
 Runs using the previous queue artifact filenames and step/message names remain readable. New filenames take precedence; invalid new artifacts are reported as errors rather than falling back to an older copy.
 
@@ -250,8 +299,10 @@ Parent workflow success does not imply successful delegation. `metrics.error_cou
 | `agentic_overkill_for_agentic` | The task may not require an agentic workflow |
 | `agentic_poor_agentic_control` | Agentic control signals were weak |
 | `agentic_partially_reducible` | Part of the task could use deterministic steps |
-| `agentic_model_downgrade_available` | A smaller model may be sufficient |
+| `agentic_model_downgrade_available` | A routine task may not need a high-capability model. Consider [per-task routing](/gh-aw/reference/model-routing/) with `model: router`, or use `model: router/economy` for a fixed economy level. The finding can also appear on runs using a fixed balanced or robust level. It does not appear for economy runs or when the router chose a higher level for the task. |
 | `agentic_delegated_context_present` | Delegated workflow context was preserved |
+
+The `agentic_poor_agentic_control` assessment uses the larger of reported control signals and counted friction occurrences. This avoids summing potentially overlapping sources, but can undercount distinct signals. Counted friction includes integrity-filtered responses: these indicate friction, not that the gateway control failed. A derived count covers only the available log sources.
 
 The audit inspects the `detection` job result and the downloaded `detection` artifact. A failed job emits `threat_detection_job_failed`. A structured verdict in `detection_result.json`, or a legacy `THREAT_DETECTION_RESULT` verdict in `detection.log`, emits `threat_detected` when `prompt_injection`, `secret_leak`, or `malicious_patch` is true. Threat reasons are not copied into the finding description because they may contain sensitive agent output.
 
@@ -314,6 +365,8 @@ gh aw json-schema logs-jsonl > logs-jsonl.schema.json
 `make recompile` regenerates the checked-in schemas (including `schemas/logs-jsonl.schema.json`) from the Go output types.
 
 When routing records are available, single-run `audit --json` includes `model_routing` with status, objective, labels, classifier and selected model details, ranked choices, router metadata, effective and selected endpoints, request outcome/deviation counts, failure details, and classifier/selected/deviated cost buckets. Logs JSON includes `model_routing.routes` entries keyed by labels, mode, model, effort, router version, and endpoint attribution, with `run_count`, `total_aic`, and `average_aic`, plus classifier AIC and deviation totals.
+
+For a routed run whose agent made requests, `model_routing` in `audit --json` and in each run of `logs --json` also includes `observation`: whether the run's result counts as evidence about the model and effort AWF selected (`outcome` is `success` or `failure`), or why it does not (`skip` with a `reason`: `cancelled`, `infrastructure`, `rate_limited`, `pair_mismatch`, or `unknown_evidence`). The console report prints it as an `observation` line in the model routing details. Older sessions and unrouted runs have no observation. The [Unified Agent Session Specification](/gh-aw/specs/unified-agent-session-specification/#routing-analytics) defines the rules.
 
 ## `gh aw logs --format <fmt>`
 
@@ -499,7 +552,7 @@ permissions:
 
 # Auto-File Issues for Critical Findings
 
-Use the `agentic-workflows` MCP tool `audit` with run ID ${{ github.event.workflow_run.id }}. Filter `key_findings` for severity `high` or `critical`. For each finding without a matching open issue, create one with the finding title, description, impact, and recommendations, labelled `audit-finding`. If no critical findings, call the `noop` safe output tool.
+Use the `agentic-workflows` MCP tool `audit` with run ID ${{ github.event.workflow_run.id }}. Filter `key_findings` for severity `high` or `critical`. For each finding without a matching open issue, create one with the finding title, description, impact, and recommendations, labeled `audit-finding`. If no critical findings, call the `noop` safe output tool.
 ```
 
 ### Weekly audit monitoring agent

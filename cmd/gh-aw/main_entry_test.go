@@ -142,6 +142,10 @@ func TestMainFunction(t *testing.T) {
 	})
 
 	t.Run("root command help", func(t *testing.T) {
+		t.Cleanup(func() {
+			require.NoError(t, rootCmd.Flags().Set("help", "false"))
+		})
+
 		// Capture output
 		oldStderr := os.Stderr
 		r, w, _ := os.Pipe()
@@ -443,6 +447,7 @@ func TestCommandErrorHandling(t *testing.T) {
 		err := rootCmd.Execute()
 
 		assert.Error(t, err, "invalid command should produce an error")
+		assert.ErrorContains(t, err, `unknown command "invalid-command" for "gh aw"`)
 
 		// With RunE and SilenceErrors, errors are returned but not automatically printed
 		// The main() function is responsible for formatting and printing errors

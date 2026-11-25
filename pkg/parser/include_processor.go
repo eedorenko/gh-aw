@@ -53,6 +53,9 @@ func processIncludesWithVisited(content, baseDir string, extractTools bool, visi
 		}
 	}
 
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("scan imported Markdown: %w", err)
+	}
 	return result.String(), nil
 }
 
@@ -170,6 +173,7 @@ func processIncludedFileWithVisited(filePath, sectionName string, extractTools b
 		return "", fmt.Errorf("failed to read included file %s: %w", filePath, err)
 	}
 	includeLog.Printf("Read %d bytes from included file: %s", len(content), filePath)
+	content = []byte(RemoveConnectorDocumentation(string(content)))
 
 	result, validationErr, isWorkflowFile, isAgentFile, err := parseAndValidateIncludedFrontmatter(filePath, content)
 	if err != nil {
@@ -262,6 +266,7 @@ func collectUnexpectedIncludedFrontmatterFields(frontmatter map[string]any) []st
 		"mcp-scripts":     {},
 		"services":        {},
 		"runtimes":        {},
+		"runs-on":         {},
 		"permissions":     {},
 		"secret-masking":  {},
 		"inputs":          {},

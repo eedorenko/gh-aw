@@ -3,7 +3,6 @@ package workflow
 import (
 	"fmt"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
@@ -59,6 +58,9 @@ func generateSafeOutputsConfig(data *WorkflowData) (string, error) {
 		safeOutputsConfigLog.Print("Added ledger_mutation config so ledger audit entries are ingested")
 	}
 	addStandaloneLedgerConfigs(safeOutputsConfig, data.LedgerConfig)
+	addSafeOutputAuthorizationRuntimeConfig(safeOutputsConfig, data.SafeOutputs)
+	// Global authority is handler-manager metadata, not an agent-callable tool.
+	delete(safeOutputsConfig, "authorization")
 
 	if len(safeOutputsConfig) == 0 {
 		return "", nil
@@ -115,16 +117,7 @@ func addStandardHandlerConfigs(safeOutputsConfig map[string]any, data *WorkflowD
 		if handlerCfg == nil {
 			continue
 		}
-		// Credentials are only needed by the safe_outputs job, never by the agent.
-		delete(handlerCfg, "github-token")
-		delete(handlerCfg, "head-github-token")
-		if tools, ok := handlerCfg["tools"].(map[string]any); ok {
-			for _, tool := range tools {
-				if toolConfig, ok := tool.(map[string]any); ok {
-					delete(toolConfig, "github-token")
-				}
-			}
-		}
+		stripTrustedJobHandlerKeys(handlerName, handlerCfg)
 		injectCurrentCheckoutPatchWorkspacePath(handlerName, handlerCfg, data)
 		injectCheckoutMapping(handlerName, handlerCfg, data)
 		excludeFiles := ParseStringArrayFromConfig(handlerCfg, "_protected_files_exclude", nil)
@@ -161,6 +154,27 @@ func addStandardHandlerConfigs(safeOutputsConfig map[string]any, data *WorkflowD
 			}
 		}
 		safeOutputsConfig[handlerName] = handlerCfg
+	}
+}
+
+// stripTrustedJobHandlerKeys removes handler config the agent must not see:
+// credentials, needed only by the safe_outputs job, and a routed
+// request_continuation's destination and hop policy. The agent-side collector
+// needs only the route to apply routed limits.
+func stripTrustedJobHandlerKeys(handlerName string, handlerCfg map[string]any) {
+	delete(handlerCfg, "github-token")
+	delete(handlerCfg, "head-github-token")
+	if tools, ok := handlerCfg["tools"].(map[string]any); ok {
+		for _, tool := range tools {
+			if toolConfig, ok := tool.(map[string]any); ok {
+				delete(toolConfig, "github-token")
+			}
+		}
+	}
+	if handlerName == "request_continuation" {
+		for _, key := range []string{"max_depth", "workflow", "workflow_file", "aw_context"} {
+			delete(handlerCfg, key)
+		}
 	}
 }
 
@@ -208,18 +222,10 @@ func addSafeJobsConfig(safeOutputsConfig map[string]any, jobs map[string]*SafeJo
 	safeOutputsConfigLog.Printf("Processing %d safe job configurations", len(jobs))
 	for jobName, jobConfig := range jobs {
 		safeOutputsConfigLog.Printf("Generating config for safe job: %s", jobName)
-		safeJobConfig := map[string]any{}
-		if jobConfig.Description != "" {
-			safeJobConfig["description"] = jobConfig.Description
-		}
+		safeJobConfig := buildSafeToolConfigFields(jobConfig.Description, jobConfig.Max, jobConfig.Inputs)
+		safeJobConfig["supports_dependencies"] = false
 		if jobConfig.Output != "" {
 			safeJobConfig["output"] = jobConfig.Output
-		}
-		if jobConfig.Max > 0 {
-			safeJobConfig["max"] = jobConfig.Max
-		}
-		if inputsConfig := buildSafeOutputInputsConfig(jobConfig.Inputs); inputsConfig != nil {
-			safeJobConfig["inputs"] = inputsConfig
 		}
 		safeOutputsConfig[jobName] = safeJobConfig
 	}
@@ -235,18 +241,76 @@ func addSafeScriptsConfig(safeOutputsConfig map[string]any, scripts map[string]*
 	for scriptName, scriptConfig := range scripts {
 		normalizedName := stringutil.NormalizeSafeOutputIdentifier(scriptName)
 		safeOutputsConfigLog.Printf("Generating config for safe script: %s (normalized: %s)", scriptName, normalizedName)
-		safeScriptConfigMap := map[string]any{}
-		if scriptConfig.Max > 0 {
-			safeScriptConfigMap["max"] = scriptConfig.Max
-		}
-		if scriptConfig.Description != "" {
-			safeScriptConfigMap["description"] = scriptConfig.Description
-		}
-		if inputsConfig := buildSafeOutputInputsConfig(scriptConfig.Inputs); inputsConfig != nil {
-			safeScriptConfigMap["inputs"] = inputsConfig
-		}
-		safeOutputsConfig[normalizedName] = safeScriptConfigMap
+		safeOutputsConfig[normalizedName] = buildSafeToolConfigFields(scriptConfig.Description, scriptConfig.Max, scriptConfig.Inputs)
 	}
+	addConnectorThreatWarningPolicies(safeOutputsConfig, scripts)
+}
+
+func addConnectorThreatWarningPolicies(config map[string]any, scripts map[string]*SafeScriptConfig) {
+	for name, script := range scripts {
+		if script.connectorInputSchema == nil {
+			continue
+		}
+		normalizedName := stringutil.NormalizeSafeOutputIdentifier(name)
+		handler, ok := config[normalizedName].(map[string]any)
+		if !ok {
+			handler = map[string]any{}
+		}
+		handler["threat_warning_policy"] = "abort"
+		if field, ok := script.connectorInputSchema["x-gh-aw-temporary-id"].(string); ok {
+			handler["temporary_id_field"] = field
+		}
+		if files := connectorStagedFilePolicies(script.connectorInputSchema); len(files) != 0 {
+			handler["staged_files"] = files
+		}
+		if script.connectorOptions != nil {
+			handler["connector_operation"] = true
+			handler["max"] = script.connectorOptions.Max
+			if script.connectorOptions.Staged != nil {
+				staged := script.connectorOptions.Staged
+				if isExpression(staged.String()) {
+					// Only interpolate a canonical boolean into the JSON config.
+					// An arbitrary expression result must not inject policy fields.
+					handler["staged"] = "${{ format('{0}', " + stripExpressionWrapper(staged.String()) + ") == 'true' }}"
+				} else {
+					handler["staged"] = templatableBoolIsTrue(staged)
+				}
+			}
+		}
+		config[normalizedName] = handler
+	}
+}
+
+func connectorStagedFilePolicies(schema map[string]any) map[string]any {
+	result := map[string]any{}
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		if schema != nil {
+			safeOutputsConfigLog.Printf("connector staging metadata has no object properties")
+		}
+		return result
+	}
+	for name, raw := range properties {
+		property, ok := raw.(map[string]any)
+		if ok && property["x-gh-aw-staged-file"] != nil {
+			result[name] = property["x-gh-aw-staged-file"]
+		}
+	}
+	return result
+}
+
+func buildSafeToolConfigFields(description string, max int, inputs map[string]*InputDefinition) map[string]any {
+	config := make(map[string]any)
+	if description != "" {
+		config["description"] = description
+	}
+	if max > 0 {
+		config["max"] = max
+	}
+	if inputsConfig := buildSafeOutputInputsConfig(inputs); inputsConfig != nil {
+		config["inputs"] = inputsConfig
+	}
+	return config
 }
 
 // buildSafeOutputInputsConfig converts safe-job/safe-script input definitions into
@@ -436,7 +500,7 @@ func generateCustomJobToolDefinition(jobName string, jobConfig *SafeJobConfig) m
 	requiredFields := populateCustomJobToolProperties(properties, jobConfig.Inputs)
 
 	if len(requiredFields) > 0 {
-		sort.Strings(requiredFields)
+		slices.Sort(requiredFields)
 		inputSchema["required"] = requiredFields
 	}
 

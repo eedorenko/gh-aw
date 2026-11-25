@@ -15,6 +15,8 @@ import (
 
 const threatDetectionResultPrefix = "THREAT_DETECTION_RESULT:"
 
+const threatDetectionWarningTitle = "Threat Detection Warning"
+
 var auditThreatDetectionLog = logger.New("cli:audit_threat_detection")
 
 type threatDetectionVerdict struct {
@@ -67,6 +69,7 @@ func generateThreatDetectionFindings(processedRun ProcessedRun) []AuditFinding {
 		description := "The threat-detection job failed before producing a threat verdict"
 		impact := "Safe outputs may have been blocked because the security control did not complete"
 		title := "Threat Detection Job Failed"
+		category := "security"
 		if detectionExecutionNotStarted && !detectionJobFailed {
 			description = "Usage artifact evidence indicates the threat-detection job did not start"
 			impact = "Safe outputs may have been blocked because the security control did not run"
@@ -75,19 +78,35 @@ func generateThreatDetectionFindings(processedRun ProcessedRun) []AuditFinding {
 			impact = "Safe outputs were blocked by the failed security gate"
 		}
 		if detectionFailed && !detectionJobFailed && usageResult.Conclusion == "warning" {
-			title = "Threat Detection Warning"
+			title = threatDetectionWarningTitle
 			description = "Threat detection reported a warning"
 			impact = "The security control did not complete successfully; review detection results before applying agent output"
 		}
 		if detectionFailed {
 			switch usageResult.Reason {
-			case "agent_failure", "parse_error", "threat_detected":
+			case "agent_failure", "parse_error":
+				category = "tooling"
+				description = "The threat detection engine could not complete its analysis (" + usageResult.Reason + "); this is a tooling error, not a security finding"
+			case "threat_detected":
 				description += " (" + usageResult.Reason + ")"
+			case "github_api_quota_exhausted":
+				// An operational quota stop, not a security finding, and never a security pass.
+				category = "operational"
+				title = "Threat Detection Deferred: GitHub API Quota Exhausted"
+				if !detectionJobFailed && usageResult.Conclusion == "warning" {
+					title = threatDetectionWarningTitle + ": GitHub API Quota Exhausted"
+				}
+				description = "GitHub API quota was exhausted before AWF attestation verification completed, so threat detection was deferred and did not run"
+				if details := readDetectionQuotaDetails(processedRun.Run.LogsPath); details != "" {
+					description += " (" + details + ")"
+				}
+				description += "; this is an operational quota stop, not a security finding, and not a security pass"
+				impact = "No threat verdict was produced; rerun after the GitHub API quota reset before trusting agent output"
 			}
 		}
 		findings = append(findings, AuditFinding{
 			Code:        AuditFindingDetectionJobFailed,
-			Category:    "security",
+			Category:    category,
 			Severity:    "high",
 			Title:       title,
 			Description: description,
@@ -133,6 +152,24 @@ func readDetectionUsageResult(runDir string) (detectionUsageResult, bool) {
 	return evidence.Result, evidence.HasResult
 }
 
+func appendAuditDetectionIssues(data *AuditData) {
+	for _, finding := range data.KeyFindings {
+		if finding.Code != AuditFindingDetectionJobFailed && finding.Code != AuditFindingThreatDetected {
+			continue
+		}
+		issue := ValidationIssue{Type: "error", Message: finding.Description}
+		if strings.HasPrefix(finding.Title, threatDetectionWarningTitle) {
+			issue.Type = "warning"
+			data.Warnings = append(data.Warnings, issue)
+		} else {
+			data.Errors = append(data.Errors, issue)
+		}
+	}
+	// The same failure may already have been counted from job or agent logs.
+	data.Metrics.ErrorCount = max(data.Metrics.ErrorCount, len(data.Errors))
+	data.Metrics.WarningCount = max(data.Metrics.WarningCount, len(data.Warnings))
+}
+
 func validDetectionJobResult(result string) bool {
 	return result == "success" || result == "failure" || result == "cancelled" || result == "skipped"
 }
@@ -143,14 +180,17 @@ func readLegacyDetectionUsageResult(runDir string) (detectionUsageResult, bool) 
 	}
 	file, err := os.Open(filepath.Join(runDir, constants.UsageArtifactName.String(), "detection", "detection_result.json"))
 	if err != nil {
-		return detectionUsageResult{}, false
+		return readConclusionDetectionUsageResult(runDir)
 	}
 	defer closeThreatDetectionFile(file)
 	var result detectionUsageResult
 	if err := json.NewDecoder(io.LimitReader(file, 1024*1024)).Decode(&result); err != nil {
-		return detectionUsageResult{}, false
+		return readConclusionDetectionUsageResult(runDir)
 	}
-	return result, validDetectionJobResult(result.JobResult)
+	if !validDetectionJobResult(result.JobResult) {
+		return readConclusionDetectionUsageResult(runDir)
+	}
+	return result, true
 }
 
 func (v threatDetectionVerdict) threatKinds() []string {

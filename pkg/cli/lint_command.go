@@ -67,7 +67,7 @@ All registered AST rules run by default. Use --rules to select AST rules and ski
 	cmd.Flags().Bool("pyflakes", false, "Enable pyflakes integration in actionlint")
 	cmd.Flags().StringSlice("rules", nil, "Select built-in AST rules and skip actionlint (default: all AST rules plus actionlint; empty selects all)")
 	cmd.Flags().Bool("list-rules", false, "List available built-in AST lint rules")
-	cmd.Flags().Bool("json", false, "Emit structured diagnostics (requires --rules)")
+	cmd.Flags().BoolP("json", "j", false, "Emit structured diagnostics (requires --rules)")
 	cmd.Flags().Bool("debug", false, "Include secret-leak analysis coverage warnings for investigation")
 	registerJavaScriptLintFlags(cmd)
 	// The root routes help to stderr. Structured lint reports belong on stdout.
@@ -83,7 +83,7 @@ func selectWorkflowLintRules(cmd *cobra.Command) (*workflowlint.Runner, error) {
 	listRules, _ := cmd.Flags().GetBool("list-rules")
 	if listRules {
 		for _, rule := range runner.Rules() {
-			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\t%s\t%s\n", rule.ID, rule.Severity, rule.Targets, rule.Description, rule.ThreatRuleID); err != nil {
+			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\t%s\t%s\n", rule.ID, rule.Severity, rule.Targets, rule.Description, ruleThreatIDs(rule)); err != nil {
 				return nil, err
 			}
 		}
@@ -193,4 +193,13 @@ func expandLintCandidate(candidate string) ([]string, error) {
 	default:
 		return nil, fmt.Errorf("path %q is not a .md, .yml, or .yaml workflow file or directory", candidate)
 	}
+}
+
+// ruleThreatIDs lists the rule-level threat ID followed by any per-finding IDs.
+func ruleThreatIDs(rule workflowlint.Rule) string {
+	ids := slices.Clone(rule.FindingThreatRuleIDs)
+	if rule.ThreatRuleID != "" {
+		ids = append([]string{rule.ThreatRuleID}, ids...)
+	}
+	return strings.Join(ids, ",")
 }

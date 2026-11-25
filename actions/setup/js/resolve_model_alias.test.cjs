@@ -1,5 +1,5 @@
 // @ts-check
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createRequire } from "module";
 
 const require = createRequire(import.meta.url);
@@ -10,12 +10,13 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const {
   buildCatalogFromReflect,
   globMatch,
-  isBundledModelId,
+  isExplicitModelId,
   loadBuiltinModelAliases,
   loadModelAliasMap,
   ModelAliasResolutionError,
   normalizeForCopilotCLI,
   resolveConfiguredCopilotModel,
+  resolveConfiguredModel,
   resolveEngineModel,
   resolveModelAlias,
   selectLatestGlobMatch,
@@ -35,6 +36,19 @@ describe("resolve_model_alias", () => {
   it("selects the highest-version glob match", () => {
     const matches = selectLatestGlobMatch("copilot/*sonnet*", ["copilot/claude-sonnet-4.5", "copilot/claude-sonnet-4.6"]);
     expect(matches).toBe("copilot/claude-sonnet-4.6");
+  });
+
+  it("selects the highest-version namespaced glob match", () => {
+    const matches = selectLatestGlobMatch("openrouter/anthropic/claude-sonnet-*", ["openrouter/anthropic/claude-sonnet-4.9", "openrouter/anthropic/claude-sonnet-4.10"]);
+    expect(matches).toBe("openrouter/anthropic/claude-sonnet-4.10");
+  });
+
+  it("preserves the full namespaced model token when matching", () => {
+    expect(globMatch("openrouter/anthropic/claude-sonnet-4", "openrouter/anthropic/claude-sonnet-4")).toBe(true);
+    expect(globMatch("openrouter/anthropic/claude-sonnet-4", "openrouter/anthropic/claude-opus-4")).toBe(false);
+    expect(globMatch("openrouter/*", "openrouter/anthropic/claude-sonnet-4")).toBe(false);
+    expect(globMatch("openrouter/anthropic/*sonnet*", "openrouter/anthropic/claude-sonnet-4")).toBe(true);
+    expect(resolveModelAlias("sonnet", { sonnet: ["openrouter/anthropic/claude-sonnet-4"] }, ["openrouter/anthropic/claude-opus-4", "openrouter/anthropic/claude-sonnet-4"])).toBe("openrouter/anthropic/claude-sonnet-4");
   });
 
   it("resolves small -> mini -> haiku glob chain", () => {
@@ -95,14 +109,21 @@ describe("resolve_model_alias", () => {
     expect(ALIAS_MAP).not.toHaveProperty("mai-code-1-flash-picker");
   });
 
-  it("resolves Linter Miner main and sub-agent models against its advertised catalog", () => {
+  it("routes Linter Miner's main model and resolves its sub-agent models against the advertised catalog", () => {
     const workflow = fs.readFileSync(path.join(__dirname, "../../../.github/workflows/linter-miner.md"), "utf8");
-    const models = [...workflow.matchAll(/^model: (.+)$/gm)].map(match => match[1]);
+    const mainModel = workflow.match(/^model: (.+)$/m)?.[1];
+    const [, ...agents] = workflow.split(/^## agent: /m);
+    const subAgentModels = agents.map(agent => {
+      const model = agent.match(/^model: (.+)$/m)?.[1];
+      if (!model) throw new Error("Missing model in Linter Miner sub-agent");
+      return model;
+    });
     const reflectData = {
       endpoints: [{ configured: true, provider: "copilot", models: ["claude-haiku-4.5", "claude-haiku-5.5", "claude-opus-5.5", "claude-sonnet-5", "claude-sonnet-5.5"] }],
     };
-    expect(models).toHaveLength(3);
-    for (const configuredModel of models) {
+    expect(mainModel).toBe("router/economy");
+    expect(subAgentModels.length).toBeGreaterThan(0);
+    for (const configuredModel of subAgentModels) {
       const resolved = resolveConfiguredCopilotModel({ configuredModel, aliasMap: ALIAS_MAP, reflectData });
       expect(reflectData.endpoints[0].models).toContain(resolved);
     }
@@ -317,14 +338,39 @@ describe("resolve_model_alias", () => {
   });
 });
 
-// Without AWF no /reflect catalogue can exist. A name listed in the bundled model catalogue
-// (models.json) is a plausible model id and passes through as exact; pure aliases fail.
+// Without AWF, only explicit overlay metadata can disambiguate aliases from exact IDs.
 describe("resolveEngineModel without a possible catalogue", () => {
   const run = (configuredModel, env = {}) => resolveEngineModel({ engine: "test", configuredModel, aliasMap: ALIAS_MAP, reflectData: null, env, record: false });
+  const { _resetModelCostsCache } = require("./model_costs.cjs");
+  let directory;
+  let previousPath;
+  beforeEach(() => {
+    previousPath = process.env.GH_AW_MODELS_JSON_PATH;
+    directory = fs.mkdtempSync(path.join(require("os").tmpdir(), "gh-aw-alias-models-"));
+    process.env.GH_AW_MODELS_JSON_PATH = path.join(directory, "models.json");
+    fs.writeFileSync(process.env.GH_AW_MODELS_JSON_PATH, JSON.stringify({ providers: { "github-copilot": { models: { "gpt-5-mini": {}, "gpt-5.4": {}, "gpt-5.5": {}, "gpt-5": {} } } } }));
+    _resetModelCostsCache();
+  });
+  afterEach(() => {
+    fs.rmSync(directory, { recursive: true, force: true });
+    if (previousPath === undefined) delete process.env.GH_AW_MODELS_JSON_PATH;
+    else process.env.GH_AW_MODELS_JSON_PATH = previousPath;
+    _resetModelCostsCache();
+  });
 
-  it("defines plausible model ids by the bundled catalogue", () => {
-    for (const id of ["gpt-5-mini", "gpt-5.4", "gpt-5.5", "gpt-5"]) expect(isBundledModelId(id)).toBe(true);
-    for (const alias of ["small", "opus", "auto", "sonnet", "mini"]) expect(isBundledModelId(alias)).toBe(false);
+  it("recognizes only explicitly configured model ids", () => {
+    for (const id of ["gpt-5-mini", "gpt-5.4", "gpt-5.5", "gpt-5"]) expect(isExplicitModelId(id)).toBe(true);
+    for (const alias of ["small", "opus", "auto", "sonnet", "mini"]) expect(isExplicitModelId(alias)).toBe(false);
+  });
+
+  it("preserves native model-shaped IDs without a pricing overlay", async () => {
+    delete process.env.GH_AW_MODELS_JSON_PATH;
+    _resetModelCostsCache();
+    expect(isExplicitModelId("gpt-5-mini")).toBe(false);
+    for (const model of ["copilot/gpt-5-mini", "gpt-5.5", "gpt-5", "openai/gpt-5.4?effort=high"]) {
+      expect(await run(model)).toMatchObject({ engineModel: model, status: "exact", alias: false });
+    }
+    expect(await run("custom-exact-model")).toMatchObject({ engineModel: "custom-exact-model", status: "exact" });
   });
 
   it.each(["copilot/gpt-5.4", "copilot/gpt-5-mini", "gpt-5.5", "gpt-5", "copilot/gpt-5"])("passes %s through as exact", async model => {
@@ -335,12 +381,43 @@ describe("resolveEngineModel without a possible catalogue", () => {
     await expect(run(model)).rejects.toMatchObject({ reason: "catalog_unavailable", message: `model-catalog retrieval prevented alias resolution for '${model}'` });
   });
 
+  it("does not mistake user-defined version-shaped glob aliases for native model IDs", async () => {
+    delete process.env.GH_AW_MODELS_JSON_PATH;
+    _resetModelCostsCache();
+    await expect(resolveEngineModel({ engine: "test", configuredModel: "custom-5", aliasMap: { "custom-5": ["copilot/custom-5*"] }, reflectData: null, env: {}, record: false })).rejects.toMatchObject({ reason: "catalog_unavailable" });
+    await expect(resolveEngineModel({ engine: "test", configuredModel: "gpt-5", aliasMap: { "gpt-5": ["copilot/other-model*"] }, reflectData: null, env: {}, record: false })).rejects.toMatchObject({ reason: "catalog_unavailable" });
+  });
+
   it("keeps the with-AWF rule: incomplete discovery fails an alias that is also a model id", async () => {
     await expect(run("copilot/gpt-5-mini", { AWF_REFLECT_ENABLED: "1" })).rejects.toMatchObject({ reason: "catalog_unavailable" });
   });
 
   it("overlays GH_AW_MODEL_ALIASES on the bundled built-ins", () => {
     expect(loadModelAliasMap({ env: { GH_AW_MODEL_ALIASES: '{"opus":["anthropic/claude-opus-4-7"]}', GH_AW_AWF_CONFIG_PATH: "/nonexistent" } })).toEqual({ ...ALIAS_MAP, opus: ["anthropic/claude-opus-4-7"] });
+  });
+});
+
+describe("resolveEngineModel with engine.model-catalog: false", () => {
+  const run = (configuredModel, aliases) => {
+    const logs = [];
+    const env = { GH_AW_MODEL_CATALOG: "false", ...(aliases ? { GH_AW_MODEL_ALIASES: JSON.stringify(aliases) } : {}) };
+    return resolveEngineModel({ engine: "test", configuredModel, reflectData: null, env, record: false, logger: msg => logs.push(msg) }).then(result => ({ result, logs }));
+  };
+
+  it("warns that a workflow-defined alias is passed through verbatim", async () => {
+    for (const model of ["gpt-fast", "copilot/gpt-fast?effort=high"]) {
+      const { result, logs } = await run(model, { "gpt-fast": ["copilot/gpt-5.6*"] });
+      expect(result).toMatchObject({ engineModel: model, status: "exact", alias: false });
+      expect(logs.some(msg => msg.includes("warning") && msg.includes("workflow-defined alias 'gpt-fast'"))).toBe(true);
+    }
+  });
+
+  it("does not warn for built-in aliases or concrete ids", async () => {
+    for (const model of ["gpt-5-mini", "small", "my-deployment"]) {
+      const { result, logs } = await run(model, { "gpt-fast": ["copilot/gpt-5.6*"] });
+      expect(result).toMatchObject({ engineModel: model, status: "exact" });
+      expect(logs.some(msg => msg.includes("warning"))).toBe(false);
+    }
   });
 });
 
@@ -369,5 +446,139 @@ describe("bundled built-in model aliases", () => {
     const first = loadBuiltinModelAliases();
     first?.sonnet.push("mutated");
     expect(loadBuiltinModelAliases()?.sonnet).toEqual(ALIAS_MAP.sonnet);
+  });
+});
+
+// Threat detection selection with the built-in alias map (github/gh-aw#74955).
+describe("built-in detection alias selection", () => {
+  // Exact 26-model Copilot catalog from cli/cli run 41881019520 (sandbox/firewall/awf-reflect.json).
+  const CLI_CLI_CATALOG = [
+    "claude-opus-4.8",
+    "claude-opus-4.8-fast",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "gpt-3.5-turbo",
+    "gpt-3.5-turbo-0613",
+    "gpt-4",
+    "gpt-4-0613",
+    "gpt-4-o-preview",
+    "gpt-4.1",
+    "gpt-4.1-2025-04-14",
+    "gpt-41-copilot",
+    "gpt-4o",
+    "gpt-4o-2024-05-13",
+    "gpt-4o-2024-08-06",
+    "gpt-4o-2024-11-20",
+    "gpt-4o-mini",
+    "gpt-4o-mini-2024-07-18",
+    "gpt-5.3-codex",
+    "gpt-5.6-luna",
+    "gpt-5.6-luna-utility",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "text-embedding-3-small",
+    "text-embedding-3-small-inference",
+    "text-embedding-ada-002",
+  ];
+
+  // Mirrors the compiled detection step: COPILOT_MODEL: ${{ vars.GH_AW_MODEL_DETECTION_COPILOT || vars.GH_AW_DEFAULT_MODEL_COPILOT || 'detection' }}
+  const detectionConfiguredModel = (vars = {}) => vars.GH_AW_MODEL_DETECTION_COPILOT || vars.GH_AW_DEFAULT_MODEL_COPILOT || "detection";
+
+  const resolveDetection = async (models, vars) => {
+    const aliasMap = loadBuiltinModelAliases();
+    expect(aliasMap).toEqual(ALIAS_MAP);
+    const result = await resolveEngineModel({
+      engine: "copilot",
+      role: "detection",
+      configuredModel: detectionConfiguredModel(vars),
+      aliasMap,
+      reflectData: { models_fetch_complete: true, endpoints: [{ configured: true, provider: "copilot", models }] },
+      env: {},
+      record: false,
+      normalize: r => normalizeForCopilotCLI(r.resolvedModel),
+    });
+    return result.engineModel;
+  };
+
+  it("resolves the real cli/cli catalog to gpt-5.6-luna, never the utility variant", async () => {
+    expect(CLI_CLI_CATALOG).toHaveLength(26);
+    expect(await resolveDetection(CLI_CLI_CATALOG)).toBe("gpt-5.6-luna");
+  });
+
+  it("keeps preferring haiku over Luna models", async () => {
+    expect(await resolveDetection(["claude-haiku-5.5", "gpt-5.6-luna", "gpt-6-luna"])).toBe("claude-haiku-5.5");
+  });
+
+  it("selects the latest Luna model and ignores suffixed Luna variants", async () => {
+    expect(await resolveDetection(["gpt-5.6-luna", "gpt-6-luna", "gpt-5.6-luna-utility", "gpt-6-luna-decisions"])).toBe("gpt-6-luna");
+  });
+
+  it("falls back to the agent tier when no small model is available", async () => {
+    expect(await resolveDetection(["claude-sonnet-5", "claude-opus-4.8", "gpt-5.6-sol"])).toBe("claude-sonnet-5");
+  });
+
+  it("does not match suffixed Luna variants and falls through to the agent tier", async () => {
+    expect(await resolveDetection(["gpt-5.6-luna-utility", "gpt-6-luna-decisions", "claude-sonnet-5"])).toBe("claude-sonnet-5");
+  });
+
+  it("falls back to the small-agent tier when no small or Luna model is available", async () => {
+    expect(await resolveDetection(["gemini-3.8-flash", "claude-sonnet-5", "gpt-5.6-sol"])).toBe("gemini-3.8-flash");
+  });
+
+  it("selects Luna when Haiku, GPT-5 Mini/Nano and Gemini Flash Lite are absent", async () => {
+    expect(await resolveDetection(["gpt-5.6-luna", "gemini-3.8-flash", "claude-sonnet-5"])).toBe("gpt-5.6-luna");
+  });
+
+  it("keeps an explicit GH_AW_MODEL_DETECTION_COPILOT override", async () => {
+    expect(await resolveDetection(CLI_CLI_CATALOG, { GH_AW_MODEL_DETECTION_COPILOT: "gpt-5.3-codex" })).toBe("gpt-5.3-codex");
+  });
+});
+
+// Copilot catalogue from github/gh-aw#76961, where `auto` chose a Decisions-only model.
+describe("alias wildcards and automatic selection eligibility", () => {
+  const ROUTING_MODELS = [
+    { model_id: "claude-haiku-4.5", automatic_selection_eligible: true },
+    { model_id: "gpt-5.3-codex", automatic_selection_eligible: true },
+    { model_id: "gpt-5.6-luna-utility", automatic_selection_eligible: false, automatic_selection_reason: "model_picker_disabled" },
+    { model_id: "gpt-6-luna-decisions", automatic_selection_eligible: false, automatic_selection_reason: "no_agent_endpoint" },
+    { model_id: "text-embedding-3-small", automatic_selection_eligible: false, automatic_selection_reason: "no_agent_endpoint" },
+  ];
+  const reflect = (routingModels = ROUTING_MODELS) => ({
+    models_fetch_complete: true,
+    endpoints: [{ configured: true, provider: "copilot", models: ROUTING_MODELS.map(model => model.model_id), ...(routingModels ? { routing_models: routingModels } : {}) }],
+  });
+  const resolve = (configuredModel, options = {}) => resolveConfiguredModel({ configuredModel, aliasMap: ALIAS_MAP, reflectData: reflect(), ...options }).modelId;
+
+  it.each(["auto", "large", "gpt-5"])("resolves %s past models that cannot serve an agent", configuredModel => {
+    expect(resolve(configuredModel)).toBe("gpt-5.3-codex");
+    expect(resolve(configuredModel, { provider: "copilot" })).toBe("gpt-5.3-codex");
+  });
+
+  it("filters a caller-supplied catalogue with the /reflect eligibility", () => {
+    const ids = ROUTING_MODELS.map(model => model.model_id);
+    expect(resolve("auto", { catalog: ids.map(id => `copilot/${id}`) })).toBe("gpt-5.3-codex");
+    expect(resolve("auto", { catalog: ids, provider: "copilot" })).toBe("gpt-5.3-codex");
+  });
+
+  it("fails an alias whose only wildcard matches are not automatically selectable", () => {
+    expect(() => resolve("gpt-6")).toThrow(expect.objectContaining({ reason: "model_unavailable" }));
+  });
+
+  it("logs the wildcard matches it skipped", () => {
+    const messages = [];
+    resolve("auto", { logger: message => messages.push(message) });
+    expect(messages).toContain("model alias resolution: 'copilot/gpt-6*' skipped copilot/gpt-6-luna-decisions: AWF marks them as not automatically selectable");
+    expect(messages).toContain("model alias resolution: 'copilot/gpt-5*' skipped copilot/gpt-5.6-luna-utility: AWF marks them as not automatically selectable");
+  });
+
+  it.each(["evals", "copilot/gpt-6-luna-decisions"])("keeps the explicit choice %s", configuredModel => {
+    expect(resolve(configuredModel)).toBe("gpt-6-luna-decisions");
+  });
+
+  it.each([
+    ["without routing_models", null],
+    ["without the eligibility field", ROUTING_MODELS.map(({ model_id }) => ({ model_id }))],
+  ])("leaves resolution unchanged when /reflect is %s", (_, routingModels) => {
+    expect(resolveConfiguredModel({ configuredModel: "auto", aliasMap: ALIAS_MAP, reflectData: reflect(routingModels) }).modelId).toBe("gpt-6-luna-decisions");
   });
 });

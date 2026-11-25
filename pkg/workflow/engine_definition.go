@@ -131,8 +131,11 @@ type ModelSelection struct {
 // engine definition frontmatter.
 type EngineCapabilitiesDefinition struct {
 	ToolsAllowlist       bool `yaml:"tools-allowlist,omitempty"`
+	GitHubCLIProxy       bool `yaml:"github-cli-proxy,omitempty"`
+	AutoMCPCLI           bool `yaml:"auto-mcp-cli,omitempty"`
 	MaxTurns             bool `yaml:"max-turns,omitempty"`
 	WebSearch            bool `yaml:"web-search,omitempty"`
+	WebFetchFallback     bool `yaml:"web-fetch-fallback,omitempty"`
 	MaxContinuations     bool `yaml:"max-continuations,omitempty"`
 	NativeAgentFile      bool `yaml:"native-agent-file,omitempty"`
 	BareMode             bool `yaml:"bare-mode,omitempty"`
@@ -145,8 +148,11 @@ type EngineCapabilitiesDefinition struct {
 func (d EngineCapabilitiesDefinition) ToRuntimeCapabilities() EngineCapabilities {
 	return EngineCapabilities{
 		ToolsAllowlist:       d.ToolsAllowlist,
+		GitHubCLIProxy:       d.GitHubCLIProxy,
+		AutoMCPCLI:           d.AutoMCPCLI,
 		MaxTurns:             d.MaxTurns,
 		WebSearch:            d.WebSearch,
+		WebFetchFallback:     d.WebFetchFallback,
 		MaxContinuations:     d.MaxContinuations,
 		NativeAgentFile:      d.NativeAgentFile,
 		BareMode:             d.BareMode,
@@ -194,14 +200,23 @@ type EngineNetworkDefinition struct {
 }
 
 // EngineInstallationDefinition describes how an engine CLI is installed.
+// EnginePythonRequirement pins one Python distribution to a version and wheel SHA-256.
+type EnginePythonRequirement struct {
+	Name    string `yaml:"name"`
+	Version string `yaml:"version"`
+	SHA256  string `yaml:"sha256"`
+}
+
 type EngineInstallationDefinition struct {
-	PackageManager     string `yaml:"package-manager,omitempty"`
-	PackageName        string `yaml:"package-name,omitempty"`
-	Version            string `yaml:"version,omitempty"`
-	StepName           string `yaml:"step-name,omitempty"`
-	BinaryName         string `yaml:"binary-name,omitempty"`
-	IncludeNodeSetup   bool   `yaml:"include-node-setup,omitempty"`
-	PostInstallScripts bool   `yaml:"post-install-scripts,omitempty"`
+	PackageManager string `yaml:"package-manager,omitempty"`
+	PackageName    string `yaml:"package-name,omitempty"`
+	Version        string `yaml:"version,omitempty"`
+	// Requirements is the pip-only complete hash-locked dependency list.
+	Requirements       []EnginePythonRequirement `yaml:"requirements,omitempty"`
+	StepName           string                    `yaml:"step-name,omitempty"`
+	BinaryName         string                    `yaml:"binary-name,omitempty"`
+	IncludeNodeSetup   bool                      `yaml:"include-node-setup,omitempty"`
+	PostInstallScripts bool                      `yaml:"post-install-scripts,omitempty"`
 	// Deprecated: workflow engine.cooldown replaces this compiler-ignored metadata.
 	Cooldown         *bool  `yaml:"cooldown,omitempty"`
 	VerifyCommand    string `yaml:"verify-command,omitempty"`
@@ -269,7 +284,11 @@ type EngineBehaviorDefinition struct {
 	Plugins             *EnginePluginsDefinition      `yaml:"plugins,omitempty"`
 	ConfigFile          *EngineConfigFileDefinition   `yaml:"config-file,omitempty"`
 	Execution           *EngineExecutionDefinition    `yaml:"execution,omitempty"`
+	Durable             *EngineDurableDefinition      `yaml:"durable,omitempty"`
 	MCP                 *EngineMCPDefinition          `yaml:"mcp,omitempty"`
+	// OutputFiles are untrusted diagnostic files retained by the redaction-gated
+	// agent artifact upload; they do not enable structured session parsing.
+	OutputFiles []string `yaml:"output-files,omitempty"`
 	// HarnessScript is the JavaScript source of a Node.js harness that spawns the
 	// engine CLI.  When non-empty the script is written to
 	// ${RUNNER_TEMP}/gh-aw/actions/<engine-id>_harness.cjs before execution and the
@@ -288,6 +307,15 @@ type EngineBehaviorDefinition struct {
 	// A createEngineLogParser wrapper is automatically appended so the author only
 	// needs to provide the parsing function; the wrapper handles exports and bootstrap.
 	LogParser string `yaml:"log-parser,omitempty"`
+}
+
+// EngineDurableDefinition reuses normal installation and execution behavior for
+// engines whose durable harness differs from their ordinary invocation.
+type EngineDurableDefinition struct {
+	Files         []string                       `yaml:"files,omitempty"`
+	Installation  []EngineInstallationDefinition `yaml:"installation,omitempty"`
+	Execution     *EngineExecutionDefinition     `yaml:"execution,omitempty"`
+	HarnessScript string                         `yaml:"harness-script,omitempty"`
 }
 
 // AuthBinding maps a logical authentication role to a secret name.
@@ -357,6 +385,7 @@ type EngineDefinition struct {
 // EngineCatalog is a collection of EngineDefinition entries backed by an EngineRegistry
 // for runtime adapter resolution.
 type EngineCatalog struct {
+	offline     bool
 	definitions map[string]*EngineDefinition
 	registry    *EngineRegistry
 }
@@ -663,9 +692,11 @@ func (c *EngineCatalog) Resolve(id string, config *EngineConfig) (*ResolvedEngin
 			constants.DocsEnginesURL)
 	}
 
-	if importPath, ok := knownEngineImportFor(id); ok {
-		errMsg += fmt.Sprintf("\n\nTip: %q is a known engine with a shared definition file. Import it before using this engine:\n\nimports:\n  - %s",
-			id, importPath)
+	if !c.offline {
+		if importPath, ok := knownEngineImportFor(id); ok {
+			errMsg += fmt.Sprintf("\n\nTip: %q is a known engine with a shared definition file. Import it before using this engine:\n\nimports:\n  - %s",
+				id, importPath)
+		}
 	}
 
 	return nil, &unknownEngineError{message: errMsg}

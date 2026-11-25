@@ -1,5 +1,47 @@
 # Ledger protocol: bounded TLA+ model-checking results
 
+## Comment-backed publication
+
+[`CommentLedgerPublication.tla`](CommentLedgerPublication.tla) models the
+[comment-backed storage contract](../../docs/src/content/docs/specs/repo-memory-ledger-specification.md#comment-backed-storage)
+separately from Git-backed transactions. It represents one target with
+serialized persistence, two batch identities with three rotated shards each,
+and at most two attempts per batch. Publication can fail without acceptance,
+succeed with a response, or be accepted with a lost response. Every retry
+starts by scanning durable history; an already present batch does not post
+another comment. Staged runs and invalid history cannot publish.
+
+`CommentLedgerPublication.cfg` checks complete batches, unique publication,
+durability before success, and the staged/invalid-history gates.
+`CommentLedgerLostResponseWitness.cfg` additionally negates reachability of
+successful reconciliation after a lost response. The expected witness verdict
+is an invariant violation of `NoLostResponseRecovery` (exit 12), not a safety
+failure. TLC 2.19 on Java 21 exhausted 279 distinct safety states at depth 13.
+The witness reached reconciliation in six states. The finite model has no
+fairness or progress claim.
+
+From `specs/ledger`, run each configuration with the repository's
+[pinned Java and TLC tooling](../../.github/aw/formal-methods.md), using a
+fresh `-metadir` for each run:
+
+```sh
+"$JAVA_BIN" -cp "$TLA2TOOLS_JAR" tlc2.TLC -workers 2 \
+  -config CommentLedgerPublication.cfg -metadir "$TMPDIR/comment-ledger-safety" \
+  CommentLedgerPublication.tla
+"$JAVA_BIN" -cp "$TLA2TOOLS_JAR" tlc2.TLC -workers 2 \
+  -config CommentLedgerLostResponseWitness.cfg -metadir "$TMPDIR/comment-ledger-witness" \
+  CommentLedgerPublication.tla
+```
+
+This models `persistCommentLedgerAppends` after resolution of the target and
+publisher. It assumes serialized writers and a complete read that sees prior
+accepted comments; delayed visibility and simultaneous cross-repository
+writers are not checked. Batch identities and prepared shard contents abstract
+deterministic IDs, rendering, and size validation. Authentication, pagination,
+partially overlapping batches, and SQLite replay are implementation obligations.
+
+## Git-backed transactions
+
 `LedgerProtocol.tla` models the generic raw-record ledger and all six declared
 types (`log`, `set`, `map`, `table`, `counter`, `notes`). Its actions represent the
 agent's queued intent, validation in `safe_outputs`, the versioned transaction
@@ -30,12 +72,13 @@ The model checks these safety properties in every reachable state:
 
 ## Behavioral test coverage
 
-The conformance tests use the repository's JavaScript ledger implementation;
-there is no Go ledger package to test. `ledger_protocol_generated.test.cjs`
-checks each TLC operation witness against `replayBuiltin`, verifies append-only
-history and shard coverage, and ensures queueing or validation leaves the
-snapshot unchanged. `ledger_protocol_model.test.cjs` adds hand-selected witnesses for each ledger
-type, including invalid note votes.
+The conformance tests use the repository's JavaScript ledger implementation.
+Go compiler wiring and tests live in `pkg/workflow/`, rather than a dedicated
+Go ledger package. `ledger_protocol_generated.test.cjs` checks each TLC
+operation witness against `replayBuiltin`, verifies append-only history and
+shard coverage, and ensures queueing or validation leaves the snapshot
+unchanged. `ledger_protocol_model.test.cjs` adds hand-selected witnesses for
+each ledger type, including invalid note votes.
 
 | Property | Concrete test |
 | --- | --- |
@@ -98,18 +141,64 @@ is distinct from the passing safety checks above.
 
 ## Abstraction boundary
 
-These are **bounded model-checking results**, not an unbounded TLAPS theorem or
-a proof of the implementation. A value denotes a canonical-JSON equality
-class, a table row has a primary key and one non-key field, a counter operation
-has amount one, and a note has a valid citation represented abstractly. IDs
-distinguish transactions but do not model hashes or duplicate-ID retries. One
-artifact contains one operation at a time; the generated traces are shortest
-operation witnesses, **not** exhaustive conformance tests for every reachable
-state. Batch temporary-ID rewriting,
-forward references in a batch, SHA-256 collision resistance, JSON schemas,
-record/shard byte limits, Git authentication, failed network pushes, DAG
-topological ordering, and real SQLite are not modeled. In particular,
-`Compact` preserves modeled history and shard-ID coverage but does not
-represent or verify the physical compaction implementation. Production tests
-cover these separate obligations. Do not interpret the safety results as a
-liveness or distributed-serializability guarantee.
+**Requirements**
+
+- Results MUST be interpreted only as bounded checks of the abstractions and
+  configurations listed above, not as an unbounded theorem or a proof of the
+  implementation.
+- Concrete runtime behavior MUST be assessed separately with implementation
+  tests; the model's shortest operation witnesses are not exhaustive
+  conformance tests for every reachable state.
+- The model does not prove batch temporary-ID rewriting, forward references,
+  SHA-256 collision resistance, JSON schemas, record/shard byte limits, Git
+  authentication, failed network pushes, DAG topological ordering, or real
+  SQLite behavior.
+
+**Safeguards**
+
+- A value MUST be understood as a canonical-JSON equality class; table rows,
+  counters, notes, transaction IDs, and artifacts remain bounded abstractions.
+- The table model has a primary key and one non-key field per row; counter
+  operations change the value by one; note votes require a citation to an
+  existing note. Each artifact contains one operation, and only one agent
+  request is in flight at a time; independent branch appends may interleave.
+- Transaction IDs are deterministic non-hash strings. Duplicate-ID collision
+  and retry behavior is not modeled.
+- Claims about `Compact` MUST be limited to preserving modeled history and
+  shard-ID coverage; physical compaction is not represented or verified.
+- The model MUST NOT be cited as evidence of liveness or
+  distributed-serializability. Production tests cover separate obligations.
+
+## Last synced with implementation (2026-11-17)
+
+- **Go compiler wiring and tests:** `pkg/workflow/compiler_main_job_ledger.go`,
+  `pkg/workflow/ledger.go`, `pkg/workflow/ledger_job.go`,
+  `pkg/workflow/ledger_test.go`,
+  `pkg/workflow/maintenance_workflow_ledger_compaction.go`,
+  `pkg/workflow/maintenance_workflow_ledger_compaction_test.go`,
+  `pkg/workflow/comment_memory_ledger_integration_test.go`,
+  `pkg/workflow/repo_memory_ledger_safe_output.go`,
+  `pkg/workflow/repo_memory_ledger_safe_output_test.go`,
+  `pkg/workflow/repo_memory_ledger_compliance_test.go`, and
+  `pkg/workflow/repo_memory_ledger_test.go` cover persistence, read-only
+  projection, compaction, and repository-memory integration.
+- **TLA+:** `LedgerProtocol.tla`, `LedgerProtocolWitness.tla`, and the `*.cfg`
+  model configurations in this directory.
+- **JavaScript implementation:** `actions/setup/js/ledger_append.cjs`,
+  `ledger_replay.cjs`, `ledger_builtin.cjs`, `ledger_mutation.cjs`,
+  `ledger_store.cjs`, `ledger_transactions.cjs`, `merge_ledger_transactions.cjs`,
+  `push_ledger_changes.cjs`, `ledger_mcp_server.cjs`,
+  `ledger_request_compaction.cjs`, `ledger_compaction.cjs`,
+  `ledger_compaction_plan.cjs`, `ledger_compaction_apply.cjs`,
+  `comment_memory_ledger.cjs`, `create_ledger_projection.cjs`, and
+  `daily_aic_repo_memory_ledger.cjs`.
+- **Conformance inputs and tests:** `actions/setup/js/ledger_protocol_vectors.json`,
+  `ledger_protocol_model.test.cjs`, `ledger_protocol_generated.test.cjs`,
+  `ledger_append.test.cjs`, `ledger_replay.test.cjs`, `ledger_builtin.test.cjs`,
+  `ledger_mutation.test.cjs`, `ledger_store.test.cjs`,
+  `ledger_transactions.test.cjs`, `merge_ledger_transactions.test.cjs`,
+  `push_ledger_changes.test.cjs`, `ledger_mcp_server.test.cjs`,
+  `ledger_request_compaction.test.cjs`, `ledger_compaction.test.cjs`,
+  `comment_memory_ledger.test.cjs`, `create_ledger_projection.test.cjs`,
+  `daily_aic_repo_memory_ledger.test.cjs`, and
+  `repo_memory_ledger_compliance.test.cjs`.

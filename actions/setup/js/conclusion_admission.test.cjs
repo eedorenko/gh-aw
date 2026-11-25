@@ -29,6 +29,7 @@ describe("admission conclusion notification", () => {
   let sessionFile;
   let options;
   beforeEach(() => {
+    vi.spyOn(fs, "appendFileSync").mockImplementation(() => {});
     vi.useFakeTimers();
     vi.stubEnv("GH_AW_OTLP_ENDPOINTS", "");
     directory = fs.mkdtempSync(path.join(os.tmpdir(), "admission-conclusion-"));
@@ -55,6 +56,8 @@ describe("admission conclusion notification", () => {
     const mask = vi.fn();
     options.env.GITHUB_TOKEN = "never-forward";
     options.env.GH_AW_ADMISSION_RESULT = "ignored";
+    options.env.GITHUB_JOB = "conclusion";
+    options.env.GITHUB_AW_OTEL_TRACE_ID = "a".repeat(32);
     expect(await sendConclusion({ ...options, fetchImpl, mask })).toEqual({ result: "delivered" });
     const [url, acquisition] = fetchImpl.mock.calls[0];
     expect(url.searchParams.get("job")).toBe("synthetic");
@@ -68,7 +71,8 @@ describe("admission conclusion notification", () => {
       authorization: `bearer ${jwt()}`,
       "content-type": "application/json",
       "cache-control": "no-store",
-      traceparent: expect.stringMatching(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/),
+      traceparent: expect.stringMatching(new RegExp(`^00-${"a".repeat(32)}-[0-9a-f]{16}-01$`)),
+      baggage: "cicd.pipeline.task.name=conclusion",
     });
     expect(JSON.parse(request.body)).toEqual({
       repo: base.GITHUB_REPOSITORY,
@@ -77,6 +81,7 @@ describe("admission conclusion notification", () => {
       workflow_call_id: `${base.GITHUB_RUN_ID}-2:${base.GH_AW_INFO_WORKFLOW_ID}`,
       run_id: base.GITHUB_RUN_ID,
       run_attempt: "2",
+      job_id: "conclusion",
       ref: base.GITHUB_REF,
       event_type: base.GITHUB_EVENT_NAME,
       actor: "original",

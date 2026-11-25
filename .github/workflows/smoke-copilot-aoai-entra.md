@@ -78,7 +78,7 @@ tools:
   cli-proxy: true
 runtimes:
   go:
-    version: "1.27.3"
+    version: "1.27.4"
 safe-outputs:
     allowed-domains: [default-safe-outputs]
     upload-artifact:
@@ -94,7 +94,7 @@ safe-outputs:
       group: true
       close-older-issues: true
       close-older-key: "smoke-copilot-aoai-entra"
-      labels: [automation, testing]
+      labels: [automation, testing, "backlog:smoke-tests"]
     create-discussion:
       category: announcements
       labels: [ai-generated]

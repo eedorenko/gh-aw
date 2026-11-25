@@ -1,7 +1,7 @@
 // @ts-check
 "use strict";
 
-const { iterateJsonl, readJsonlFile } = require("./jsonl_helpers.cjs");
+const { iterateJsonl } = require("./jsonl_helpers.cjs");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -9,10 +9,10 @@ const { validateModelIdentifier } = require("./model_attribution.cjs");
 const { normalizeForCopilotCLI, splitModelIdentifier } = require("./resolve_model_alias.cjs");
 const { copilotSessionContext } = require("./copilot_session.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { COPILOT_MODEL_VERIFICATION_EXIT_CODE } = require("./driver_exit_codes.cjs");
 
-// Exit code the SDK driver uses to report a main-session model verification failure (substitution
-// or unverifiable evidence) so the harness stops without retrying, as it does in CLI mode.
-const COPILOT_MODEL_VERIFICATION_EXIT_CODE = 79;
+// Bounds the per-run model history persisted in the selection log (16 KiB) and aw_info.json.
+const MAX_OBSERVED_MODELS = 32;
 
 function modelID(value) {
   return validateModelIdentifier(normalizeForCopilotCLI(splitModelIdentifier(String(value || "")).base));
@@ -42,6 +42,32 @@ function recordCopilotModelSelection(selection, env = process.env) {
   }
 }
 
+/**
+ * Models already observed by an earlier attempt in this agent phase, so a retried or resumed
+ * session extends the history instead of overwriting it.
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {string[]}
+ */
+function previouslyObservedModels(env) {
+  const file = path.join(env.GH_AW_TMP_DIR || "/tmp/gh-aw", "sandbox/agent/logs/copilot-model-selection.json");
+  try {
+    if (!fs.existsSync(file)) return [];
+    const record = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (record?.status !== "observed") return [];
+    const models = Array.isArray(record.observed_models) ? record.observed_models : [record.effective_model];
+    return [
+      ...new Set(
+        models
+          .filter(model => typeof model === "string")
+          .map(modelID)
+          .filter(Boolean)
+      ),
+    ].slice(-MAX_OBSERVED_MODELS);
+  } catch {
+    return [];
+  }
+}
+
 // Only the runner post-step updates workflow metadata; the harness writes a log.
 function persistCopilotModelSelection(env = process.env) {
   if (env.GH_AW_PHASE && env.GH_AW_PHASE !== "agent") return;
@@ -60,6 +86,17 @@ function persistCopilotModelSelection(env = process.env) {
       resolved_model: typeof record?.resolved_model === "string" ? modelID(record.resolved_model) : "",
       effective_model: typeof record?.effective_model === "string" ? modelID(record.effective_model) : "",
     };
+    const observedModels = Array.isArray(record?.observed_models)
+      ? [
+          ...new Set(
+            record.observed_models
+              .filter(model => typeof model === "string")
+              .map(modelID)
+              .filter(Boolean)
+          ),
+        ].slice(0, MAX_OBSERVED_MODELS)
+      : [];
+    if (observedModels.length > 1) selection.observed_models = observedModels;
     if (!selection.configured_model || !["observed", "substituted", "unavailable"].includes(selection.status)) throw new Error("Invalid Copilot model selection");
     if (selection.status === "unavailable") {
       selection.resolved_model = "";
@@ -80,9 +117,9 @@ function persistCopilotModelSelection(env = process.env) {
 /**
  * Observe only the invocation's exact session and newly appended records, not other sessions or subagents.
  * Native CLI startup fallback is not an authorized AWF fallback.
- * @param {{ configuredModel: string, resolvedModel: string, sessionId?: string, env?: NodeJS.ProcessEnv, sessionDirs?: string[], logger?: (message: string) => void }} options
+ * @param {{ configuredModel: string, resolvedModel: string, sessionId?: string, env?: NodeJS.ProcessEnv, sessionDirs?: string[], logger?: (message: string) => void, onSessionProgress?: () => void, verifyModel?: boolean }} options
  */
-function createCopilotModelObserver({ configuredModel, resolvedModel, sessionId, env = process.env, sessionDirs, logger = () => {} }) {
+function createCopilotModelObserver({ configuredModel, resolvedModel, sessionId, env = process.env, sessionDirs, logger = () => {}, onSessionProgress = () => {}, verifyModel = true }) {
   const directories = sessionDirs || copilotSessionStateDirectories(env);
   /** @type {Map<string, number>} */
   const offsets = new Map();
@@ -91,7 +128,8 @@ function createCopilotModelObserver({ configuredModel, resolvedModel, sessionId,
   let diagnostic = "";
   let observedModel = "";
   const expected = modelID(resolvedModel);
-  if (!expected || (env.GH_AW_PHASE && env.GH_AW_PHASE !== "agent")) return { check: () => "" };
+  const checkModel = verifyModel && Boolean(expected) && (!env.GH_AW_PHASE || env.GH_AW_PHASE === "agent");
+  const observedModels = new Set(previouslyObservedModels(env));
   if (!sessionId || !/^[a-z0-9_-]+$/i.test(sessionId)) throw new Error("Copilot model verification requires an exact invocation session ID");
   const ownedSessionId = sessionId;
 
@@ -141,11 +179,27 @@ function createCopilotModelObserver({ configuredModel, resolvedModel, sessionId,
         for (const event of iterateJsonl(text.slice(0, end))) {
           const context = copilotSessionContext(event);
           if (context.agentId !== undefined || context.parentToolUseId || (context.sessionId !== undefined && context.sessionId !== ownedSessionId)) continue;
+          if (isCopilotSessionProgress(event, ownedSessionId)) onSessionProgress();
+          if (!checkModel) continue;
           const model = modelID(event.type === "session.model_change" && event.data?.source === "startup" ? event.data.newModel : event.type === "assistant.message" ? event.data?.model : "");
           if (!model || model === observedModel) continue;
           observedModel = model;
+          if (!observedModels.has(model)) {
+            const oldest = observedModels.values().next().value;
+            if (observedModels.size >= MAX_OBSERVED_MODELS && oldest !== undefined) observedModels.delete(oldest);
+            observedModels.add(model);
+          }
           const substituted = expected.toLowerCase() !== "auto" && model.toLowerCase() !== expected.toLowerCase();
-          recordCopilotModelSelection({ status: substituted ? "substituted" : "observed", configured_model: configuredModel, resolved_model: resolvedModel, effective_model: model }, env);
+          recordCopilotModelSelection(
+            {
+              status: substituted ? "substituted" : "observed",
+              configured_model: configuredModel,
+              resolved_model: resolvedModel,
+              effective_model: model,
+              ...(observedModels.size > 1 ? { observed_models: [...observedModels] } : {}),
+            },
+            env
+          );
           if (substituted) {
             diagnostic = modelSubstitutionDiagnostic(expected, model);
             logger(diagnostic);
@@ -161,6 +215,19 @@ function createCopilotModelObserver({ configuredModel, resolvedModel, sessionId,
     }
   }
   return { check };
+}
+
+/**
+ * Progress means successful main-session model/tool work, not startup, user input,
+ * subagent activity or synthesized runtime-error messages. Native JSONL and SDK
+ * stream events use the same contract, independently of model verification.
+ * @param {any} event
+ * @param {string | undefined} [sessionId]
+ */
+function isCopilotSessionProgress(event, sessionId) {
+  const context = copilotSessionContext(event);
+  if (context.agentId !== undefined || context.parentToolUseId || (sessionId && context.sessionId !== undefined && context.sessionId !== sessionId)) return false;
+  return event?.type === "tool.execution_start" || (event?.type === "assistant.message" && event.data?.rte !== true);
 }
 
 /** @param {any} event */
@@ -185,9 +252,9 @@ function sdkEventModel(event) {
  * The expected model is the qualified session model (the router's wire model on routed runs);
  * the configured SDK provider mapping reconciles provider-qualified and bare identifiers.
  * A recorded substitution is final: later matching events cannot clear it.
- * @param {{ configuredModel: string, expectedModel: string, providerConfig?: { providers: Array<{ name: string }>, models: Array<{ provider: string, id: string }> } | null, env?: NodeJS.ProcessEnv, sessionDirs?: string[], logger?: (message: string) => void }} options
+ * @param {{ configuredModel: string, expectedModel: string, sessionId?: string, providerConfig?: { providers: Array<{ name: string }>, models: Array<{ provider: string, id: string }> } | null, env?: NodeJS.ProcessEnv, sessionDirs?: string[], logger?: (message: string) => void }} options
  */
-function createCopilotSDKModelObserver({ configuredModel, expectedModel, providerConfig = null, env = process.env, sessionDirs, logger = () => {} }) {
+function createCopilotSDKModelObserver({ configuredModel, expectedModel, sessionId: restoredSessionId, providerConfig = null, env = process.env, sessionDirs, logger = () => {} }) {
   if (!configuredModel || (env.GH_AW_PHASE && env.GH_AW_PHASE !== "agent")) return { observe: () => "", finalize: () => "", setSessionId: () => {} };
   const rows = providerConfig ? providerConfig.models.filter(entry => providerConfig.providers.some(provider => provider.name === entry.provider)) : [];
   /** @param {string} base */
@@ -200,6 +267,15 @@ function createCopilotSDKModelObserver({ configuredModel, expectedModel, provide
   let sessionId = "";
   let diagnostic = "";
   let recorded = "";
+  const observedModels = new Set();
+  const initialOffsets = new Map();
+  if (restoredSessionId) {
+    if (!/^[a-z0-9_-]+$/i.test(restoredSessionId)) throw new Error("Copilot model verification requires an exact restored session ID");
+    for (const directory of sessionDirs || copilotSessionStateDirectories(env)) {
+      const file = path.join(directory, restoredSessionId, "events.jsonl");
+      if (fs.existsSync(file)) initialOffsets.set(file, fs.statSync(file).size);
+    }
+  }
 
   /** @param {any} event */
   function observe(event) {
@@ -219,7 +295,20 @@ function createCopilotSDKModelObserver({ configuredModel, expectedModel, provide
       const effective = matches ? (unconstrained ? model : expected) : validateModelIdentifier(base) || model;
       if (matches && effective === recorded) return "";
       recorded = effective;
-      recordCopilotModelSelection({ status: matches ? "observed" : "substituted", configured_model: configuredModel, resolved_model: resolvedModel, effective_model: effective }, env);
+      if (!observedModels.has(effective)) {
+        if (observedModels.size >= MAX_OBSERVED_MODELS) observedModels.delete(observedModels.values().next().value);
+        observedModels.add(effective);
+      }
+      recordCopilotModelSelection(
+        {
+          status: matches ? "observed" : "substituted",
+          configured_model: configuredModel,
+          resolved_model: resolvedModel,
+          effective_model: effective,
+          ...(observedModels.size > 1 ? { observed_models: [...observedModels] } : {}),
+        },
+        env
+      );
       if (matches) return "";
       diagnostic = modelSubstitutionDiagnostic(expected, effective);
     } catch (error) {
@@ -242,7 +331,10 @@ function createCopilotSDKModelObserver({ configuredModel, expectedModel, provide
       for (const directory of sessionDirs || copilotSessionStateDirectories(env)) {
         const file = path.join(directory, id, "events.jsonl");
         if (!fs.existsSync(file)) continue;
-        for (const event of readJsonlFile(file)) if (observe(event)) return diagnostic;
+        const bytes = fs.readFileSync(file);
+        const offset = initialOffsets.get(file) || 0;
+        if (offset > bytes.length) throw new Error("Restored Copilot transcript was truncated during model verification");
+        for (const event of iterateJsonl(bytes.subarray(offset).toString("utf8"))) if (observe(event)) return diagnostic;
       }
     } catch (error) {
       diagnostic = verificationFailureDiagnostic(error);
@@ -278,4 +370,13 @@ function readCopilotModelSubstitution(env = process.env) {
   }
 }
 
-module.exports = { COPILOT_MODEL_VERIFICATION_EXIT_CODE, copilotSessionStateDirectories, createCopilotModelObserver, createCopilotSDKModelObserver, readCopilotModelSubstitution, recordCopilotModelSelection, persistCopilotModelSelection };
+module.exports = {
+  COPILOT_MODEL_VERIFICATION_EXIT_CODE,
+  copilotSessionStateDirectories,
+  createCopilotModelObserver,
+  createCopilotSDKModelObserver,
+  isCopilotSessionProgress,
+  readCopilotModelSubstitution,
+  recordCopilotModelSelection,
+  persistCopilotModelSelection,
+};

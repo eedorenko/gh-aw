@@ -192,10 +192,23 @@ function readInboundAwContext(payload) {
   return parseInboundAwContext(payload?.inputs?.aw_context) || parseInboundAwContext(payload?.client_payload?.aw_context);
 }
 
+/**
+ * The dispatched worker input `work_queue_assignment` is exactly `{"version":4,"dispatch_id":"d_…"}`;
+ * the worker loads its Claims from the ledger by `dispatch_id`.
+ * @returns {{version: 4, dispatch_id: string}}
+ */
 function parseWorkQueueAssignment(raw) {
-  const { parseStrictJSON } = require("./work_queue_codec.cjs");
-  const { normalizeAssignment } = require("./work_queue_claim_scope.cjs");
-  return normalizeAssignment(typeof raw === "string" ? parseStrictJSON(raw) : raw);
+  const { identity, parseStrictJSON } = require("./work_queue_codec.cjs");
+  let value;
+  try {
+    value = typeof raw === "string" ? parseStrictJSON(raw) : raw;
+    if (!isRecord(value) || Object.keys(value).length !== 2 || value.version !== 4 || !Object.hasOwn(value, "dispatch_id")) throw new Error("shape");
+    identity(value.dispatch_id, "dispatch_id");
+  } catch {
+    throw new TypeError("work_queue_assignment_invalid");
+  }
+  // prettier-ignore
+  return Object.freeze({ version: /** @type {const} */ (4), dispatch_id: /** @type {string} */ (value.dispatch_id) });
 }
 
 function readInboundWorkQueueAssignment(payload) {
@@ -284,6 +297,7 @@ function normalizeLegacyWorkQueueContext(awContext, rawClaim) {
  *   episode_id: string,
  *   hop_id: string,
  *   parent_hop_id: string,
+ *   parent_run_id: string,
  *   origin_event: string,
  *   root_repo: string,
  *   root_workflow_id: string,
@@ -353,6 +367,10 @@ function normalizeLegacyWorkQueueContext(awContext, rawClaim) {
  *     pattern).  Propagated to child workflows so their confused-deputy check can
  *     skip the actor-vs-comment-author mismatch guard for this known-safe scenario.
  *     `false` in all other cases.
+ *
+ * Not produced here: `continuation_run_id` names the run whose durable checkpoint
+ * a dispatched run should resume. Only continuation dispatchers set it, and it is
+ * never relayed, so it applies to exactly one hop.
  */
 function buildAwContext() {
   const { item_type, item_number, comment_id, comment_node_id } = resolveItemContext(context.payload);
@@ -416,6 +434,7 @@ function buildAwContext() {
     // parent_hop_id identifies the immediate caller when a workflow was spawned
     // by a previous automation hop.
     parent_hop_id: parentHopId,
+    parent_run_id: parentHopId.match(/^([1-9]\d*)-/)?.[1] || "",
     // origin_event captures the original GitHub event that started the episode.
     origin_event: originEvent,
     // root_* fields stay stable across all child workflow hops in the episode.

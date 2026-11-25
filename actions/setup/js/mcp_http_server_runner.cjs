@@ -8,7 +8,7 @@
  * between mcp_scripts_mcp_server_http.cjs and safe_outputs_mcp_server_http.cjs.
  *
  * It handles:
- * - CORS headers and OPTIONS preflight
+ * - Rejection of requests carrying an Origin header
  * - GET /health endpoint
  * - API key authentication and bounded request body reads
  * - POST body parsing and JSON-RPC request routing
@@ -22,6 +22,7 @@
 const http = require("http");
 const { timingSafeEqual } = require("crypto");
 const { createLogger } = require("./mcp_logger.cjs");
+const { ERR_CONFIG } = require("./error_codes.cjs");
 
 const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
 const REQUEST_BODY_TIMEOUT_MS = 30_000;
@@ -33,7 +34,7 @@ const REQUEST_BODY_TIMEOUT_MS = 30_000;
  */
 function requireHttpApiKey(apiKey, credentialName) {
   if (typeof apiKey !== "string" || !apiKey.trim()) {
-    throw new Error(`${credentialName} must be set to a non-empty API key for HTTP MCP requests`);
+    throw new Error(`${ERR_CONFIG}: ${credentialName} must be set to a non-empty API key for HTTP MCP requests`);
   }
   return apiKey;
 }
@@ -116,11 +117,6 @@ async function runHttpServer(options) {
 
   const httpServer = http.createServer(async (req, res) => {
     req.on("error", error => logger.debugError("HTTP request stream error: ", error));
-    // Set CORS headers for development
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization");
-
     /** @param {number} statusCode @param {string} message */
     function rejectRequest(statusCode, message) {
       // Flush the error response, then close rather than draining an unbounded upload.
@@ -130,10 +126,9 @@ async function runHttpServer(options) {
       res.end(JSON.stringify({ error: message }));
     }
 
-    // Handle OPTIONS preflight
-    if (req.method === "OPTIONS") {
-      res.writeHead(200);
-      res.end();
+    // The default gateway configuration and runner health checks do not set Origin.
+    if (req.headers.origin !== undefined) {
+      rejectRequest(403, "Origin header not permitted on this endpoint");
       return;
     }
 
@@ -225,7 +220,7 @@ async function runHttpServer(options) {
   httpServer.headersTimeout = REQUEST_BODY_TIMEOUT_MS;
   httpServer.requestTimeout = REQUEST_BODY_TIMEOUT_MS;
 
-  // Start listening
+  // Bridged gateways and agents reach MCP Scripts through the Docker host gateway.
   logger.debug(`Attempting to bind to port ${port}...`);
   httpServer.listen(port, () => {
     logger.debug(`=== ${serverLabel} HTTP Server Started Successfully ===`);

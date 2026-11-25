@@ -23,6 +23,14 @@ func TestAuditCommandDescriptionsAreConsistent(t *testing.T) {
 	assert.Contains(t, cmd.Long, "remaining runs are compared against it", "audit help should document multi-run analysis mode")
 }
 
+func TestCLICommandPathUsesExtensionPrefixWhenAttached(t *testing.T) {
+	root := &cobra.Command{Use: "gh aw"}
+	cmd := &cobra.Command{Use: "work-queue"}
+	root.AddCommand(cmd)
+
+	assert.Equal(t, "gh aw work-queue", cliCommandPath(cmd))
+}
+
 func TestTrialCommandUsesStandardExamplesHeading(t *testing.T) {
 	t.Parallel()
 	cmd := NewTrialCommand(func(string) error { return nil })
@@ -104,6 +112,132 @@ func TestCLIDocsReflectStatusAuditExperimentsAndGradersCommands(t *testing.T) {
 	assert.Contains(t, text, "| `-h`, `--help` | Show help (`gh aw help [command]` for command-specific help) |\n| `-v`, `--verbose` | Enable verbose output showing detailed information |\n| `--banner` | Display ASCII logo banner with purple GitHub color theme |", "global options table rows should remain contiguous")
 }
 
+func TestCLIDocsDocumentTimeoutFlagFormats(t *testing.T) {
+	t.Parallel()
+	_, currentFile, _, ok := runtime.Caller(0)
+	require.True(t, ok, "should resolve current test file path")
+
+	docsPath := filepath.Join(filepath.Dir(currentFile), "..", "..", "docs", "src", "content", "docs", "setup", "cli.md")
+	content, err := os.ReadFile(docsPath)
+	require.NoError(t, err, "should read CLI setup docs")
+
+	text := string(content)
+	assert.Contains(t, text, "| `audit` | Go duration | `0` | `--timeout 5m` | No additional deadline |")
+	assert.Contains(t, text, "| `health` | Go duration | `2m` | `--timeout 5m` | Disables its collection deadline |")
+	assert.Contains(t, text, "| `connector test` | Go duration greater than zero and at most `20s` | `20s` | `--timeout 10s` | Rejected |")
+	assert.Contains(t, text, "| `logs episode` | Go duration | `5m` | `--timeout 10m` | Rejected |")
+	assert.Contains(t, text, "| `logs`, `forecast` | Integer minutes or whole-minute duration | `0` | `--timeout 5` or `--timeout 5m` | No timeout |")
+	assert.Contains(t, text, "| `trial` | Integer minutes or whole-minute duration | `30` | `--timeout 10` or `--timeout 10m` | No timeout |")
+	assert.Equal(t, 2, strings.Count(text, "`--repos`, `--interactive/-i`, `--dry-run`"))
+}
+
+func TestEditAndUpgradeHelpScope(t *testing.T) {
+	t.Parallel()
+	assert.Contains(t, NewEditCommand().Long, "gh aw update --no-merge to replace them with the upstream version")
+	assert.Contains(t, NewUpgradeCommand(validateEngineStub).Long, "all Markdown files in the workflow directory (default .github/workflows)")
+}
+
+func TestCLIDocsDocumentLogsEpisodeDeliveryOptions(t *testing.T) {
+	t.Parallel()
+	_, currentFile, _, ok := runtime.Caller(0)
+	require.True(t, ok)
+	content, err := os.ReadFile(filepath.Join(filepath.Dir(currentFile), "..", "..", "docs", "src", "content", "docs", "setup", "cli.md"))
+	require.NoError(t, err)
+	text := string(content)
+	start := strings.Index(text, "##### `logs episode <run-id-or-url>`")
+	require.NotEqual(t, -1, start)
+	end := strings.Index(text[start:], "\n#### ")
+	require.NotEqual(t, -1, end)
+	section := text[start : start+end]
+	assert.Contains(t, section, "| `--delivery` |")
+	assert.Contains(t, section, "| `--adoption` |")
+	assert.Contains(t, section, "| `--adoption-dir` |")
+	assert.Contains(t, section, "Requires `--adoption`")
+}
+
+func TestCLIDocsDocumentCommandSideEffectsAndDefaults(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	require.True(t, ok, "should resolve current test file path")
+
+	docsPath := filepath.Join(filepath.Dir(currentFile), "..", "..", "docs", "src", "content", "docs", "setup", "cli.md")
+	content, err := os.ReadFile(docsPath)
+	require.NoError(t, err, "should read CLI setup docs")
+	text := string(content)
+
+	section := func(name, next string) string {
+		start := strings.Index(text, "#### `"+name+"`")
+		require.NotEqual(t, -1, start, "CLI setup docs should contain the %s section", name)
+		end := strings.Index(text[start:], "#### `"+next+"`")
+		require.NotEqual(t, -1, end, "CLI setup docs should contain the section after %s", name)
+		return strings.Join(strings.Fields(text[start:start+end]), " ")
+	}
+
+	fixDocs := section("fix", "format")
+	fixHelp := NewFixCommand().Long
+	assert.Contains(t, fixHelp, "deprecated .github/aw/schemas/agentic-workflow.json")
+	assert.Contains(t, fixHelp, "old template files")
+	assert.Contains(t, fixHelp, "legacy files under .github/agents/")
+	assert.Contains(t, fixHelp, ".github/aw/upgrade-agentic-workflow.md")
+	assert.Contains(t, fixHelp, "instruction-file updates are disabled")
+	assert.Contains(t, fixHelp, ".github/skills/agentic-workflows/SKILL.md")
+	assert.Contains(t, fixHelp, ".github/agents/agentic-workflows.md")
+	for _, path := range []string{
+		".github/aw/schemas/agentic-workflow.json",
+		"pkg/cli/templates/",
+		".github/agents/",
+		".github/aw/upgrade-agentic-workflow.md",
+		".github/skills/agentic-workflows/SKILL.md",
+		".github/agents/agentic-workflows.md",
+	} {
+		assert.Contains(t, fixDocs, path, "fix docs should describe --write changes to %s", path)
+	}
+	assert.Contains(t, fixDocs, "Without `--write`, no files are modified.")
+	assert.Contains(t, fixDocs, "including `.agent.md` and `.md` files")
+	assert.Contains(t, fixDocs, "skipped when instruction-file updates are disabled")
+
+	trialDocs := section("trial", "run")
+	trialHelp := NewTrialCommand(func(string) error { return nil })
+	deleteHostRepoFlag := trialHelp.Flags().Lookup("delete-host-repo-after")
+	require.NotNil(t, deleteHostRepoFlag, "trial command should define --delete-host-repo-after")
+	assert.Contains(t, trialHelp.Long, "retained by default")
+	assert.Contains(t, deleteHostRepoFlag.Usage, "retained by default")
+	assert.Equal(t, "false", deleteHostRepoFlag.DefValue)
+	assert.Contains(t, trialDocs, "the host repository is retained after the trial")
+	assert.Contains(t, trialDocs, "including an existing repository supplied with `--host-repo`")
+
+	listDocs := section("list", "status")
+	t.Setenv("GH_AW_WORKFLOWS_DIR", "")
+	listHelp := NewListCommand()
+	staleFlag := listHelp.Flags().Lookup("stale")
+	require.NotNil(t, staleFlag, "list command should define --stale")
+	pathFlag := listHelp.Flags().Lookup("path")
+	require.NotNil(t, pathFlag, "list command should define --path")
+	assert.Contains(t, staleFlag.Usage, "(local only)")
+	assert.Equal(t, "false", staleFlag.DefValue)
+	assert.Contains(t, pathFlag.Usage, "remote repository")
+	assert.Equal(t, ".github/workflows", pathFlag.DefValue)
+	assert.Contains(t, listDocs, "Without `--repo`")
+	assert.Contains(t, listDocs, "without GitHub API queries")
+	assert.Contains(t, listDocs, "With `--repo`")
+	assert.Contains(t, listDocs, "remote workflows directory (default: `$GH_AW_WORKFLOWS_DIR` or `.github/workflows`)")
+	assert.Contains(t, listDocs, "The `--stale` filter is local-only")
+	assert.NotContains(t, listDocs, "`list` enumerates workflows locally without GitHub API queries.")
+
+	logsDocs := section("logs", "audit")
+	logsCommand := NewLogsCommand()
+	artifactsFlag := logsCommand.Flags().Lookup("artifacts")
+	require.NotNil(t, artifactsFlag, "logs command should define --artifacts")
+	assert.Equal(t, "[usage]", artifactsFlag.DefValue)
+	logsHelp := logsCommand.Long
+	assert.Contains(t, logsHelp, "only the compact usage artifact is downloaded")
+	assert.Contains(t, logsDocs, "By default, only the compact usage")
+	assert.Contains(t, logsDocs, "`--artifacts` replaces this default")
+	assert.Contains(t, logsDocs, "`--artifacts agent`")
+	assert.Contains(t, logsDocs, "`--artifacts firewall`")
+	assert.Contains(t, logsDocs, "`--artifacts usage,agent`")
+	assert.Contains(t, logsDocs, "downloads only agent data")
+}
+
 func TestSubcommandListingsUseHyphenBullets(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -155,6 +289,17 @@ func TestHelpTextUsesStandardEgPunctuation(t *testing.T) {
 	assert.Contains(t, NewExperimentsAnalyzeSubcommand().Long, "e.g., \"my-workflow\"", "experiments analyze help should use e.g., punctuation")
 }
 
+func TestHelpTextUsesConsistentFlagDescriptions(t *testing.T) {
+	t.Parallel()
+	add := NewAddCommand(func(string) error { return nil })
+	assert.Contains(t, add.Long, "default: $GH_AW_WORKFLOWS_DIR or .github/workflows")
+
+	value := NewValueCommand()
+	jsonFlag := value.Flags().Lookup("json")
+	require.NotNil(t, jsonFlag)
+	assert.Equal(t, "Output results in JSON format", jsonFlag.Usage)
+}
+
 func TestCommandExamplesDoNotEndWithTrailingNewline(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -204,7 +349,7 @@ func TestLegacyNestedGHHelpIsRejected(t *testing.T) {
 
 			err := cmd.Execute()
 			require.Error(t, err)
-			assert.Equal(t, `unknown command "gh" for "`+tt.cmdName+`"`, err.Error())
+			assert.Equal(t, `unknown command "gh" for "gh aw `+tt.cmdName+`"`, err.Error())
 		})
 	}
 }

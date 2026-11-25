@@ -11,6 +11,20 @@ import (
 	"github.com/github/gh-aw/pkg/testutil"
 )
 
+func TestCommentMemoryWorkflowConcurrencyNoCancellation(t *testing.T) {
+	for _, command := range []bool{false, true} {
+		data := &WorkflowData{
+			On:                  "on:\n  pull_request:",
+			CommentMemoryConfig: &CommentMemoryConfig{},
+			CommandOtherEvents:  map[string]any{"pull_request": nil},
+		}
+		config := GenerateConcurrencyConfig(data, command)
+		if strings.Contains(config, "cancel-in-progress:") || !strings.Contains(config, "queue: max") {
+			t.Errorf("comment-memory workflow must queue rather than cancel a writer (command=%v):\n%s", command, config)
+		}
+	}
+}
+
 func TestConcurrencyRules(t *testing.T) {
 	// Test the new concurrency rules for pull_request and alias workflows
 	tmpDir := testutil.TempDir(t, "concurrency-test")
@@ -1502,6 +1516,19 @@ func TestHasBotSelfCancelRisk(t *testing.T) {
 			description: "issue_comment workflows with GitHub App safe-outputs can self-cancel",
 		},
 		{
+			name: "mixed pull_request and issue_comment with broker is at risk",
+			workflowData: &WorkflowData{
+				On: `on:
+  pull_request:
+    types: [opened]
+  issue_comment:
+    types: [created]`,
+				SafeOutputs: &SafeOutputsConfig{TokenBroker: true},
+			},
+			expected:    true,
+			description: "broker-authored comments must be isolated from the originating PR run",
+		},
+		{
 			name: "command trigger with github-app is at risk",
 			workflowData: &WorkflowData{
 				On:          `on:`,
@@ -1722,6 +1749,21 @@ func TestGenerateConcurrencyConfigWithBotIsolation(t *testing.T) {
   group: "gh-aw-${{ github.workflow }}-${{ contains(github.actor, '[bot]') && github.run_id || github.event.issue.number || github.run_id }}"
   queue: max`,
 			description: "issue_comment + github-app generates bot-isolated concurrency group",
+		},
+		{
+			name: "mixed pull_request and issue_comment with broker uses bot-actor isolation",
+			workflowData: &WorkflowData{
+				On: `on:
+  pull_request:
+    types: [opened]
+  issue_comment:
+    types: [created]`,
+				SafeOutputs: &SafeOutputsConfig{TokenBroker: true},
+			},
+			expected: `concurrency:
+  group: "gh-aw-${{ github.workflow }}-${{ contains(github.actor, '[bot]') && github.run_id || github.event.issue.number || github.event.pull_request.number || github.run_id }}"
+  cancel-in-progress: true`,
+			description: "broker + mixed triggers generates bot-isolated concurrency group",
 		},
 		{
 			name: "slash_command without github-app uses standard concurrency key",

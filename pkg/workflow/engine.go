@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 
@@ -46,7 +47,7 @@ func toEngineEnvValueString(value any) (string, bool) {
 type EngineConfig struct {
 	ID                 string
 	Version            string
-	Cooldown           *int // Minimum release age in days; nil defaults to 3, zero disables it outside strict mode.
+	Cooldown           *int // Minimum release age in days; nil defaults to 3, zero disables it.
 	cooldownError      error
 	ChecksumsSHA256    string      // Trusted release checksum-manifest digest (Copilot CLI only)
 	LLMProvider        LLMProvider // Inference provider override for this engine (engine.provider / engine.model-provider)
@@ -89,15 +90,25 @@ type EngineConfig struct {
 
 	// Extensions is a list of engine-specific plugin names to install before launching the engine.
 	// Currently used by the Pi engine: each entry is passed to `pi install <extension>`.
-	Extensions []string
+	Extensions   []string
+	Durable      *DurableConfig
+	durableError error
 
-	ModelRouting   *CopilotModelRoutingConfig
-	FallbackModels []string
+	ModelRouting *CopilotModelRoutingConfig
+	// ModelRoutingDisabled records an explicit `engine.model-routing: false`,
+	// which opts out of the implicit cost/auto routing default.
+	ModelRoutingDisabled bool
+	// ModelCatalogDisabled records an explicit `engine.model-catalog: false`: the
+	// harness passes configured models verbatim instead of resolving aliases against
+	// the live model catalogue (for BYOK providers without a /models route).
+	ModelCatalogDisabled bool
+	FallbackModels       []string
 
 	// CopilotSDK enables the GitHub Copilot SDK integration.
 	// When true the compiler enables a harness-managed Copilot CLI headless sidecar
 	// and sets COPILOT_SDK_URI on child processes so the SDK can connect to it.
-	CopilotSDK bool
+	CopilotSDK    bool
+	CopilotSDKPin *copilotSDKNPMProjectPin
 
 	// Cwd is a templatable string that overrides the working directory for the engine's
 	// spawned process. When set, it is passed as GH_AW_ENGINE_CWD to the execution
@@ -131,7 +142,7 @@ type InlineEngineDriver struct {
 type EngineAuthConfig struct {
 	Type     string `json:"type"`
 	Audience string `json:"audience"`
-	Provider string `json:"provider"` // "azure", "anthropic", or "gcp"
+	Provider string `json:"provider"` // "azure", "anthropic", "gcp", or "openai"
 	// Azure WIF fields
 	AzureTenantID string `json:"azure-tenant-id"`
 	AzureClientID string `json:"azure-client-id"`
@@ -140,13 +151,15 @@ type EngineAuthConfig struct {
 	// Anthropic WIF fields
 	AnthropicFederationRuleID string `json:"federation-rule-id"`
 	AnthropicOrganizationID   string `json:"organization-id"`
-	AnthropicServiceAccountID string `json:"service-account-id"`
+	ServiceAccountID          string `json:"service-account-id"`
 	AnthropicWorkspaceID      string `json:"workspace-id"`
 	// Google / Vertex AI WIF fields
 	GoogleWorkloadIdentityProvider string `json:"workload-identity-provider"`
 	GoogleServiceAccount           string `json:"service-account"`
 	GoogleProject                  string `json:"project"`
 	GoogleLocation                 string `json:"location"`
+	// OpenAI WIF fields
+	OpenAIIdentityProviderID string `json:"identity-provider-id"`
 }
 
 // NetworkPermissions represents network access permissions for workflow execution
@@ -365,6 +378,12 @@ func extractStringEngineConfig(engineStr string, topLevel engineTopLevelConfig) 
 
 func extractObjectEngineConfig(engineObj map[string]any, topLevel engineTopLevelConfig) (string, *EngineConfig, string) {
 	engineLog.Print("Found engine in object format, parsing configuration")
+	if pi, ok := engineObj["pi"].(map[string]any); ok {
+		options := make(map[string]any, len(pi)+1)
+		maps.Copy(options, pi)
+		options["id"] = "pi"
+		return extractReferencedEngineConfig(options, topLevel)
+	}
 	if runtime, hasRuntime := engineObj["runtime"]; hasRuntime {
 		return extractInlineEngineConfig(runtime, engineObj, topLevel)
 	}
@@ -426,6 +445,7 @@ func parseNonEmptyAuthDefinition(authObj map[string]any) *AuthDefinition {
 }
 
 func applyInlineEngineFields(config *EngineConfig, engineObj map[string]any, topLevel engineTopLevelConfig) {
+	applyEngineDurableField(config, engineObj)
 	applyEngineCooldownField(config, engineObj)
 	applyEngineBareField(config, engineObj)
 	applyEnginePermissionMode(config, engineObj)
@@ -456,6 +476,7 @@ func extractReferencedEngineConfig(engineObj map[string]any, topLevel engineTopL
 }
 
 func applyReferencedEngineFields(config *EngineConfig, engineObj map[string]any, topLevel engineTopLevelConfig) {
+	applyEngineDurableField(config, engineObj)
 	applyEngineCooldownField(config, engineObj)
 	applyEngineProviderFields(config, engineObj)
 	applyEnginePermissionMode(config, engineObj)
@@ -482,6 +503,11 @@ func applyReferencedEngineFields(config *EngineConfig, engineObj map[string]any,
 }
 
 func applyEngineModelRoutingField(config *EngineConfig, engineObj map[string]any) {
+	if disabled, ok := engineObj["model-routing"].(bool); ok && !disabled {
+		config.ModelRouting = nil
+		config.ModelRoutingDisabled = true
+		return
+	}
 	routing, ok := engineObj["model-routing"].(map[string]any)
 	if !ok {
 		return
@@ -771,6 +797,17 @@ func applyEngineBooleanFields(config *EngineConfig, engineObj map[string]any) {
 		config.CopilotSDK = sdkVal
 		engineLog.Printf("Extracted copilot-sdk: %v", config.CopilotSDK)
 	}
+	if sdk, ok := engineObj["copilot-sdk"].(map[string]any); ok {
+		config.CopilotSDK = true
+		pin := &copilotSDKNPMProjectPin{}
+		if version, ok := sdk["version"].(string); ok {
+			pin.Version = version
+		}
+		if digest, ok := sdk["sha256"].(string); ok {
+			pin.SHA256 = digest
+		}
+		config.CopilotSDKPin = pin
+	}
 	if config.Driver != "" && config.ID == "copilot" && !config.CopilotSDK {
 		config.CopilotSDK = true
 		engineLog.Print("Enabled copilot-sdk because driver is configured for copilot engine")
@@ -788,6 +825,10 @@ func applyEngineBareField(config *EngineConfig, engineObj map[string]any) {
 	if bare, ok := engineObj["bare"].(bool); ok {
 		config.Bare = bare
 		engineLog.Printf("Extracted bare mode: %v", config.Bare)
+	}
+	if catalog, ok := engineObj["model-catalog"].(bool); ok {
+		config.ModelCatalogDisabled = !catalog
+		engineLog.Printf("Extracted model-catalog: %v", catalog)
 	}
 }
 
@@ -879,7 +920,7 @@ func (c *Compiler) extractEngineConfigFromJSON(engineJSON string) (*EngineConfig
 
 	_, config, model := c.ExtractEngineConfig(tempFrontmatter)
 	// Strict policy is validated after merging, using the main workflow's mode.
-	if err := validateEngineCooldown(config, false); err != nil {
+	if err := validateEngineCooldown(config); err != nil {
 		return nil, "", err
 	}
 	return config, model, nil
@@ -904,7 +945,12 @@ func applyEngineAuthEnv(config *EngineConfig) {
 	setEngineAuthEnv(config.Env, "AWF_AUTH_PROVIDER", config.Auth.Provider)
 	setEngineAuthEnv(config.Env, "AWF_AUTH_ANTHROPIC_FEDERATION_RULE_ID", config.Auth.AnthropicFederationRuleID)
 	setEngineAuthEnv(config.Env, "AWF_AUTH_ANTHROPIC_ORGANIZATION_ID", config.Auth.AnthropicOrganizationID)
-	setEngineAuthEnv(config.Env, "AWF_AUTH_ANTHROPIC_SERVICE_ACCOUNT_ID", config.Auth.AnthropicServiceAccountID)
+	if config.Auth.Provider == "openai" {
+		setEngineAuthEnv(config.Env, "AWF_AUTH_OPENAI_IDENTITY_PROVIDER_ID", config.Auth.OpenAIIdentityProviderID)
+		setEngineAuthEnv(config.Env, "AWF_AUTH_OPENAI_SERVICE_ACCOUNT_ID", config.Auth.ServiceAccountID)
+	} else {
+		setEngineAuthEnv(config.Env, "AWF_AUTH_ANTHROPIC_SERVICE_ACCOUNT_ID", config.Auth.ServiceAccountID)
+	}
 	setEngineAuthEnv(config.Env, "AWF_AUTH_ANTHROPIC_WORKSPACE_ID", config.Auth.AnthropicWorkspaceID)
 	setEngineAuthEnv(config.Env, "AWF_AUTH_GCP_WORKLOAD_IDENTITY_PROVIDER", config.Auth.GoogleWorkloadIdentityProvider)
 	setEngineAuthEnv(config.Env, "AWF_AUTH_GCP_SERVICE_ACCOUNT", config.Auth.GoogleServiceAccount)

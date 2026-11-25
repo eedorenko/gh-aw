@@ -10,7 +10,12 @@ permissions:
   issues: read
   pull-requests: read
   actions: read
-engine: claude
+  copilot-requests: write
+max-ai-credits: 250
+model: router/economy
+engine:
+  id: claude
+  model-provider: github
 timeout-minutes: 30
 tools:
   github:

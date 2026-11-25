@@ -1,5 +1,6 @@
 ---
 title: Git-backed Ledger Specification
+spec: true
 description: Specification for standalone Git-backed ledgers, built-in projections, trusted persistence, and lossless compaction
 sidebar:
   order: 1370
@@ -19,6 +20,10 @@ configuration, record identity, per-job responsibilities, built-in state models,
 concurrent reconstruction, compaction, retirement, configuration limits, the
 validated transactions consumed by trusted persistence, and the adversarial
 review of the feature.
+
+The [bounded TLA+ ledger models](https://github.com/github/gh-aw/tree/main/specs/ledger)
+cover Git-backed replay and persistence, and separately check comment-backed
+batch publication and retry reconciliation.
 
 ## 1. Conformance and terminology
 
@@ -77,6 +82,10 @@ safe-outputs job MUST NOT mutate ledger storage. An immediate safe-output respon
 MUST NOT imply durability: an accepted request becomes durable only after the
 persistence job succeeds. The persistence job MUST treat transaction artifacts
 and restored ledger files as untrusted input and revalidate both.
+The persistence job MUST run only after the safe-outputs job succeeds. Skipped,
+failed, or cancelled safe outputs MUST NOT trigger persistence. If downloading
+validated transactions fails, reconciliation MUST NOT run and the persistence
+job MUST fail rather than treating missing transactions as an empty batch.
 
 ## 4. Built-in behavior and script restrictions
 
@@ -144,6 +153,94 @@ retain the generic records projection and raw-record append interface. They
 MUST NOT execute custom replay code.
 
 ## 5. Lifecycle
+
+### Comment-backed storage
+
+Git remains the default backend. A ledger MAY declare `storage: comment-memory`
+to persist on the issue or PR selected by `tools.comment-memory` instead of a
+Git branch:
+
+```aw
+tools:
+  comment-memory:
+    target: triggering
+  ledger:
+    history:
+      storage: comment-memory
+      type: notes
+```
+
+Both backends use the same ledger operations, transaction validation,
+deterministic IDs, canonical record DAG, and read-only SQLite projections.
+Comment-backed history MUST remain readable JSONL in persisted comments, never
+base64 or a binary SQLite database. Trusted preparation reconstructs the JSONL
+records and creates the same disposable `/tmp/gh-aw/ledgers/<name>/ledger.db`
+projection used by Git-backed ledgers. The agent queries this read-only SQLite
+projection; only JSONL comments are durable state.
+Comment-backed persistence MUST run only in the trusted persistence job, using
+the configured comment-memory token, target repository, and repository allowlist.
+The target MUST be `triggering`, `*`, or a literal positive issue/PR number;
+`target-repo` MUST be literal. Staged runs MUST NOT publish ledger comments.
+
+Each accepted batch creates one new managed comment containing every new plain
+JSONL shard under separate `gh-aw-comment-ledger:<ledger-name>` code fences.
+Segment rotation MUST retain all accepted records, not just the final writer
+segment, and MUST publish every newly created segment in that same comment.
+Persistence MUST validate the complete transition, aggregate batch
+size, and exact rendered JSONL before its single publication request. An API
+failure MUST NOT report success; a retry MUST reconcile against durable history.
+The regression `rotation publishes every shard atomically and restores every
+record into the SQLite projection` in
+`actions/setup/js/comment_memory_ledger.test.cjs` MUST enforce this contract
+across three rotated shards and an idempotent retry.
+The separate marker prevents ordinary editable comment-memory files from
+overwriting ledger history. Persistence MUST NOT update or delete prior ledger
+comments. Retrying an already persisted transaction MUST NOT duplicate records.
+Within a workflow repository, the compiler serializes persistence jobs by target
+repository and issue/PR. Writers in different repositories sharing a target
+MUST coordinate externally.
+Persistence jobs MUST honor `features.group-concurrency-queue` and emit
+`queue: max` when enabled (the default), retaining pending jobs up to GitHub
+Actions queue limits. Disabling the feature restores pending-job replacement.
+Workloads requiring every run to persist MUST account for queue limits and
+workflow cancellation.
+
+Readers MUST accept ledger shards only from the verified publishing identity
+of the selected comment-memory credential, using GitHub's numeric author ID.
+PATs use the authenticated user; the built-in installation token requires
+protected compiler metadata identifying GitHub Actions, bound to the selected
+client token. Opaque configured tokens, including authored App installation-token
+expressions, MUST fail if the authenticated-user lookup cannot verify their
+identity; implementations MUST NOT guess App metadata. A provenance marker or an
+arbitrary Bot account MUST NOT authorize history. Untrusted authors' shards MUST
+be ignored before JSONL parsing and size accounting, including malformed planted shards. Failure
+to verify the writer identity MUST fail explicitly rather than trust bot authors.
+
+The `gh-aw-comment-ledger:` code-fence language namespace is reserved for typed
+blocks constructed by trusted persistence. Markdown imports from ordinary
+safe-output comments MUST neutralize that language, even when published using
+the same credential. Readers MUST ignore fences nested within editable memory
+or other code blocks. The `same-publisher %s cannot promote agent-authored ledger
+fences into history` regression covers both publication paths.
+These publication boundaries and numeric author checks are not cryptographic
+authentication: the credential's other holders can still author or edit comments.
+Deployments MUST trust every holder of the publishing credential; independent
+writers requiring stronger isolation need a persistence-only credential or an
+independently verified integrity mechanism.
+The verified publishing identity is the configured trust anchor, matching
+writer-credential authority in Git-backed storage; no separate ledger-signing
+key is required.
+
+The existing comment-memory limits apply to JSONL shards: 16 KiB per batch
+and 48 KiB total per ledger. Readers MUST fail on malformed shards or incomplete
+history, including unterminated or mismatched selected-ledger fences and the
+50-page comment scan limit. Malformed selected history MUST block both restore
+and subsequent persistence, not fall back to an older or empty ledger. The
+`malformed selected-ledger fences reject restore and later persistence: %j`
+regression enforces this rule. Comment storage does not
+support compaction; explicit enabled compaction MUST be rejected. Larger or
+long-lived histories SHOULD use Git storage. Existing comment limits and
+repository permissions still apply, and records remain untrusted data.
 
 ### 5.1 Restore and reconstruct
 

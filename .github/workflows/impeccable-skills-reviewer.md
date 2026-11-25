@@ -31,7 +31,7 @@ features:
 network:
   allowed: [defaults, go, node]
 
-model: claude-sonnet-5
+model: router/economy
 engine:
   id: copilot
   copilot-sdk: true
@@ -44,7 +44,7 @@ imports:
   - shared/otlp.md
   - shared/pr-diff-data-fetch.md
 skills:
-  - pbakaus/impeccable/.agents/skills/impeccable@19786e7a225c3688e558f8694a7c8c6a8a25d840
+  - pbakaus/impeccable/.agents/skills/impeccable@924bbd194d02e5e15a227e75b5901fb0d7a4ecad
 tools:
   cli-proxy: true
   github:

@@ -9,6 +9,9 @@ Use the `runs-on` frontmatter field to target a self-hosted runner instead of th
 
 Runners must be Linux with Docker support. macOS and Windows are not supported.
 
+> [!IMPORTANT]
+> **Runner configuration is not a product availability statement.** Choose your GitHub deployment separately from your runner topology in the [deployment and runner applicability summary](/gh-aw/reference/enterprise-configuration/#deployment-and-runner-applicability). GHES, data-residency tenant, and Kubernetes ARC end-to-end combinations remain unconfirmed unless explicitly confirmed by the product owners. See also [AWF applicability and CI boundaries](https://github.com/github/gh-aw-firewall/blob/main/docs/compatibility.md#environment-and-runner-applicability) and [AWF ARC/DinD requirements](https://github.com/github/gh-aw-firewall/blob/main/docs/arc-dind.md).
+
 To enforce self-hosted runners for every generated job, set `require_self_hosted_runners` in `.github/workflows/aw.json` or pass `--require-self-hosted-runners` for a one-off compile:
 
 ```json title=".github/workflows/aw.json"
@@ -37,7 +40,68 @@ Self-hosted runners may require `sudo` depending on the selected engine and conf
 
 - **AWF (Agentic Workflow Firewall)**: Runs rootless in the default network-isolation mode. Egress is enforced via Docker network topology — an internal Docker network (`awf-net`) with no internet route and a dual-homed Squid proxy as the sole egress path. No `sudo` and no `NET_ADMIN` are required on the runner for AWF in this mode. Container-level `iptables`, Squid proxy ACLs, and capability drops provide defense in depth, all managed inside the Docker daemon's domain.
 
-- **Copilot CLI install**: The `install_copilot_cli.sh` script runs as the runner user. By default it escalates via `sudo` for file operations (fixing `.copilot` directory ownership, cleaning stale chroot directories, and installing the Copilot binary to `/usr/local/bin`). Pass `--rootless` to the script to install to `~/.local/bin` without `sudo`, which is required on ARC pods with `allowPrivilegeEscalation: false`.
+- **Copilot CLI and threat-detect installation**: Root and passwordless-sudo runners install these binaries to `/usr/local/bin`. Rootless installation uses the job-scoped `$RUNNER_TEMP/gh-aw/bin` directory without `sudo`.
+
+### Unprivileged CLI installation
+
+Set `runner.installation: rootless` for a native Linux runner without `sudo` or write access to `/usr/local/bin`:
+
+```aw
+---
+on: issues
+runs-on: linux64-selfhosted
+runner:
+  installation: rootless
+---
+Triage this issue.
+```
+
+This setting applies to the generated Copilot CLI and threat-detect installers in the agent and detection jobs, including when `safe-outputs.threat-detection.runs-on` selects a different runner. Rootless installs use `$RUNNER_TEMP/gh-aw/bin`, a job-scoped directory that AWF mounts read-only, and publish it through `GITHUB_PATH`. This protects host-executed binaries from sandbox changes. The directory must be writable during setup. External threat detection stages the verified detector there so the sandbox can resolve it independently of its home directory. Release pins, checksum verification, HTTPS requirements, platform checks, and Copilot's trusted toolcache policy remain unchanged.
+
+Omitting `runner.installation` preserves the existing defaults. Explicit `privileged` selects the native sudo-based installation and is rejected with `runner.topology: arc-dind`.
+
+Installation privilege does not change AWF runtime privileges or enable split-filesystem handling. Leave `runner.topology` unset for a native runner; use `arc-dind` only for a split runner/daemon filesystem. Other engines, custom steps, and privileged runtime profiles may still require `sudo`. Recompile with `gh aw compile` after changing the setting; do not edit the generated lock file.
+
+When `runner.installation` is omitted, native installers automatically choose rootless mode if the runner is neither root nor able to run `sudo -n true`; root and passwordless-sudo runners retain privileged installation. ARC/DinD explicitly selects rootless mode even when sudo is available.
+
+`engine.command` skips standard Copilot installation only for the primary agent. External Copilot threat detection still installs and uses the standard `copilot` executable; it does not run the primary agent's custom command. A preinstalled executable on `PATH` does not skip either installer or its privilege checks.
+
+Rootless installation cannot repair root-owned state from previous privileged AWF runs. If preparing `~/.copilot` fails, installation stops with an ownership-repair diagnostic. Before retrying, a runner administrator must restore ownership of that directory and its contents to the runner's UID and GID and make it writable. Installers clean only their own staging directories, not shared `/tmp/awf-*-chroot-home` or `/tmp/awf-chroot-*` directories that may belong to active jobs. A runner administrator must remove confirmed stale directories before the runner is reused.
+
+## Shared-daemon concurrency
+
+Self-hosted jobs using the same Docker daemon are **serialized**, not run concurrently inside AWF. Setup acquires the daemon-visible `gh-aw-daemon-lease` container before modifying shared runtime state and holds it through the action's always/post cleanup. Another job waits up to ten minutes, then fails without starting AWF or stopping the lease owner's services. Startup retries retain the lease. Separate runs, reruns, and matrix copies receive distinct SHA-256 invocation identities incorporating run metadata and a random UUID.
+
+The lease and its private image carry the `io.github.gh-aw.invocation` label. The image is imported locally from a minimal archive containing a static pause executable for the Docker daemon's architecture; the network-isolated lease container runs that executable with an `unless-stopped` restart policy so ordinary Docker prune operations do not remove an active lease. No lock image or executable is downloaded. The container also records repository, run ID, attempt, and job labels. Acquisition uses Docker's atomic container-name reservation, not a local lock file, so separate runner processes targeting the same daemon coordinate. Cleanup verifies the invocation label and removes the lease by immutable container ID.
+
+### Compatibility resource inventory
+
+The current AWF compatibility boundary includes these shared resources:
+
+| Resource | Names or listeners | Coordination |
+| --- | --- | --- |
+| gh-aw containers | `awmg-mcpg`, `awmg-cli-proxy`, `awmg-proxy` | Startup and stop scripts require a validated lease; replacement and cleanup also verify the container's invocation label. |
+| AWF containers | `awf-agent`, `awf-squid`, `awf-iptables-init`, `awf-api-proxy`, `awf-router`, `awf-doh-proxy`, `awf-cli-proxy`, `awf-enclave-mcp-server`, `awf-enclave-agent-api-proxy` | Upstream fixed names remain inside the exclusive lease. |
+| Networks and addresses | `awf-net`, `awf-ext`, enclave networks; default subnet `172.30.0.0/24` and fixed sidecar addresses | Serialized with AWF's setup and teardown. Changing a subnet alone does not isolate resource names. |
+| Host listeners | MCP gateway `8080` by default, delegation control at gateway port + 10, MCP scripts `3000`, DIFC/CLI proxy `18443` | The entire listener lifecycle is serialized, including custom gateway ports. The MCP Scripts host PID is tracked and must exit before lease release. |
+| Sandbox listeners | Inspector `3001`, Copilot SDK `3002`; Squid `3128`, CLI proxy `11000`, provider proxies `10000`–`10005`, DNS `53` | Private to the sandbox topology, whose fixed names and addresses are serialized. |
+| Volumes and storage | Runtime bind mounts, Compose-managed state, shared `/tmp/gh-aw`, caches and image tags | No new shared named data volume is introduced. Residual `awf-*`/`awmg-*` containers, networks, volumes, and resources labelled with an `awf-*` Compose project block reuse. Image pulls retain normal content-addressed Docker behavior. |
+
+The pinned AWF release has no general resource-namespace option. gh-aw therefore cannot independently rename all upstream containers, networks, and listeners. Per-job runtime paths do **not** imply unrestricted same-host concurrency. Full parallelism requires separate hosts/VMs and Docker daemons, including isolated writable state and host listener namespaces.
+
+All jobs sharing this boundary must use this setup/cleanup implementation and the same daemon. Do not mix it with older gh-aw actions, standalone AWF commands, or unrelated workloads using the reserved names or ports. Separate daemons sharing one host's runtime paths or host networking do not coordinate with each other. Runner administrators must provide isolation for that topology. A lease is coordination between trusted runner components, not a security boundary between trust domains.
+
+### Failed or interrupted jobs
+
+Normal failure cleanup stops invocation-owned host listeners before lease release. If an MCP Scripts process, AWF container, network, or volume remains, cleanup fails closed and retains the lease instead of guessing that the resource is stale. A hard interruption that prevents post cleanup also leaves the running lease in place. There is no age-based expiry or automatic lock stealing: an old job can still have live listeners or containers.
+
+For recovery, first drain the affected runners and confirm that the recorded workflow invocation and all its processes have stopped. Inspect the lease metadata:
+
+```bash
+docker container inspect gh-aw-daemon-lease --format '{{json .Config.Labels}}'
+```
+
+A runner administrator must identify and remove only that invocation's confirmed stale resources and listeners, then remove its lease container and private image by their inspected IDs. Do not prune the daemon or remove resources by name while another invocation might be active. A lease-free daemon containing reserved AWF resources is also rejected during setup; ownership cannot be inferred merely from a stopped container or an old timestamp.
 
 ## Runner HTTP proxy settings
 
@@ -49,7 +113,7 @@ CLI proxy startup checks upstream GitHub API connectivity before reporting readi
 
 ## ARC with Docker-in-Docker (DinD)
 
-For a complete ARC DinD setup walkthrough for GitHub Copilot coding agent, see [How to run GitHub Copilot coding agent on ARC with Docker-in-Docker](/gh-aw/reference/arc-dind-copilot-agent/).
+For a complete ARC DinD setup walkthrough for the gh-aw Copilot engine, see [How to run the gh-aw Copilot engine on ARC with Docker-in-Docker](/gh-aw/reference/arc-dind-copilot-agent/).
 
 Actions Runner Controller (ARC) deployments that use a Docker-in-Docker sidecar split the runner container and the Docker daemon container across separate filesystems.
 
@@ -141,7 +205,7 @@ Triage this issue.
 
 ## Configuring the detection job runner
 
-When [threat detection](/gh-aw/reference/threat-detection/) is enabled, the detection job runs on the agent job's runner by default. Override it with `safe-outputs.threat-detection.runs-on`:
+When [threat detection](/gh-aw/reference/threat-detection/) is enabled, the detection job runs on GitHub-hosted `ubuntu-latest` by default, independently of the agent job's runner. For self-hosted-only setups, set `safe-outputs.threat-detection.runs-on` to a self-hosted runner:
 
 ```aw
 ---
@@ -154,7 +218,7 @@ safe-outputs:
 ---
 ```
 
-This is useful when your self-hosted runner lacks outbound internet access for AI detection, or when you want to run the detection job on a cheaper runner.
+The detection job runs on a separate runner from the agent job. Ensure the selected runner has the network access needed for AI detection.
 
 ## Configuring the framework job runner
 
@@ -344,9 +408,11 @@ Self-hosted runners must meet these requirements for agentic workflows to run re
 
 A working Docker daemon is required. The MCP gateway and sandbox run as containers.
 
+AWF documents Docker Engine `20.10+` and Docker Compose `v2.0+` as installation baselines, not certified deployment versions. Verify `docker info` and `docker compose version` on the actual runner. See [component prerequisites and evidence](/gh-aw/reference/enterprise-configuration/#component-versions-and-validation-evidence).
+
 - **Unix socket**: Docker must be accessible via a Unix socket (typically `/var/run/docker.sock`). If `DOCKER_HOST` is unset, the gateway mounts `/var/run/docker.sock`. If `DOCKER_HOST` is `unix://...` or a bare absolute path, the gateway mounts that socket path. Other schemes (for example `tcp://...`) are ignored for mounts and default back to `/var/run/docker.sock`.
 - **Docker group**: Grant the runner user access through the socket's owning group (typically `docker`). Do not make the socket world-accessible; Docker daemon access is a privileged host capability.
-- **ARC/Kubernetes**: Docker-in-Docker (DinD) is **required** for ARC. Set `containerMode.type="dind"` in your ARC Helm configuration. The `containerMode.type="kubernetes"` mode is not supported. The dind sidecar must share the Docker socket via an `emptyDir` volume, and the gateway retries the socket check for up to 10 seconds to handle startup race conditions. See [How to run GitHub Copilot coding agent on ARC with Docker-in-Docker](/gh-aw/reference/arc-dind-copilot-agent/) for the complete setup guide, and [ARC (Actions Runner Controller)](#arc-actions-runner-controller) below for pod security details.
+- **ARC/Kubernetes**: Docker-in-Docker (DinD) is **required** for this ARC execution path. Set `containerMode.type="dind"` in your ARC Helm configuration. The `containerMode.type="kubernetes"` mode without a Docker daemon does not satisfy this setup. The dind sidecar must share the Docker socket via an `emptyDir` volume, and the gateway retries the socket check for up to 10 seconds to handle startup race conditions. See [How to run the gh-aw Copilot engine on ARC with Docker-in-Docker](/gh-aw/reference/arc-dind-copilot-agent/) for the complete setup guide, and [ARC (Actions Runner Controller)](#arc-actions-runner-controller) below for pod security details.
 - **Split-daemon override**: On ARC or other split-daemon topologies where the socket path or group ID cannot be auto-detected, set `GH_AW_DOCKER_SOCK_PATH` and `GH_AW_DOCKER_SOCK_GID` environment variables at the runner level. See [Docker socket override for split-daemon topologies](#docker-socket-override-for-split-daemon-topologies) for details.
 
 ### Node.js
@@ -398,11 +464,11 @@ Self-hosted runners need outbound HTTPS access to:
 
 ## GHES (GitHub Enterprise Server)
 
-Agentic workflows can run on GHES with some additional configuration.
+gh-aw implements GHES compatibility paths; these are not an owner-confirmed end-to-end GHES support commitment. See the [applicability summary](/gh-aw/reference/enterprise-configuration/#deployment-and-runner-applicability) and [AWF enterprise routing scope](https://github.com/github/gh-aw-firewall/blob/main/docs/enterprise-configuration.md).
 
 ### GHES compatibility mode
 
-GHES does not support the `@actions/artifact` v2.0.0+ backend used by `upload-artifact@v4+` and `download-artifact@v4+`. Compiled workflows use the latest artifact action versions by default, which fail on GHES with `GHESNotSupportedError`.
+GHES instances without the `@actions/artifact` v2.0.0+ backend cannot use `upload-artifact@v4+` and `download-artifact@v4+`. Default compiled artifact actions fail there with `GHESNotSupportedError`.
 
 Enable GHES compatibility mode in `.github/workflows/aw.json` to compile with GHES mode explicitly enabled:
 
@@ -420,11 +486,11 @@ gh aw compile --ghes my-workflow.md
 
 Compatibility mode emits `upload-artifact@v3.2.2` and `download-artifact@v3.1.0`, which use the artifact backend supported by GHES. Default GitHub.com compilation continues to use the latest artifact actions.
 
-This path supports GHES 3.21.x and earlier when the workflow runs on Actions Runner 2.327.1 or later, which is required by the Node.js 24 runtime used by these pinned artifact actions. Keep compatibility mode enabled on later releases until the instance supports the v4 artifact backend.
+Compatibility mode also omits compiler-generated `cache-mode` fields. The historical GHES 3.21.x-and-earlier guidance concerns artifact-backend compatibility only; Actions Runner `2.327.1+` is the pinned actions' Node.js 24 requirement. Neither is a stack certification or a tested GHES release matrix. See [GHES compatibility mode and its cache security caveat](/gh-aw/reference/enterprise-configuration/#ghes-compatibility-mode).
 
 ### API endpoint
 
-GHES instances need the `api-target` engine configuration. See [Enterprise Configuration](/gh-aw/reference/enterprise-configuration/) for full setup instructions.
+For Copilot compatibility investigations, configure the inference endpoint confirmed for your deployment, independently of the GHES repository/API host. The example below is an enterprise endpoint routing example, not proof that Copilot is available on the server. See [Copilot prerequisites](/gh-aw/troubleshooting/common-issues/#copilot-engine-prerequisites-on-ghes).
 
 ```aw
 ---
@@ -441,7 +507,7 @@ network:
 
 ## ARC (Actions Runner Controller)
 
-GitHub Copilot coding agent **requires** Docker-in-Docker (DinD) mode on ARC. Set `containerMode.type="dind"` in your ARC Helm configuration. The `containerMode.type="kubernetes"` mode is not supported.
+The gh-aw Copilot engine's ARC path **requires** Docker-in-Docker (DinD). It runs Copilot CLI in an Actions job, not the separate GitHub Copilot coding-agent service. Set `containerMode.type="dind"` in your ARC Helm configuration; Kubernetes mode without a Docker daemon does not satisfy this path.
 
 Set `runner.topology: arc-dind` in workflow frontmatter to enable ARC DinD split-filesystem handling. See the [ARC with Docker-in-Docker (DinD)](#arc-with-docker-in-docker-dind) section above and the [ARC DinD setup guide](/gh-aw/reference/arc-dind-copilot-agent/) for a complete walkthrough.
 
@@ -460,4 +526,4 @@ The dind sidecar requires `privileged: true` so `dockerd` can run. The runner co
 In network-isolation mode (the default for `topology: arc-dind`), AWF enforces egress via Docker network topology — an internal Docker network with no internet route and a dual-homed Squid proxy. All network enforcement happens inside the Docker daemon's domain (the dind sidecar). The runner container only issues Docker API commands via the socket; it never manipulates host `iptables` or network namespaces.
 
 > [!NOTE]
-> If your cluster enforces `allowPrivilegeEscalation: false` or `no-new-privileges` on the runner container, pass `--rootless` to the Copilot CLI install script so it installs to `~/.local/bin` without `sudo`. See [Pod security and rootless install](/gh-aw/reference/arc-dind-copilot-agent/#pod-security-and-rootless-install) in the ARC DinD guide.
+> ARC DinD selects rootless installation by default. If you install Copilot CLI manually in a setup step on a runner that enforces `allowPrivilegeEscalation: false` or `no-new-privileges`, pass `--rootless` so it installs to `$RUNNER_TEMP/gh-aw/bin` without `sudo`. See [Pod security and rootless install](/gh-aw/reference/arc-dind-copilot-agent/#pod-security-and-rootless-install) in the ARC DinD guide.

@@ -1,0 +1,64 @@
+{
+  "workflow": {
+    "path": "workflow.md",
+    "frontmatter": "engine: copilot\nimports:\n  - shared/graders.md\n  - uses: \".github/workflows/shared/repository.md#shared\"\n  - uses: \"/.agents/planner.md\"",
+    "body": "Main workflow"
+  },
+  "imports": [
+    {
+      "path": "shared/graders.md",
+      "importPath": "shared/graders.md",
+      "frontmatter": "imports:\n  - shared/graders/recurrence-determinism.md\n  - ./sibling.md\n  - bare.md\n  - uses: \"/.github/workflows/shared/nested-repository.md\"",
+      "body": "Shared graders"
+    },
+    {
+      "path": "shared/graders/recurrence-determinism.md",
+      "importPath": "shared/graders/recurrence-determinism.md",
+      "frontmatter": "imports:\n  - ./deep/branch.md\ngraders:\n  recurrence-determinism: true",
+      "body": "Determinism"
+    },
+    {
+      "path": "shared/graders/deep/branch.md",
+      "importPath": "./deep/branch.md",
+      "frontmatter": "imports:\n  - shared/graders.md\n  - ./leaf.md",
+      "body": "Branch"
+    },
+    {
+      "path": "shared/graders/deep/leaf.md",
+      "importPath": "./leaf.md",
+      "frontmatter": "description: nested leaf",
+      "body": "Leaf ${{ vars.GRADER_CONTEXT }}"
+    },
+    {
+      "path": "shared/sibling.md",
+      "importPath": "./sibling.md",
+      "frontmatter": "description: dot-relative sibling",
+      "body": "Sibling"
+    },
+    {
+      "path": "shared/bare.md",
+      "importPath": "bare.md",
+      "frontmatter": "description: bare sibling",
+      "body": "Bare"
+    },
+    {
+      "path": "shared/repository.md",
+      "importPath": ".github/workflows/shared/repository.md#shared",
+      "frontmatter": "description: repository-relative import",
+      "body": "# Shared\nRepository"
+    },
+    {
+      "path": "shared/nested-repository.md",
+      "importPath": "/.github/workflows/shared/nested-repository.md",
+      "frontmatter": "description: nested repository-relative import",
+      "body": "Nested repository ${{ vars.REPOSITORY_CONTEXT }}"
+    },
+    {
+      "path": "../../.agents/planner.md",
+      "importPath": "/.agents/planner.md",
+      "frontmatter": "description: approved agent import",
+      "body": "Planner"
+    }
+  ],
+  "expressions": ["${{ vars.GRADER_CONTEXT }}", "${{ vars.REPOSITORY_CONTEXT }}"]
+}

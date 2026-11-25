@@ -15,20 +15,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func hasModelPricingResolver(compiler *workflow.Compiler) bool {
-	// Keep this field name in sync with workflow.Compiler; this helper intentionally
-	// inspects private state to preserve behavioral coverage without re-exporting API.
-	return !reflect.ValueOf(compiler).Elem().FieldByName("modelPricingResolver").IsNil()
-}
-
-func TestCreateAndConfigureCompiler_RegistersModelPricingResolverByDefault(t *testing.T) {
-	t.Parallel()
-	compiler := createAndConfigureCompiler(CompileConfig{})
-	if !hasModelPricingResolver(compiler) {
-		t.Fatal("expected local model pricing resolver to be registered")
-	}
-}
-
 func TestCreateAndConfigureCompiler_ReadOnly(t *testing.T) {
 	t.Parallel()
 	for _, config := range []CompileConfig{{}, {NoEmit: true}, {ReadOnly: true}} {
@@ -95,8 +81,17 @@ Test.
 	require.ErrorContains(t, compiler.CompileWorkflow(path), "strict mode: write permission 'contents: write' is not allowed")
 }
 
-func TestCreateAndConfigureCompiler_GPT61SolFirewallPricing(t *testing.T) {
+func TestCreateAndConfigureCompiler_ExplicitFirewallPricingOnly(t *testing.T) {
 	t.Parallel()
+	type modelCostEntry struct {
+		Cost map[string]string `json:"cost"`
+	}
+	type modelsCatalogProvider struct {
+		Models map[string]modelCostEntry `json:"models"`
+	}
+	type modelsCatalogData struct {
+		Providers map[string]modelsCatalogProvider `json:"providers"`
+	}
 	pricingOverlay := func(provider string) string {
 		return fmt.Sprintf(`
 models:
@@ -114,18 +109,18 @@ models:
 	for _, tt := range []struct {
 		engine, model, provider, overlay, input string
 	}{
-		{"codex", "gpt-6.1-sol", "openai", "", "2e-06"},
-		{"codex", "gpt-6-1-sol", "openai", "", "2e-06"},
-		{"codex", "openai/gpt-6.1-sol", "openai", "", "2e-06"},
-		{"copilot", "copilot/gpt-6.1-sol", "github-copilot", "", "2e-06"},
-		{"codex", "gpt-6.1-sol?effort=high", "openai", "", "2e-06"},
-		{"codex", "openai/gpt-6.1-sol?effort=high&temperature=0.2", "openai", "", "2e-06"},
-		{"copilot", "gpt-6.1-sol?temperature=0.2", "github-copilot", "", "2e-06"},
-		{"copilot", "copilot/gpt-6.1-sol?effort=high", "github-copilot", "", "2e-06"},
-		{"copilot", "copilot/gpt-6-1-sol?effort=high", "github-copilot", "", "2e-06"},
-		{"copilot", "github-copilot/gpt-6.1-sol?effort=high", "github-copilot", "", "2e-06"},
-		{"codex", "GPT_6_1_SOL", "openai", "", "2e-06"},
-		{"copilot", "copilot/GPT_6.1_SOL?effort=high", "github-copilot", "", "2e-06"},
+		{"codex", "gpt-6.1-sol", "openai", "", ""},
+		{"codex", "gpt-6-1-sol", "openai", "", ""},
+		{"codex", "openai/gpt-6.1-sol", "openai", "", ""},
+		{"copilot", "copilot/gpt-6.1-sol", "github-copilot", "", ""},
+		{"codex", "gpt-6.1-sol?effort=high", "openai", "", ""},
+		{"codex", "openai/gpt-6.1-sol?effort=high&temperature=0.2", "openai", "", ""},
+		{"copilot", "gpt-6.1-sol?temperature=0.2", "github-copilot", "", ""},
+		{"copilot", "copilot/gpt-6.1-sol?effort=high", "github-copilot", "", ""},
+		{"copilot", "copilot/gpt-6-1-sol?effort=high", "github-copilot", "", ""},
+		{"copilot", "github-copilot/gpt-6.1-sol?effort=high", "github-copilot", "", ""},
+		{"codex", "GPT_6_1_SOL", "openai", "", ""},
+		{"copilot", "copilot/GPT_6.1_SOL?effort=high", "github-copilot", "", ""},
 		{"codex", "openai/gpt_6.1_sol_unknown?effort=high", "openai", "", ""},
 		{"copilot", "copilot/auto?effort=high", "github-copilot", "", ""},
 		{"codex", "gpt-6.1-sol?effort=high", "openai", pricingOverlay("openai"), "3e-06"},
@@ -165,10 +160,10 @@ Check model pricing.
 			require.NoError(t, err)
 			var modelCosts modelsCatalogData
 			require.NoError(t, json.Unmarshal(modelCostsJSON, &modelCosts))
-			require.Equal(t, modelCosts.Providers, config.APIProxy.Providers, "info metadata and firewall must receive the same pricing")
 			require.Equal(t, 1500, config.APIProxy.MaxAiCredits)
 			require.Nil(t, config.APIProxy.DefaultAiCreditsPricing, "catalog lookup must not synthesize fallback pricing")
 			if tt.input == "" {
+				require.Empty(t, modelCosts.Providers)
 				require.Empty(t, config.APIProxy.Providers)
 				return
 			}
@@ -177,12 +172,20 @@ Check model pricing.
 				base = model
 			}
 			base = strings.ToLower(base)
-			models := config.APIProxy.Providers[tt.provider].Models
-			require.Len(t, models, 1)
-			require.Equal(t, map[string]string{
+			reportingModels := modelCosts.Providers[tt.provider].Models
+			require.Len(t, reportingModels, 1)
+			expectedCost := map[string]string{
 				"input": tt.input, "output": "1e-05",
 				"cache_read": "1e-07", "cache_write": "2.5e-06",
-			}, models[base].Cost)
+			}
+			require.Equal(t, expectedCost, reportingModels[base].Cost, "resolved pricing must be retained for reporting")
+			if tt.overlay == "" {
+				require.Empty(t, config.APIProxy.Providers, "catalog pricing must not become firewall overrides")
+				return
+			}
+			models := config.APIProxy.Providers[tt.provider].Models
+			require.Len(t, models, 1)
+			require.Equal(t, expectedCost, models[base].Cost, "authored pricing must be sent to the firewall")
 			for model := range models {
 				require.NotContains(t, model, "?")
 			}

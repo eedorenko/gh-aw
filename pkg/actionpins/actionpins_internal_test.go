@@ -94,6 +94,36 @@ func TestResolveActionPin_GHESArtifactCompatibility(t *testing.T) {
 	}
 }
 
+func TestGHESArtifactPin(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		repo string
+		want ActionPin
+		ok   bool
+	}{
+		{
+			repo: "actions/upload-artifact",
+			want: ActionPin{
+				Repo:    "actions/upload-artifact",
+				Version: "v3.2.2",
+				SHA:     "c6a366c94c3e0affe28c06c8df20a878f24da3cf",
+			},
+			ok: true,
+		},
+		{repo: "unknown/action"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.repo, func(t *testing.T) {
+			t.Parallel()
+			got, ok := ghesArtifactPin(tt.repo)
+			assert.Equal(t, tt.ok, ok)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestResolveActionPin_GHESMappingTakesPrecedence(t *testing.T) {
 	t.Parallel()
 
@@ -645,7 +675,7 @@ func TestGetContainerPin_DefaultMCPGatewayReleaseDigest(t *testing.T) {
 	image := constants.DefaultMCPGatewayContainer + ":" + string(constants.DefaultMCPGatewayVersion)
 	pin, ok := GetContainerPin(image)
 	require.True(t, ok, "Expected embedded container pin for %s", image)
-	assert.Equal(t, "sha256:38fda60f9478165577af9c69d6f059d5968d191f834eb181119cb3e7e925aef6", pin.Digest)
+	assert.Equal(t, "sha256:716b41d53a20660e945c351c08140380430d65d98d3263596e45114c29fa7a43", pin.Digest)
 	assert.Equal(t, image+"@"+pin.Digest, pin.PinnedImage)
 }
 

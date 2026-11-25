@@ -17,7 +17,19 @@ const { maskedValueMatches, overlappingMatchGroups } = require("./mask_value_mat
 const { redactSafeOutputContent } = require("./safe_output_redaction.cjs");
 const { redactPiSessionHTML } = require("./pi_session_redaction.cjs");
 const { getOTLPSecretValues } = require("./otlp_header_helpers.cjs");
-const { redactSensitiveConfig } = require("./safe_outputs_config_redact.cjs");
+const { isSensitiveConfigKey, redactSensitiveConfig } = require("./safe_outputs_config_redact.cjs");
+
+/**
+ * Heuristic screening, not a guarantee that arbitrary text is secret-free.
+ * @param {string} text
+ * @param {string[]} [secretValues]
+ * @returns {boolean}
+ */
+function containsSensitiveContent(text, secretValues = []) {
+  if (redactBuiltInPatterns(text).redactionCount || redactSecrets(text, secretValues).redactionCount) return true;
+  if (/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/.test(text) || /\bASIA[0-9A-Z]{16}\b/.test(text) || /\bBearer\s+[A-Za-z0-9._~+/-]+=*/i.test(text)) return true;
+  return [...text.matchAll(/(?:^|[\s{,])["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?\s*[:=]\s*["']?([^\s"',;}\]]+)/g)].some(match => isSensitiveConfigKey(match[1]));
+}
 
 const AWF_RESOLVED_CONFIG_PATH_PATTERN = /^\/run\/awf-config-audit\/run-[a-zA-Z0-9]{6}\/awf-resolved-config\.json$/;
 const AWF_RESOLVED_CONFIG_STAGING_PATH = "/tmp/gh-aw/awf-resolved-config.json";
@@ -119,10 +131,6 @@ function findFiles(dir, extensions) {
         } catch (error) {
           if (isErrnoCode(error, "ENOENT")) {
             core.warning(`Skipping directory that disappeared during secret redaction: ${currentDir}`);
-            continue;
-          }
-          if (isErrnoCode(error, "EACCES", "EPERM")) {
-            core.warning(`Skipping inaccessible directory during secret redaction: ${currentDir}`);
             continue;
           }
           throw error;
@@ -623,8 +631,9 @@ function processFile(filePath, secretValues, maskedValues = [], prepareForCustom
   /** @type {number | undefined} */
   let inputBytes;
   try {
-    const content = additionalArtifact ? readAdditionalArtifactText(filePath) : fs.readFileSync(filePath, "utf8");
-    inputBytes = Buffer.byteLength(content, "utf8");
+    const input = additionalArtifact ? readAdditionalArtifactText(filePath) : fs.readFileSync(filePath);
+    const content = typeof input === "string" ? input : input.toString("utf8");
+    inputBytes = typeof input === "string" ? Buffer.byteLength(input, "utf8") : input.length;
     stage = "redact";
     const structured = redactSafeOutputContent(
       filePath,
@@ -640,10 +649,48 @@ function processFile(filePath, secretValues, maskedValues = [], prepareForCustom
       }
       return redactionCount;
     }
+    // Scan binary bytes losslessly in memory; remove sensitive binary state rather than rewrite it.
+    if (Buffer.isBuffer(input) && !input.equals(Buffer.from(content, "utf8"))) {
+      const byteResult = redactArtifactContent(input.toString("latin1"), secretValues, maskedValues);
+      const textResult = redactArtifactContent(content, secretValues, maskedValues);
+      const redactionCount = byteResult.redactionCount + textResult.redactionCount;
+      if (redactionCount > 0) {
+        stage = "unlink";
+        fs.unlinkSync(filePath);
+        return redactionCount;
+      }
+    }
     const encodedResult = path.extname(filePath).toLowerCase() === ".html" ? redactPiSessionHTML(content, text => redactArtifactContent(text, secretValues, maskedValues)) : { content, redactionCount: 0 };
     const genericResult = redactArtifactContent(encodedResult.content, secretValues, maskedValues);
     const redacted = genericResult.content;
     const totalRedactions = encodedResult.redactionCount + genericResult.redactionCount;
+
+    if (path.basename(filePath) === "detection_result.json" && path.basename(path.dirname(filePath)) === "threat-detection" && totalRedactions > 0) {
+      let before;
+      try {
+        before = JSON.parse(content);
+      } catch {
+        before = null;
+      }
+      const kinds = ["prompt_injection", "secret_leak", "malicious_patch"];
+      if (before && kinds.every(kind => typeof before[kind] === "boolean")) {
+        let after;
+        try {
+          after = JSON.parse(redacted);
+        } catch {
+          throw new Error(`${ERR_VALIDATION}: Redaction changed the detection verdict schema`);
+        }
+        const sameStructure = (a, b) => {
+          if (typeof a !== typeof b || (a === null) !== (b === null)) return false;
+          if (a === null) return true;
+          if (Array.isArray(a)) return Array.isArray(b) && a.length === b.length && a.every((value, index) => sameStructure(value, b[index]));
+          if (typeof a === "object") return !Array.isArray(b) && Object.keys(a).length === Object.keys(b).length && Object.keys(a).every(key => Object.hasOwn(b, key) && sameStructure(a[key], b[key]));
+          if (typeof a === "string") return b.trim() !== "";
+          return a === b;
+        };
+        if (!sameStructure(before, after)) throw new Error(`${ERR_VALIDATION}: Redaction changed the detection verdict schema`);
+      }
+    }
 
     if (totalRedactions > 0 || prepareForCustomMasking) {
       stage = "write";
@@ -679,9 +726,9 @@ function processFile(filePath, secretValues, maskedValues = [], prepareForCustom
 
 /**
  * Main function
- * @param {{prepareForCustomMasking?: boolean, additionalDirectories?: string[], persistDetectionMasks?: (values: string[]) => void}} [options]
+ * @param {{prepareForCustomMasking?: boolean, additionalDirectories?: string[], persistDetectionMasks?: (values: string[]) => void, redactDurableCopilot?: boolean, durableRoot?: string}} [options]
  */
-async function main({ prepareForCustomMasking = false, additionalDirectories = [], persistDetectionMasks } = {}) {
+async function main({ prepareForCustomMasking = false, additionalDirectories = [], persistDetectionMasks, redactDurableCopilot = false, durableRoot } = {}) {
   // Get the list of secret names from environment variable
   const secretNames = process.env.GH_AW_SECRET_NAMES;
 
@@ -699,6 +746,11 @@ async function main({ prepareForCustomMasking = false, additionalDirectories = [
           continue;
         }
         secretValues.push(secretValue.trim());
+      }
+    }
+    for (const [name, value] of Object.entries(process.env)) {
+      if (name.startsWith("GH_AW_DYNAMIC_SECRET_VALUE_") && value && value.trim() !== "") {
+        secretValues.push(value.trim());
       }
     }
 
@@ -755,6 +807,41 @@ async function main({ prepareForCustomMasking = false, additionalDirectories = [
       throw new Error(`${ERR_VALIDATION}: Removed artifact sources after runtime mask collection failed`, { cause: error });
     }
     const maskedValues = [...masks].sort((a, b) => b.length - a.length);
+    const processedCheckpointFiles = new Set();
+    let rejectedCheckpointBundle;
+    if (redactDurableCopilot) {
+      try {
+        const { redactCopilotCheckpoint } = require("./durable_files.cjs");
+        const allowedValues = new Set([...secretValues, ...maskedValues]);
+        const transcripts = redactCopilotCheckpoint(
+          text => {
+            const escapes = { '"': '"', "\\": "\\", "/": "/", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" };
+            const decoded = text.replace(/\\(["\\/bfnrt]|u[0-9a-fA-F]{4})/g, (_, escape) => (escape[0] === "u" ? String.fromCharCode(parseInt(escape.slice(1), 16)) : escapes[escape]));
+            for (const source of new Set([text, decoded])) {
+              for (const { pattern } of BUILT_IN_PATTERNS) {
+                pattern.lastIndex = 0;
+                for (const match of source.matchAll(pattern)) allowedValues.add(match[0]);
+              }
+            }
+            return redactArtifactContent(text, secretValues, maskedValues).content;
+          },
+          durableRoot,
+          allowedValues
+        );
+        for (const file of transcripts) processedCheckpointFiles.add(file);
+        core.setOutput("durable_checkpoint_safe", "true");
+      } catch {
+        core.setOutput("durable_checkpoint_safe", "false");
+        try {
+          const { invalidateCopilotCheckpoint } = require("./durable_files.cjs");
+          invalidateCopilotCheckpoint(durableRoot);
+          rejectedCheckpointBundle = path.join(durableRoot || "/tmp/gh-aw/agent", "durable/bundle");
+        } catch {
+          core.warning("Could not remove the rejected durable Copilot checkpoint");
+        }
+        core.warning(`${ERR_VALIDATION}: Rejected the durable Copilot checkpoint during secret redaction`);
+      }
+    }
     try {
       stageAWFResolvedConfig(process.env.AWF_RESOLVED_CONFIG, secretValues, maskedValues);
     } catch (error) {
@@ -764,6 +851,7 @@ async function main({ prepareForCustomMasking = false, additionalDirectories = [
     }
     // Process each file
     for (const file of files) {
+      if (processedCheckpointFiles.has(file) || (rejectedCheckpointBundle && file.startsWith(rejectedCheckpointBundle + path.sep))) continue;
       processFile(file, secretValues, maskedValues, prepareForCustomMasking, additionalFiles.has(file));
     }
   } catch (error) {
@@ -811,6 +899,7 @@ module.exports = {
   processFile,
   redactSecrets,
   redactBuiltInPatterns,
+  containsSensitiveContent,
   redactArtifactContent,
   redactStepSummaryContent,
   extractMCPGatewayTokens,

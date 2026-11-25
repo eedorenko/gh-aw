@@ -1,10 +1,11 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const { getIssueLabel, getIssueLabelQuery } = require("./issue_label.cjs");
 const { createReportIssue } = require("./issue_report.cjs");
 
 const fs = require("fs");
-const { getErrorMessage } = require("./error_helpers.cjs");
+const { getErrorMessage, isCommentLimitError } = require("./error_helpers.cjs");
 const { ERR_API, ERR_SYSTEM } = require("./error_codes.cjs");
 const { parseReportMarkdown } = require("./report_markdown.cjs");
 const { renderSizedReport } = require("./report_size.cjs");
@@ -19,9 +20,10 @@ const { buildNoopConclusionSummary } = require("./conclusion_summary.cjs");
  * A noop is an agent-reported outcome, not independent completion evidence.
  * @param {string} agentConclusion
  * @param {boolean} [hasIncompleteReport]
+ * @param {boolean} [hasNonNoopOutput]
  * @returns {{category: string, description: string}}
  */
-function classifyNoopOutcome(agentConclusion, hasIncompleteReport = false) {
+function classifyNoopOutcome(agentConclusion, hasIncompleteReport = false, hasNonNoopOutput = false) {
   if (hasIncompleteReport) {
     return {
       category: "incomplete",
@@ -35,6 +37,12 @@ function classifyNoopOutcome(agentConclusion, hasIncompleteReport = false) {
     };
   }
   if (agentConclusion === "success") {
+    if (hasNonNoopOutput) {
+      return {
+        category: "reported_action",
+        description: "The agent completed and reported one or more actions. The no-op output is a completion signal, not a claim that no action was taken.",
+      };
+    }
     return {
       category: "reported_no_action",
       description: "The agent completed and reported no action. A no-op output alone does not verify that all required work was completed or that publication was possible.",
@@ -45,23 +53,27 @@ function classifyNoopOutcome(agentConclusion, hasIncompleteReport = false) {
     description: "The agent emitted a no-op output, but successful task completion is unconfirmed.",
   };
 }
+
+const NOOP_RUNS_ISSUE_TITLE = "[aw] No-Op Runs";
+
 /**
  * Search for or create the parent issue for all agentic workflow no-op runs
  * @returns {Promise<{number: number, node_id: string}>} Parent issue number and node ID
  */
 async function ensureAgentRunsIssue() {
   const { owner, repo } = context.repo;
-  const parentTitle = "[aw] No-Op Runs";
-  const parentLabel = "agentic-workflows";
+  const parentTitle = NOOP_RUNS_ISSUE_TITLE;
 
   core.info(`Searching for no-op runs issue: "${parentTitle}"`);
 
   // Search for existing no-op runs issue
-  const searchQuery = `repo:${owner}/${repo} is:issue is:open label:${parentLabel} in:title "${parentTitle}"`;
+  const searchQuery = `repo:${owner}/${repo} is:issue is:open ${getIssueLabelQuery()} in:title "${parentTitle}"`;
 
   try {
     const { data } = await github.rest.search.issuesAndPullRequests({
       q: searchQuery,
+      sort: "created",
+      order: "desc",
       per_page: 1,
     });
 
@@ -78,8 +90,43 @@ async function ensureAgentRunsIssue() {
     throw new Error(`${ERR_API}: Failed to search for existing no-op runs issue: ${getErrorMessage(error)}`, { cause: error });
   }
 
-  // Create no-op runs issue if it doesn't exist
   core.info(`No no-op runs issue found, creating one`);
+  return createAgentRunsIssue();
+}
+
+/**
+ * Find another open no-op runs issue (for example one created by a concurrent rotation).
+ * Uses the issues list API rather than search to avoid search index lag.
+ * @param {number} excludeNumber - Issue number of the full tracker to skip
+ * @returns {Promise<{number: number, node_id: string} | null>} Newest matching open issue, or null
+ */
+async function findReplacementAgentRunsIssue(excludeNumber) {
+  const { owner, repo } = context.repo;
+  const { data } = await github.rest.issues.listForRepo({
+    owner,
+    repo,
+    labels: getIssueLabel(),
+    state: "open",
+    sort: "created",
+    direction: "desc",
+    per_page: 100,
+  });
+  const existing = data.find(issue => !issue.pull_request && issue.number !== excludeNumber && issue.title === NOOP_RUNS_ISSUE_TITLE);
+  if (!existing) {
+    return null;
+  }
+  core.info(`Found replacement no-op runs issue #${existing.number}: ${existing.html_url}`);
+  return { number: existing.number, node_id: existing.node_id };
+}
+
+/**
+ * Create a new parent issue for agentic workflow no-op runs
+ * @returns {Promise<{number: number, node_id: string}>} Parent issue number and node ID
+ */
+async function createAgentRunsIssue() {
+  const { owner, repo } = context.repo;
+  const parentTitle = NOOP_RUNS_ISSUE_TITLE;
+  const parentLabel = getIssueLabel();
 
   // Load template from file
   const templatePath = getPromptPath("noop_runs_issue.md");
@@ -186,37 +233,49 @@ function buildHistoryLink() {
   return historyUrl
     ? [
         { type: "text", value: " · ", agentTainted: false },
-        { type: "link", url: historyUrl, children: [{ type: "text", value: "◷", agentTainted: false }], agentTainted: false },
+        { type: "link", url: historyUrl, children: [{ type: "text", value: "history", agentTainted: false }], agentTainted: false },
       ]
     : [];
 }
 
 /**
- * Render the no-op comment body shared by the no-op runs issue comment and the
- * comment posted on other run-scoped tracking items.
+ * Parse the shared no-op report once for the footer-free completion summary
+ * and the attributed tracker comment.
  * @param {string} workflowName
  * @param {string} agentConclusion
  * @param {string} runUrl
  * @param {boolean} hasIncompleteReport
- * @returns {string}
+ * @param {boolean} hasNonNoopOutput
+ * @returns {{commentReport: import("./report_ast.cjs").Report, issueReport: import("./report_ast.cjs").Report}}
  */
-function buildNoopCommentBody(workflowName, agentConclusion, runUrl, hasIncompleteReport) {
-  const outcome = classifyNoopOutcome(agentConclusion, hasIncompleteReport);
+function buildNoopCommentReports(workflowName, agentConclusion, runUrl, hasIncompleteReport, hasNonNoopOutput) {
+  const outcome = classifyNoopOutcome(agentConclusion, hasIncompleteReport, hasNonNoopOutput);
   const commentTemplatePath = getPromptPath("noop_comment.md");
-  const children = parseReportMarkdown(fs.readFileSync(commentTemplatePath, "utf8"), {
+  const footer = parseReportMarkdown("> Generated from [{workflow_name}]({run_url}){aic_suffix}{ambient_context_suffix}{history_link}", {
     context: {
       workflow_name: workflowName,
-      category: outcome.category,
-      description: outcome.description,
       run_url: runUrl,
       aic_suffix: buildAICSuffix(),
       ambient_context_suffix: buildAmbientContextSuffix(),
       history_link: { type: "inline_slot", children: buildHistoryLink() },
     },
+    agentTainted: false,
+  });
+  const children = parseReportMarkdown(fs.readFileSync(commentTemplatePath, "utf8"), {
+    context: {
+      workflow_name: workflowName,
+      category: outcome.category,
+      description: outcome.description,
+    },
     minimumHeadingLevel: 2,
     agentTainted: false,
   });
-  return renderSizedReport({ type: "report", title: "No-op run", children, agentTainted: false }, 65000).body;
+  /** @type {import("./report_ast.cjs").Report} */
+  const report = { type: "report", title: "No-op run", children, agentTainted: false };
+  return {
+    commentReport: report,
+    issueReport: { ...report, children: [...children, ...footer] },
+  };
 }
 
 /**
@@ -246,6 +305,7 @@ async function main() {
     const limitedMaxCount = maxCount;
     const allNoopItems = (result.items || []).filter(/** @param {any} item */ item => item.type === "noop");
     const noopItems = limitedMaxCount > 0 ? allNoopItems.slice(0, limitedMaxCount) : allNoopItems;
+    const nonNoopItems = result.items.filter(/** @param {any} item */ ({ type }) => type !== "noop" && type !== "request_continuation");
 
     if (noopItems.length === 0) {
       core.info("No noop items found in agent output");
@@ -282,20 +342,24 @@ async function main() {
     const runUrl = process.env.GH_AW_RUN_URL || "";
     const agentConclusion = process.env.GH_AW_AGENT_CONCLUSION || "";
     const hasIncompleteReport = result.items.some(/** @param {any} item */ item => item.type === "report_incomplete") && !shouldIgnoreTaskCompleteRegistrationReports(result.items);
+    const hasNonNoopOutput = nonNoopItems.length > 0;
     const reportAsIssue = process.env.GH_AW_NOOP_REPORT_AS_ISSUE !== "false"; // Default to true
 
-    // Reuse this privacy-safe body in the run's completion status comment.
+    // Completion comments add their own attribution footer.
     let commentBody = "";
+    let issueBody = "";
     try {
-      commentBody = buildNoopCommentBody(workflowName, agentConclusion, runUrl, hasIncompleteReport);
+      const { commentReport, issueReport } = buildNoopCommentReports(workflowName, agentConclusion, runUrl, hasIncompleteReport, hasNonNoopOutput);
+      commentBody = renderSizedReport(commentReport, 65000).body;
       core.setOutput("noop_comment_body", commentBody);
+      issueBody = renderSizedReport(issueReport, 65000).body;
     } catch (error) {
       core.warning(`Could not render no-op comment body: ${getErrorMessage(error)}`);
     }
 
     core.info(`Workflow name: ${workflowName}`);
     core.info(`Run URL: ${runUrl}`);
-    core.info(`No-op outcome: ${classifyNoopOutcome(agentConclusion, hasIncompleteReport).category}`);
+    core.info(`No-op outcome: ${classifyNoopOutcome(agentConclusion, hasIncompleteReport, hasNonNoopOutput).category}`);
     core.info(`Report as issue: ${reportAsIssue}`);
 
     if (!reportAsIssue) {
@@ -314,7 +378,6 @@ async function main() {
     }
 
     // Skip posting when there are non-noop outputs (agent did real work)
-    const nonNoopItems = result.items.filter(/** @param {any} item */ ({ type }) => type !== "noop");
     if (nonNoopItems.length > 0) {
       core.info(`Found ${nonNoopItems.length} non-noop output(s), skipping no-op message posting`);
       return;
@@ -343,14 +406,43 @@ async function main() {
       core.warning("No-op comment body is unavailable, skipping no-op message posting");
       return;
     }
+    if (!issueBody) return;
 
     try {
-      await github.rest.issues.createComment({
-        owner,
-        repo,
-        issue_number: noopRunsIssue.number,
-        body: commentBody,
-      });
+      try {
+        await github.rest.issues.createComment({
+          owner,
+          repo,
+          issue_number: noopRunsIssue.number,
+          body: issueBody,
+        });
+      } catch (error) {
+        if (!isCommentLimitError(error)) {
+          throw error;
+        }
+        // The tracking issue is full; GitHub rejects every further comment, so roll over to a fresh issue.
+        // Record the comment on the replacement before closing the full issue so a failed rollover is retried next run.
+        const fullIssueNumber = noopRunsIssue.number;
+        core.info(`No-op runs issue #${fullIssueNumber} reached the comment limit, rotating to a new issue`);
+        noopRunsIssue = (await findReplacementAgentRunsIssue(fullIssueNumber)) || (await createAgentRunsIssue());
+        await github.rest.issues.createComment({
+          owner,
+          repo,
+          issue_number: noopRunsIssue.number,
+          body: issueBody,
+        });
+        try {
+          await github.rest.issues.update({
+            owner,
+            repo,
+            issue_number: fullIssueNumber,
+            state: "closed",
+            state_reason: "completed",
+          });
+        } catch (closeError) {
+          core.warning(`Failed to close full no-op runs issue #${fullIssueNumber}: ${getErrorMessage(closeError)}`);
+        }
+      }
 
       core.info(`✓ Posted no-op message to no-op runs issue #${noopRunsIssue.number}`);
     } catch (error) {
@@ -363,4 +455,4 @@ async function main() {
   }
 }
 
-module.exports = { main, ensureAgentRunsIssue, classifyNoopOutcome };
+module.exports = { main, ensureAgentRunsIssue, createAgentRunsIssue, classifyNoopOutcome };

@@ -1,32 +1,34 @@
 # Architecture Diagram
 
-> Last updated: 2026-11-02 · Source: [Architecture Diagram issue](https://github.com/github/gh-aw/issues?q=is%3Aissue%20%22Architecture%20Diagram%20%E2%80%94%202026-11-02%22)
+> Last updated: 2026-11-23 · Source: [Workflow run](https://github.com/github/gh-aw/actions/runs/45140538836)
 
 ## Overview
 
 This diagram shows the package structure and dependencies of the `gh-aw` codebase. Arrows point from an importing package to an imported package.
 
 ```text
-┌──────────────────────────────────────────────────────────────────────────────────────────────┐
-│ ENTRY POINTS                                                                                 │
-│ cmd/gh-aw ─▶ cli, workflow, parser, console    cmd/gh-aw-wasm ─▶ workflow, parser            │
-│ cmd/linters ─▶ linters                         cmd/gh-aw-security-model (standalone)         │
-├──────────────────────────────────────────────────────────────────────────────────────────────┤
-│ CORE PACKAGES                                                                                │
-│ cli (commands) ─▶ workflow (compiler) ─▶ parser (Markdown/YAML) ─▶ console (terminal UI)     │
-│ cli ─▶ actionpins, agentdrain, atif, intent, github, githubapi, modelsdev, scanfindings       │
-│ cli ─▶ workqueue       workqueue (queue delivery) ─▶ parser, githubapi, console              │
-│ workflow ─▶ actionpins, scanfindings, workqueue, console      parser ─▶ githubapi            │
-│ actionpins (SHA pins) ─▶ console     agentdrain (log mining)   atif (session export)         │
-│ intent (policy)   linters (Go analyzers)                                                   │
-├──────────────────────────────────────────────────────────────────────────────────────────────┤
-│ UTILITIES (arrows point from importer to imported package)                                   │
-│ cli/workflow/parser ─▶ fileutil, gitutil, logger, stringutil, types, constants               │
-│ parser/workflow ─▶ importinpututil, jsonutil, setutil, sliceutil, syncutil, typeutil         │
-│ workflow ─▶ repoutil, semverutil, validationerror, ctxutil, tty                              │
-│ cli ─▶ envutil, errorutil, stats, timeutil     console ─▶ colorwriter, styles, tty           │
-│ console ─▶ logger, stringutil                 logger ─▶ colorwriter, styles, timeutil        │
-└──────────────────────────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ ENTRY POINTS                                                                                   │
+│ cmd/gh-aw ─▶ cli, workflow, parser, console, constants                                         │
+│ cmd/gh-aw-wasm ─▶ workflow, parser                 cmd/linters ─▶ linters                      │
+│ cmd/gh-aw-security-model (standalone conformance runner)                                       │
+├────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ CORE PACKAGES  (arrows point from importer to imported package)                                │
+│ cli (commands) ─▶ workflow (compiler), parser (frontmatter), console (terminal UI)             │
+│ cli ─▶ workqueue (delivery), agentdrain (logs), atif (trajectories), intent (policy)           │
+│ workflow ─▶ parser, console, workqueue, actionpins (SHA pins), connectors (declarations)       │
+│ workflow ─▶ workflow/{actions,aw,lint,taint,...} (compiler internals)                          │
+│ parser ─▶ console, githubapi (API), workflow/actionslanguageservice                            │
+│ workqueue ─▶ parser, console, githubapi;  cli ─▶ github, modelsdev, scanfindings               │
+│ cli ─▶ lifecycle (safe-output rules and evidence)                                              │
+│ cmd/linters ─▶ linters ─▶ linters/* (Go analyzers)                                             │
+├────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ UTILITIES                                                                                      │
+│ cli/workflow/parser ─▶ fileutil, gitutil, logger, stringutil, constants                        │
+│ workflow ─▶ setutil, sliceutil, typeutil, validationerror;  parser ─▶ validationerror          │
+│ console ─▶ colorwriter, logger, styles, tty;  logger ─▶ colorwriter, styles, timeutil          │
+│ actionpins ─▶ gitutil, semverutil;  agentdrain ─▶ logger, setutil, sliceutil                   │
+└────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Package Reference
@@ -38,18 +40,22 @@ This diagram shows the package structure and dependencies of the `gh-aw` codebas
 | `cmd/gh-aw-security-model` | Entry | Security conformance runner |
 | `cmd/linters` | Entry | Custom linter binary |
 | `actionpins` | Core | Action reference and SHA pin resolution |
-| `agentdrain` | Core | Agent log mining |
-| `atif` | Core | Session JSONL to ATIF trajectory conversion |
+| `agentdrain` | Core | Agent session log mining |
+| `atif` | Core | Session trajectory export |
 | `cli` | Core | Command implementations |
+| `connectors` | Core | Connector declarations |
 | `console` | Core | Terminal UI rendering |
 | `github` | Core | GitHub label and objective mapping |
-| `githubapi` | Core | GitHub API client options and requests |
+| `githubapi` | Core | GitHub API requests |
 | `intent` | Core | Intent policy resolution |
+| `lifecycle` | Core | Safe-output lifecycle rules and evidence |
 | `linters` | Core | Custom Go analyzers |
-| `modelsdev` | Core | Model catalog and provider normalization |
+| `linters/*` | Core | Individual Go analyzer packages |
+| `modelsdev` | Core | Model catalog normalization |
 | `parser` | Core | Markdown and frontmatter parsing |
 | `scanfindings` | Core | Scan finding data model |
 | `workflow` | Core | Workflow compilation and generation |
+| `workflow/*` | Core | Compiler AST, lint, taint, and policy packages |
 | `workqueue` | Core | Work queue selection and delivery |
 | `colorwriter` | Utility | Color aware writer |
 | `constants` | Utility | Shared constants |
@@ -75,4 +81,3 @@ This diagram shows the package structure and dependencies of the `gh-aw` codebas
 | `types` | Utility | Shared types |
 | `typeutil` | Utility | Untyped value conversion |
 | `validationerror` | Utility | Validation error payloads |
-| `workflowcontract` | Utility | Workflow contract tests |

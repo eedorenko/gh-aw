@@ -1,6 +1,6 @@
 // @ts-check
 
-const { normalizeReportText, normalizeReportAllowedURL, normalizeReportImage } = require("./report_ast.cjs");
+const { normalizeReportText, normalizeReportAllowedURL, normalizeReportImage, isTemporaryIdLink, isReportReferenceDefinition } = require("./report_ast.cjs");
 const { buildAllowedDomains, buildAllowedGitHubReferences, getCurrentRepoSlug, sanitizeUrlProtocols, sanitizeUrlDomains } = require("./sanitize_content_core.cjs");
 const { isRepoAllowed } = require("./repo_helpers.cjs");
 
@@ -128,8 +128,72 @@ function markdownLink(source, offset, delimiters) {
     raw: source.slice(offset, destinationEnd + 1),
     label: source.slice(start + 1, labelEnd),
     destination: source.slice(labelEnd + 2, destinationEnd).replace(/\\([\\()])/g, "$1"),
+    destinationStart: labelEnd + 2,
+    destinationEnd,
+    end: destinationEnd + 1,
     image,
   };
+}
+
+/**
+ * Transform inline Markdown link destinations without touching code spans or fenced blocks.
+ * @param {string} markdown
+ * @param {(destination: string) => string} transform
+ * @returns {string}
+ */
+function transformMarkdownLinkDestinations(markdown, transform) {
+  let fence;
+  return markdown
+    .split("\n")
+    .map(line => {
+      if (fence) {
+        const closing = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
+        if (closing && closing[1][0] === fence.character && closing[1].length >= fence.length) fence = undefined;
+        return line;
+      }
+      const opening = openingFence(line);
+      if (opening) {
+        fence = { character: opening[1][0], length: opening[1].length };
+        return line;
+      }
+
+      const delimiters = markdownDelimiters(line);
+      let output = "";
+      let copiedThrough = 0;
+      let changed = false;
+      for (let index = 0; index < line.length; index++) {
+        if (line[index] === "\\") {
+          index++;
+          continue;
+        }
+        if (line[index] === "`") {
+          const openingTicks = /^`+/.exec(line.slice(index))?.[0] ?? "`";
+          let closingIndex = line.indexOf("`", index + openingTicks.length);
+          while (closingIndex >= 0) {
+            const closingTicks = /^`+/.exec(line.slice(closingIndex))?.[0] ?? "`";
+            if (closingTicks.length === openingTicks.length) {
+              index = closingIndex + closingTicks.length - 1;
+              break;
+            }
+            closingIndex = line.indexOf("`", closingIndex + closingTicks.length);
+          }
+          continue;
+        }
+
+        const link = markdownLink(line, index, delimiters);
+        if (!link) continue;
+        const destination = line.slice(link.destinationStart, link.destinationEnd);
+        const replacement = transform(destination);
+        if (replacement !== destination) {
+          output += line.slice(copiedThrough, link.destinationStart) + replacement;
+          copiedThrough = link.destinationEnd;
+          changed = true;
+        }
+        index = link.end - 1;
+      }
+      return changed ? output + line.slice(copiedThrough) : line;
+    })
+    .join("\n");
 }
 
 /** @param {string} source */
@@ -170,10 +234,13 @@ function bareURL(source) {
  * Inline slots do not enable scalar template substitution in surrounding Markdown.
  * onBlockSlot observes actual typed insertions, not literal placeholder text.
  * @param {string} markdown
- * @param {{context?: ReportContext, inlineSlots?: Record<string, ReportInline[]>, blockSlots?: Record<string, ReportBlock[]>, onBlockSlot?: (key: string) => void, agentTainted?: boolean, minimumHeadingLevel?: number, depth?: number, allowFlagMarkers?: boolean, allowMetadata?: boolean, allowedMentions?: string[], deferMentions?: boolean}} [options]
+ * @param {{context?: ReportContext, inlineSlots?: Record<string, ReportInline[]>, blockSlots?: Record<string, ReportBlock[]>, onBlockSlot?: (key: string) => void, agentTainted?: boolean, minimumHeadingLevel?: number, depth?: number, allowFlagMarkers?: boolean, allowMetadata?: boolean, allowedMentions?: string[], deferMentions?: boolean, allowTemporaryIdLinks?: boolean}} [options]
  * @returns {ReportBlock[]}
  */
-function parseReportMarkdown(markdown, { context, inlineSlots, blockSlots, onBlockSlot, agentTainted, minimumHeadingLevel = 3, depth = 0, allowFlagMarkers = false, allowMetadata = false, allowedMentions = [], deferMentions = false } = {}) {
+function parseReportMarkdown(
+  markdown,
+  { context, inlineSlots, blockSlots, onBlockSlot, agentTainted, minimumHeadingLevel = 3, depth = 0, allowFlagMarkers = false, allowMetadata = false, allowedMentions = [], deferMentions = false, allowTemporaryIdLinks = false } = {}
+) {
   if (depth > 16) throw new TypeError("Report template nesting exceeds the maximum depth");
   if (agentTainted !== undefined && typeof agentTainted !== "boolean") throw new TypeError("Report agent taint must be a boolean");
   const allowedReferences = agentTainted === false ? null : buildAllowedGitHubReferences();
@@ -197,7 +264,7 @@ function parseReportMarkdown(markdown, { context, inlineSlots, blockSlots, onBlo
   function substitute(source) {
     return source.replace(/\{(\w+)\}/g, (match, key) => {
       const value = valueFor(key);
-      if (typeof value === "object") throw new TypeError("Report nodes cannot appear in scalar fields");
+      if (value !== null && typeof value === "object") throw new TypeError("Report nodes cannot appear in scalar fields");
       return value === undefined ? match : String(value);
     });
   }
@@ -317,7 +384,7 @@ function parseReportMarkdown(markdown, { context, inlineSlots, blockSlots, onBlo
         else {
           const value = valueFor(match[1]);
           if (Array.isArray(value)) throw new TypeError("Report blocks cannot appear inline");
-          if (typeof value === "object") nodes.push(...value.children.map(node => ({ ...node })));
+          if (value !== null && typeof value === "object") nodes.push(...value.children.map(node => ({ ...node })));
           else text(value === undefined ? match[0] : String(value));
         }
       } else if (
@@ -335,7 +402,13 @@ function parseReportMarkdown(markdown, { context, inlineSlots, blockSlots, onBlo
         const label = link.image ? [fromSource({ type: "text", value: substitute(link.label) })] : inline(link.label, inlineDepth + 1, true);
         const url = substitute(link.destination);
         try {
-          nodes.push(fromSource(link.image ? normalizeReportImage({ type: "image", url, alt: substitute(link.label.replace(/\\([\\`*_[\]{}()#+.!|>~-])/g, "$1")) }) : { type: "link", url: normalizeReportAllowedURL(url), children: label }));
+          nodes.push(
+            fromSource(
+              link.image
+                ? normalizeReportImage({ type: "image", url, alt: substitute(link.label.replace(/\\([\\`*_[\]{}()#+.!|>~-])/g, "$1")) })
+                : { type: "link", url: allowTemporaryIdLinks && isTemporaryIdLink(url) ? url : normalizeReportAllowedURL(url), children: label }
+            )
+          );
         } catch (error) {
           if (!(error instanceof TypeError)) throw error;
           nodes.push(...label, fromSource({ type: "text", value: link.image ? " (image unavailable: URL must use an allowed HTTPS domain)" : " (link unavailable: invalid HTTPS URL)" }));
@@ -392,16 +465,29 @@ function parseReportMarkdown(markdown, { context, inlineSlots, blockSlots, onBlo
   const lines = markdown.replace(/\r\n?/g, "\n").split("\n");
   let index = 0;
   const nested = source =>
-    parseReportMarkdown(source, { context, inlineSlots, blockSlots, onBlockSlot, agentTainted, minimumHeadingLevel: Math.max(3, minimumHeadingLevel), depth: depth + 1, allowFlagMarkers, allowMetadata, allowedMentions, deferMentions });
+    parseReportMarkdown(source, {
+      context,
+      inlineSlots,
+      blockSlots,
+      onBlockSlot,
+      agentTainted,
+      minimumHeadingLevel: Math.max(3, minimumHeadingLevel),
+      depth: depth + 1,
+      allowFlagMarkers,
+      allowMetadata,
+      allowedMentions,
+      deferMentions,
+      allowTemporaryIdLinks,
+    });
   const blockSlot = line => /^\{(\w+)\}$/.exec(line.trim())?.[1];
   const isBlockSlot = line => blockSlots && Object.hasOwn(blockSlots, blockSlot(line) ?? "");
   const isFieldLine = line => /^(?:\{\w+\}\s*)+$/.test(line.trim()) && (!inlineSlots || [...line.matchAll(/\{(\w+)\}/g)].some(field => !Object.hasOwn(inlineSlots, field[1])));
   const isBlockStart = line =>
     openingFence(line) ||
-    /^(?:#{1,6}\s|>|<details>(?:\s*$|\s*<summary>)|<\/details>\s*$|[-*+]\s|\d+\.\s|---\s*$)/.test(line) ||
+    /^(?:#{1,6}\s|>|<details(?:\s+open)?>(?:\s*$|\s*<summary>)|<\/details>\s*$|[-*+]\s|\d+\.\s|---\s*$)/.test(line) ||
     isFieldLine(line) ||
     isBlockSlot(line) ||
-    (allowMetadata && /^(?:<!--|\[gh-aw-workflow-call-id\]: # ")/.test(line.trim())) ||
+    (allowMetadata && (/^(?:<!--|\[gh-aw-workflow-call-id\]: # ")/.test(line.trim()) || isReportReferenceDefinition(line))) ||
     (allowFlagMarkers && /^<!-- (?:gh-aw-threat-detected|gh-aw-threat-engine-error) -->$/.test(line.trim()));
   /** @param {string} line */
   function cells(line) {
@@ -448,6 +534,9 @@ function parseReportMarkdown(markdown, { context, inlineSlots, blockSlots, onBlo
           nodes.push(fromSource({ type: "paragraph", children: inline(line) }));
         }
         index++;
+      } else if (allowMetadata && isReportReferenceDefinition(line)) {
+        nodes.push(fromSource({ type: "reference_definition", value: line }));
+        index++;
       } else if (allowMetadata && (match = /^<!-- ([a-zA-Z][a-zA-Z0-9_-]*)(?:: ?([\s\S]*))? -->$/.exec(line.trim()))) {
         if (["gh-aw-execution", "aw-essential-meta"].includes(match[1])) {
           if (match[2] === undefined) throw new TypeError("JSON report metadata requires a value");
@@ -470,7 +559,7 @@ function parseReportMarkdown(markdown, { context, inlineSlots, blockSlots, onBlo
         for (const field of line.matchAll(/\{(\w+)\}/g)) {
           const value = valueFor(field[1]);
           if (Array.isArray(value)) nodes.push(...value);
-          else if (typeof value === "object") nodes.push(fromSource({ type: "paragraph", children: value.children }));
+          else if (value !== null && typeof value === "object") nodes.push(fromSource({ type: "paragraph", children: value.children }));
           else if (String(value).trim()) nodes.push(fromSource({ type: "paragraph", children: [fromSource({ type: "text", value: String(value) })] }));
         }
         index++;
@@ -498,17 +587,20 @@ function parseReportMarkdown(markdown, { context, inlineSlots, blockSlots, onBlo
             // Invalid JSON examples remain literal code.
           }
         }
-        nodes.push(fromSource({ type: "code_block", language: /^[a-zA-Z0-9_+:-]*$/.test(language) ? language : "text", value, ...(fence[0] === "`" && fence.length > 3 ? { fenceLength: Math.min(fence.length, 128) } : {}) }));
+        // Only trusted persistence may construct ledger blocks as typed nodes.
+        // Markdown imports include ordinary comments published by the same bot.
+        const safeLanguage = !language.startsWith("gh-aw-comment-ledger:") && /^[a-zA-Z0-9_+:-]*$/.test(language) ? language : "text";
+        nodes.push(fromSource({ type: "code_block", language: safeLanguage, value, ...(fence[0] === "`" && fence.length > 3 ? { fenceLength: Math.min(fence.length, 128) } : {}) }));
       } else if ((match = /^(#{1,6})\s+(.+)$/.exec(line))) {
         nodes.push(fromSource({ type: "heading", level: Math.max(minimumHeadingLevel, match[1].length), children: inline(match[2]) }));
         index++;
-      } else if ((match = /^<details>\s*<summary>(.*)<\/summary>$/.exec(line.trim()))) {
+      } else if ((match = /^<details(\s+open)?>\s*<summary>(.*)<\/summary>$/.exec(line.trim()))) {
         index++;
-        nodes.push(fromSource({ type: "details", summary: summary(match[1]), children: blocks(true, detailsDepth + 1) }));
-      } else if (line.trim() === "<details>" && /^<summary>.*<\/summary>$/.test(lines[index + 1]?.trim() || "")) {
+        nodes.push(fromSource({ type: "details", ...(match[1] ? { open: true } : {}), summary: summary(match[2]), children: blocks(true, detailsDepth + 1) }));
+      } else if ((match = /^<details(\s+open)?>$/.exec(line.trim())) && /^<summary>.*<\/summary>$/.test(lines[index + 1]?.trim() || "")) {
         const summarySource = lines[index + 1].trim().slice("<summary>".length, -"</summary>".length);
         index += 2;
-        nodes.push(fromSource({ type: "details", summary: summary(summarySource), children: blocks(true, detailsDepth + 1) }));
+        nodes.push(fromSource({ type: "details", ...(match[1] ? { open: true } : {}), summary: summary(summarySource), children: blocks(true, detailsDepth + 1) }));
       } else if (/^>/.test(line)) {
         const quoted = [];
         while (index < lines.length && /^>/.test(lines[index])) quoted.push(lines[index++].replace(/^> ?/, ""));
@@ -556,4 +648,4 @@ function parseReportMarkdown(markdown, { context, inlineSlots, blockSlots, onBlo
   return blocks();
 }
 
-module.exports = { parseReportMarkdown };
+module.exports = { parseReportMarkdown, transformMarkdownLinkDestinations };

@@ -109,7 +109,10 @@ safe-outputs:
     allowed-files: ["**"]
     exclude-lock-yml: true
     excluded-files: [".github/workflows/*.yml", ".github/workflows/*.yaml"]
-    protected-files: fallback-to-issue
+    protected-files:
+      policy: fallback-to-issue
+      exclude:
+        - /.github/workflows/shared/*.md
     fallback-as-pull-request: false
   reply-to-pull-request-review-comment:
     target: ${{ needs.preflight.outputs.pr_number }}
@@ -159,8 +162,10 @@ Use the explicit PR number above for all reads and safe outputs, never an inheri
    workflow YAML from the submitted changes. Do not modify security configuration,
    instructions, or credentials to bypass protected-file restrictions.
 5. Commit validated changes locally and call `push_to_pull_request_branch` once,
-   explicitly supplying this PR's number as `pull_request_number` and its checked-out
-   head branch as `branch` so patch generation uses the pinned PR-head baseline.
+   explicitly supplying the required `message` (a concise summary of the pushed
+   changes), this PR's number as `pull_request_number` and its checked-out head
+   branch as `branch` so patch generation uses the pinned PR-head baseline.
+   The tool rejects calls without `message`; it is not read from the local commit.
    Use no cloud-agent `report_progress` or assignment tools; this is an agentic
    workflow and all remote writes must use its declared safe outputs. Never create
    a replacement PR, merge, approve, dispatch, retry CI, or assign another agent.

@@ -8,9 +8,18 @@ See [jobs.md](jobs.md) for the full compiler-generated job graph and which job e
 
 The `report-incomplete` safe-output is enabled by default and is distinct from `noop`. Use it when required tools or data are unavailable and the task cannot be meaningfully performed (e.g., MCP server crash, missing authentication, inaccessible repository). When an agent emits `report_incomplete`, gh-aw activates failure handling even when the agent process exits 0 — preventing empty outputs from being classified as successful, so every unrecoverable failure is tracked.
 
+When top-level `skip-if-decision` denies an otherwise eligible invocation, the
+AWF harness attempts to record `noop` only if no terminal safe output exists.
+Existing task outputs, no-ops, and incomplete diagnostics are preserved; the
+decision does not authorize their publication or override failure/detection
+policy. Decision evaluation errors abstain and do not independently emit
+`noop` or `report_incomplete`. Use `harness.decision` unified-session events and
+audit decision history to distinguish an avoided invocation from agent work.
+Decision-model usage remains part of normal proxy accounting.
+
 **Per-handler modifiers** — most handlers accept `max`, `github-token`, `github-app`, and `staged` to override the global equivalents for that one output type. Two extras:
 
-- `issue-intent:` (boolean) on `close-issue`, `set-issue-type`, `set-issue-field`, `assign-to-user`, and `assign-to-agent` — enables issue-intent metadata (rationale/confidence/suggest) fields and their schema requirements on that tool's payload.
+- `issue-intent:` (boolean, experimental, default `false`) on `close-issue`, `add-labels`, `set-issue-type`, `set-issue-field`, `assign-to-user`, and `assign-to-agent` — `true` opts in to issue-intent metadata (rationale/confidence/suggest) fields and their schema requirements on that tool's payload.
 - `normalize-closing-keywords:` (boolean) on body-carrying handlers (`create-issue`, `add-comment`, `create-pull-request`, …) — strips backticks around recognized issue-closing keywords so they stay active.
 
 - `jobs:` - Custom safe-output jobs registered as MCP tools for third-party integrations
@@ -87,7 +96,7 @@ The `report-incomplete` safe-output is enabled by default and is distinct from `
 
   Resolved at compile time — the compiler fetches `action.yml`, parses inputs, and exposes them as MCP tool parameters. The agent calls the action by its normalized name (dashes → underscores). Each action runs as an injected step in the safe-outputs job. Local actions (`./path/to/action`) are also supported.
 
-- `claim-adapters:` - Work-queue custom claim delivery adapters, each bound to one independently-verified effect (object)
+- `claim-adapters:` - Work-queue custom Claim effect adapters, each bound to one declared effect (object)
 
   ```yaml
   safe-outputs:
@@ -101,7 +110,7 @@ The `report-incomplete` safe-output is enabled by default and is distinct from `
           body: review_body
   ```
 
-  Binds a work-queue worker's Claim output to a trusted, independently verified effect: prepared/script claim handlers never receive write credentials directly, and the safe-outputs handler applies and verifies the effect afterward instead of trusting job success. `effect-type` selects a native builtin (`create_issue` … `replace_label`, restricted to that handler's own fields) or a generic `github_rest`/`git_tree`/`github_graphql` effect, each requiring its matching `request`/`verifier`, `git-tree`, or `graphql` sub-config. `field-map` maps declared effect fields to adapter-supplied source fields; `expected` fixes literal field values instead of mapping them; a field cannot use both. `verifier-id` names the immutable effect-contract verifier (defaults to the normalized adapter name) and must not collide with an enabled native verifier for the same effect. See [work-queue.md](work-queue.md) for the Claim lifecycle this binds into.
+  Binds a work-queue worker's Claim output to one trusted effect: prepared/script claim handlers never receive write credentials directly; the safe-outputs handler applies the effect only while the Claim is open and bound to the run, and records it in the Claim's Completion. `effect-type` selects a native builtin (`create_issue` … `replace_label`, restricted to that handler's own fields) or a generic `github_rest`/`git_tree`/`github_graphql` effect, each requiring its matching `request`, `git-tree`, or `graphql` sub-config. `field-map` maps declared effect fields to adapter-supplied source fields; `expected` fixes literal field values instead of mapping them; a field cannot use both. `verifier` and `verifier-id` are accepted for compatibility and ignored. See [work-queue.md](work-queue.md) for the Claim lifecycle this binds into.
 
 **Global Safe Output Configuration:**
 - `github-token:` - Custom GitHub token for all safe output jobs
@@ -126,6 +135,7 @@ The `report-incomplete` safe-output is enabled by default and is distinct from `
   - `true` - accept any object as the `data` field alongside `body`
   - Inline schema object - enforce shape; supports full JSON Schema keywords (`type`, `properties`, `required`, `items`, `enum`, etc.) or shorthand (`{ verdict: string, score: number }`)
   - `${{ ... }}` expression - resolves to one of the above at runtime
+  - `add-comment.collapse-data: true` renders comment data in a collapsed "Structured data" section; the default remains visible fenced JSON.
   - Example:
 
     ```yaml
@@ -315,7 +325,7 @@ Fields that influence permission computation (`add-comment.discussions`, `hide-c
     - `max-ai-credits:` - Per-run AIC budget for the detection engine (numeric only, no expressions; default `${{ vars.GH_AW_DEFAULT_DETECTION_MAX_AI_CREDITS || '400' }}`)
     - `runs-on:` - Runner override for the detection job (defaults to `agent.runs-on`)
     - `continue-on-error:` - When `true` (default), detection failures emit a warning and proceed with a `needs-review` label; when `false`, failures block safe outputs (boolean or expression)
-    - `report-as-issue:` - When `true` (default), detection warnings/failures create or update the `[aw] Detection Runs` tracking issue; set `false` to keep detection and its enforcement active while skipping the tracking issue (results stay visible in Actions run diagnostics) (boolean)
+    - `report-as-issue:` - When `true` (default), detection warnings/failures create or update the `[aw] Detection Runs` tracking issue; set `false` to keep detection and its enforcement active while skipping the tracking issue (results stay visible in Actions run diagnostics) (boolean). While enabled with runnable detection, the `conclusion` job requests `issues: write` (as does its token when `safe-outputs.github-app` is configured, so the App needs **Issues: write**); reusable-workflow callers must grant it through the caller chain. `false` drops only this detection-specific grant; other issue-writing outputs can still require it.
   - Example to disable AI-based detection (use custom steps only):
 
     ```yaml
@@ -341,4 +351,4 @@ The safe-outputs job emits named step outputs for the first successful result of
 
 ### Code-Push Failure Handling
 
-If `create-pull-request` or `push-to-pull-request-branch` fails, remaining safe outputs still run; later `add_comment` outputs get a failure note, and the conclusion job reports details. No setting cancels selected outputs on code-push failure. To gate dependent work, use a custom safe-output job with `needs: safe_outputs` and `if: needs.safe_outputs.outputs.code_push_failure_count == '0'`.
+If `create-pull-request` or `push-to-pull-request-branch` fails, remaining safe outputs still run; later `add_comment` outputs get a failure note, and the conclusion job reports details. No setting cancels selected outputs on code-push failure. To gate a later built-in output, have the agent pass the code-push call's `output_id` as `depends-on` (see [Shared Rules](safe-outputs.md#shared-rules)). Custom safe jobs reject `depends-on`; gate them with `needs: safe_outputs` and `if: needs.safe_outputs.outputs.code_push_failure_count == '0'`.

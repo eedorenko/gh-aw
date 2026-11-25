@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -84,61 +85,55 @@ func getLoadedEcosystemDomains() map[string][]string {
 // a deliberate exception: github.com is needed for repository access and AWF also permits
 // its package subdomains. TestGitHubTransportPackageRegistryException documents this limit;
 // callers can explicitly block pkg.github.com when that capability is unwanted.
-// Copilot threat detection is another exception: its dedicated detection allow-list includes
-// registry.npmjs.org for read-only lockfile validation, outside normal agent engine defaults.
 
 // engineDefaultDomainSets centralizes every engine allow-list. These sets are
 // user-selectable domain lists: workflows opt into them through network.allowed
 // the same way they opt into ecosystem domain lists.
 //
 // Runtime engine default domain lists intentionally exclude package registries
-// (npm, PyPI, and similar). The threat-detection set is the exception because
-// Copilot threat detection uses the npm registry. See the package-registry
-// invariant above.
+// (npm, PyPI, and similar). See the package-registry invariant above.
 var engineDefaultDomainSets = getLoadedDomainSets().EngineDefaults
 
 func copyEngineDefaultDomainSet(domains []string) []string {
 	return append([]string(nil), domains...)
 }
 
-// CopilotDefaultDomains are the default domains required for GitHub Copilot CLI authentication and operation.
+// CopilotDefaultDomains are the default domains required for GitHub Copilot CLI transport.
 //
-// This list is limited to the shared gateway/GitHub transport baseline: the MCP/API gateway
-// (host.docker.internal), the GitHub API and web hosts, and the Copilot routing hub used for
-// inference. Plan-specific Copilot API hosts (business/enterprise/individual) and Copilot
-// telemetry are *not* part of the default set: agents route inference through the AWF api-proxy,
-// so those vendor hosts require an explicit `network: { allowed: [copilot-vendor] }` opt-in.
+// This list is limited to the shared gateway/GitHub transport baseline. Agents route inference
+// through the AWF api-proxy, so direct Copilot API hosts require an explicit
+// `network: { allowed: [copilot-vendor] }` opt-in.
 var CopilotDefaultDomains = copyEngineDefaultDomainSet(engineDefaultDomainSets["copilot"])
 
-// CodexDefaultDomains retain gateway/GitHub transport and the concrete OpenAI API host.
-// Optional authentication/telemetry hosts require an explicit codex-vendor opt-in.
+// CodexDefaultDomains contain the gateway/GitHub transport baseline. Direct OpenAI API and
+// optional authentication/telemetry hosts require an explicit `codex-vendor` opt-in.
 var CodexDefaultDomains = copyEngineDefaultDomainSet(engineDefaultDomainSets["codex"])
 
 // ClaudeDefaultDomains are the opt-in Claude gateway/GitHub transport baseline.
-// Direct Anthropic API access is added only when Claude's effective target is Anthropic.
+// Direct Anthropic API access must be explicitly added to network.allowed.
 // Claude uses API-key or gateway authentication, not interactive browser login.
 // Do not include anthropic.com: AWF also allows subdomains, which would re-enable
 // statsig.anthropic.com. Infrastructure and downloads belong in ecosystem opt-ins.
 var ClaudeDefaultDomains = copyEngineDefaultDomainSet(engineDefaultDomainSets["claude"])
 
-// GeminiDefaultDomains retain the concrete model API, not the googleapis.com wildcard
-// that would also grant access to unrelated package and browser download hosts.
+// GeminiDefaultDomains contain the gateway/GitHub transport baseline. Direct Gemini API
+// access requires the explicit `gemini-vendor` opt-in.
 var GeminiDefaultDomains = copyEngineDefaultDomainSet(engineDefaultDomainSets["gemini"])
 
 var AgyDefaultDomains = copyEngineDefaultDomainSet(engineDefaultDomainSets["agy"])
 
-// PiBaseDefaultDomains are the base domains required for the Pi CLI to operate,
-// independent of the chosen LLM provider. When a model uses provider/model format,
-// provider-specific API domains are added on top via GetDefaultDomainsForEngine.
+// PiBaseDefaultDomains are the domains required for the Pi CLI to operate,
+// independent of the chosen LLM provider.
 var PiBaseDefaultDomains = copyEngineDefaultDomainSet(engineDefaultDomainSets["pi-base"])
 
-// piProviderDomains maps provider prefixes to their API domains. It covers the
-// same set of providers that Pi can route through via the AWF LLM gateway.
+// piProviderDomains maps Pi provider prefixes to their API endpoints. This metadata
+// is used to describe provider routing and does not grant those endpoints through
+// the selectable engine transport bundles.
 var piProviderDomains = getLoadedDomainSets().PiProviderDomains
 
 // PiDefaultDomains are the static default domains for backward compatibility when
-// no model provider prefix is given. When a provider/model format is used, the
-// dynamic path (GetDefaultDomainsForEngine) resolves provider-specific domains instead.
+// no model provider prefix is given. Direct provider APIs require an explicit
+// vendor set or literal-domain opt-in.
 var PiDefaultDomains = copyEngineDefaultDomainSet(engineDefaultDomainSets["pi"])
 
 // extractProviderFromModel parses "provider/model" format and returns the
@@ -163,27 +158,20 @@ func extractProviderFromModel(model string) (string, error) {
 	return provider, nil
 }
 
-// getPiDefaultDomains returns the default domains for Pi based on the model provider.
-// It starts with PiBaseDefaultDomains and adds the provider-specific API domain when
-// the model uses provider/model format (e.g. "copilot/claude-sonnet-4-20250514").
-// When no provider prefix is present the default Copilot API domain is included for
-// backward compatibility.
+// getPiDefaultDomains returns Pi's baseline and model-specific provider endpoint
+// metadata. These domains are not automatically granted by the network allow-list.
 // Returns an error if the model string is malformed (e.g. a leading slash).
 func getPiDefaultDomains(model string) ([]string, error) {
 	provider, err := extractProviderFromModel(model)
 	if err != nil {
 		return nil, err
 	}
-	domains := make([]string, 0, typeutil.SafeAllocationCapacity(len(PiBaseDefaultDomains), 1))
-	domains = append(domains, PiBaseDefaultDomains...)
-
+	domains := append([]string(nil), PiBaseDefaultDomains...)
 	if domain, ok := piProviderDomains[provider]; ok {
 		domains = append(domains, domain)
 	} else if provider == "" {
-		// No provider prefix → default to Copilot routing for backward compatibility.
 		domains = append(domains, piProviderDomains["copilot"])
 	}
-
 	return domains, nil
 }
 
@@ -319,8 +307,9 @@ func getDomainsFromRuntimes(runtimes map[string]any) []string {
 //   - "chrome": headless Chrome/Puppeteer browser testing (*.google.com, *.googleapis.com, *.gvt1.com)
 //   - "clojure": Clojure/Clojars
 //   - "containers": container registries (Docker, GHCR, etc.)
-//   - "copilot-vendor": plan-specific Copilot API hosts and Copilot telemetry (opt-in)
-//   - "codex-vendor": optional Codex authentication and telemetry hosts (opt-in)
+//   - "copilot-vendor": direct Copilot API hosts and Copilot telemetry (opt-in)
+//   - "codex-vendor": direct OpenAI API, authentication, and telemetry hosts (opt-in)
+//   - "gemini-vendor": direct Gemini API host (opt-in)
 //   - "dart": Dart/Flutter ecosystem
 //   - "deno": Deno runtime (deno.land, jsr.io, googleapis.deno.dev, fresh.deno.dev)
 //   - "dotnet": .NET and NuGet ecosystem
@@ -393,6 +382,7 @@ var ecosystemPriority = []string{
 	"containers",
 	"copilot-vendor",
 	"codex-vendor",
+	"gemini-vendor",
 	"dart",
 	"defaults",
 	"dev-tools",
@@ -716,13 +706,11 @@ func GetAllowedDomainsForEngine(engine constants.EngineName, network *NetworkPer
 	return result
 }
 
-// GetThreatDetectionAllowedDomains returns the minimal set of domains allowed for a Copilot
-// detection run. The "threat-detection" engine domain set includes the Copilot API endpoints
-// needed for read-only threat analysis plus registry.npmjs.org
-// for read-only npm package validation (e.g. verifying lockfile integrity hashes). It intentionally
-// excludes raw.githubusercontent.com (not needed when MCP servers are disabled and the CLI binary
-// is pre-installed). npm registry access is read-only metadata lookup only — installs are not
-// permitted during detection runs.
+// GetThreatDetectionAllowedDomains returns the minimal set of domains allowed for inline Copilot
+// threat detection. The "threat-detection" engine domain set includes the Copilot API endpoints
+// needed for threat analysis. It intentionally excludes package registries and
+// raw.githubusercontent.com. Inline detection handles npm registry opt-in separately; external
+// detectors do not use this metadata-validation path.
 // Any additional user-specified network.allowed entries are merged in (typically empty for detection).
 // Returns a deduplicated, sorted, comma-separated string suitable for AWF's --allow-domains flag.
 func GetThreatDetectionAllowedDomains(network *NetworkPermissions) string {
@@ -840,8 +828,21 @@ func mergeAllowedDomainList(domainsStr string, extraDomains ...string) string {
 	return strings.Join(sliceutil.SortedKeys(domainMap), ",")
 }
 
-// computeAllowedDomainsForSanitization computes the allowed domains for sanitization
-// based on the network configuration, matching what's provided to the firewall.
+// computeAllowedDomainsForSanitization also permits proxy upstream links in agent output,
+// without adding those upstreams to the cached agent firewall policy.
+func (c *Compiler) computeAllowedDomainsForSanitization(data *WorkflowData) (string, error) {
+	base, err := c.computeAllowedDomainsForFirewall(data)
+	if err != nil {
+		return "", err
+	}
+	engineID, err := validateDomainEngineModel(data)
+	if err != nil {
+		return "", err
+	}
+	return mergeAPITargetDomains(base, GetGeminiAPITarget(data, engineID)), nil
+}
+
+// computeAllowedDomainsForFirewall computes the agent egress policy.
 // The result is cached in data.CachedAllowedDomainsStr after the first call so that
 // repeated calls (e.g. from the activation job, safe-outputs steps, and agent run step)
 // do not recompute the same domain list.
@@ -849,7 +850,7 @@ func mergeAllowedDomainList(domainsStr string, extraDomains ...string) string {
 // current FrontmatterHash so repeated compilations of an unchanged workflow skip the
 // full domain computation without unbounded hash-key growth in watch mode.
 // Returns an error if the engine's model is malformed (e.g. a leading slash).
-func (c *Compiler) computeAllowedDomainsForSanitization(data *WorkflowData) (string, error) {
+func (c *Compiler) computeAllowedDomainsForFirewall(data *WorkflowData) (string, error) {
 	// Return cached result if available (engine/network/tools/runtimes do not change during compilation).
 	// CachedAllowedDomainsComputed is used as the sentinel so that a legitimately empty domain
 	// list is not confused with "not yet computed".
@@ -883,9 +884,9 @@ func (c *Compiler) computeAllowedDomainsForSanitization(data *WorkflowData) (str
 		base = mergeAPITargetDomains(base, copilotTarget)
 	}
 
-	// Add Gemini API target domains.
-	// Resolved from GEMINI_API_BASE_URL in engine.env or default generativelanguage.googleapis.com.
-	if geminiAPITarget := GetGeminiAPITarget(data, engineID); geminiAPITarget != "" {
+	// Preserve explicit custom-target egress, but never infer agent access from
+	// the default Gemini proxy upstream.
+	if geminiAPITarget := explicitGeminiAPITargetHost(data, engineID); geminiAPITarget != "" {
 		base = mergeAPITargetDomains(base, geminiAPITarget)
 	}
 
@@ -904,6 +905,33 @@ func (c *Compiler) computeAllowedDomainsForSanitization(data *WorkflowData) (str
 	}
 
 	return base, nil
+}
+
+func explicitGeminiAPITargetHost(data *WorkflowData, engineID string) string {
+	if data == nil || data.EngineConfig == nil || data.EngineConfig.Env == nil {
+		return ""
+	}
+
+	envVars := []string{"GEMINI_API_BASE_URL"}
+	if engineID == string(constants.AgyEngine) {
+		envVars = append([]string{"GOOGLE_GEMINI_BASE_URL"}, envVars...)
+	}
+
+	for _, envVar := range envVars {
+		baseURL := data.EngineConfig.Env[envVar]
+		if baseURL == "" {
+			continue
+		}
+		if !strings.Contains(baseURL, "://") {
+			baseURL = "//" + baseURL
+		}
+		parsedURL, err := url.Parse(baseURL)
+		if err == nil && parsedURL.Hostname() != "" {
+			return parsedURL.Hostname()
+		}
+	}
+
+	return ""
 }
 
 func validateDomainEngineModel(data *WorkflowData) (string, error) {

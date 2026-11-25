@@ -118,7 +118,7 @@ func (c *Compiler) buildActivationDailyAICGuardrailStep(data *WorkflowData) []st
 		steps = append(steps, c.buildDailyAICAppTokenMintStep(data.MaxDailyAICreditsGitHubApp)...)
 	}
 	if entry, ok := dailyAICRepoMemoryEntry(data); ok {
-		steps = append(steps, buildDailyAICRepoMemoryCloneStep(entry)...)
+		steps = append(steps, c.buildDailyAICRepoMemoryCloneStep(entry)...)
 	}
 	// Only restore observations from a verified workflow-run artifact. Actions
 	// cache restore-key matches do not establish producer provenance or freshness.
@@ -230,36 +230,41 @@ func dailyAICLedgerHydrationDir(memory RepoMemoryEntry) string {
 // clone/push steps (defaulting to the current repository and appending ".wiki"
 // for wiki-backed memories).
 func dailyAICRepoMemoryTargetRepo(memory RepoMemoryEntry) string {
-	targetRepo := memory.TargetRepo
-	if targetRepo == "" {
-		targetRepo = "${{ github.repository }}"
-	}
-	if memory.Wiki {
-		targetRepo += ".wiki"
-	}
-	return targetRepo
+	return repoMemoryTargetRepo(memory, PermissionRead)
 }
 
-func buildDailyAICRepoMemoryCloneStep(memory RepoMemoryEntry) []string {
+func (c *Compiler) buildDailyAICRepoMemoryCloneStep(memory RepoMemoryEntry) []string {
 	targetRepo := dailyAICRepoMemoryTargetRepo(memory)
 	memoryLabel := "repo-memory"
 	if memory.Wiki {
 		memoryLabel = "wiki-memory"
 	}
 	memoryDir := dailyAICRepoMemoryDir(memory)
-	return []string{
+	token := "${{ github.token }}"
+	if memory.githubApp(PermissionRead) != nil {
+		token = repoMemoryAppToken(memory, PermissionRead)
+	}
+	var steps []string
+	condition := admissionDailyAICFallbackIfExpr
+	if memory.githubApp(PermissionRead) != nil {
+		steps = append(steps, c.buildRepoMemoryAppTokenMintStep(memory, PermissionRead, string(constants.ActivationJobName), condition)...)
+	}
+	if targetCondition := repoMemoryAppTargetCondition(memory, PermissionRead); targetCondition != "" {
+		condition = combineGitHubIfExpressions(condition, targetCondition)
+	}
+	return append(steps, []string{
 		fmt.Sprintf("      - name: Clone daily AIC %s ledger (%s)\n", memoryLabel, memory.ID),
 		"        id: daily-aic-repo-memory-clone\n",
-		fmt.Sprintf("        if: %s\n", admissionDailyAICFallbackIfExpr),
+		fmt.Sprintf("        if: %s\n", condition),
 		"        env:\n",
-		"          GH_TOKEN: ${{ github.token }}\n",
+		fmt.Sprintf("          GH_TOKEN: %s\n", token),
 		"          GITHUB_SERVER_URL: ${{ github.server_url }}\n",
 		fmt.Sprintf("          BRANCH_NAME: %s\n", memory.BranchName),
 		fmt.Sprintf("          TARGET_REPO: %s\n", targetRepo),
 		fmt.Sprintf("          MEMORY_DIR: %s\n", memoryDir),
 		fmt.Sprintf("          CREATE_ORPHAN: %t\n", memory.CreateOrphan),
 		"        run: bash \"${RUNNER_TEMP}/gh-aw/actions/clone_repo_memory_branch.sh\"\n",
-	}
+	}...)
 }
 
 func appendDailyAICContinueOnError(steps []string, data *WorkflowData) []string {
@@ -289,4 +294,29 @@ func buildDailyAICActivationJobEnv(data *WorkflowData) map[string]string {
 		return map[string]string{maxDailyAICreditsEnvVar: value}
 	}
 	return map[string]string{maxDailyAICreditsEnvVar: strconv.Quote(value)}
+}
+
+// dailyAICQuotaStepCondition gates an activation step that consumes GitHub API
+// quota after the daily-AIC guardrail. In enforce mode a handled quota stop
+// skips the agent; later API steps must not turn it back into a failed
+// activation. Warning mode is fail-open and keeps the condition unchanged.
+// Returns nil when the condition is unchanged and empty.
+func dailyAICQuotaStepCondition(data *WorkflowData, condition ConditionNode) ConditionNode {
+	if !hasMaxDailyAICGuardrail(data) || data.MaxDailyAICContinueOnError {
+		return condition
+	}
+	guard := &ExpressionNode{Expression: "steps.daily-ai-credits-workflow-guardrail.outputs.daily_ai_credits_guardrail_status != 'quota_blocked'"}
+	if condition == nil {
+		return guard
+	}
+	return BuildAnd(condition, guard)
+}
+
+// appendDailyAICQuotaStepIf emits the quota gate for an activation step that
+// has no other condition.
+func appendDailyAICQuotaStepIf(steps []string, data *WorkflowData) []string {
+	if condition := dailyAICQuotaStepCondition(data, nil); condition != nil {
+		steps = append(steps, fmt.Sprintf("        if: %s\n", RenderCondition(condition)))
+	}
+	return steps
 }

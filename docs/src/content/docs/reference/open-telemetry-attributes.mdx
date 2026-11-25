@@ -1,6 +1,6 @@
 ---
 title: OpenTelemetry Attribute Reference
-description: Exhaustive reference for built-in OpenTelemetry resource attributes, span attributes, outcome attributes, and trace artifacts emitted by GitHub Agentic Workflows.
+description: Exhaustive reference for built-in OpenTelemetry resource attributes, span attributes, adoption attributes, and trace artifacts emitted by GitHub Agentic Workflows.
 sidebar:
   order: 205
 ---
@@ -113,8 +113,8 @@ These attributes appear on built-in workflow setup, agent, and conclusion spans 
     <tr><td><code>gh-aw.agent.conclusion</code></td><td>Normalized agent conclusion.</td></tr>
     <tr><td><code>gh-aw.detection.conclusion</code></td><td>Detection subsystem conclusion when present.</td></tr>
     <tr><td><code>gh-aw.detection.reason</code></td><td>Detection subsystem reason when present.</td></tr>
-    <tr><td><code>gh-aw.otlp.export_errors</code></td><td>Count of OTLP export errors seen during the run.</td></tr>
-    <tr><td><code>gh-aw.otlp.export_error_details</code></td><td>Serialized OTLP export error details when present.</td></tr>
+    <tr><td><code>gh-aw.otlp.export_errors</code></td><td>Count of OTLP export errors seen during the run, including partial rejection and unknown acceptance due to invalid response diagnostics. Counts export errors, not rejected records; warning-only partial success is excluded.</td></tr>
+    <tr><td><code>gh-aw.otlp.export_error_details</code></td><td>Serialized sanitized OTLP export error details when present, including signal-specific partial-rejection counts. Collector response messages are withheld.</td></tr>
     <tr><td><code>gh-aw.error.count</code></td><td>Count of output errors on the conclusion span.</td></tr>
     <tr><td><code>gh-aw.error.messages</code></td><td>Joined error messages when present.</td></tr>
     <tr><td><code>gh-aw.output.item_count</code></td><td>Count of output items produced by the run.</td></tr>
@@ -143,26 +143,31 @@ These attributes carry model, token, and stop-reason data on built-in agent span
     </tr>
   </thead>
   <tbody>
-    <tr><td><code>gen_ai.system</code></td><td>Compatibility GenAI system/provider name used by existing gh-aw dashboards and backends.</td></tr>
+    <tr><td><code>gen_ai.provider.name</code></td><td>Current GenAI provider name, for example <code>github</code>, <code>anthropic</code>, or <code>openai</code>. Copilot BYOK runs report the configured provider, such as <code>azure.ai.openai</code> for Azure endpoints.</td></tr>
+    <tr><td><code>gen_ai.system</code></td><td>Deprecated by OpenTelemetry and superseded by <code>gen_ai.provider.name</code>. gh-aw retains this compatibility attribute by default; it is not deprecated by gh-aw in this version.</td></tr>
     <tr><td><code>gh-aw.engine.id</code></td><td>Raw gh-aw engine identifier.</td></tr>
     <tr><td><code>gen_ai.request.model</code></td><td>Requested model name.</td></tr>
     <tr><td><code>gh-aw.model.requested</code></td><td>Configured model request, including a routing placeholder when applicable.</td></tr>
     <tr><td><code>gh-aw.model.effort</code></td><td>Effective reasoning effort for the selected routed model.</td></tr>
-    <tr><td><code>gen_ai.operation.name</code></td><td>Always <code>chat</code> for built-in agent spans.</td></tr>
-    <tr><td><code>gen_ai.workflow.name</code></td><td>Workflow name repeated in GenAI namespace.</td></tr>
+    <tr><td><code>gen_ai.operation.name</code></td><td><code>chat</code> by default; <code>invoke_agent</code> with <code>gen_ai_v1</code>.</td></tr>
+    <tr><td><code>gen_ai.agent.name</code></td><td>Workflow name on the built-in agent span.</td></tr>
+    <tr><td><code>gen_ai.workflow.name</code></td><td>Removed from the current GenAI conventions and superseded by <code>gen_ai.agent.name</code>. gh-aw retains this compatibility attribute by default.</td></tr>
     <tr><td><code>gen_ai.response.model</code></td><td>Resolved runtime model when available.</td></tr>
     <tr><td><code>gen_ai.response.finish_reasons</code></td><td>Array of stop reasons, defaulting to <code>unknown</code> when needed.</td></tr>
     <tr><td><code>gen_ai.usage.input_tokens</code></td><td>Input token count.</td></tr>
     <tr><td><code>gen_ai.usage.output_tokens</code></td><td>Output token count.</td></tr>
     <tr><td><code>gen_ai.usage.cache_read.input_tokens</code></td><td>Cache-read token count.</td></tr>
-    <tr><td><code>gen_ai.usage.cache_creation.input_tokens</code></td><td>Cache-write token count.</td></tr>
-    <tr><td><code>gen_ai.usage.total_tokens</code></td><td>Total input plus output tokens.</td></tr>
+    <tr><td><code>gen_ai.usage.cache_write.input_tokens</code></td><td>Current cache-write token count.</td></tr>
+    <tr><td><code>gen_ai.usage.cache_creation.input_tokens</code></td><td>No longer defined by the current GenAI conventions; superseded by <code>gen_ai.usage.cache_write.input_tokens</code>. gh-aw retains this compatibility alias by default.</td></tr>
+    <tr><td><code>gen_ai.usage.total_tokens</code></td><td>Removed from the current GenAI conventions; gh-aw retains this compatibility attribute by default. It is input plus output, excluding cache, with no standard replacement.</td></tr>
     <tr><td><code>gh-aw.harness.attempts</code></td><td>Integer count of started harness attempts, including the initial attempt.</td></tr>
     <tr><td><code>gh-aw.harness.retry_reasons</code></td><td>String array of failure classes in attempt order, including terminal failures. Repeated classes are preserved; first-attempt success produces an empty array.</td></tr>
   </tbody>
 </table>
 
-Harness retry attributes appear only on the span that owns the job's token usage: the dedicated agent span when present, otherwise the executing job's conclusion span. They remain available after retry exhaustion even when token accounting is missing; missing token counts are not synthesized. The usage artifact preserves per-attempt exit codes and failure classes in `agent/harness_retry.json` and `detection/harness_retry.json` when available.
+Token counters preserve measured zero as a numeric value; missing, null, or invalid counters are omitted, not converted to zero. Proxy-log aggregates include a counter only when every deduplicated request reports a valid value for it. An absent or unreadable usage log does not establish zero usage. These availability rules also apply to detection's namespaced usage artifact.
+
+Token and harness retry attributes appear only on the span that owns the job's token usage: the dedicated agent span when present, otherwise the executing job's conclusion span (agent, detection, or engine job). Detection uses only its own counters; downstream jobs never re-export downloaded agent usage. Harness retry attributes remain available after retry exhaustion even when token accounting is missing. The usage artifact preserves per-attempt exit codes and failure classes in `agent/harness_retry.json` and `detection/harness_retry.json` when available.
 
 ## Model-routing attributes
 
@@ -219,9 +224,11 @@ The episode ID stays fixed across hops. Each child records its immediate caller'
   </tbody>
 </table>
 
-## Outcome summary attributes
+## Adoption summary attributes
 
-These attributes appear on workflow-level outcome summary or conclusion spans.
+Consumers exporting collected adoption observations can use this attribute
+vocabulary. Lifecycle refresh does not run in conclusion; collection results are
+available through `logs --adoption` and single-run `audit --adoption`.
 
 <table>
   <thead>
@@ -231,34 +238,39 @@ These attributes appear on workflow-level outcome summary or conclusion spans.
     </tr>
   </thead>
   <tbody>
-    <tr><td><code>gh-aw.outcome.runs_checked</code></td><td>Number of runs checked while computing the summary.</td></tr>
-    <tr><td><code>gh-aw.outcome.total</code></td><td>Total evaluated outcomes.</td></tr>
-    <tr><td><code>gh-aw.outcome.accepted</code></td><td>Accepted outcome count.</td></tr>
-    <tr><td><code>gh-aw.outcome.rejected</code></td><td>Rejected outcome count.</td></tr>
-    <tr><td><code>gh-aw.outcome.ignored</code></td><td>Ignored outcome count.</td></tr>
-    <tr><td><code>gh-aw.outcome.pending</code></td><td>Pending outcome count.</td></tr>
-    <tr><td><code>gh-aw.outcome.noop</code></td><td>No-op outcome count.</td></tr>
-    <tr><td><code>gh-aw.outcome.accepted_strong</code></td><td>Strongly accepted outcome count.</td></tr>
-    <tr><td><code>gh-aw.outcome.accepted_medium</code></td><td>Medium-strength accepted outcome count.</td></tr>
-    <tr><td><code>gh-aw.outcome.accepted_weak</code></td><td>Weakly accepted outcome count.</td></tr>
-    <tr><td><code>gh-aw.outcome.fallback_exists_only_count</code></td><td>Fallback exists-only acceptance count.</td></tr>
-    <tr><td><code>gh-aw.outcome.acceptance_rate</code></td><td>Accepted fraction.</td></tr>
-    <tr><td><code>gh-aw.outcome.waste_rate</code></td><td>Rejected fraction.</td></tr>
-    <tr><td><code>gh-aw.outcome.noop_rate</code></td><td>No-op fraction.</td></tr>
-    <tr><td><code>gh-aw.outcome.zero_touch_count</code></td><td>Zero-touch accepted count.</td></tr>
-    <tr><td><code>gh-aw.outcome.zero_touch_rate</code></td><td>Zero-touch acceptance fraction.</td></tr>
-    <tr><td><code>gh-aw.outcome.item_count</code></td><td>Number of evaluated items in the summary payload.</td></tr>
-    <tr><td><code>gh-aw.outcome.date</code></td><td>Summary date when present.</td></tr>
-    <tr><td><code>gh-aw.outcome.median_resolution_sec</code></td><td>Median resolution time in seconds.</td></tr>
-    <tr><td><code>gh-aw.outcome.events</code></td><td>Comma-separated event names represented in the summary.</td></tr>
-    <tr><td><code>gh-aw.outcome.workflows</code></td><td>Comma-separated workflow names represented in the summary.</td></tr>
-    <tr><td><code>gh-aw.outcome.types</code></td><td>Comma-separated outcome object types represented in the summary.</td></tr>
+    <tr><td><code>gh-aw.adoption.runs_checked</code></td><td>Number of runs checked while computing the summary.</td></tr>
+    <tr><td><code>gh-aw.adoption.total</code></td><td>Total evaluated outcomes.</td></tr>
+    <tr><td><code>gh-aw.adoption.accepted</code></td><td>Accepted outcome count.</td></tr>
+    <tr><td><code>gh-aw.adoption.rejected</code></td><td>Rejected outcome count.</td></tr>
+    <tr><td><code>gh-aw.adoption.not_applicable</code></td><td>Infrastructure records not eligible for repository value.</td></tr>
+    <tr><td><code>gh-aw.adoption.accepted_human</code></td><td>Verified human adoption count.</td></tr>
+    <tr><td><code>gh-aw.adoption.accepted_automation</code></td><td>Automation-decided acceptance count; not human adoption.</td></tr>
+    <tr><td><code>gh-aw.adoption.accepted_delivery_fallback</code></td><td>Adoption by an explicitly permitted delivery fallback.</td></tr>
+    <tr><td><code>gh-aw.adoption.pending</code></td><td>Pending outcome count.</td></tr>
+    <tr><td><code>gh-aw.adoption.noop</code></td><td>No-op outcome count.</td></tr>
+    <tr><td><code>gh-aw.adoption.accepted_strong</code></td><td>Strongly accepted outcome count.</td></tr>
+    <tr><td><code>gh-aw.adoption.accepted_medium</code></td><td>Medium-strength accepted outcome count.</td></tr>
+    <tr><td><code>gh-aw.adoption.accepted_weak</code></td><td>Weakly accepted outcome count.</td></tr>
+    <tr><td><code>gh-aw.adoption.fallback_exists_only_count</code></td><td>Fallback exists-only acceptance count.</td></tr>
+    <tr><td><code>gh-aw.adoption.acceptance_rate</code></td><td>Accepted fraction.</td></tr>
+    <tr><td><code>gh-aw.adoption.waste_rate</code></td><td>Rejected fraction.</td></tr>
+    <tr><td><code>gh-aw.adoption.noop_rate</code></td><td>No-op fraction.</td></tr>
+    <tr><td><code>gh-aw.adoption.zero_touch_count</code></td><td>Zero-touch accepted count.</td></tr>
+    <tr><td><code>gh-aw.adoption.zero_touch_rate</code></td><td>Zero-touch acceptance fraction.</td></tr>
+    <tr><td><code>gh-aw.adoption.item_count</code></td><td>Number of evaluated items in the summary payload.</td></tr>
+    <tr><td><code>gh-aw.adoption.date</code></td><td>Summary date when present.</td></tr>
+    <tr><td><code>gh-aw.adoption.median_resolution_sec</code></td><td>Median resolution time in seconds.</td></tr>
+    <tr><td><code>gh-aw.adoption.events</code></td><td>Comma-separated event names represented in the summary.</td></tr>
+    <tr><td><code>gh-aw.adoption.workflows</code></td><td>Comma-separated workflow names represented in the summary.</td></tr>
+    <tr><td><code>gh-aw.adoption.types</code></td><td>Comma-separated outcome object types represented in the summary.</td></tr>
   </tbody>
 </table>
 
-## Outcome per-item attributes
+## Adoption per-item attributes
 
-These attributes appear on <code>gh-aw.outcome.evaluation</code> spans for individual evaluated items.
+Consumers can map individual decision observations onto
+<code>gh-aw.adoption.evaluation</code> spans. Execution-fact events remain distinct
+from later adoption observations.
 
 <table>
   <thead>
@@ -268,29 +280,29 @@ These attributes appear on <code>gh-aw.outcome.evaluation</code> spans for indiv
     </tr>
   </thead>
   <tbody>
-    <tr><td><code>gh-aw.outcome.type</code></td><td>Object type being evaluated.</td></tr>
-    <tr><td><code>gh-aw.outcome.result</code></td><td>Observed result classification.</td></tr>
-    <tr><td><code>gh-aw.outcome.outcome_status</code></td><td>Normalized outcome status.</td></tr>
-    <tr><td><code>gh-aw.outcome.evidence_strength</code></td><td>Evidence strength classification.</td></tr>
-    <tr><td><code>gh-aw.outcome.workflow</code></td><td>Source workflow name.</td></tr>
-    <tr><td><code>gh-aw.outcome.run_id</code></td><td>Source run ID.</td></tr>
-    <tr><td><code>gh-aw.outcome.repo</code></td><td>Repository associated with the item.</td></tr>
-    <tr><td><code>gh-aw.outcome.url</code></td><td>Primary URL for the evaluated object.</td></tr>
-    <tr><td><code>gh-aw.outcome.detail</code></td><td>Additional detail string.</td></tr>
-    <tr><td><code>gh-aw.outcome.signal</code></td><td>Signal that triggered evaluation.</td></tr>
-    <tr><td><code>gh-aw.outcome.created_at</code></td><td>Creation timestamp.</td></tr>
-    <tr><td><code>gh-aw.outcome.event</code></td><td>Outcome event label.</td></tr>
-    <tr><td><code>gh-aw.outcome.resolution_sec</code></td><td>Resolution time in seconds.</td></tr>
-    <tr><td><code>gh-aw.outcome.pending_age_sec</code></td><td>Age of a pending item in seconds.</td></tr>
-    <tr><td><code>gh-aw.outcome.review_comments</code></td><td>Review comment count.</td></tr>
-    <tr><td><code>gh-aw.outcome.changed_files</code></td><td>Changed file count.</td></tr>
-    <tr><td><code>gh-aw.outcome.additions</code></td><td>Added line count.</td></tr>
-    <tr><td><code>gh-aw.outcome.deletions</code></td><td>Deleted line count.</td></tr>
-    <tr><td><code>gh-aw.outcome.reactions_total</code></td><td>Total reaction count.</td></tr>
-    <tr><td><code>gh-aw.outcome.reactions_positive</code></td><td>Positive reaction count.</td></tr>
-    <tr><td><code>gh-aw.outcome.reactions_negative</code></td><td>Negative reaction count.</td></tr>
-    <tr><td><code>gh-aw.outcome.comments</code></td><td>Comment count.</td></tr>
-    <tr><td><code>gh-aw.outcome.zero_touch</code></td><td>Boolean zero-touch flag.</td></tr>
+    <tr><td><code>gh-aw.adoption.type</code></td><td>Object type being evaluated.</td></tr>
+    <tr><td><code>gh-aw.adoption.result</code></td><td>Observed result classification.</td></tr>
+    <tr><td><code>gh-aw.adoption.adoption_status</code></td><td>Adoption decision state.</td></tr>
+    <tr><td><code>gh-aw.adoption.evidence_strength</code></td><td>Evidence strength classification.</td></tr>
+    <tr><td><code>gh-aw.adoption.workflow</code></td><td>Source workflow name.</td></tr>
+    <tr><td><code>gh-aw.adoption.run_id</code></td><td>Source run ID.</td></tr>
+    <tr><td><code>gh-aw.adoption.repo</code></td><td>Repository associated with the item.</td></tr>
+    <tr><td><code>gh-aw.adoption.url</code></td><td>Primary URL for the evaluated object.</td></tr>
+    <tr><td><code>gh-aw.adoption.detail</code></td><td>Additional detail string.</td></tr>
+    <tr><td><code>gh-aw.adoption.signal</code></td><td>Signal that triggered evaluation.</td></tr>
+    <tr><td><code>gh-aw.adoption.created_at</code></td><td>Creation timestamp.</td></tr>
+    <tr><td><code>gh-aw.adoption.event</code></td><td>Outcome event label.</td></tr>
+    <tr><td><code>gh-aw.adoption.resolution_sec</code></td><td>Resolution time in seconds.</td></tr>
+    <tr><td><code>gh-aw.adoption.pending_age_sec</code></td><td>Age of a pending item in seconds.</td></tr>
+    <tr><td><code>gh-aw.adoption.review_comments</code></td><td>Review comment count.</td></tr>
+    <tr><td><code>gh-aw.adoption.changed_files</code></td><td>Changed file count.</td></tr>
+    <tr><td><code>gh-aw.adoption.additions</code></td><td>Added line count.</td></tr>
+    <tr><td><code>gh-aw.adoption.deletions</code></td><td>Deleted line count.</td></tr>
+    <tr><td><code>gh-aw.adoption.reactions_total</code></td><td>Total reaction count.</td></tr>
+    <tr><td><code>gh-aw.adoption.reactions_positive</code></td><td>Positive reaction count.</td></tr>
+    <tr><td><code>gh-aw.adoption.reactions_negative</code></td><td>Negative reaction count.</td></tr>
+    <tr><td><code>gh-aw.adoption.comments</code></td><td>Comment count.</td></tr>
+    <tr><td><code>gh-aw.adoption.zero_touch</code></td><td>Boolean zero-touch flag.</td></tr>
   </tbody>
 </table>
 
@@ -311,6 +323,62 @@ These attributes are emitted when experiments are active for a run.
   </tbody>
 </table>
 
+## Safe-output authorization attributes
+
+Protected live invocations emit `safe_output.authorization.oidc.run`, `safe_output.authorization.authority.run`, and `safe_output.authorization.decision.run` spans for the phases reached. These spans require a valid `GITHUB_AW_OTEL_TRACE_ID`; staged invocations and those without an authorization requirement emit none.
+
+<table>
+  <thead>
+    <tr>
+      <th>Attribute</th>
+      <th>Type</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td><code>gh-aw.safe_output.gate.phase</code></td><td>string</td><td>Authorization phase: <code>oidc</code>, <code>authority</code>, or <code>decision</code>.</td></tr>
+    <tr><td><code>gh-aw.safe_output.gate.state</code></td><td>string</td><td>Request-phase state: <code>succeeded</code> or <code>error</code>. Decision state: <code>allowed</code>, <code>denied</code>, or <code>error</code>.</td></tr>
+    <tr><td><code>gh-aw.safe_output.gate.reason_code</code></td><td>string</td><td>Stable outcome or failure code, such as <code>completed</code>, <code>allowed</code>, <code>denied</code>, <code>timeout</code>, <code>credential_error</code>, <code>authority_unavailable</code>, or <code>evidence_failed</code>.</td></tr>
+    <tr><td><code>gh-aw.safe_output.gate.executor</code></td><td>string</td><td>Executor on decision spans when available: <code>manager</code>, <code>native</code>, <code>script</code>, <code>action</code>, <code>job</code>, <code>standalone</code>, <code>workflow</code>, or <code>queue</code>.</td></tr>
+    <tr><td><code>gh-aw.safe_output.gate.binding</code></td><td>string</td><td>Prepared scope binding on decision spans when available: <code>invocation</code> or <code>resolved_effect</code>.</td></tr>
+    <tr><td><code>gh-aw.safe_output.gate.requirement_source</code></td><td>string</td><td>Effective requirement source on decision spans when available: <code>global</code> or <code>local</code>.</td></tr>
+  </tbody>
+</table>
+
+A successful authority request does not imply an allow decision, and an allow decision does not confirm execution or its effects. Network export is not awaited; exporter failures do not change the authorization decision.
+
+Gate attributes exclude endpoints, audiences, tokens, invocation and decision IDs, policy revisions, output names, and request or response bodies. See the [safe-output authorization contract](/gh-aw/specs/safe-outputs-specification/#safe-output-invocation-authorization) for binding, freshness, and evidence requirements.
+
+## Work queue attributes
+
+Queue runtime helpers emit one span per outer ledger operation: `work_queue.read` or `work_queue.publish`. Nested reads and publications fold into the outer span. Attributes describe only committed results; candidate operations are never recorded. See [OpenTelemetry queue health](/gh-aw/reference/work-queue/#opentelemetry-queue-health) for usage.
+
+<table>
+  <thead>
+    <tr><th>Attribute</th><th>Type</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>gh-aw.work_queue.operation</code></td><td>string</td><td>Outer operation: <code>read</code> or <code>publish</code>.</td></tr>
+    <tr><td><code>gh-aw.work_queue.publication.attempts</code></td><td>int</td><td>Compare-and-swap publication attempts.</td></tr>
+    <tr><td><code>gh-aw.work_queue.publication.conflict</code></td><td>int</td><td>Attempts that lost a ref-update race and re-planned.</td></tr>
+    <tr><td><code>gh-aw.work_queue.publication.ambiguous</code></td><td>int</td><td>Attempts whose write outcome was unknown and was re-read.</td></tr>
+    <tr><td><code>gh-aw.work_queue.publication.commits</code></td><td>int</td><td>Commits this operation appended.</td></tr>
+    <tr><td><code>gh-aw.work_queue.publication.recovered</code></td><td>int</td><td>Publications found already committed on re-read.</td></tr>
+    <tr><td><code>gh-aw.work_queue.request.kind</code></td><td>string</td><td>Committed request kind: <code>submit</code>, <code>dispatch_next</code>, <code>launch</code>, <code>bind</code>, <code>finish</code>, <code>release</code>, <code>cancel_work</code>, <code>checkpoint</code>, <code>issue_link</code>, or <code>migrate</code>.</td></tr>
+    <tr><td><code>gh-aw.work_queue.reason</code></td><td>string</td><td>Scheduler plan reason: <code>no_work</code>, <code>no_eligible_work</code>, <code>capacity_blocked</code>, <code>account_capacity_blocked</code>, <code>claim_budget_reached</code>, or <code>prefix_complete</code>.</td></tr>
+    <tr><td><code>gh-aw.work_queue.outcome</code></td><td>string</td><td><code>started</code>, <code>launch_failed</code>, <code>bound</code>, <code>released</code>, <code>settled</code>, or <code>blocked</code>. <code>blocked</code> marks the span as an error.</td></tr>
+    <tr><td><code>gh-aw.work_queue.error.type</code></td><td>string</td><td>Stable error code when the operation throws, such as <code>ledger_invalid</code>, <code>unsupported_protocol</code>, or <code>cas_exhausted</code>.</td></tr>
+    <tr><td><code>gh-aw.work_queue.queue.id</code></td><td>string</td><td>SHA-256 of the lowercased owner, repository, and queue branch.</td></tr>
+    <tr><td><code>gh-aw.work_queue.snapshot.present</code></td><td>boolean</td><td>Whether a replayed projection was observed.</td></tr>
+    <tr><td><code>gh-aw.work_queue.work.&lt;state&gt;</code></td><td>int</td><td>Work counts by state in the observed projection: <code>total</code>, <code>available</code>, <code>claimed</code>, <code>completed</code>, <code>cancelled</code>.</td></tr>
+    <tr><td><code>gh-aw.work_queue.claims.open</code></td><td>int</td><td>Open Claims in the observed projection.</td></tr>
+    <tr><td><code>gh-aw.work_queue.dispatches.&lt;state&gt;</code></td><td>int</td><td>Non-closed dispatches by state: <code>reserved</code>, <code>started</code>, <code>bound</code>.</td></tr>
+    <tr><td><code>gh-aw.work_queue.committed.&lt;kind&gt;</code></td><td>int</td><td>Committed operations of each kind: <code>Work</code>, <code>Claim</code>, <code>Dispatch</code>, <code>Bound</code>, <code>Completion</code>, <code>ClaimCancellation</code>, <code>WorkCancellation</code>, <code>Release</code>.</td></tr>
+  </tbody>
+</table>
+
+Projection counts are present only when <code>snapshot.present</code> is true. These measurements are span attributes, not continuously sampled metrics, and are never scheduling inputs.
+
 ## Trace files and artifacts
 
 When observability is enabled, trace data is also mirrored to local JSONL files and uploaded in the <code>agent</code> artifact:
@@ -322,6 +390,6 @@ See the [OpenTelemetry guide](/gh-aw/reference/open-telemetry/) for setup and [A
 ## Learn More
 
 - [OpenTelemetry guide](/gh-aw/reference/open-telemetry/)
-- [Outcomes](/gh-aw/reference/outcomes/)
+- [Delivery and adoption](/gh-aw/reference/delivery-adoption/)
 - [Cost Management](/gh-aw/reference/cost-management/)
 - [Artifacts](/gh-aw/reference/artifacts/)

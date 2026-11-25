@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -26,6 +28,13 @@ func TestOutcomeConformance(t *testing.T) {
 	content, err := os.ReadFile("testdata/outcome_conformance.json")
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal(content, &cases))
+	spec, err := os.ReadFile(filepath.Join("..", "..", "specs", "safe-output-lifecycle.md"))
+	require.NoError(t, err)
+	countMatch := regexp.MustCompile(`\b(\d+)-case fixture corpus\b`).FindSubmatch(spec)
+	require.Len(t, countMatch, 2, "adoption specification must state the fixture corpus count")
+	expectedCount, err := strconv.Atoi(string(countMatch[1]))
+	require.NoError(t, err)
+	require.Len(t, cases, expectedCount, "adoption fixture count must match specs/safe-output-lifecycle.md")
 	oldGet, oldArray := outcomeEvidenceGHAPIGet, outcomeEvidenceGHAPIGetArray
 	oldPR, oldPRArray := outcomeEvalPRGHAPIGet, outcomeEvalPRGHAPIGetArray
 	oldClose, oldCloseArray := closeStickyGHAPIGet, closeStickyGHAPIGetArray

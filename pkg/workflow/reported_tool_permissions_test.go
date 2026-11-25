@@ -16,11 +16,12 @@ func TestReportedWorkflowToolPermissions(t *testing.T) {
 		workflow string
 		grants   []string
 	}{
-		{"daily-graft-intelligence", []string{"shell(graft:*)", "shell(cat /tmp/gh-aw/agent/graft-changed-files.txt)", "shell(cat /tmp/gh-aw/agent/graft-recent-activity.txt)"}},
+		{"daily-graft-intelligence", []string{"shell(graft --help)", "shell(graft --dir=/tmp/gh-aw/graft map:*)", "shell(graft --dir=/tmp/gh-aw/graft ask:*)", "shell(graft --dir=/tmp/gh-aw/graft callers:*)", "shell(graft --dir=/tmp/gh-aw/graft skeleton:*)", "shell(graft --dir=/tmp/gh-aw/graft grep:*)", "shell(cat /tmp/gh-aw/agent/graft-changed-files.txt)", "shell(cat /tmp/gh-aw/agent/graft-recent-activity.txt)"}},
 		{"daily-schema-audit-cursor", []string{"shell(find)", "shell(jq)", "shell(sort)", "shell(echo)"}},
 		{"daily-regression-audit-kiro", []string{"shell(cd)", "shell(cut)", "shell(jq)"}},
 		{"daily-compiler-quality", []string{"shell(cd)", "shell(test)", "shell([)", "shell(awk)"}},
-		{"code-scanning-fixer", []string{"shell(cut)", "shell(github:*)", "shell(safeoutputs:*)"}},
+		{"code-scanning-fixer-worker", []string{"shell(cut)", "shell(github:*)", "shell(safeoutputs:*)", "shell(work-queue:*)"}},
+		{"tidy", []string{"shell(make:*)", "shell(git status)", "shell(safeoutputs:*)"}},
 		{"smoke-copilot-aoai-apikey", []string{"shell", "safeoutputs"}},
 		{"smoke-workflow-call", []string{"Bash(git status:*)", "Bash(git branch:*)", "Bash(git remote:*)", "Bash(git log:*)"}},
 		{"sighthound-security-scan", nil},
@@ -35,8 +36,8 @@ func TestReportedWorkflowToolPermissions(t *testing.T) {
 			switch ResolveEngineID(data) {
 			case "claude":
 				assert.False(t, data.BashDisabled)
-				allowed := NewClaudeEngine().computeAllowedClaudeToolsString(
-					data.Tools, data.SafeOutputs, data.CacheMemoryConfig, data.DriveMemoryConfig, data.MCPScripts, data.SandboxConfig)
+				allowed := NewClaudeEngine().computeAllowedClaudeToolsStringWithDynamicWorkflows(
+					data.Tools, data.SafeOutputs, data.CacheMemoryConfig, data.DriveMemoryConfig, data.MCPScripts, data.SandboxConfig, false)
 				for _, grant := range tt.grants {
 					assert.Contains(t, strings.Split(allowed, ","), grant)
 				}
@@ -47,11 +48,32 @@ func TestReportedWorkflowToolPermissions(t *testing.T) {
 					assert.Contains(t, args, grant)
 				}
 				if tt.workflow == "daily-graft-intelligence" {
-					assert.Contains(t, getMCPCLIExcludeFromAgentConfig(data), "graft")
-					graft, ok := data.Tools["graft"].(map[string]any)
+					assert.NotContains(t, args, "shell(graft:*)")
+					assert.NotContains(t, data.Tools, "graft")
+				}
+				if tt.workflow == "code-scanning-fixer-worker" {
+					assert.NotContains(t, args, "shell")
+					assert.NotContains(t, args, "shell(node:*)")
+					assert.NotContains(t, args, "shell(make:*)")
+					assert.NotContains(t, data.MarkdownContent, "full bash access")
+					require.NotEmpty(t, data.ImportedFiles)
+					for _, importedFile := range data.ImportedFiles {
+						importedPath := strings.SplitN(importedFile, "#", 2)[0]
+						assert.NotEqual(t, "security-analysis-base.md", filepath.Base(importedPath),
+							"restricted fixer must not import the full-Bash security prompt: %s", importedFile)
+					}
+					assert.Contains(t, data.MarkdownContent, "Tests not run: test execution is not available in this workflow")
+					assert.Contains(t, data.MarkdownContent, "DIFC/policy-filtered result")
+					assert.Contains(t, data.MarkdownContent, "work_queue_claim_finish")
+					github, ok := data.Tools["github"].(map[string]any)
 					require.True(t, ok)
-					assert.Contains(t, graft["allowed"], "graft_check")
-					assert.Contains(t, graft["allowed"], "graft_map")
+					assert.Contains(t, github["toolsets"], "repos")
+					assert.Contains(t, github["toolsets"], "code_security")
+				}
+				if tt.workflow == "tidy" {
+					assert.NotContains(t, args, "shell(git status:*)")
+					assert.NotContains(t, data.MarkdownContent, "git status --porcelain")
+					assert.Contains(t, data.MarkdownContent, "git status` reports a clean working tree")
 				}
 				if tt.workflow == "smoke-copilot-aoai-apikey" {
 					assert.Contains(t, getMCPCLIExcludeFromAgentConfig(data), "safeoutputs")

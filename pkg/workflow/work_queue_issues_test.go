@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,33 +11,56 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestWorkQueueIssuesProjectorAppTokensStayInHooks(t *testing.T) {
+func TestWorkQueueIssuesProjectorAppTokensStayInConclusion(t *testing.T) {
 	compiler := NewCompiler()
 	data := &WorkflowData{SafeOutputs: &SafeOutputsConfig{GitHubApp: &GitHubAppConfig{
 		AppID: "${{ secrets.PROJECTOR_APP_ID }}", PrivateKey: "${{ secrets.PROJECTOR_APP_KEY }}",
 	}}}
-	for _, job := range []string{"activation", "conclusion"} {
-		steps := compiler.workQueueProjectorTokenSteps(data, job)
-		var document map[string]any
-		require.NoError(t, yaml.Unmarshal([]byte("steps:\n"+strings.Join(steps, "")), &document))
-		minted := document["steps"].([]any)[0].(map[string]any)
-		require.Equal(t, "write", minted["with"].(map[string]any)["permission-issues"])
-		if job == "conclusion" {
-			require.Equal(t, "always()", minted["if"])
-		}
-		steps = append(steps, "        with:\n")
-		compiler.addWorkQueueProjectorToken(&steps, data)
-		result := strings.Join(steps, "")
-		require.Contains(t, result, "id: work-queue-projector-token")
-		require.Contains(t, result, "permission-contents: write")
-		require.Contains(t, result, "permission-issues: write")
-		require.Contains(t, result, "permission-actions: read")
-		require.Contains(t, result, "github-token: ${{ steps.work-queue-projector-token.outputs.token }}")
-		require.NotContains(t, result, "steps.safe-outputs-app-token.outputs.token")
-		if job == "conclusion" {
-			require.Contains(t, result, "if: always()")
-		}
+	steps := compiler.workQueueProjectorTokenSteps(data, "conclusion")
+	var document map[string]any
+	require.NoError(t, yaml.Unmarshal([]byte("steps:\n"+strings.Join(steps, "")), &document))
+	minted := document["steps"].([]any)[0].(map[string]any)
+	require.Equal(t, "write", minted["with"].(map[string]any)["permission-issues"])
+	require.Equal(t, "always()", minted["if"])
+	steps = append(steps, "        with:\n")
+	compiler.addWorkQueueProjectorToken(&steps, data, "conclusion")
+	result := strings.Join(steps, "")
+	require.Contains(t, result, "id: work-queue-projector-token")
+	require.Contains(t, result, "permission-contents: write")
+	require.Contains(t, result, "permission-issues: write")
+	require.Contains(t, result, "permission-actions: read")
+	require.Contains(t, result, "github-token: ${{ steps.work-queue-projector-token.outputs.token }}")
+	require.NotContains(t, result, "steps.safe-outputs-app-token.outputs.token")
+	require.Contains(t, result, "if: always()")
+}
+
+func TestWorkQueueIssuesBrokerProjectorUsesJobLocalCredential(t *testing.T) {
+	compiler := NewCompiler()
+	data := &WorkflowData{
+		Tools:       map[string]any{"work-queue": map[string]any{"worker": true, "issues": true}},
+		SafeOutputs: &SafeOutputsConfig{TokenBroker: true},
 	}
+	require.NoError(t, validateWorkQueueConfiguration(data))
+	ctx := &activationJobBuildContext{data: data, outputs: map[string]string{}}
+	compiler.addWorkQueueSnapshotStep(ctx)
+	var activation []struct {
+		ID   string            `yaml:"id"`
+		If   string            `yaml:"if"`
+		With map[string]string `yaml:"with"`
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(strings.Join(ctx.steps, "")), &activation))
+	require.Len(t, activation, 3)
+	require.Equal(t, "work-queue-activation-broker-token", activation[0].ID)
+	require.Contains(t, activation[0].With["script"], "getBrokerToken('github-app'")
+	require.Equal(t, "work_queue_snapshot", activation[1].ID)
+	require.Equal(t, "${{ steps.work-queue-activation-broker-token.outputs.token }}", activation[1].With["github-token"])
+	require.Equal(t, "always()", activation[2].If)
+	require.Contains(t, activation[2].With["script"], "invalidateBrokerTokens")
+
+	conclusion := strings.Join(compiler.buildWorkQueueTerminationStep(data), "")
+	require.Contains(t, conclusion, "github-token: ${{ steps.safe-outputs-app-token.outputs.token }}")
+	require.NotContains(t, conclusion, "secrets.GITHUB_TOKEN")
+	require.NotContains(t, conclusion, "work-queue-projector-token")
 }
 
 func TestWorkQueueIssuesConfiguration(t *testing.T) {
@@ -50,12 +74,14 @@ func TestWorkQueueIssuesConfiguration(t *testing.T) {
 		{"false", false, true, ""},
 		{"object", map[string]any{"label": "cookie"}, true, "cookie"},
 		{"custom-title", map[string]any{"title_prefix": "[cookie queue]"}, true, "work"},
+		{"orphaned-age", map[string]any{"orphaned_after_days": float64(7)}, true, "work"},
 		{"maximum-label-prefix", map[string]any{"label": strings.Repeat("x", 33)}, true, strings.Repeat("x", 33)},
 		{"empty-object", map[string]any{}, true, "work"},
 		{"blank-label", map[string]any{"label": " "}, false, ""},
 		{"label-prefix-too-long", map[string]any{"label": strings.Repeat("x", 34)}, false, ""},
 		{"status-field", map[string]any{"status-field": "CustomStatus"}, false, ""},
 		{"unknown", map[string]any{"storage": "issues"}, false, ""},
+		{"invalid-orphaned-age", map[string]any{"orphaned_after_days": float64(3651)}, false, ""},
 		{"null", nil, false, ""},
 		{"expression", map[string]any{"label": "${{ inputs.label }}"}, false, ""},
 		{"blank-title", map[string]any{"title_prefix": " "}, false, ""},
@@ -74,13 +100,18 @@ func TestWorkQueueIssuesConfiguration(t *testing.T) {
 			config := workQueueIssuesConfig(data)
 			if test.label == "" {
 				require.Nil(t, config)
+				return
+			}
+			require.Equal(t, test.label, config.Label)
+			if test.name == "orphaned-age" {
+				require.Equal(t, 7, config.OrphanedAfterDays)
 			} else {
-				require.Equal(t, test.label, config.Label)
-				if test.name == "custom-title" {
-					require.Equal(t, "[cookie queue]", config.TitlePrefix)
-				} else {
-					require.Empty(t, config.TitlePrefix)
-				}
+				require.Equal(t, 30, config.OrphanedAfterDays)
+			}
+			if test.name == "custom-title" {
+				require.Equal(t, "[cookie queue]", config.TitlePrefix)
+			} else {
+				require.Equal(t, "[work queue]", config.TitlePrefix)
 			}
 		})
 	}
@@ -121,40 +152,39 @@ func TestWorkQueueIssuesCompilationUsesExistingJobs(t *testing.T) {
 	activation := jobs["activation"].(map[string]any)
 	conclusion := jobs["conclusion"].(map[string]any)
 	require.Equal(t, "always()", conclusion["if"])
-	for _, job := range []map[string]any{activation, conclusion} {
-		perms := job["permissions"].(map[string]any)
-		require.Equal(t, "write", perms["contents"])
-		require.Equal(t, "write", perms["issues"])
-		require.Equal(t, "read", perms["actions"])
-	}
+	activationPerms := activation["permissions"].(map[string]any)
+	require.Equal(t, "write", activationPerms["contents"])
+	require.NotContains(t, activationPerms, "issues")
+	conclusionPerms := conclusion["permissions"].(map[string]any)
+	require.Equal(t, "write", conclusionPerms["contents"])
+	require.Equal(t, "write", conclusionPerms["issues"])
+	require.Equal(t, "read", conclusionPerms["actions"])
 	agent := jobs["agent"].(map[string]any)
 	perms := agent["permissions"].(map[string]any)
 	require.NotEqual(t, "write", perms["issues"])
 	require.NotEqual(t, "write", perms["contents"])
-	seen := false
-	detectionSeen := false
+	conclusionYAML, err := yaml.Marshal(conclusion["steps"])
+	require.NoError(t, err)
+	require.NotContains(t, string(conclusionYAML), "work_queue_issues.cjs")
+	require.NotContains(t, string(conclusionYAML), "GH_AW_WORK_QUEUE_CHECKED_TRANSPORT")
+	var termination map[string]any
 	for _, value := range conclusion["steps"].([]any) {
-		step := value.(map[string]any)
-		if step["id"] == "work_queue_issues" {
-			require.Equal(t, "always()", step["if"])
-			env := step["env"].(map[string]any)
-			require.JSONEq(t, `{"label":"cookie","title_prefix":"[cookie queue]"}`, env["GH_AW_WORK_QUEUE_ISSUES"].(string))
-			require.Contains(t, step["with"].(map[string]any)["script"], "core.setFailed(")
-			seen = true
-		}
-		if step["id"] == "detection_runs" {
-			require.True(t, seen, "the detection tracker follows the potentially failed Issue projection")
-			require.Equal(t, "always()", step["if"], "pending mirrors must not skip required detection reporting")
-			detectionSeen = true
+		if step := value.(map[string]any); step["id"] == "worker_termination" {
+			termination = step
 		}
 	}
-	require.True(t, seen)
-	require.True(t, detectionSeen)
+	require.NotNil(t, termination)
+	require.Equal(t, "always()", termination["if"])
+	var policy struct {
+		Issues map[string]any `json:"issues"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(termination["env"].(map[string]any)["GH_AW_WORK_QUEUE_POLICY"].(string)), &policy))
+	require.Equal(t, map[string]any{"label": "cookie", "title_prefix": "[cookie queue]", "orphaned_after_days": float64(30)}, policy.Issues)
 	trial := compile("true", true)
 	for _, name := range []string{"activation", "conclusion"} {
 		for _, value := range trial["jobs"].(map[string]any)[name].(map[string]any)["steps"].([]any) {
 			step := value.(map[string]any)
-			if step["id"] == "work_queue_snapshot" || step["id"] == "work_queue_issues" {
+			if step["id"] == "work_queue_snapshot" || step["id"] == "worker_termination" {
 				require.Equal(t, "true", step["env"].(map[string]any)["GH_AW_SAFE_OUTPUTS_STAGED"])
 			}
 		}

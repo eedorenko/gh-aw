@@ -18,11 +18,6 @@ func (c *Compiler) SetContext(ctx context.Context) {
 	c.ctx = ctx
 }
 
-// SetModelPricingResolver configures pricing lookup for models absent from workflow frontmatter.
-func (c *Compiler) SetModelPricingResolver(resolver func(ctx context.Context, provider, model string) (map[string]float64, bool)) {
-	c.modelPricingResolver = resolver
-}
-
 // SetRequireDocker configures whether Docker must be available for container image validation.
 // When true, validation fails with an error if Docker is not installed or the daemon is not running.
 // When false (default), validation is silently skipped when Docker is unavailable.
@@ -62,6 +57,12 @@ func (c *Compiler) GetExperimentalFeatureUsage() map[string]int {
 // CopilotRequestsTipNeeded reports whether batch output should show the token-based inference tip.
 func (c *Compiler) CopilotRequestsTipNeeded() bool {
 	return c.copilotTipNeeded
+}
+
+// DefaultModelRoutingWorkflowCount returns how many workflows compiled in batch
+// mode received the implicit cost/auto model-routing default.
+func (c *Compiler) DefaultModelRoutingWorkflowCount() int {
+	return c.defaultRoutingCount
 }
 
 // SetExperimentalFeatureUsage replaces the experimental feature usage map.
@@ -239,6 +240,11 @@ func (c *Compiler) SetConfiguredModelValidator(validator func(data *WorkflowData
 // GetWarningCount returns the current warning count
 func (c *Compiler) GetWarningCount() int {
 	return c.warningCount
+}
+
+// GetDiagnostics returns a copy of the structured compiler diagnostics.
+func (c *Compiler) GetDiagnostics() []CompilerDiagnostic {
+	return append([]CompilerDiagnostic(nil), c.diagnostics...)
 }
 
 // ResetWarningCount resets the warning counter to zero

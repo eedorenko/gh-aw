@@ -1,17 +1,17 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "fs";
-import os from "os";
 import path from "path";
 import safeOutputsMCPServerHTTP from "./safe_outputs_mcp_server_http.cjs";
 import { normalizeSafeOutputToolArguments } from "./safe_outputs_mcp_arguments.cjs";
 
 const { createMCPServer } = safeOutputsMCPServerHTTP;
+const outputId = expect.stringMatching(/^so_[A-Za-z0-9_-]{12}$/);
 
 describe("safe_outputs_mcp wrapped tool arguments", () => {
   let tempDir;
 
   beforeEach(() => {
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "safe-outputs-mcp-wrapped-"));
+    tempDir = fs.mkdtempSync(path.join(process.cwd(), ".safe-outputs-mcp-wrapped-"));
   });
 
   afterEach(() => {
@@ -21,6 +21,33 @@ describe("safe_outputs_mcp wrapped tool arguments", () => {
     delete process.env.GH_AW_SAFE_OUTPUTS_CONFIG_PATH;
     delete process.env.GH_AW_SAFE_OUTPUTS_TOOLS_PATH;
     delete process.env.GH_AW_SAFE_OUTPUTS;
+  });
+
+  it.each([
+    ["add_labels", { labels: [{ name: "a".repeat(54) }] }],
+    ["remove_labels", { labels: ["a".repeat(54)] }],
+    ["replace_label", { label_to_remove: "bug", label_to_add: "a".repeat(54) }],
+  ])("rejects oversized %s labels without recording an output", async (toolName, args) => {
+    const configPath = path.join(tempDir, "config.json");
+    const toolsPath = path.join(tempDir, "tools.json");
+    const outputPath = path.join(tempDir, "output.jsonl");
+    const tools = JSON.parse(fs.readFileSync(path.join(process.cwd(), "safe_outputs_tools.json"), "utf8"));
+    fs.writeFileSync(configPath, JSON.stringify({ [toolName]: { target: "*" } }));
+    fs.writeFileSync(toolsPath, JSON.stringify(tools.filter(tool => tool.name === toolName)));
+    process.env.GH_AW_SAFE_OUTPUTS_CONFIG_PATH = configPath;
+    process.env.GH_AW_SAFE_OUTPUTS_TOOLS_PATH = toolsPath;
+    process.env.GH_AW_SAFE_OUTPUTS = outputPath;
+
+    const { server } = createMCPServer();
+    const response = await server.handleRequest({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: toolName, arguments: { ...args, item_number: 42 } },
+    });
+    expect(response.error.code).toBe(-32602);
+    expect(response.error.message).toContain("maximum length of 50 characters");
+    expect(fs.existsSync(outputPath)).toBe(false);
   });
 
   it("logs when wrapped arguments are unwrapped", () => {
@@ -46,6 +73,33 @@ describe("safe_outputs_mcp wrapped tool arguments", () => {
     expect(debug).toHaveBeenCalledWith(expect.stringContaining("Recovered wrapped safe-output tool arguments for 'create_discussion'"));
     expect(debug).toHaveBeenCalledWith(expect.stringContaining("unwrapping key 'create_discussion'"));
     expect(debug).toHaveBeenCalledWith(expect.stringContaining(JSON.stringify(payloadKeys)));
+  });
+
+  it.each([null, "so_BBBBBBBBBBBB"])("rejects simultaneous dependency aliases before normalization can discard one: %j", async alias => {
+    const configPath = path.join(tempDir, "config.json");
+    const toolsPath = path.join(tempDir, "tools.json");
+    const outputPath = path.join(tempDir, "output.jsonl");
+    const tools = JSON.parse(fs.readFileSync(path.join(process.cwd(), "safe_outputs_tools.json"), "utf8"));
+    fs.writeFileSync(configPath, JSON.stringify({ add_comment: { enabled: true, target: "42" } }));
+    fs.writeFileSync(toolsPath, JSON.stringify(tools.filter(tool => tool.name === "add_comment")));
+    process.env.GH_AW_SAFE_OUTPUTS_CONFIG_PATH = configPath;
+    process.env.GH_AW_SAFE_OUTPUTS_TOOLS_PATH = toolsPath;
+    process.env.GH_AW_SAFE_OUTPUTS = outputPath;
+    const { server } = createMCPServer();
+    const response = await server.handleRequest({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "add_comment", arguments: { body: "A useful comment", "depends-on": "so_AAAAAAAAAAAA", depends_on: alias } },
+    });
+    expect(response.error || response.result?.isError).toBeTruthy();
+    expect(fs.existsSync(outputPath)).toBe(false);
+  });
+
+  it("preserves outer dependencies when recovering wrapped arguments", () => {
+    const dependency = "so_AAAAAAAAAAAA";
+    expect(normalizeSafeOutputToolArguments("add_comment", { add_comment: { body: "A useful comment" }, "depends-on": dependency })).toEqual({ body: "A useful comment", "depends-on": dependency });
+    expect(() => normalizeSafeOutputToolArguments("add_comment", { add_comment: { body: "A useful comment", "depends-on": dependency }, depends_on: dependency })).toThrow("Provide depends-on only once");
   });
 
   it.each(["", " \t\n"])("omits blank optional fields before MCP validation and NDJSON append (%j)", async blank => {
@@ -106,24 +160,30 @@ describe("safe_outputs_mcp wrapped tool arguments", () => {
         id: 1,
         error: {
           code: -32602,
-          message: "ERR_VALIDATION: update_issue requires at least one of: status, title, body, labels, assignees, milestone fields",
+          message: "ERR_VALIDATION: update_issue requires at least one of: status, title, body, labels, assignees, milestone, artifacts fields",
         },
       });
       expect(fs.existsSync(outputPath)).toBe(false);
     }
 
+    const returnedIds = [];
     for (const update of [{ milestone: null }, { title: "Updated title" }, { body: "" }, { labels: [] }, { assignees: [] }]) {
       const response = await server.handleRequest(request(update));
       expect(response.error).toBeUndefined();
       expect(response.result.isError).toBe(false);
+      const result = JSON.parse(response.result.content[0].text);
+      expect(result).toEqual({ result: "success", output_id: outputId });
+      returnedIds.push(result.output_id);
     }
-    expect(fs.readFileSync(outputPath, "utf8").trim().split("\n").map(JSON.parse)).toEqual([
-      { type: "update_issue", issue_number: 42, milestone: null },
-      { type: "update_issue", issue_number: 42, title: "Updated title" },
-      { type: "update_issue", issue_number: 42, body: "" },
-      { type: "update_issue", issue_number: 42, labels: [] },
-      { type: "update_issue", issue_number: 42, assignees: [] },
+    const written = fs.readFileSync(outputPath, "utf8").trim().split("\n").map(JSON.parse);
+    expect(written).toEqual([
+      { type: "update_issue", issue_number: 42, milestone: null, output_id: returnedIds[0] },
+      { type: "update_issue", issue_number: 42, title: "Updated title", output_id: returnedIds[1] },
+      { type: "update_issue", issue_number: 42, body: "", output_id: returnedIds[2] },
+      { type: "update_issue", issue_number: 42, labels: [], output_id: returnedIds[3] },
+      { type: "update_issue", issue_number: 42, assignees: [], output_id: returnedIds[4] },
     ]);
+    expect(new Set(returnedIds).size).toBe(5);
   });
 
   it("maps configured parameter synonyms to canonical field names", () => {

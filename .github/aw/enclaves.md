@@ -12,6 +12,7 @@ Use these instructions when a workflow needs bounded, auditable access to a priv
 - Each entry is either a **script enclave** (`script:` + `repos:`) registering `enclave_run_script`, or an **agent enclave** (`agent:` + static `repos:` or dynamic `dynamic:`) registering `enclave_run_agent`.
 - Omit `enclaves:` entirely to disable the feature — this is the default.
 - This is a preview feature gated on `github/gh-aw-firewall#6992`; an older pinned AWF version will not provide the enclave server.
+- Before using `dynamic:`, the deprecated `agent.github.cli: issues-read-v1` profile, or string fields in `enclave_run_agent` response schemas, read the matching sections after the prefix marker below.
 
 ## Prerequisites
 
@@ -49,7 +50,7 @@ enclaves:
 
 ## Docker enclave credential staging and diagnostics
 
-- The default AWF release is `v0.29.5`. Compilation generates authenticated installation and probing of a same-release, runner-UID-scoped storage helper for Docker enclaves. Only helper provisioning is privileged; AWF itself stays rootless with network isolation and `noexec` writable invocation storage.
+- The default AWF release is `v0.29.7`. Compilation generates authenticated installation and probing of a same-release, runner-UID-scoped storage helper for Docker enclaves. Only helper provisioning is privileged; AWF itself stays rootless with network isolation and `noexec` writable invocation storage.
 - Set `sandbox.agent.host-github-token` to stage private host-side repository content for Docker enclaves, e.g. `host-github-token: ${{ secrets.GH_AW_GITHUB_TOKEN }}`. Requires `enclaves` and AWF `v0.29.5` or newer. Compilation rejects a missing staging credential and binds it only as host `GH_TOKEN`, excluded from the primary agent environment. This is separate from the enclave's own GitHub-tool credential and is never persisted through `GITHUB_ENV`. Grant only the repository read access needed for staging.
 - Set `sandbox.agent.enclave-debug-public: true` only for static, public-only Docker enclaves using official release images; default is `false`. Confidential, private, mixed, dynamic, custom-image, and unsupported-runtime configurations cannot opt in, and AWF independently verifies repository visibility before capture. Public diagnostic artifacts have a fixed one-day retention ceiling and redaction does not cover private repository content — never enable this for confidential targets.
 
@@ -88,6 +89,10 @@ enclaves:
 - Unsupported tools and out-of-scope repositories fail closed at compile time.
 - GraphQL, search, writes, and all other GitHub tools remain denied.
 - Minimum versions are AWF `v0.28.9` and mcpg `v0.4.15`; trusted repositories additionally require AWF `v0.28.14`.
+
+See also: [agent-runtime-instructions.md](agent-runtime-instructions.md) for `sandbox.agent` fields, and [network.md](network.md) for network isolation defaults.
+
+<!-- instruction-prefix-end -->
 
 ## Dynamic agent repository policies
 
@@ -151,8 +156,7 @@ enclaves:
 - `enclaves[].agent.github.cli: issues-read-v1` is deprecated. Migrate to `enclaves[].agent.tools.github`.
 - `issues-read-v1` permits only the `list_issues` and `issue_read` GitHub MCP
   tools. GraphQL, search, writes, and all other GitHub tools fail closed.
-- V1 allows at most one repository whose sensitivity is neither `public` nor `trusted` in the agent entry; `trusted` is public-equivalent for this limit.
-- `trusted` repositories are public-equivalent for this limit, so multiple `trusted` and `public` repositories are allowed.
+- V1 allows at most one repository whose sensitivity is neither `public` nor `trusted` in the agent entry; `trusted` is public-equivalent for this limit, so multiple `trusted` and `public` repositories are allowed.
 - The compiler generates separate primary and enclave identities for one shared
   mcpg gateway. The enclave identity is restricted to the GitHub server, those
   two tools, and the union of repositories declared in its trusted entry.
@@ -178,5 +182,3 @@ For a trusted repository, an `enclave_run_agent` response schema may contain str
 ```
 
 Responses must conform exactly to the declared schema: fields are required, extra properties are rejected, floats, `$ref`, recursion, regex schemas, and untagged unions are unsupported. Output remains subject to AWF's configured limit and the global 8 KiB ceiling.
-
-See also: [agent-runtime-instructions.md](agent-runtime-instructions.md) for `sandbox.agent` fields, and [network.md](network.md) for network isolation defaults.

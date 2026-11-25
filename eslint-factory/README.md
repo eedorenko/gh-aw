@@ -44,6 +44,7 @@ negative controls and validated readable traces without live effects.
 | [`no-core-exportvariable-non-string`](#no-core-exportvariable-non-string) | Require explicit string values for `core.exportVariable` calls |
 | [`no-core-setoutput-non-string`](#no-core-setoutput-non-string) | Require explicit string values for `core.setOutput` calls |
 | [`no-deprecated-string-substr`](#no-deprecated-string-substr) | Disallow deprecated `String.prototype.substr()` calls |
+| [`no-dynamic-string-replacement`](#no-dynamic-string-replacement) | Disallow dynamic replacement values passed to `String.prototype.replace()` or `replaceAll()` |
 | [`no-empty-catch-block`](#no-empty-catch-block) | Disallow undocumented empty `catch` blocks |
 | [`no-duplicate-constant-values`](#no-duplicate-constant-values) | Report constants with duplicate static primitive values in the same file |
 | [`no-child-process-interpolated-command`](#no-child-process-interpolated-command) | Disallow interpolated command strings in shell-evaluated `child_process` calls |
@@ -53,6 +54,7 @@ negative controls and validated readable traces without live effects.
 | [`no-json-stringify-set-or-map`](#no-json-stringify-set-or-map) | Disallow `JSON.stringify()` directly on `Set` or `Map` instances |
 | [`no-math-minmax-array-spread`](#no-math-minmax-array-spread) | Disallow spreading a non-literal array into `Math.min(...)` / `Math.max(...)` |
 | [`no-map-parseint-callback`](#no-map-parseint-callback) | Disallow passing `parseInt` directly as an array callback, because the element index is used as the radix |
+| [`no-path-startswith-without-separator`](#no-path-startswith-without-separator) | Disallow `startsWith()` containment checks against a bare `path.resolve/join/normalize` result |
 | [`no-misplaced-error-code-definition`](#no-misplaced-error-code-definition) | Require exported error-code constants to be defined in `error_codes.cjs` |
 | [`no-single-char-string-replace`](#no-single-char-string-replace) | Disallow `String.prototype.replace()` with a single-character string pattern, which replaces only the first occurrence |
 | [`no-split-filter-trim-without-trim-map`](#no-split-filter-trim-without-trim-map) | Require split values to be trimmed before filtering out empty entries |
@@ -109,6 +111,8 @@ negative controls and validated readable traces without live effects.
 | [`prefer-actions-exec-over-child-process`](#prefer-actions-exec-over-child-process) | Prefer `@actions/exec` over `child_process` to spawn processes that run to completion |
 | [`no-unguarded-async-timer-callback`](#no-unguarded-async-timer-callback) | Require async timer callbacks to wrap their entire body in try/catch |
 | [`require-finite-check-before-date-toisostring`](#require-finite-check-before-date-toisostring) | Validate dynamic dates before calling `toISOString()` or `toJSON()` |
+| [`require-null-check-with-typeof-object`](#require-null-check-with-typeof-object) | Require a null check for the same value alongside `typeof value === "object"` |
+| [`require-per-page-on-github-list-call`](#require-per-page-on-github-list-call) | Require explicit `per_page` values on paginated Octokit REST list calls |
 
 ### `no-ad-hoc-jsonl-parser`
 
@@ -244,6 +248,10 @@ Disallow spreading an array of unknown size into `Math.min(...)` / `Math.max(...
 ### `no-map-parseint-callback`
 
 Disallow passing global `parseInt` or `Number.parseInt` directly to `.map()`, because `.map()` passes the element index as the second callback argument and `parseInt` interprets it as the radix. Use `.map(value => parseInt(value, 10))` or `.map(Number)` instead.
+
+### `no-path-startswith-without-separator`
+
+Disallow `value.startsWith(root)` where `root` is a bare `path.resolve()`/`path.join()`/`path.normalize()` result (directly or via a single-assignment variable). `/work/repo-evil` passes a `startsWith("/work/repo")` check. Compare against `root.endsWith(path.sep) ? root : root + path.sep` (plus `=== root`) or use `path.relative()` and reject `relative === ".."`, `relative.startsWith(".." + path.sep)`, or `path.isAbsolute(relative)`.
 
 ### `no-split-filter-trim-without-trim-map`
 
@@ -1312,3 +1320,40 @@ Disallow async callbacks passed to `setTimeout()`, `setInterval()`, or `setImmed
 ### `require-finite-check-before-date-toisostring`
 
 Require validation of dynamic values passed to `new Date(...)` before calling `toISOString()` or `toJSON()`, since invalid dates throw a `RangeError`. Validate the input with `Number.isFinite()` / `Number.isNaN()` or wrap the serialization in `try/catch`.
+
+### `require-per-page-on-github-list-call`
+
+Require an explicit `per_page` value on Octokit REST `list*` calls whose endpoints support pagination. `repos.listLanguages` is excluded because it returns all languages and does not accept `per_page`. Statically undefined values such as `per_page: undefined` and `per_page: void 0` are also reported; dynamic values are allowed.
+
+**Flagged form:**
+```js
+const comments = await github.rest.issues.listComments({ owner, repo, issue_number: 1 });
+```
+
+**Safe alternatives:**
+```js
+const page = await github.rest.issues.listComments({ owner, repo, issue_number: 1, per_page: 100 });
+const allComments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: 1, per_page: 100 });
+```
+
+### `require-null-check-with-typeof-object`
+
+Require a null check for the same value when `typeof value === "object"` or `typeof value == "object"` is used. `typeof null` is `"object"`, so a `null` value passes these checks and later property access (for example `value.counts` or `Object.values(value)`) throws a `TypeError`. Inequality comparisons (`!==` and `!=`) exclude `null` and are not flagged. In `actions/setup/js` this shows up when parsing state files and API payloads where `null` is a valid JSON value.
+
+**Flagged forms:**
+```js
+const ok = !!parsed && typeof parsed.counts === "object"; // parsed.counts may be null
+const states = typeof result === "object" ? Object.values(result.claims || {}) : [];
+```
+
+**Safe alternatives:**
+```js
+const ok = !!parsed && parsed.counts !== null && typeof parsed.counts === "object";
+const states = result && typeof result === "object" ? Object.values(result.claims || {}) : [];
+```
+
+**Not flagged:**
+- A null/truthiness guard for the same value makes the conjunction fail for `null`, or a top-level early-exit `if` in the same function exits for `null`/falsy values before the check.
+- A loose comparison against `undefined` (`value != undefined`) excludes `null`; strict comparisons (`!== undefined` or `=== undefined`) do not.
+- Other `typeof` comparisons such as `"string"` or `"function"`.
+- `typeof` operands that are not a plain identifier or non-computed member chain (calls, computed access).

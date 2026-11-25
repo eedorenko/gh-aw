@@ -2,6 +2,7 @@
 "use strict";
 // @safe-outputs-exempt SEC-005 — work_queue_claim_adapters.cjs:119 validates the fixed adapter repository and assertClaimAuthorized gates preparation; this module writes only local Claim artifacts.
 
+const { ERR_VALIDATION } = require("./error_codes.cjs");
 const fs = require("fs");
 const path = require("path");
 const { normalizeAssignment, normalizeClaimScope, readClaimScopeContext, withClaimExecution, assertClaimAuthorized, claimArtifactPath, assertClaimArtifactDirectory } = require("./work_queue_claim_scope.cjs");
@@ -13,9 +14,11 @@ async function prepareAdapterContext(options) {
   const assignment = normalizeAssignment(options.assignment);
   const adapter = validateAdapter(options.adapter);
   const index = Number(options.index);
-  if (!Number.isSafeInteger(index) || index < 0 || index > 15) throw new Error("Claim adapter slot must be within the original bounded assignment");
-  const member = assignment.claims[index];
-  if (!member) return { active: false };
+  if (!Number.isSafeInteger(index) || index < 0 || index > 15) throw new Error(ERR_VALIDATION + ": Claim adapter slot must be within the original bounded assignment");
+  // An assignment has one member, prepared by slot zero. Slots 1–15 exist only in
+  // older compiled workflows and stay inactive; they are never redirected to slot zero.
+  const member = assignment.claims[0];
+  if (index !== 0 || !member) return { active: false };
   return withClaimExecution({ assignment, claim_handle: member.handle, authorize: options.authorize }, async () => {
     const messages = [];
     for (const input of options.messages || []) {
@@ -24,7 +27,7 @@ async function prepareAdapterContext(options) {
         if (message.type === options.type && message.claim_handle === member.handle) messages.push(message);
       } catch {
         // Invalid messages remain errors at authoritative ingestion. They never
-        // become executable custom input or prevent valid sibling preparation.
+        // become executable custom input or prevent valid preparation.
       }
     }
     if (!messages.length) return { active: false, claim_handle: member.handle };
@@ -48,11 +51,16 @@ async function prepareAdapterContext(options) {
 
 async function main(options = {}) {
   const coreApi = options.core || global.core;
+  if (require("./safe_output_helpers.cjs").isStagedMode({ staged: process.env.GH_AW_CLAIM_ADAPTER_STAGED })) {
+    coreApi.setOutput("active", "false");
+    coreApi.info("Staged Claim adapter preparation skipped before execution Claims");
+    return { active: false, staged: true };
+  }
   const scope = readClaimScopeContext();
-  if (!scope?.assignment) throw new Error("Claim adapter preparation requires the authenticated immutable worker snapshot");
+  if (!scope?.assignment) throw new Error(ERR_VALIDATION + ": Claim adapter preparation requires the authenticated immutable worker snapshot");
   const { loadAgentOutput } = require("./load_agent_output.cjs");
   const output = loadAgentOutput({ partitioning: true });
-  if (!output.success) throw new Error(`Claim adapter preparation cannot load agent output${output.error ? ": " + output.error : ""}`);
+  if (!output.success) throw new Error(`${ERR_VALIDATION}: Claim adapter preparation cannot load agent output${output.error ? ": " + output.error : ""}`);
   const adapter = parseStrictJSON(process.env.GH_AW_CLAIM_ADAPTER_CONFIG || "{}");
   const result = await prepareAdapterContext({
     ...options,

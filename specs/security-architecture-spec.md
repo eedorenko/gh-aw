@@ -7,7 +7,7 @@ sidebar:
 
 # GitHub Agentic Workflows Security Architecture Specification
 
-**Version**: 1.1.8<br>
+**Version**: 1.1.11<br>
 **Status**: Candidate Recommendation  
 **Latest Version**: https://github.com/github/gh-aw/blob/main/specs/security-architecture-spec.md  
 **Editors**: GitHub Next (GitHub, Inc.)
@@ -24,7 +24,7 @@ The security architecture employs defense-in-depth principles including input sa
 
 This is a Candidate Recommendation specification and represents the current state of the GitHub Agentic Workflows security architecture. This specification is subject to updates based on security research, community feedback, and operational experience. Future versions may introduce additional security controls or refine existing requirements.
 
-**Publication Date**: January 29, 2026  
+**Publication Date**: November 23, 2026  
 **Governance**: This specification is maintained by GitHub Next and governed by GitHub's security and research processes.
 
 ## Table of Contents
@@ -547,7 +547,7 @@ Destination authorization, endpoint authentication, and artifact authentication 
 |---|---|
 | **TT-01 TLS policy** | The following hardened bootstrap curl paths MUST restrict both initial and redirected URLs to HTTPS and MUST retain hostname/chain validation: `install_awf_binary.sh`, `install_copilot_cli.sh`, `install_threat_detect_binary.sh`, the GitHub CLI key installer (`install_gh_cli.sh`), Cloud Hypervisor setup downloads (including `cloud_hypervisor_setup_bundle.sh`'s latest-release API probe), and the generated Compose installer in `copilot_engine_installation.go`. No insecure certificate override or HTTP retry is permitted on these paths. The inline Maven bootstrap in `copilot_engine_installation.go` remains outside this TLS policy and TT-02's independent archive-integrity guarantees. |
 | **TT-02 Independent release integrity** | AWF and downloaded Copilot CLI archives MUST authenticate their checksum manifest against a release-bound SHA256 digest before consuming it. The trusted setup action's `release_integrity.sh` supplies built-in pins; literal workflow `sandbox.agent.checksums-sha256` (AWF `checksums.txt`) and `engine.checksums-sha256` (Copilot `SHA256SUMS.txt`) MUST allow independently provisioned overrides for explicit semantic release versions. Missing, duplicate or malformed trusted pins and mismatched bytes MUST fail installation before archive extraction, installation or execution. Explicit Copilot pins MUST bypass toolcache activation and verify both host and requested musl guest archives. Pins MUST propagate with their versions to matching detection/eval installations; engine normalization MUST NOT carry another engine's version or pin. Replacing both the artifact and its network-served checksum MUST NOT bypass authentication. A bundle integrity failure MUST NOT trigger an AWF binary fallback. Threat-detect retains compiler-supplied asset digests; Compose retains architecture-specific compiler digests and an inline verifier in the generated installer, without sourcing a job-writable helper; `install_gh_cli.sh` authenticates the GitHub CLI apt signing key before installation. Cloud Hypervisor/NVX attestation checks remain independent requirements. |
-| **TT-03 Toolchain evidence** | Release builds MUST reject Go toolchains older than 1.27.3 and development/prerelease toolchains. `scripts/check-go-toolchain.sh` checks the actual compiler; `scripts/build-release.sh` inspects each native binary's embedded toolchain and records `dist/build-toolchain.txt`. Repository modules, lint tooling, the devcontainer and owned workflow Go pins use 1.27.3; user-selected Go runtimes remain author-controlled and are not attested by compilation. Generated root capture and Serena setup MUST clear inherited `GOROOT` when discovering the selected local toolchain and refresh the host environment before subsequent builds. |
+| **TT-03 Toolchain evidence** | Release builds MUST reject Go toolchains older than 1.27.4 and development/prerelease toolchains. `scripts/check-go-toolchain.sh` checks the actual compiler; `scripts/build-release.sh` inspects each native binary's embedded toolchain and records `dist/build-toolchain.txt`. Repository modules, lint tooling, the devcontainer and owned workflow Go pins use 1.27.4; user-selected Go runtimes remain author-controlled and are not attested by compilation. Generated root capture and Serena setup MUST clear inherited `GOROOT` when discovering the selected local toolchain and refresh the host environment before subsequent builds. |
 | **TT-04 Runtime evidence** | Setup MUST log a bounded inventory of available host TLS consumers without credentials, environment dumps, or authenticated URLs. Missing inspection tools and uninspected container/proxy trust stores MUST be identified rather than reported as compliant. `runtime_trust_inventory.sh` supplies host versions; image operators retain responsibility for image contents and actual trust-store selection. |
 
 The trusted bootstrap baseline includes the setup action and its digest table, literal author-supplied version/pin pairs, compiler, GitHub Actions control plane, and runner/toolcache provisioning. It excludes attacker-controlled network responses. A preinstalled Copilot CLI from a trusted runner toolcache retains the existing cache policy only when no explicit manifest pin is supplied; cache contents are not newly authenticated by download checks. An arbitrary runner binary, compromised setup action, or malicious workflow author is not repaired by a digest table.
@@ -834,7 +834,10 @@ threat-detection:
 }
 ```
 
-**TD-09**: If any threat is detected (`true`), the workflow MUST fail and safe outputs MUST NOT execute.
+**TD-09**: If any threat is detected (`true`), the implementation MUST apply the configured detection mode:
+
+- In strict mode (`continue-on-error: false`), the workflow MUST fail and safe outputs MUST NOT execute.
+- In warn mode (`continue-on-error: true`), the workflow MUST conclude with a warning and MUST enforce the applicable safe-output warn-mode requirements defined by WTD1, WTD1a, WTD2, and WTD3 in the Safe Outputs MCP Gateway Specification. Reviewable outputs MUST receive the required threat annotation, convertible outputs MUST be transformed into their mapped reviewable type, and non-reviewable outputs MUST NOT be applied. A warning MUST NOT be treated as a passed detection or as an access grant.
 
 **TD-10**: The `reasons` array SHOULD contain human-readable explanations for detected threats.
 
@@ -1928,33 +1931,33 @@ more test function names. Cells marked **covered** have at least one dedicated t
 cells marked **gap** lack direct formal test coverage; cells marked **partial** have
 related coverage that does not fully satisfy the checklist item.
 
-Path check revalidated on 2026-08-25: every named test below resolves in
+Path check revalidated on 2026-11-05: every named test below resolves in
 `pkg/workflow/security_architecture_sg_formal_test.go`.
 
 | Checklist Category | Formal Test(s) | Coverage |
 |---|---|---|
-| **G.1** Action pinning | _(none)_ | **gap** — no formal test verifies that compiled `uses:` lines are SHA-pinned; relies on actionlint/poutine in CI |
+| **G.1** Action pinning | `pkg/workflow/lint/integrity_test.go:TestActionPinGeneratedReferences`, `pkg/workflow/action_sha_validation_test.go:TestCompiledWorkflowAppliesActionPinPrefixes` | **partial** — generated pin references and configured pin prefixes are tested; the full Appendix G lock-file action inventory remains enforced by actionlint/poutine rather than this formal suite |
 | **G.2** Permission separation — agent job | `TestFormalSG02_AgentJobHasNoWritePermissions`, `TestFormalSG04_LeastPrivilegeBasePermissions` | covered |
 | **G.2** Permission separation — safe_outputs job | `TestFormalStaged_HandlerRequiresNoWritePerms` | **partial** — verifies that a globally staged handler does not accumulate write grants via `ComputePermissionsForSafeOutputs`, but does not inspect the compiled `safe_outputs` job itself or verify that its `permissions:` block is limited to the configured operations |
-| **G.3** Fork protection | `TestFormalBasicConformance_AllFourControls` | **partial** — verifies `safe_outputs` job presence, permission management, and compilation-time checks; does not inspect the activation job's `if:` expression or assert a repository-ID fork guard |
+| **G.3** Fork protection | `TestFormalBasicConformance_AllFourControls`, `TestFormalAppG2_PullRequestTargetContainsForkValidation`, `TestFormalRS05a_ActorTrustForkRejected`, `TestFormalRS05a_UnverifiableForkStatusRejected` | **partial** — formal and RS-05a tests cover fork authorization, but do not assert every compiled activation-job condition in this checklist |
 | **G.4** Input sanitization | `TestFormalSG01_InputSanitizationInvariant` | **partial** — verifies that a generic `run:` step with a `${{ }}` expression is rewritten and an `env:` block is injected; does not assert either required activation step or that compiled prompts consume `steps.sanitized.outputs.text` |
 | **G.5** Threat detection | `TestFormalSG06_ThreatDetectionAuditArtifact`, `TestFormalThreatDetection_EnabledByDefault`, `TestFormalThreatDetection_ExplicitDisable` | **partial** — detection-job presence and configuration defaults are covered; `permissions: {}` on the detection job and the `needs.detection.outputs.success` gate on `safe_outputs` are not directly asserted |
 | **G.6** RBAC — job topology (PM-10b) | `TestFormalJobTopology_PipelineOrderEnforced` (verifies `pre_activation → activation` needs dependency) | covered |
 | **G.6** RBAC — membership check step (PM-11) | `TestFormalPM11_PreActivationContainsMembershipStep` | covered |
 | **G.7** AWF sandbox | `TestFormalSG05_SandboxIsolationPresence` | **partial** — verifies `isSandboxEnabled()` return value for configuration combinations (AWF type, disabled flag, firewall); does not compile a workflow or assert `install_awf_binary.sh` step presence or execution inside the AWF container |
-| **G.8** Concurrency control | _(none)_ | **gap** — no formal test verifies `concurrency.group` is set or that `cancel-in-progress` matches workflow type |
-| **G.9** Runtime validation — timestamp check | _(none)_ | **gap** — `TestFormalSG07_FailSecureOnSecurityError` tests write-permission rejection at compile time and is unrelated to the G.9 checklist items; neither the activation timestamp step nor conclusion-job behavior is asserted by any test in this file |
+| **G.8** Concurrency control | `TestFormalCC01_ConcurrencyGroupAlwaysConfigured`, `TestFormalCC02_ConcurrencyGroupIncludesWorkflowIdentity`, `TestFormalCC07_ConcurrencyGateIsFirstInSequence`, `TestFormalCC08_GeneratedConcurrencyYAMLShape` | covered for generated concurrency configuration; checklist-specific cancel behavior remains described in the referenced assertions |
+| **G.9** Runtime validation — timestamp check | `TestActivationStepsAddVersionCheckStep`, `TestTaskJobGenerationFix`, `TestActivationJobNoCheckoutStep` | **partial** — tests assert activation timestamp/version-check generation and API-based check placement; conclusion-job behavior is not directly covered |
 
-**Summary of coverage gaps (as of 2026-08-25)**:
+**Summary of coverage gaps (as of 2026-11-05)**:
 
-- **G.1 Action pinning**: Formal test gap. CI tooling (actionlint, poutine) provides runtime coverage; consider adding a dedicated test that parses compiled lock file `uses:` patterns.
+- **G.1 Action pinning**: Partial formal coverage for generated pinning and configured prefixes. CI tooling (actionlint, poutine) checks the compiled action references; retain that independent gate.
 - **G.2 Permission separation — safe_outputs job**: Partial coverage. `TestFormalStaged_HandlerRequiresNoWritePerms` does not inspect the compiled `safe_outputs` job's own `permissions:` block. A dedicated test compiling a safe-outputs workflow and asserting its permission scope would close this gap.
 - **G.3 Fork protection**: Partial coverage. `TestFormalBasicConformance_AllFourControls` does not inspect the activation job's `if:` expression or verify a repository-ID fork guard. A test asserting the exact `if:` condition on the compiled activation job is needed.
 - **G.4 Input sanitization**: Partial coverage. `TestFormalSG01_InputSanitizationInvariant` covers expression rewriting but not the full three-item checklist (activation step presence; `steps.sanitized.outputs.text` consumption in compiled prompts).
 - **G.5 Threat detection**: Partial coverage. Detection-job presence and defaults are covered. Tests asserting `permissions: {}` on the detection job and the `needs.detection.outputs.success` gate on `safe_outputs` are missing.
 - **G.7 AWF sandbox**: Partial coverage. Configuration-logic checks are covered; lock-file-level assertions (`install_awf_binary.sh`, AWF container execution) are missing.
-- **G.8 Concurrency control**: Formal test gap. Concurrency group format is validated only by manual review. Consider a test that compiles a PR-trigger workflow and asserts `concurrency.group` contains the PR number expression.
-- **G.9 Runtime validation — timestamp check**: Formal test gap. No formal test verifies the activation timestamp step or conclusion-job behavior.
+- **G.8 Concurrency control**: Formal tests cover generated group configuration and ordering; the row references the specific functions, while per-trigger cancellation policy remains a separate workflow-level check.
+- **G.9 Runtime validation — timestamp check**: Activation timestamp/version-check generation has test coverage; conclusion-job behavior remains a formal coverage gap.
 
 ---
 
@@ -2098,6 +2101,27 @@ roles: [admin, maintainer]  # Restrict to trusted roles
 ---
 
 ## Change Log
+
+### Version 1.1.11 (Warn-Mode Threat Enforcement Clarification)
+
+**Published**: November 23, 2026
+
+- Clarifies TD-09 to distinguish strict-mode blocking from warn-mode threat surfacing.
+- Aligns TD-09 with the existing §11.9 threat-detection gate and Safe Outputs requirements WTD1, WTD1a, WTD2, and WTD3.
+- Preserves mandatory blocking in strict mode and all existing safe-output security requirements.
+
+### Version 1.1.10 (Go Toolchain Security Baseline)
+
+**Published**: November 11, 2026
+
+- Raises the TT-03 repository Go toolchain baseline from 1.27.3 to 1.27.4 in response to GO-2026-6859.
+- Preserves release-toolchain rejection, embedded-toolchain evidence, repository pinning, user-selected runtime ownership, and `GOROOT` isolation requirements.
+
+### Version 1.1.9 (Appendix G Test Mapping)
+
+**Published**: November 5, 2026
+
+Revalidated Appendix G.10 test paths, added existing pinning, fork, concurrency, and timestamp checks to the coverage map, and clarified remaining partial-coverage limits.
 
 ### Version 1.1.8 (Explicit Floating-Head Checkout)
 
@@ -2265,12 +2289,12 @@ The revalidation cadence **SHOULD** also include a review of `specs/security-arc
 
 ### Last Revalidation
 
-The most recent full validation pass against this specification was completed on **2026-07-15**. The results are recorded in `specs/security-architecture-spec-validation.md`. Any changes to MUST-level requirements after this date require a new validation pass per the triggers above.
+The most recent full validation pass against this specification was completed on **2026-11-08**. The results and remaining evidence gaps are recorded in `specs/security-architecture-spec-validation.md`. Any changes to MUST-level requirements after this date require a new validation pass per the triggers above.
 
-Sync check on **2026-08-25** found no new minor-version bump, reported security incident, or reference-implementation change requiring a full revalidation since the 2026-07-15 pass. This maintenance pass synchronized §9/§11 prose to the existing `pkg/workflow/threat_detection_config.go` parser and `pkg/workflow/threat_detection_inline_engine.go` runtime behavior; because it clarifies MUST-level runtime sequencing text, a targeted §9/§11 revalidation is scheduled with the Security Architecture maintainers by **2026-09-01**. The known Appendix G.10 partial-coverage gaps remain tracked there.
+Sync check on **2026-08-25** found no new minor-version bump, reported security incident, or reference-implementation change requiring a full revalidation since the 2026-07-15 pass. This maintenance pass synchronized §9/§11 prose to the existing `pkg/workflow/threat_detection_config.go` parser and `pkg/workflow/threat_detection_inline_engine.go` runtime behavior; because it clarifies MUST-level runtime sequencing text, a targeted §9/§11 revalidation was scheduled with the Security Architecture maintainers by **2026-09-01**. That deadline was missed. On **2026-11-15**, Security Architecture maintainers formally rescheduled the targeted revalidation to **2026-11-30**; it remains incomplete, with no result claimed. The known Appendix G.10 partial-coverage gaps remain tracked in `specs/security-architecture-spec-validation.md`.
 
-On **2026-10-09**, RS-05a was targeted-revalidated against the allow-listed same-repository App comment implementation, unit tests, and Z3 safety model for Version 1.1.1. Version 1.1.2 extends that contract to `pull_request_review` and updates its conformance mapping and formal model; targeted revalidation of those additions is pending in `security-architecture-spec-validation.md` §7b. Version 1.1.3 extends the same-repository bot branch-event exception to `ready_for_review` and `reopened`; targeted revalidation of those additions is also pending in §7b. This does not replace the full revalidation pass required by the policy. The previous RS-05a branch-event revalidation was completed on 2026-10-01.
+On **2026-10-09**, RS-05a was targeted-revalidated against the allow-listed same-repository App comment implementation, unit tests, and Z3 safety model for Version 1.1.1. On **2026-11-09**, the bounded RS-05a authorization model was revalidated: `checkout_pr_branch_z3.test.cjs` passed all 14 expected query results (11 `unsat`, 3 `sat`), alongside the runtime and Go formal tests recorded in `security-architecture-spec-validation.md` §7b. The model does not prove webhook change-field semantics, revision freshness, fetch-time races, checked-out commit identity, or live GitHub SHA-fetch support. The November 8, 2026 full revalidation confirms runtime mappings for v1.1.2 through v1.1.8, verifies PM-08 default fork denial and configured allowlisting, and records the separate TT-01–04 evidence gap. The prior RS-05a branch-event revalidation was completed on 2026-10-01.
 
-Version 1.1.7 aligns RS-05a with immutable revision binding and explicit dispatch-context failures; v1.1.8 adds the explicit floating-head opt-in. Runtime regression mappings are recorded in the validation document; targeted formal revalidation and the policy-required full revalidation remain pending. The bounded SMT authorization model is not a proof of revision freshness or live GitHub SHA-fetch support.
+Version 1.1.7 aligns RS-05a with immutable revision binding and explicit dispatch-context failures; v1.1.8 adds the explicit floating-head opt-in. Runtime regression mappings and explicit version statuses are recorded in the validation document. The policy-required full revalidation was completed on **2026-11-08**; targeted formal authorization-model revalidation passed on **2026-11-09**. The bounded SMT model does not prove revision freshness or live GitHub SHA-fetch support.
 
 *This specification is provided under the MIT License.*

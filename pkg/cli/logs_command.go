@@ -95,6 +95,7 @@ const logsCommandExampleTemplate = `  # Basic usage
   %[1]s logs -v                        # Verbose compact output (extra columns + sections)
   %[1]s logs --json                    # JSON format (compact by default, use -v for full)
   %[1]s logs --json -v                 # Full JSON with audit metadata
+  %[1]s logs --format jsonl            # Stream progress, run records, and a final report as JSON Lines
   %[1]s logs --cached-jsonl logs.jsonl # Reuse matching records and append new results immediately
   %[1]s logs --cached-jsonl 'logs-*'   # Reuse logs-*.jsonl files and write new data to a unique logs-*.jsonl file
   %[1]s logs --format tsv              # Tab-separated (minimal, raw data)
@@ -156,25 +157,25 @@ By default, only the compact usage artifact is downloaded (token usage, run meta
 Use --artifacts all to download all artifacts, or specify individual sets such as
 --artifacts agent,firewall to fetch only what you need.
 
-Use --outcomes to evaluate the current GitHub state of each selected run's safe
-outputs and include per-run and episode outcome summaries. This also downloads
+Use --adoption to evaluate the current GitHub state of each selected run's safe
+outputs and include per-run and episode adoption summaries. This also downloads
 safe-output manifests, without requiring full agent artifacts or workflow logs.
-Use --outcomes-dir to persist the observations as JSONL for downstream processing.
+Use --adoption-dir to persist the observations as JSONL for downstream processing.
 
 Available unified JSONL sessions are retained and automatically exported to
 sibling .atif trajectories, without changing the report format.
 
 Use --harbor --output DIR to also export a portable Harbor job to DIR/harbor.
 This downloads recorded usage, experiment, grader, and available agent artifacts;
-it does not run graders or evaluate outcomes unless explicitly requested.
+it does not run graders or evaluate adoption unless explicitly requested.
 Use repeatable --additional-grader WORKFLOW:GRADER to compute additional built-in
 or isolated JavaScript results over recorded unified sessions before Harbor export.
 Recorded scores remain unchanged; additional results have separate provenance and
-reward keys. Bash graders are not supported in this offline collection pipeline.
+reward keys.
 The normal logs report is preserved.
 
 Use --episodes to include recorded episode membership and hops in text reports.
-Combine --episodes --outcomes to join the selected episodes with live outcome
+Combine --episodes --adoption to join the selected episodes with live adoption
 observations and downloaded usage in the same invocation; no separate
 command or JSONL export is needed. Membership remains limited
 to the selected runs; this flag does not discover additional episode members.
@@ -207,6 +208,9 @@ func buildLogsCommandExample() string {
 
 func runLogsCommand(cmd *cobra.Command, args []string) error {
 	logsCommandLog.Printf("Starting logs command: args=%d", len(args))
+	if getBoolFlag(cmd, "retained") {
+		return runRetainedAdoptionCommand(cmd, args)
+	}
 	stdin, _ := cmd.Flags().GetBool("stdin")
 	if stdin {
 		return runLogsCommandFromStdin(cmd, args)
@@ -275,6 +279,7 @@ func loadStdinLogsOptions(cmd *cobra.Command) (StdinLogsOptions, error) {
 		Parse:             values.Parse,
 		JSONOutput:        values.JSONOutput,
 		Episodes:          values.Episodes,
+		Delivery:          values.Delivery,
 		Outcomes:          values.Outcomes,
 		Harbor:            values.Harbor,
 		AdditionalGraders: values.AdditionalGraders,
@@ -429,7 +434,7 @@ func splitCrossRepoWorkflowTarget(arg string) (string, string, bool) {
 	return strings.Join(parts[:repoParts], "/"), strings.Join(parts[repoParts:], "/"), true
 }
 
-func loadCommonLogsOptions(cmd *cobra.Command) (LogsDownloadOptions, error) {
+func loadCommonLogsOptions(cmd *cobra.Command) (LogsDownloadOptions, error) { //nolint:largefunc // Keeps shared logs flag parsing and validation in one place.
 	count, _ := cmd.Flags().GetInt("count")
 	if last, _ := cmd.Flags().GetInt("last"); last > 0 {
 		count = last
@@ -459,10 +464,11 @@ func loadCommonLogsOptions(cmd *cobra.Command) (LogsDownloadOptions, error) {
 		Parse:                 getBoolFlag(cmd, "parse"),
 		JSONOutput:            getBoolFlag(cmd, "json"),
 		Episodes:              getBoolFlag(cmd, "episodes"),
-		Outcomes:              getBoolFlag(cmd, "outcomes"),
+		Delivery:              getBoolFlag(cmd, "delivery"),
+		Outcomes:              getBoolFlag(cmd, "adoption"),
 		Harbor:                getBoolFlag(cmd, "harbor"),
 		AdditionalGraders:     getStringSliceFlag(cmd, "additional-grader"),
-		OutcomesDir:           getStringFlag(cmd, "outcomes-dir"),
+		OutcomesDir:           getStringFlag(cmd, "adoption-dir"),
 		TimeoutMinutes:        getIntFlag(cmd, "timeout"),
 		TimeoutSeconds:        getIntFlag(cmd, "timeout-seconds"),
 		MaxGitHubAPIRateLimit: getIntFlag(cmd, "max-github-api-rate-limit"),
@@ -493,7 +499,7 @@ func loadCommonLogsOptions(cmd *cobra.Command) (LogsDownloadOptions, error) {
 }
 
 func logsCommandArtifactSets(cmd *cobra.Command) []string {
-	sets := logsOutcomeArtifactSets(getStringSliceFlag(cmd, "artifacts"), getBoolFlag(cmd, "outcomes"))
+	sets := logsOutcomeArtifactSets(getStringSliceFlag(cmd, "artifacts"), getBoolFlag(cmd, "adoption") || getBoolFlag(cmd, "delivery"))
 	if len(sets) > 0 {
 		sets = applyEvalsArtifact(sets, getBoolFlag(cmd, "evals"))
 		sets = applyGradersArtifact(sets, getBoolFlag(cmd, "graders"))
@@ -545,6 +551,9 @@ func resolveLogsDateRange(startDate, endDate string, now time.Time) (string, str
 }
 
 func validateLogsOptions(options LogsDownloadOptions) error {
+	if options.Format == "jsonl" && options.JSONOutput {
+		return errors.New("--format jsonl cannot be combined with --json. Use --format jsonl for streaming events or --json for a single JSON document")
+	}
 	if err := validateMaxStorageMB(options.MaxStorageMB); err != nil {
 		return err
 	}
@@ -558,7 +567,7 @@ func validateLogsOptions(options LogsDownloadOptions) error {
 		return err
 	}
 	if options.OutcomesDir != "" && !options.Outcomes {
-		return errors.New("--outcomes-dir requires --outcomes")
+		return errors.New("--adoption-dir requires --adoption")
 	}
 	if len(options.AdditionalGraders) > 0 {
 		if !options.Harbor {
@@ -676,7 +685,7 @@ func resolveLogsWorkflowNameLocally(arg string) (string, error) {
 func addLogsCommandFlags(logsCmd *cobra.Command, validArtifactSets string) {
 	logsCmd.Flags().IntP("count", "c", 10, "Maximum matching workflow runs to return across all targets (after applying filters)")
 	addLogsOutcomeFlags(logsCmd)
-	logsCmd.Flags().Bool("episodes", false, "Include recorded episode membership and hops; combine with --outcomes for episode outcome summaries")
+	logsCmd.Flags().Bool("episodes", false, "Include recorded episode membership and hops; combine with --adoption for episode adoption summaries")
 	logsCmd.Flags().Bool("harbor", false, "Export downloaded runs as a Harbor job in the output directory using recorded results and available sessions")
 	logsCmd.Flags().StringSlice("additional-grader", nil, "Additional in-memory grader WORKFLOW:GRADER to execute before --harbor export (repeatable)")
 	logsCmd.Flags().String("start-date", "", "Filter runs created after this date (YYYY-MM-DD or delta like -1d, -1w, -1mo)")
@@ -703,16 +712,16 @@ func addLogsCommandFlags(logsCmd *cobra.Command, validArtifactSets string) {
 	logsCmd.Flags().Bool("parse", false, "Run JavaScript parsers on agent logs and firewall logs, writing Markdown to log.md and firewall.md")
 	logsCmd.Flags().Bool("audit", false, "Generate audit.json in each workflow run cache directory (comparisons use downloaded runs only)")
 	addJSONFlag(logsCmd)
-	logsCmd.Flags().Int("timeout", 0, "Total download timeout in minutes across all targets (0 = no timeout)")
+	addMinuteTimeoutFlag(logsCmd, 0, "Total download timeout across all targets in minutes or a whole-minute duration (e.g. 10 or 10m; 0 = no timeout)")
 	logsCmd.Flags().Int("timeout-seconds", 0, "Download timeout in seconds (0 = use --timeout)")
 	_ = logsCmd.Flags().MarkHidden("timeout-seconds")
 	logsCmd.Flags().Int("max-github-api-rate-limit", 0, "Maximum used GitHub core API requests before pausing one target or stopping multiple targets (positive = absolute, negative = reserve from API limit; e.g. 12000 or -2000)")
-	logsCmd.Flags().Int("max-storage", defaultLogsMaxStorageMB, "Maximum logs storage in MB after pruning non-essential cache data (default: 1 GB; 0 = unlimited)")
+	logsCmd.Flags().Int("max-storage", defaultLogsMaxStorageMB, "Maximum logs storage in MB after pruning non-essential cache data (0 = unlimited)")
 	logsCmd.Flags().Bool("prune-older-runs", false, "Remove oldest completed runs when non-essential cache pruning cannot satisfy --max-storage")
 	logsCmd.Flags().String("summary-file", "summary.json", "Path to write the summary JSON file relative to output directory (use empty string to disable)")
 	logsCmd.Flags().Bool("train", false, "Analyze log patterns across downloaded runs and save pattern weights to drain3_weights.json in the output directory")
 	logsCmd.Flags().String("drain3-weights", "", "Path to existing Drain3 weights JSON used to seed log pattern training")
-	logsCmd.Flags().String("format", "", "Output format: console (decorated tables), tsv (tab-separated), pretty (cross-run report), markdown (cross-run Markdown). Default: compact agent-optimized output")
+	logsCmd.Flags().String("format", "", "Output format: jsonl (streaming JSON Lines), console (decorated tables), tsv (tab-separated), pretty (cross-run report), markdown (cross-run Markdown). Default: compact agent-optimized output")
 	logsCmd.Flags().String("report-file", "", "Write --format markdown output directly to this file path instead of stdout (creates parent directories as needed)")
 	logsCmd.Flags().String("cached-jsonl", "", "Path to cached logs JSONL to reuse, append new results, and retain runs in the requested date range")
 	logsCmd.Flags().Int("last", 0, "Alias for --count/-c: number of recent runs to download")

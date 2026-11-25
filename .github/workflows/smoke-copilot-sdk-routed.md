@@ -25,10 +25,9 @@ engine:
   id: copilot
   copilot-sdk: true
   bare: true
-  model-routing:
-    goal: cost
-    mode: economy
-    allowed-models: [gpt-5.6-luna]
+model: router/economy
+model-routing:
+  allowed-models: [gpt-5.6-luna]
 imports:
   - shared/reporting.md
 max-tool-denials: 3
@@ -38,7 +37,7 @@ safe-outputs:
     group: true
     close-older-issues: true
     close-older-key: "smoke-copilot-sdk-routed"
-    labels: [automation, testing]
+    labels: [automation, testing, "backlog:smoke-tests"]
 timeout-minutes: 10
 features:
   gh-aw-detection: false

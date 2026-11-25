@@ -19,12 +19,11 @@ strict: true
 engine:
   id: copilot
   bare: true
-  model-routing:
-    goal: cost
-    mode: auto
-    # Claude-only pool: the main model's family, and so its endpoint
-    # (/chat/completions), is fixed; the model's effort is not.
-    allowed-models: [claude-sonnet-5]
+model: router
+model-routing:
+  # Claude-only pool: the main model's family, and so its endpoint
+  # (/chat/completions), is fixed; the model's effort is not.
+  allowed-models: [claude-sonnet-5]
 imports:
   - shared/smoke-test-brevity.md
   - shared/reporting.md
@@ -37,7 +36,7 @@ safe-outputs:
     group: true
     close-older-issues: true
     close-older-key: "smoke-copilot-routed-claude"
-    labels: [automation, testing]
+    labels: [automation, testing, "backlog:smoke-tests"]
 timeout-minutes: 10
 features:
   gh-aw-detection: false

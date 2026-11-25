@@ -3,14 +3,47 @@
 package workflow
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/goccy/go-yaml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestSafeOutputsRequireAgentSuccessImports(t *testing.T) {
+	for _, main := range []string{"", "false", "true"} {
+		for _, first := range []string{"false", "true"} {
+			for _, second := range []string{"false", "true"} {
+				t.Run(fmt.Sprintf("main=%s/first=%s/second=%s", main, first, second), func(t *testing.T) {
+					dir := t.TempDir()
+					for name, value := range map[string]string{"first": first, "second": second} {
+						require.NoError(t, os.WriteFile(filepath.Join(dir, name+".md"), []byte(
+							"---\nsafe-outputs:\n  require-agent-success: "+value+"\n---\nShared gate.\n"), 0o600))
+					}
+					config := ""
+					if main != "" {
+						config = "  require-agent-success: " + main + "\n"
+					}
+					source := "---\non: workflow_dispatch\nimports:\n  - ./first.md\n  - ./second.md\nsafe-outputs:\n" +
+						config + "  add-comment:\n---\nMain workflow.\n"
+					path := filepath.Join(dir, "main.md")
+					require.NoError(t, os.WriteFile(path, []byte(source), 0o600))
+					compiler := NewCompiler()
+					data, err := compiler.ParseWorkflowFile(path)
+					require.NoError(t, err)
+					enabled := main == "true" || (main == "" && (first == "true" || second == "true"))
+					require.Equal(t, enabled, data.SafeOutputs.RequireAgentSuccess)
+					condition := RenderCondition(buildSafeOutputsJobCondition(data, true))
+					assert.Equal(t, enabled, strings.Contains(condition, "needs.agent.result == 'success'"))
+				})
+			}
+		}
+	}
+}
 
 // TestSafeOutputsImport tests that safe-output types can be imported from shared workflows
 func TestSafeOutputsImport(t *testing.T) {
@@ -425,6 +458,7 @@ func TestSafeOutputsImportMergePullRequestType(t *testing.T) {
 	sharedWorkflow := `---
 safe-outputs:
   merge-pull-request:
+    allowed-base-branches: [agent-work/*]
     required-labels:
       - ready-to-merge
 ---
@@ -537,7 +571,7 @@ func TestMergeSafeOutputsUnit(t *testing.T) {
 			name:      "import merge-pull-request to empty config",
 			topConfig: nil,
 			importedJSON: []string{
-				`{"merge-pull-request":{"required-labels":["ready-to-merge"]}}`,
+				`{"merge-pull-request":{"allowed-base-branches":["agent-work/*"],"required-labels":["ready-to-merge"]}}`,
 			},
 			expectError:   false,
 			expectedTypes: []string{"merge-pull-request"},
@@ -594,6 +628,64 @@ func TestMergeSafeOutputsDescriptorMergedFieldsUnit(t *testing.T) {
 	})
 }
 
+func TestMergeSafeOutputsMergePullRequestProtectedFilesExclude(t *testing.T) {
+	compiler := NewCompiler(WithVersion("1.0.0"))
+
+	tests := []struct {
+		name         string
+		topExclude   []string
+		importedJSON []string
+		wantExclude  []string
+	}{
+		{
+			name:         "import supplies exclusions",
+			importedJSON: []string{`{"merge-pull-request":{"protected-files":{"policy":"allowed","exclude":["AGENTS.md"]}}}`},
+			wantExclude:  []string{"AGENTS.md"},
+		},
+		{
+			name:         "import supplies rooted changeset exclusion",
+			importedJSON: []string{`{"merge-pull-request":{"protected-files":{"policy":"allowed","exclude":["/.changeset/*.md"]}}}`},
+			wantExclude:  []string{"/.changeset/*.md"},
+		},
+		{
+			name:         "main and import exclusions merge as a set",
+			topExclude:   []string{"CLAUDE.md"},
+			importedJSON: []string{`{"merge-pull-request":{"protected-files":{"exclude":["AGENTS.md","CLAUDE.md"]}}}`},
+			wantExclude:  []string{"CLAUDE.md", "AGENTS.md"},
+		},
+		{
+			name:       "multiple overridden imports contribute exclusions",
+			topExclude: []string{"AGENTS.md"},
+			importedJSON: []string{
+				`{"merge-pull-request":{"protected-files":{"exclude":["AGENTS.md","CLAUDE.md"]}}}`,
+				`{"merge-pull-request":{"protected-files":{"exclude":["CLAUDE.md","GEMINI.md"]}}}`,
+			},
+			wantExclude: []string{"AGENTS.md", "CLAUDE.md", "GEMINI.md"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			topConfig := &SafeOutputsConfig{
+				MergePullRequest: &MergePullRequestConfig{
+					ProtectedFilesPolicy:  "blocked",
+					ProtectedFilesExclude: tt.topExclude,
+					RequiredLabels:        []string{"ready-to-merge"},
+				},
+			}
+			result, err := compiler.MergeSafeOutputs(topConfig, tt.importedJSON, map[string]any{
+				"merge-pull-request": map[string]any{"protected-files": "blocked"},
+			})
+
+			require.NoError(t, err)
+			require.NotNil(t, result.MergePullRequest)
+			assert.Equal(t, tt.wantExclude, result.MergePullRequest.ProtectedFilesExclude)
+			assert.Equal(t, "blocked", result.MergePullRequest.ProtectedFilesPolicy)
+			assert.Equal(t, []string{"ready-to-merge"}, result.MergePullRequest.RequiredLabels)
+		})
+	}
+}
+
 func TestMergeSafeOutputsSteer(t *testing.T) {
 	compiler := NewCompiler(WithVersion("1.0.0"))
 
@@ -613,6 +705,85 @@ func TestMergeSafeOutputsSteer(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, result)
 		assert.False(t, result.Steer)
+	})
+}
+
+func TestMergeSafeOutputsCreatePullRequestDefaults(t *testing.T) {
+	compiler := NewCompiler(WithVersion("1.0.0"))
+	imported := []string{`{"create-pull-request":{"expires":"2d","draft":false,"title-prefix":"[imported] "}}`}
+
+	t.Run("fills omitted defaults without replacing local options", func(t *testing.T) {
+		topConfig := &SafeOutputsConfig{
+			CreatePullRequests: &CreatePullRequestsConfig{TitlePrefix: "[local] "},
+		}
+		topRawSafeOutputs := map[string]any{
+			"create-pull-request": map[string]any{"title-prefix": "[local] "},
+		}
+
+		result, err := compiler.MergeSafeOutputs(topConfig, imported, topRawSafeOutputs)
+
+		require.NoError(t, err)
+		require.NotNil(t, result.CreatePullRequests)
+		assert.Equal(t, 48, result.CreatePullRequests.Expires)
+		assert.Equal(t, strPtr("false"), result.CreatePullRequests.Draft)
+		assert.Equal(t, "[local] ", result.CreatePullRequests.TitlePrefix)
+	})
+
+	t.Run("shorthand config inherits omitted defaults", func(t *testing.T) {
+		topConfig := &SafeOutputsConfig{
+			CreatePullRequests: &CreatePullRequestsConfig{},
+		}
+		topRawSafeOutputs := map[string]any{
+			"create-pull-request": nil,
+		}
+
+		result, err := compiler.MergeSafeOutputs(topConfig, imported, topRawSafeOutputs)
+
+		require.NoError(t, err)
+		require.NotNil(t, result.CreatePullRequests)
+		assert.Equal(t, 48, result.CreatePullRequests.Expires)
+		assert.Equal(t, strPtr("false"), result.CreatePullRequests.Draft)
+	})
+
+	t.Run("local defaults take precedence", func(t *testing.T) {
+		topConfig := &SafeOutputsConfig{
+			CreatePullRequests: &CreatePullRequestsConfig{
+				TitlePrefix: "[local] ",
+				Expires:     72,
+				Draft:       strPtr("true"),
+			},
+		}
+		topRawSafeOutputs := map[string]any{
+			"create-pull-request": map[string]any{
+				"title-prefix": "[local] ",
+				"expires":      "3d",
+				"draft":        true,
+			},
+		}
+
+		result, err := compiler.MergeSafeOutputs(topConfig, imported, topRawSafeOutputs)
+
+		require.NoError(t, err)
+		require.NotNil(t, result.CreatePullRequests)
+		assert.Equal(t, 72, result.CreatePullRequests.Expires)
+		assert.Equal(t, strPtr("true"), result.CreatePullRequests.Draft)
+		assert.Equal(t, "[local] ", result.CreatePullRequests.TitlePrefix)
+	})
+
+	t.Run("does not add an omitted draft without an imported default", func(t *testing.T) {
+		topConfig := &SafeOutputsConfig{
+			CreatePullRequests: &CreatePullRequestsConfig{TitlePrefix: "[local] "},
+		}
+		topRawSafeOutputs := map[string]any{
+			"create-pull-request": map[string]any{"title-prefix": "[local] "},
+		}
+		importedWithoutDraft := []string{`{"create-pull-request":{"title-prefix":"[imported] "}}`}
+
+		result, err := compiler.MergeSafeOutputs(topConfig, importedWithoutDraft, topRawSafeOutputs)
+
+		require.NoError(t, err)
+		require.NotNil(t, result.CreatePullRequests)
+		assert.Nil(t, result.CreatePullRequests.Draft)
 	})
 }
 
@@ -2057,48 +2228,176 @@ safe-outputs:
 
 func TestSafeOutputsImportPreservesDisabledDiagnostics(t *testing.T) {
 	for _, tc := range []struct {
-		name        string
-		safeOutputs string
-		noop        string
+		name                            string
+		mainSafeOutputs                 string
+		importedSafeOutputs             string
+		imports                         string
+		legacyImportKeys                bool
+		wantMissingTool                 bool
+		wantMissingData                 bool
+		wantNoOp                        bool
+		wantReportIncomplete            bool
+		wantAddComment                  bool
+		wantImportedIssueSideEffectsOff bool
 	}{
-		{"metadata only", "messages:\n    footer: \"> custom footer\"", "{}"},
-		{"explicit handlers", "missing-tool: {}\n  missing-data: {}\n  report-incomplete: {}", "{}"},
-		{"disabled noop", "messages:\n    footer: \"> custom footer\"", "false"},
+		{
+			name:                            "own safe outputs",
+			mainSafeOutputs:                 "  add-comment:\n    max: 1\n",
+			imports:                         "[./shared.md]",
+			wantMissingTool:                 true,
+			wantMissingData:                 true,
+			wantNoOp:                        true,
+			wantReportIncomplete:            true,
+			wantAddComment:                  true,
+			wantImportedIssueSideEffectsOff: true,
+		},
+		{
+			name:                            "no local safe outputs",
+			imports:                         "[./shared.md]",
+			wantMissingTool:                 true,
+			wantMissingData:                 true,
+			wantNoOp:                        true,
+			wantReportIncomplete:            true,
+			wantImportedIssueSideEffectsOff: true,
+		},
+		{
+			name:                            "later imports do not re-enable handlers",
+			mainSafeOutputs:                 "  add-comment:\n    max: 1\n",
+			imports:                         "[./shared.md, ./metadata.md]",
+			wantMissingTool:                 true,
+			wantMissingData:                 true,
+			wantNoOp:                        true,
+			wantReportIncomplete:            true,
+			wantAddComment:                  true,
+			wantImportedIssueSideEffectsOff: true,
+		},
+		{
+			name:                            "earlier imports do not re-enable handlers",
+			mainSafeOutputs:                 "  add-comment:\n    max: 1\n",
+			imports:                         "[./metadata.md, ./shared.md]",
+			wantMissingTool:                 true,
+			wantMissingData:                 true,
+			wantNoOp:                        true,
+			wantReportIncomplete:            true,
+			wantAddComment:                  true,
+			wantImportedIssueSideEffectsOff: true,
+		},
+		{
+			name:                 "main enables handlers",
+			mainSafeOutputs:      "  report-missing-tool: {}\n  report-missing-data: {}\n  noop: {}\n  report-incomplete: {}\n",
+			imports:              "[./shared.md]",
+			wantMissingTool:      true,
+			wantMissingData:      true,
+			wantNoOp:             true,
+			wantReportIncomplete: true,
+		},
+		{
+			name:            "main disables handlers",
+			mainSafeOutputs: "  report-missing-tool: false\n  report-missing-data: false\n  noop: false\n  report-incomplete: false\n",
+			imports:         "[./shared.md, ./metadata.md]",
+		},
+		{
+			name:                            "legacy imported keys",
+			mainSafeOutputs:                 "  add-comment:\n    max: 1\n",
+			imports:                         "[./shared.md, ./metadata.md]",
+			legacyImportKeys:                true,
+			wantMissingTool:                 true,
+			wantMissingData:                 true,
+			wantNoOp:                        true,
+			wantReportIncomplete:            true,
+			wantAddComment:                  true,
+			wantImportedIssueSideEffectsOff: true,
+		},
+		{
+			name: "main disables legacy aliases",
+			mainSafeOutputs: "  missing-tool: false\n  missing-data: false\n" +
+				"  noop: {}\n  report-incomplete: false\n",
+			imports:             "[./shared.md]",
+			importedSafeOutputs: "  missing-tool: {}\n  missing-data: {}\n  report-incomplete: {}\n",
+			wantNoOp:            true,
+		},
+		{
+			name:                "main disables handlers with metadata import",
+			mainSafeOutputs:     "  missing-tool: false\n  missing-data: false\n  noop: {}\n  report-incomplete: false\n",
+			imports:             "[./shared.md]",
+			importedSafeOutputs: "  messages:\n    footer: \"> custom footer\"\n",
+			wantNoOp:            true,
+		},
+		{
+			name:                "main disables noop",
+			mainSafeOutputs:     "  missing-tool: false\n  missing-data: false\n  noop: false\n  report-incomplete: false\n",
+			imports:             "[./shared.md]",
+			importedSafeOutputs: "  messages:\n    footer: \"> custom footer\"\n",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			compiler := NewCompiler(WithVersion("1.0.0"))
 			workflowsDir := filepath.Join(t.TempDir(), ".github", "workflows")
 			require.NoError(t, os.MkdirAll(workflowsDir, 0755))
-			shared := "---\nsafe-outputs:\n  " + tc.safeOutputs + "\n---\n"
+			toolKey, dataKey := "report-missing-tool", "report-missing-data"
+			if tc.legacyImportKeys {
+				toolKey, dataKey = "missing-tool", "missing-data"
+			}
+			importedSafeOutputs := tc.importedSafeOutputs
+			if importedSafeOutputs == "" {
+				importedSafeOutputs = "  " + toolKey + ": false\n  " + dataKey +
+					": false\n  noop: false\n  report-incomplete: false\n"
+			}
+			shared := "---\nsafe-outputs:\n" + importedSafeOutputs + "---\n"
 			require.NoError(t, os.WriteFile(filepath.Join(workflowsDir, "shared.md"), []byte(shared), 0644))
-			main := `---
-on: workflow_dispatch
-imports:
-  - ./shared.md
-safe-outputs:
-  missing-tool: false
-  missing-data: false
-  report-incomplete: false
-  noop: ` + tc.noop + `
----
-Run a task.
-`
+			metadata := "---\nsafe-outputs:\n  messages:\n    footer: \"> custom footer\"\n---\n"
+			require.NoError(t, os.WriteFile(filepath.Join(workflowsDir, "metadata.md"), []byte(metadata), 0644))
+			main := "---\non: workflow_dispatch\nimports: " + tc.imports + "\n"
+			if tc.mainSafeOutputs != "" {
+				main += "safe-outputs:\n" + tc.mainSafeOutputs
+			}
+			main += "---\nRun a task.\n"
 			mainFile := filepath.Join(workflowsDir, "main.md")
 			require.NoError(t, os.WriteFile(mainFile, []byte(main), 0644))
 
 			data, err := compiler.ParseWorkflowFile(mainFile)
 			require.NoError(t, err)
 			require.NotNil(t, data.SafeOutputs)
-			assert.Nil(t, data.SafeOutputs.MissingTool)
-			assert.Nil(t, data.SafeOutputs.MissingData)
-			assert.Nil(t, data.SafeOutputs.ReportIncomplete)
-			if tc.noop == "false" {
-				assert.Nil(t, data.SafeOutputs.NoOp)
-			} else {
-				assert.NotNil(t, data.SafeOutputs.NoOp)
+			assert.Equal(t, tc.wantMissingTool, data.SafeOutputs.MissingTool != nil)
+			assert.Equal(t, tc.wantMissingData, data.SafeOutputs.MissingData != nil)
+			assert.Equal(t, tc.wantNoOp, data.SafeOutputs.NoOp != nil)
+			assert.Equal(t, tc.wantReportIncomplete, data.SafeOutputs.ReportIncomplete != nil)
+			assert.Equal(t, tc.wantAddComment, data.SafeOutputs.AddComments != nil)
+			if tc.wantImportedIssueSideEffectsOff {
+				require.NotNil(t, data.SafeOutputs.MissingTool)
+				require.NotNil(t, data.SafeOutputs.MissingTool.CreateIssue)
+				assert.Equal(t, "false", *data.SafeOutputs.MissingTool.CreateIssue)
+				require.NotNil(t, data.SafeOutputs.MissingData)
+				require.NotNil(t, data.SafeOutputs.MissingData.CreateIssue)
+				assert.Equal(t, "false", *data.SafeOutputs.MissingData.CreateIssue)
+				require.NotNil(t, data.SafeOutputs.NoOp)
+				require.NotNil(t, data.SafeOutputs.NoOp.ReportAsIssue)
+				assert.Equal(t, "false", *data.SafeOutputs.NoOp.ReportAsIssue)
+				require.NotNil(t, data.SafeOutputs.ReportIncomplete)
+				require.NotNil(t, data.SafeOutputs.ReportIncomplete.CreateIssue)
+				assert.Equal(t, "false", *data.SafeOutputs.ReportIncomplete.CreateIssue)
 			}
 		})
 	}
+
+	t.Run("imported noop false with repo-memory ledger", func(t *testing.T) {
+		compiler := NewCompiler(WithVersion("1.0.0"))
+		safeOutputs, err := compiler.MergeSafeOutputs(nil, []string{`{"noop":false}`}, nil)
+		require.NoError(t, err)
+		data := &WorkflowData{
+			SafeOutputs: safeOutputs,
+			RepoMemoryConfig: &RepoMemoryConfig{Memories: []RepoMemoryEntry{{
+				ID: "events", Ledger: &RepoMemoryLedgerConfig{},
+			}}},
+		}
+
+		applyDefaultCreateIssue(data)
+
+		require.NotNil(t, data.SafeOutputs.NoOp)
+		require.NotNil(t, data.SafeOutputs.NoOp.ReportAsIssue)
+		assert.Equal(t, "false", *data.SafeOutputs.NoOp.ReportAsIssue)
+		assert.Nil(t, data.SafeOutputs.CreateIssues)
+	})
 }
 
 // TestSafeOutputsDifferentTypesFromImportsMerged reproduces the bug reported in
@@ -2485,22 +2784,22 @@ Run a task.
 	assert.Contains(t, needs, "shared_job", "safe_outputs needs should include dependency from import")
 }
 
-// TestSafeOutputsImportLinearTokenFromOnlyImport ensures that a Linear handler and its
-// linear-token supplied purely by an imported shared workflow retain the credential after
-// merge, mirroring the equivalent GitHubToken merge behavior.
-func TestSafeOutputsImportLinearTokenFromOnlyImport(t *testing.T) {
+func TestSafeOutputsImportLinearConnectorCredential(t *testing.T) {
 	compiler := NewCompiler(WithVersion("1.0.0"))
 
 	tmpDir := t.TempDir()
+	compiler.gitRoot = tmpDir
+	installConnectorTestSources(t, tmpDir)
 	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
 	err := os.MkdirAll(workflowsDir, 0755)
 	require.NoError(t, err, "Failed to create workflows directory")
 
 	sharedWorkflow := `---
-safe-outputs:
-  linear-token: "${{ secrets.IMPORT_LINEAR_TOKEN }}"
-  linear-add-comment:
-    target: "ENG-123"
+imports:
+  - uses: ".github/workflows/connectors/linear.md"
+    with:
+      writer-secret: IMPORT_LINEAR_TOKEN
+      issues: [22222222-2222-4222-8222-222222222222]
 ---
 
 # Shared Linear Configuration
@@ -2516,6 +2815,8 @@ permissions:
   contents: read
 imports:
   - ./shared-linear.md
+safe-outputs:
+  linear-add-comment:
 ---
 
 # Main Workflow
@@ -2533,13 +2834,12 @@ This workflow uses only the imported Linear safe-outputs configuration.
 	require.NoError(t, err, "Failed to change directory")
 	defer func() { _ = os.Chdir(oldDir) }()
 
-	workflowData, err := compiler.ParseWorkflowFile("main.md")
+	workflowData, err := compiler.ParseWorkflowFile(mainFile)
 	require.NoError(t, err, "Failed to parse workflow")
 	require.NotNil(t, workflowData.SafeOutputs, "SafeOutputs should not be nil")
 
-	require.NotNil(t, workflowData.SafeOutputs.LinearAddComment, "LinearAddComment should be imported")
-	assert.Equal(t, "ENG-123", workflowData.SafeOutputs.LinearAddComment.Target)
-	assert.Equal(t, "${{ secrets.IMPORT_LINEAR_TOKEN }}", workflowData.SafeOutputs.LinearToken, "LinearToken should be merged from the import")
+	require.Contains(t, workflowData.SafeOutputs.Scripts, connectorSafeOutputName("linear", "add-comment"))
+	assert.Contains(t, workflowData.SafeOutputs.Env, "GH_AW_CONNECTOR_6_LINEAR_SECRET_IMPORT_LINEAR_TOKEN")
 
 	// The Linear-only configuration must not implicitly enable GitHub issue creation
 	// for incomplete-run reporting.
@@ -2548,24 +2848,22 @@ This workflow uses only the imported Linear safe-outputs configuration.
 	assert.Equal(t, "false", *workflowData.SafeOutputs.ReportIncomplete.CreateIssue, "ReportIncomplete.CreateIssue should default to false for a Linear-only merged configuration")
 }
 
-// TestSafeOutputsImportLinearOnlyDoesNotEnableGitHubIssueReporting is a regression test for
-// the implicit report-incomplete default being computed before imported Linear handlers are
-// merged in. Previously, a main workflow declaring only meta safe-outputs fields (like
-// linear-token) would get an implicit "create-issue: true" default before the import's Linear
-// handler was merged in, and that implicit true value would then be preserved by the merge
-// because the import did not explicitly set report-incomplete.
-func TestSafeOutputsImportLinearOnlyDoesNotEnableGitHubIssueReporting(t *testing.T) {
+func TestSafeOutputsImportLinearConnectorDoesNotEnableGitHubIssueReporting(t *testing.T) {
 	compiler := NewCompiler(WithVersion("1.0.0"))
 
 	tmpDir := t.TempDir()
+	compiler.gitRoot = tmpDir
+	installConnectorTestSources(t, tmpDir)
 	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
 	err := os.MkdirAll(workflowsDir, 0755)
 	require.NoError(t, err, "Failed to create workflows directory")
 
 	sharedWorkflow := `---
-safe-outputs:
-  linear-create-issue:
-    team-id: "9cfb482a-81e3-4154-b5b9-2c805e70a02d"
+imports:
+  - uses: ".github/workflows/connectors/linear.md"
+    with:
+      teams: [33333333-3333-4333-8333-333333333333]
+      projects: [44444444-4444-4444-8444-444444444444]
 ---
 
 # Shared Linear Configuration
@@ -2584,7 +2882,9 @@ permissions:
 imports:
   - ./shared-linear.md
 safe-outputs:
-  linear-token: "${{ secrets.LINEAR_API_KEY }}"
+  linear-create-issue:
+  env:
+    CUSTOM_SETTING: literal
 ---
 
 # Main Workflow
@@ -2600,11 +2900,11 @@ safe-outputs:
 	require.NoError(t, err, "Failed to change directory")
 	defer func() { _ = os.Chdir(oldDir) }()
 
-	workflowData, err := compiler.ParseWorkflowFile("main.md")
+	workflowData, err := compiler.ParseWorkflowFile(mainFile)
 	require.NoError(t, err, "Failed to parse workflow")
 	require.NotNil(t, workflowData.SafeOutputs, "SafeOutputs should not be nil")
 
-	require.NotNil(t, workflowData.SafeOutputs.LinearCreateIssue, "LinearCreateIssue should be imported")
+	require.Contains(t, workflowData.SafeOutputs.Scripts, connectorSafeOutputName("linear", "create-issue"))
 	require.Nil(t, workflowData.SafeOutputs.CreateIssues, "CreateIssues (GitHub) must not be implicitly enabled")
 	require.NotNil(t, workflowData.SafeOutputs.ReportIncomplete)
 	require.NotNil(t, workflowData.SafeOutputs.ReportIncomplete.CreateIssue)

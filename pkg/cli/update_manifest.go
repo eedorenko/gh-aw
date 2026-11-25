@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 )
 
 var updateManifestLog = logger.New("cli:update_manifest")
+var errManifestWorkflowConflictSkipped = errors.New("manifest-managed workflow update skipped because of conflicts")
 
 type manifestManagedWorkflowUpdate struct {
 	wf             *workflowWithSource
@@ -80,6 +82,7 @@ func updateManifestWorkflowGroup(ctx context.Context, source string, grouped []*
 	var successes []string
 	var failures []updateFailure
 	var groupedSuccesses []string
+	var skippedConflict bool
 
 	repoSpec, _, err := parseManifestSourceSpec(source)
 	if err != nil {
@@ -105,12 +108,12 @@ func updateManifestWorkflowGroup(ctx context.Context, source string, grouped []*
 		return successes, failures
 	}
 	if latestRefResult.CoolDownBlocked {
-		updateManifestLog.Printf("Skipping manifest update for %s due to commit cooldown", repoSpec.RepoSlug)
+		updateManifestLog.Printf("Skipping manifest update for %s due to cooldown", repoSpec.RepoSlug)
 		return successes, failures
 	}
-	latestRef := latestRefResult.Ref
+	latestRef := latestRefResult.downloadRef()
 	updateManifestLog.Printf("Resolved manifest refs: current=%s, latest=%s", currentRef, latestRef)
-	sourceFieldRef := latestRef
+	sourceFieldRef := latestRefResult.Ref
 	// Preserve branch-tracking behavior: when source points to a branch, keep the
 	// branch name in source so future updates continue following that branch.
 	// For tags/SHAs, pin to the resolved latest ref.
@@ -118,10 +121,25 @@ func updateManifestWorkflowGroup(ctx context.Context, source string, grouped []*
 		sourceFieldRef = currentRef
 	}
 
+	currentPackageRef := currentRef
+	if gitRoot, rootErr := gitutil.FindGitRoot(); rootErr == nil {
+		recordPath := packageOwnershipRecordPath(gitRoot, repositoryPackageIdentifier(repoSpec.RepoSlug, repoSpec.PackagePath))
+		if record, readErr := readPackageOwnershipRecord(recordPath); readErr == nil && IsCommitSHA(record.ResolvedCommit) {
+			currentPackageRef = record.ResolvedCommit
+		}
+	}
+	if !IsCommitSHA(currentPackageRef) {
+		for _, wf := range grouped {
+			if IsCommitSHA(wf.SourceSHA) {
+				currentPackageRef = wf.SourceSHA
+				break
+			}
+		}
+	}
 	currentPkg, err := resolveRepositoryPackage(ctx, &RepoSpec{
 		RepoSlug:    repoSpec.RepoSlug,
 		PackagePath: repoSpec.PackagePath,
-		Version:     currentRef,
+		Version:     currentPackageRef,
 	}, "")
 	if err != nil {
 		for _, wf := range grouped {
@@ -142,6 +160,7 @@ func updateManifestWorkflowGroup(ctx context.Context, source string, grouped []*
 	}
 
 	currentByName := manifestWorkflowPathByName(currentPkg.InstallationSource)
+	pathsByRevision := map[string]map[string]string{currentPackageRef: currentByName}
 	latestByName := manifestWorkflowPathByName(latestPkg.InstallationSource)
 	existingByName := make(map[string]*workflowWithSource, len(grouped))
 	for _, wf := range grouped {
@@ -160,7 +179,27 @@ func updateManifestWorkflowGroup(ctx context.Context, source string, grouped []*
 			continue
 		}
 
-		oldPath := currentByName[name]
+		installedPaths := currentByName
+		if IsCommitSHA(wf.SourceSHA) {
+			var cached bool
+			installedPaths, cached = pathsByRevision[wf.SourceSHA]
+			if !cached {
+				installedPkg, resolveErr := resolveRepositoryPackage(ctx, &RepoSpec{
+					RepoSlug: repoSpec.RepoSlug, PackagePath: repoSpec.PackagePath, Version: wf.SourceSHA,
+				}, "")
+				if resolveErr != nil {
+					failures = append(failures, updateFailure{Name: name, Error: fmt.Sprintf("failed to resolve installed manifest package: %v", resolveErr)})
+					continue
+				}
+				installedPaths = manifestWorkflowPathByName(installedPkg.InstallationSource)
+				pathsByRevision[wf.SourceSHA] = installedPaths
+			}
+		}
+		oldPath := installedPaths[name]
+		if oldPath == "" && IsCommitSHA(wf.SourceSHA) {
+			failures = append(failures, updateFailure{Name: name, Error: "workflow is missing from its installed manifest revision"})
+			continue
+		}
 		if oldPath == "" {
 			oldPath = latestPath
 		}
@@ -169,11 +208,15 @@ func updateManifestWorkflowGroup(ctx context.Context, source string, grouped []*
 			repo:           repoSpec.RepoSlug,
 			currentPath:    oldPath,
 			latestPath:     latestPath,
-			currentRef:     currentRef,
+			currentRef:     currentPackageRef,
 			latestRef:      latestRef,
 			manifestSource: manifestSource,
 		}
-		if err := updateManifestManagedWorkflow(ctx, update, opts); err != nil {
+		if err := updateManifestManagedWorkflow(ctx, update, opts); errors.Is(err, errManifestWorkflowConflictSkipped) {
+			skippedConflict = true
+			failures = append(failures, updateFailure{Name: wf.Name, Error: err.Error()})
+			continue
+		} else if err != nil {
 			failures = append(failures, updateFailure{Name: wf.Name, Error: err.Error()})
 			continue
 		}
@@ -199,7 +242,14 @@ func updateManifestWorkflowGroup(ctx context.Context, source string, grouped []*
 		groupedSuccesses = append(groupedSuccesses, name)
 	}
 
-	if err := syncManifestManagedResources(ctx, repoSpec, latestPkg, latestRef, opts); err != nil {
+	if skippedConflict {
+		// Ownership describes the entire package revision. Refreshing it would
+		// incorrectly record preserved or conflict-marked workflows as installed.
+		successes = append(successes, groupedSuccesses...)
+		return successes, failures
+	}
+
+	if err := syncManifestManagedResources(ctx, repoSpec, latestPkg, latestRef, sourceFieldRef, opts); err != nil {
 		if len(groupedSuccesses) == 0 {
 			failures = append(failures, updateFailure{Name: source, Error: err.Error()})
 			return successes, failures
@@ -212,7 +262,7 @@ func updateManifestWorkflowGroup(ctx context.Context, source string, grouped []*
 	assetEngine := resolveManifestAssetEngine(grouped, opts)
 	if err := reconcileManifestManagedAssets(ctx, repoSpec, currentPkg, latestPkg, assetEngine, opts); err != nil {
 		failures = append(failures, updateFailure{Name: source, Error: err.Error()})
-	} else if err := refreshManifestManagedOwnership(repoSpec, latestPkg, latestRef, assetEngine, opts); err != nil {
+	} else if err := refreshManifestManagedOwnership(repoSpec, latestPkg, sourceFieldRef, assetEngine, opts); err != nil {
 		failures = append(failures, updateFailure{Name: source, Error: err.Error()})
 	}
 	if len(groupedSuccesses) == 0 && len(failures) == 0 {
@@ -393,11 +443,18 @@ func rollbackPackageAssets(rollbacks []packageAssetRollback) {
 	// Rollback is best-effort so the original reconciliation error remains actionable.
 	for _, rollback := range slices.Backward(rollbacks) {
 		if rollback.existed {
-			_ = os.MkdirAll(filepath.Dir(rollback.path), constants.DirPermPublic)
-			_ = os.WriteFile(rollback.path, rollback.content, rollback.mode)
+			if err := os.MkdirAll(filepath.Dir(rollback.path), constants.DirPermPublic); err != nil {
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Unable to restore package asset %s: %v", rollback.path, err)))
+				continue
+			}
+			if err := os.WriteFile(rollback.path, rollback.content, rollback.mode); err != nil {
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Unable to restore package asset %s: %v", rollback.path, err)))
+			}
 			continue
 		}
-		_ = os.Remove(rollback.path)
+		if err := os.Remove(rollback.path); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Unable to remove package asset %s during rollback: %v", rollback.path, err)))
+		}
 	}
 }
 
@@ -508,6 +565,9 @@ func removeManifestManagedWorkflow(workflowPath string) error {
 }
 
 func updateManifestManagedWorkflow(ctx context.Context, update manifestManagedWorkflowUpdate, opts UpdateWorkflowsOptions) error { //nolint:largefunc
+	if IsCommitSHA(update.wf.SourceSHA) {
+		update.currentRef = update.wf.SourceSHA
+	}
 	updateManifestLog.Printf("Updating manifest-managed workflow %s: %s@%s -> %s@%s", update.wf.Name, update.currentPath, update.currentRef, update.latestPath, update.latestRef)
 	sourceSpecCurrent := sourceSpecWithRef(&SourceSpec{Repo: update.repo, Path: update.currentPath}, update.currentRef)
 	newContent, err := downloadWorkflowContentFn(ctx, update.repo, update.latestPath, update.latestRef, opts.Verbose)
@@ -532,6 +592,9 @@ func updateManifestManagedWorkflow(ctx context.Context, update manifestManagedWo
 	if merge {
 		baseContent, err := downloadWorkflowContentFn(ctx, update.repo, update.currentPath, update.currentRef, opts.Verbose)
 		if err != nil {
+			if IsCommitSHA(update.wf.SourceSHA) {
+				return fmt.Errorf("unable to download installed workflow for merge: %w", err)
+			}
 			updateManifestLog.Printf("Cannot fetch base for 3-way merge of %s, falling back to overwrite: %v", update.wf.Name, err)
 			merge = false
 		} else {
@@ -570,6 +633,12 @@ func updateManifestManagedWorkflow(ctx context.Context, update manifestManagedWo
 	if err != nil {
 		return fmt.Errorf("unable to update source frontmatter: %w", err)
 	}
+	if IsCommitSHA(update.latestRef) {
+		finalContent, err = updateTopLevelFieldInFrontmatterRaw(finalContent, "source-sha", fmt.Sprintf("%q", update.latestRef))
+		if err != nil {
+			return fmt.Errorf("unable to record installed source commit: %w", err)
+		}
+	}
 
 	if opts.NoStopAfter {
 		cleanedContent, err := RemoveFieldFromOnTrigger(finalContent, "stop-after")
@@ -588,6 +657,10 @@ func updateManifestManagedWorkflow(ctx context.Context, update manifestManagedWo
 			return fmt.Errorf("workflow '%s' has %d security scan issue(s); review the findings and resolve them before updating, or pass --no-security-scanner to skip this check", update.wf.Name, len(findings))
 		}
 	}
+	if hasConflicts && !opts.NoCompile {
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Could not update %s from %s to %s due to CONFLICTS - leaving the existing workflow unchanged; please review and resolve manually", update.wf.Name, shortRef(update.currentRef), shortRef(update.latestRef))))
+		return errManifestWorkflowConflictSkipped
+	}
 
 	if err := fetchManifestManagedDependencies(ctx, newContent, update.repo, update.latestPath, update.latestRef, filepath.Dir(update.wf.Path), opts.Verbose); err != nil {
 		return fmt.Errorf("unable to update workflow dependencies: %w", err)
@@ -597,7 +670,7 @@ func updateManifestManagedWorkflow(ctx context.Context, update manifestManagedWo
 	}
 	if hasConflicts {
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Updated %s from %s to %s with CONFLICTS - please review and resolve manually", update.wf.Name, shortRef(update.currentRef), shortRef(update.latestRef))))
-		return nil
+		return errManifestWorkflowConflictSkipped
 	}
 	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("Updated %s from %s to %s", update.wf.Name, shortRef(update.currentRef), shortRef(update.latestRef))))
 	if !opts.NoCompile {
@@ -618,6 +691,12 @@ func addManifestManagedWorkflow(ctx context.Context, targetDir, name, repo, late
 	content, err := UpdateFieldInFrontmatter(string(newContent), "source", manifestSource)
 	if err != nil {
 		return fmt.Errorf("unable to add source frontmatter for %s: %w", name, err)
+	}
+	if IsCommitSHA(latestRef) {
+		content, err = UpdateFieldInFrontmatter(content, "source-sha", fmt.Sprintf("%q", latestRef))
+		if err != nil {
+			return fmt.Errorf("unable to record installed source commit: %w", err)
+		}
 	}
 	if opts.NoStopAfter {
 		cleanedContent, err := RemoveFieldFromOnTrigger(content, "stop-after")

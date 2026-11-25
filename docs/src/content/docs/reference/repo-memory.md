@@ -29,11 +29,9 @@ For persistent snapshots, use a matching `safe-outputs.scripts` or custom
 preparation job and `safe-outputs.claim-adapters` with `effect-type: git_tree`.
 Pin an existing native base commit, a fixed target repository and a separate
 branch prefix. Credential-free preparation emits declared file content; the
-trusted handler creates an immutable Claim branch and independently verifies
-its commit, complete tree and blobs. The installed Work must freeze a positive
-numeric repository target and permit the output, intersecting the approved
-profile, Subject and every worker-created ancestor. Preparation and restored
-history are not authority or delivery proof.
+trusted handler creates an immutable Claim branch from the pinned base. The
+target repository must equal the worker profile's `effect_scope`. Preparation
+and restored history are not authority.
 
 The repository's
 [ESLint Refiner workflow](https://github.com/github/gh-aw/blob/main/.github/workflows/eslint-refiner.md)
@@ -89,15 +87,62 @@ tools:
 
 `branch-prefix` changes the default `memory` prefix and must be 4-32 alphanumeric, hyphen, or underscore characters; it cannot be `copilot`. `allowed-extensions` limits which file types can be stored, `format-json: true` pretty-prints `.json` files before commit, `validation.json-schemas` declares mandatory per-file JSON/JSONL validation, `validation.script` runs an optional custom JavaScript domain validator, and `max-patch-size` caps the total diff size for one push (default 10KB, max 1MB) to prevent oversized updates.
 
+Branches under `memory/adaptive-routing/` are reserved for [adaptive routing](/gh-aw/reference/adaptive-routing/) histories, which only gh-aw writes, so a repo-memory entry whose branch is `memory/adaptive-routing` or under it fails to compile, and a branch-name expression that resolves to one fails the clone and the save at run time. Adaptive routing itself requires `tools.repo-memory`.
+
+## GitHub App authentication
+
+`github-app` is optional in the object form and in each array entry. Without it, memory operations use `github.token`. Configure an installed GitHub App to write memory branches protected by rulesets:
+
+```aw wrap
+tools:
+  repo-memory:
+    github-app:
+      client-id: ${{ vars.MEMORY_APP_CLIENT_ID }}
+      private-key: ${{ secrets.MEMORY_APP_PRIVATE_KEY }}
+```
+
+The app must have **Contents: read and write** permission and be installed on the memory repository. Push tokens request only `contents: write`. `client-id` (or legacy `app-id`) and `private-key` are required. Optional `owner` and `repositories` override the installation owner and repository scope; by default, both are derived from `target-repo`, or the current repository when no target is configured. Each array entry mints its own token. Additional app permissions cannot be requested.
+
+For an explicit `target-repo`, restore steps mint a separate Contents-read token from the same app, allowing private cross-repository clones. Restores without `target-repo` continue using `github.token` unless `github-app-read` is configured. Tokens are revoked by the token action's cleanup step.
+
+Use `github-app-read` and `github-app-write` to select different apps for reads and writes. Both accept the same credential and scope fields as `github-app`, in object and array forms:
+
+```aw wrap
+tools:
+  repo-memory:
+    github-app-read:
+      client-id: ${{ vars.MEMORY_READ_APP_CLIENT_ID }}
+      private-key: ${{ secrets.MEMORY_READ_APP_PRIVATE_KEY }}
+    github-app-write:
+      client-id: ${{ vars.MEMORY_WRITE_APP_CLIENT_ID }}
+      private-key: ${{ secrets.MEMORY_WRITE_APP_PRIVATE_KEY }}
+```
+
+Each override replaces `github-app` only for its operation. An omitted override uses `github-app`, or `github.token` when no shared app is configured. An override with `ignore-if-missing: true` falls back to `github.token`, not to the shared app. The read app needs **Contents: read** and handles restores (including the current repository) and daily-credit ledger clones. The write app needs **Contents: read and write** and handles pushes, including the Git and API reads needed to commit changes. Only the write app needs the ruleset bypass.
+
+The repo-memory daily-credit backend also mints Contents-read tokens for its activation and hydration clones. App-authenticated push jobs inherit the workflow's `environment`, making environment-scoped app credentials available.
+
+Literal `target-repo` values authorize that repository. For expression targets, the resolved repository must be the current repository or a literal name in the selected app's `repositories` under its literal `owner` (default: the current owner). Wildcards and expressions cannot define this allowlist. Read and write apps authorize targets independently before minting, and tokens are scoped to the selected repository only.
+
+`ignore-if-missing: true` skips minting when either credential is missing and falls back to `github.token`. This fallback cannot bypass an app-only ruleset or access another private repository. The push job needs only `contents: read` when all entries use write apps without this fallback; otherwise it retains `contents: write`.
+
+### Protect memory branches with a ruleset
+
+Create an active branch ruleset targeting `memory/**` (or the configured branch prefix). Enable **Restrict updates** and **Restrict creations**. Add the installed memory app to the bypass list with **Always allow**; optionally add an administrator team for recovery. The built-in GitHub Actions token is not the app bypass actor.
+
+Every workflow and array entry writing to that pattern needs a bypass-listed app. Use a narrower pattern when other memories must continue using `github.token`. [Adaptive routing](/gh-aw/reference/adaptive-routing/#branch-rulesets) histories are saved with the workflow's `github.token`, so a ruleset covering `memory/**` must also allow GitHub Actions to update `memory/adaptive-routing/**`, or exclude that pattern.
+
+Keep the app's private key available only to trusted workflows and environments. A branch ruleset controls writers, not the content an authorized workflow accepts.
+
+Restored memory is untrusted data, not agent instructions. Select repositories whose memory writers are trusted data producers, and protect their memory branches. App authentication does not establish content integrity; workflows requiring stronger provenance must verify it before exposing restored content.
+
 ## Structured Ledger
 
-:::caution[Experimental]
-Ledgers are experimental and their configuration or behavior may change.
-:::
-
-Ledgers use `tools.ledger`, independently of repo-memory file storage. The legacy
-`tools.repo-memory.ledger` declaration is no longer supported. For built-in
-state models, declare `log`, `set`, `map`, `table`, `counter`, or `notes`:
+New workflows should use `tools.ledger`, independently of repo-memory file storage.
+Legacy `ledger` configuration is still accepted in a single-entry
+`tools.repo-memory` array; the object-form `tools.repo-memory.ledger` declaration
+is rejected during compilation. For built-in state models, declare `log`,
+`set`, `map`, `table`, `counter`, or `notes`:
 
 ```aw wrap
 ---
@@ -146,7 +191,7 @@ response confirms queuing, not durability. The trusted `push_ledger_changes`
 job validates and reconciles accepted requests against the latest branch state
 before pushing. Queued writes are not immediately visible in the run's projection.
 
-Ledger compaction never runs in the agent or persistence job. Standalone `tools.ledger` ledgers are compacted by Agentic Maintenance through an untrusted plan job and a trusted apply job; see [Ledger compaction](/gh-aw/experimental/ledger-compaction/).
+Ledger compaction never runs in the agent or persistence job. Standalone `tools.ledger` ledgers are compacted by Agentic Maintenance through an untrusted plan job and a trusted apply job; see [Ledger compaction](/gh-aw/reference/ledger-compaction/).
 
 Custom `replay.script`, `replay.config`, and `compaction.script` settings are
 rejected. Use schemas for domain-specific values and the built-in compaction
@@ -156,7 +201,7 @@ remains supported; it is a separate file-storage validator.
 Existing raw-record ledgers can retain their generic projection by omitting
 `type` and querying `records.payload` with SQLite JSON functions. Adding a
 built-in type does not convert historical raw payloads into operations.
-See [Ledger replay projections](/gh-aw/experimental/ledger-replay/) for type
+See [Ledger replay projections](/gh-aw/reference/ledger-replay/) for type
 semantics and migration guidance.
 
 **File Glob Matching Rules**:
@@ -203,9 +248,18 @@ Use `validation.script` when generic storage and schema checks are not enough. T
 
 The script also checks the cloned baseline before the agent starts, without formatting or filtering the checkout. A baseline failure is shown to the agent with the validator's output so it can repair memory and call `push_repo_memory` to verify the change. If an invalid baseline remains unchanged, the agent job warns and skips its memory artifact instead of failing after the agent exits. Any changed memory still requires successful validation before upload and again before the push.
 
-Available globals are Node.js `fs` and `path`, plus `memoryRoot`/`memoryDir`, `memoryId`, `memoryKind` (`"repo"`), and `memoryPhase` (`"baseline"`, `"upload"`, or `"push"`). These paths and the working directory point to a temporary copy of the eligible memory files, excluding the checkout's `.git` directory. Changes to this copy are not persisted and do not modify the original memory directory. This copy is not a sandbox: validators remain trusted code with the runner's filesystem permissions.
+Available globals are Node.js `fs` and `path`, plus `memoryRoot`/`memoryDir`, `memoryId`, `memoryKind` (`"repo"`), `memoryPhase` (`"baseline"`, `"upload"`, or `"push"`), and `memorySourceJobResult`. These paths and the working directory point to a temporary copy of the eligible memory files, excluding the checkout's `.git` directory. Changes to this copy are not persisted and do not modify the original memory directory. This copy is not a sandbox: validators remain trusted code with the runner's filesystem permissions.
 
 `memoryPhase` is set by the runtime, not memory contents. Use it to distinguish upload-directory limits from backing-branch checks: `"push"` sees the complete branch overlay, including historical files omitted from the upload. Repo-memory does not delete those omitted files. Keep snapshot integrity checks in every phase; apply upload-only retention or aggregate artifact limits during `"upload"` (and optionally `"baseline"` for repair diagnostics).
+
+During downstream repo-memory validation, `memorySourceJobResult` contains the
+completed agent job's GitHub Actions result. It is empty during baseline/upload
+validation and for callers without source-job metadata. A validator can require
+`memorySourceJobResult === "success"` during `"push"` to block publication after
+failed preparation or execution. This is an opt-in policy; ordinary repo-memory
+still supports recovery after failed runs. The result is runtime-controlled,
+not read from memory, and does not prove that queued outputs or persistence
+already succeeded.
 
 Environment variables available to the validator are intentionally limited to basic runner paths plus `GH_AW_MEMORY_ROOT`, `GH_AW_MEMORY_DIR`, `GH_AW_MEMORY_ID`, and `GH_AW_MEMORY_KIND`; GitHub tokens and write credentials are not passed to the validator subprocess. Network access follows the workflow runner's normal network policy. The default timeout is 1 minute and may be set with `validation.timeout-minutes` (1-5 minutes).
 
@@ -237,8 +291,8 @@ For fast 7-day caching without version control, see [Cache Memory](/gh-aw/refere
 - **Branch not created**: Ensure `create-orphan: true` is enabled, or create the branch manually.
 - **Validation or patch-size failures**: Keep changes within `file-glob`, `max-file-size` (100KB default), `max-file-count` (100 default), and `max-patch-size` (10KB default).
 - **Changes not persisting**: Confirm the directory path, let the workflow finish, and check the push job's **Repo-memory push failed** summary and logs for the underlying error. Custom validation failures include both stdout and stderr; updates rejected by validation are not committed or pushed.
-- **Merge conflicts**: Concurrent pushes are replayed onto the latest remote state, so your file changes win. `.jsonl` files are merged with `merge=union`, so rows written by concurrent runs are all kept; other file types keep the local version.
-- **Many runs finishing at once**: Pushes are not serialized. Each run commits with a compare-and-swap on the remote branch head and, if another run wins the race, re-reads the head, rebases its change with JSONL union merging, and retries with exponential backoff. To avoid conflicts entirely, have each run write its own file instead of all runs editing the same file, for example `runs/${{ matrix.worker }}.jsonl` or `targets/${{ matrix.target }}.jsonl`.
+- **Merge conflicts**: Each save applies only this run's changes. The push job compares every memory file with the commit the agent started from, so files this run did not change keep their latest version on the branch, even if another run saved them while this run was working. When both runs changed the same file, `.jsonl` files keep the rows from both runs (`merge=union`), and other file types keep this run's version of the lines both runs changed. If the starting commit is unknown or no longer in the branch history, the push job copies this run's files over the latest branch and logs a warning that rows saved by other runs in the meantime may be lost.
+- **Many runs finishing at once**: Pushes are not serialized. A save is committed only if the branch head is still the one the save was prepared on. If another run saved first, the push re-reads the head, rebases its change with JSONL union merging, and retries with exponential backoff. If the branch keeps moving and all 11 attempts fail, the save fails, this run's changes are not pushed, and the job reports an error. To avoid conflicts entirely, have each run write its own file instead of all runs editing the same file, for example `runs/${{ matrix.worker }}.jsonl` or `targets/${{ matrix.target }}.jsonl`. gh-aw's own state writers, such as the adaptive routing history, use an option of the same save loop that applies their change again to the newest files instead of rebasing; it is not available for agent memory.
 - **GH013 — Commits must have verified signatures**: This usually means the artifact included a symlink, executable file, or submodule entry, which forced a fallback to plain `git push`. Remove the unsupported file type and re-run.
 
 ## Security

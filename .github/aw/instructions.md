@@ -4,11 +4,19 @@ description: Repository overrides for workflow authoring, validation, and invest
 
 # Repository Instructions
 
-Apply to workflow creation, editing, review, diagnosis, debugging, and upgrades.
+Apply to workflow creation, editing, review, diagnosis, debugging, upgrades, and
+local SDLC issue preparation.
 These rules override conflicting upstream guidance.
 
 ## Repository Rules
 
+- For instruction/skill edits or generators, preserve the complete task contract
+  within 7,500 UTF-8 bytes (8,000-byte query limit, including metadata).
+  Put objective, constraints, routes, verification and stop conditions first;
+  defer examples and inventories. Use explicit imperatives; preserve safety,
+  field names and behavior. Follow
+  [packing guidance](../skills/prompt-token-efficiency/SKILL.md) and run
+  `make check-instruction-prefixes`; review semantic completeness separately.
 - After any `.github/workflows/*.md` edit, run one-shot `gh aw compile`; never `--watch`.
 - Follow [debug-agentic-workflow.md](debug-agentic-workflow.md) for diagnosis,
   patching, mode selection, and live gates. Logs/audits do not authorize live runs.
@@ -19,30 +27,88 @@ These rules override conflicting upstream guidance.
 - Before inventing workflow/shared-component/tool/safe-output patterns, inspect
   `https://github.com/gm3dmo/the-power` through GitHub APIs or `gh` for prior art.
 
+## Skipping Unnecessary Agent Invocations
+
+Use experimental top-level `skip-if-decision` when skipping requires semantic evidence from
+task or progress files. Prefer deterministic trigger/activation checks when
+ordinary conditions suffice; decisions cannot override retry limits, budgets,
+deadlines, or nonrecoverable errors.
+
+Lists accept at most 64 questions. Nonempty lists emit a compile-time experimental warning. Configuration and
+behavior may change without deprecation.
+
+```yaml
+skip-if-decision:
+  - Is there no actionable work remaining in @context/task.md?
+  - Has @reports/progress.md established that further execution is unnecessary?
+```
+
+Write each question as a skip condition, not a request to execute the agent.
+Populate referenced files through checkout, restored memory, or pre-agent setup
+before the first invocation, and keep them current for subsequent invocations.
+Runtime `@file` references resolve relative to `engine.cwd` or the workspace;
+only workspace and `/tmp/gh-aw/agent` files are eligible. Sensitive paths,
+symlinks, hardlinks, oversized context, and Actions expressions are unsupported.
+Each read is bounded by the remaining import budget, including JSON escaping
+and evidence metadata. Per-question context has a 512 KiB ceiling; the complete
+serialized Decisions request is limited to 400,000 UTF-8 bytes (approximately
+100,000 tokens at four bytes per token, not tokenizer-exact). A question that
+does not fit abstains, while smaller remaining questions may still run.
+
+The shared harness evaluates questions inside AWF before every otherwise
+eligible initial, retry, resume, or continuation invocation, including
+declarative engines. Any `deny` skips; otherwise `allow` or all `unknown`
+preserves the existing execution path. Missing files, API/model unavailability,
+timeouts, and malformed responses abstain without decision retries or workflow
+failure. An absent or empty list preserves existing behavior.
+
+Questions are batched through the existing AWF proxy, using
+`gpt-6-luna-decisions` on Copilot or `gpt-6-luna` on OpenAI. Do not add direct
+provider calls, extra credentials, host-side decision steps, or decision code
+to detection, evals, or conclusion. Decision requests retain normal proxy
+budget and usage accounting; a skipped agent is not zero total model usage.
+Inspect typed `harness.decision` unified-session events or `gh aw audit --json`
+under `retries.decisions` and `retries.avoided_invocations` for outcomes,
+sanitized errors, latency, and avoided invocations.
+
+## Indexing and Search
+
+Follow [index-search.md](index-search.md) when integrating existing indexes or
+search tools, including MCP.
+
 ## Session Graders
 
 Ten fast built-ins run by default in conclusion after session collection.
 Configure them with `graders.<builtin-id>.threshold`, `enabled`, or data-only
 `config`; expensive built-ins require opt-in.
 
-For custom outcomes, use `graders.<distinct-id>.script` with a synchronous
-JavaScript body over immutable `session`, `config`, and `helpers` inputs.
-Reuse `helpers.createSessionLookups(session)` for stats and event/tool lookups.
-Return a finite number, `null` for unavailable evidence, or an object with
-`value`; do not emit legacy metric arrays. The script limit is 256 KiB.
+For run-scoped operational outcomes, use `graders.operational-value.script`.
+It receives immutable `session`, `config`, and `helpers` inputs through the
+restricted custom-grader worker. Return a nonempty ordered array of unique
+`{id,value}` metrics; the first value is primary and remaining values are
+diagnostics. Use finite numbers or `null`. The script limit is 256 KiB.
 
-For repository-owned Bash compatibility, use `graders.operational-value.run`
-with a confined `.sh` path. Read session JSONL from `$1` / `GH_AW_SESSION_FILE`
-and JSON config from `GH_AW_GRADER_CONFIG`; retain `[{id,value}, ...]` output.
-Remove file writes and live API/checkout reads; compile/lint rejects detected
-writes. This trusted shell path is not yet microVM-isolated.
+Other custom IDs use `graders.<distinct-id>.script` and return one finite number,
+`null`, or an object with `value`. Reuse
+`helpers.createSessionLookups(session)` for stats and event/tool lookups.
 
-The compiler owns the isolated downstream `graders` job for both custom forms.
+`graders.operational-value.run` is removed. Reject it with migration guidance to
+`graders.operational-value.script`; never ignore or translate shell automatically.
+
+The compiler owns the isolated downstream `graders` job for custom JavaScript.
 Never override built-in implementations, customize `jobs.graders`, or inject
 user code or steps into `jobs.conclusion`.
 Collect required evidence before session publication; graders cannot fetch it.
 Use [operational-value-designer](../skills/operational-value-designer/SKILL.md)
 for executable examples and evidence/fixture design.
+
+gh-aw owns run facts, shared delivery/adoption/reversal/survival rules, provider
+refresh, and optional run-scoped grading. GitHub owns later object disposition.
+Every workflow can expose lifecycle evidence with `logs --delivery`,
+`logs --adoption`, or single-run `audit --adoption`, without CAO or a campaign.
+Attributed value additionally requires a declared measurement, attribution evidence,
+and complete post-adoption-window survival. CAO is an optional scheduler/consumer;
+the restricted-JS operational grader is optional evidence, not attributed value.
 
 Audit optionally retrieves registered custom results from the `graders`
 artifact; `logs --graders` and `--artifacts graders` include both it and `usage`.
@@ -60,3 +126,7 @@ configure Drain3. Grouping never changes ranking and keeps structured outcomes
 separate. These optional run-local groups are distinct from
 fleet failure clusters and `audit --group` finding codes; relevance/anomaly scores
 never replace full-stream findings or establish threat absence.
+
+## Local SDLC with Squad
+
+For local SDLC issues, follow [squad.md](squad.md).

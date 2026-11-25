@@ -4,6 +4,10 @@ description: Shared design patterns for command workflows, monitoring workflows,
 
 # Workflow Patterns
 
+## Least Privilege for Review-Only and Comment-Only Workflows
+
+- Remove `edit` and other write-capable tools unless changing files is required; keep GitHub access read-only and use `safe-outputs.add-comment` for comments.
+
 ## Command Workflows
 
 ### Prefer `slash_command` when
@@ -190,6 +194,14 @@ Use `run:` steps when `actions/github-script` is not suitable. To prevent shell 
 ### 3. Python (last resort)
 
 Use Python only when the task genuinely requires data science or numeric libraries (for example `pandas`, `numpy`, `matplotlib`). Prefer `actions/github-script` or a shell step for everything else.
+
+### Running CLI Tools Before the Agent
+
+Use deterministic `steps:` for fixed runner-side work before AI execution, such as running Lighthouse against a known preview URL and passing its compact report to the agent. Pin CLI packages to exact versions; avoid floating tags such as `latest`.
+
+These `steps:` run on the GitHub Actions runner, outside the AWF agent sandbox, so `network.allowed` does not constrain their network access. Agent tools and commands run inside the sandbox and are limited by the AWF network policy. `pre-agent-steps:` also run on the runner before MCP gateway startup; use them for required MCP setup, not agentic analysis. Keep runner-side steps deterministic and use the smallest necessary inputs and permissions.
+
+Prefer `steps:` for fixed checks such as status probes, deterministic diffs, or policy tests, and pass their compact results to the agent instead of asking it to reproduce them in agent-side shell. Reserve agent-side shell for exploratory work that needs the agent's judgment.
 
 ## Pre-Step Data Fetching Pattern
 

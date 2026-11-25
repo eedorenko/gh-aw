@@ -25,7 +25,7 @@ func PreflightCheckForCreatePR(verbose bool) error {
 
 func requireAutoMergePR(autoMerge, createPR bool) error {
 	if autoMerge && !createPR {
-		return errors.New("--auto-merge requires --pr or --create-pull-request")
+		return errors.New("--auto-merge requires --create-pull-request")
 	}
 	return nil
 }
@@ -69,6 +69,9 @@ func createPRWithChanges(ctx context.Context, branchPrefix, commitMessage, prTit
 	if err != nil {
 		_ = switchPRBranch(currentBranch, verbose)
 		return "", fmt.Errorf("failed to create PR: %w", err)
+	}
+	if reporter := updateReporter(ctx); reporter != nil {
+		reporter.recordError(emitUpdateEvent(ctx, updateJSONLEvent{Event: "pull_request", Status: "created", URL: prURL}))
 	}
 
 	var autoMergeErr error

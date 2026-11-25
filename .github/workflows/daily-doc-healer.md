@@ -14,11 +14,13 @@ network:
   - defaults
   - github
 imports:
+- shared/pr-safe-output-defaults.md
 - uses: shared/daily-audit-base.md
   with:
     expires: 3d
     title-prefix: "[doc-healer] "
 - shared/otlp.md
+- shared/reporting.md
 safe-outputs:
   create-issue:
     assignees:
@@ -28,9 +30,9 @@ safe-outputs:
     - documentation
     - automation
     title-prefix: "[doc-healer] "
-  steer: true
   create-pull-request:
     expires: 3d
+    draft: true
     labels:
     - documentation
     - automation

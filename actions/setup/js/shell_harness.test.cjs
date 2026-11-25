@@ -3,6 +3,7 @@
 "use strict";
 
 const path = require("path");
+const fs = require("node:fs");
 const { spawnSync } = require("child_process");
 
 describe("shell_harness.cjs", () => {
@@ -12,8 +13,93 @@ describe("shell_harness.cjs", () => {
     const result = spawnSync(process.execPath, [harnessPath, "test", "printf hello"], { encoding: "utf8" });
 
     expect(result.status).toBe(0);
-    expect(result.stdout).toBe("hello");
+    expect(result.stdout).toContain("hello");
     expect(result.stderr).toContain("[test-harness] attempt 1: process closed");
+  });
+
+  describe("shared retry loop", () => {
+    /** @param {string} script @param {Record<string, string>} [extraEnv] */
+    function runRetry(script, extraEnv = {}) {
+      const root = fs.mkdtempSync(path.join(__dirname, "shell-retry-"));
+      try {
+        const counter = path.join(root, "count");
+        const safeOutputs = path.join(root, "safeoutputs.jsonl");
+        const command = `n=$(($(cat "${counter}" 2>/dev/null || echo 0) + 1)); echo $n > "${counter}"; ${script}`;
+        const result = spawnSync(process.execPath, [harnessPath, "test", command], {
+          encoding: "utf8",
+          timeout: 10000,
+          env: {
+            ...process.env,
+            GH_AW_SKIP_IF_DECISION: "",
+            GH_AW_HARNESS_TELEMETRY_DIR: root,
+            GH_AW_SAFE_OUTPUTS: safeOutputs,
+            GH_AW_HARNESS_INITIAL_DELAY_MS: "10",
+            GH_AW_HARNESS_MAX_DELAY_MS: "5000",
+            SAFE_OUTPUTS: safeOutputs,
+            ...extraEnv,
+          },
+        });
+        return {
+          ...result,
+          invocations: Number(fs.readFileSync(counter, "utf8").trim()),
+          telemetry: JSON.parse(fs.readFileSync(path.join(root, "harness_retry.json"), "utf8")),
+        };
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+
+    it("honours a BYOK HTTP 429 Retry-After before retrying", () => {
+      const result = runRetry(`if [ $n -eq 1 ]; then printf 'HTTP/1.1 429 Too Many Requests\nRetry-After: 1\n' >&2; exit 1; fi; echo done`);
+      expect(result.status).toBe(0);
+      expect(result.invocations).toBe(2);
+      expect(result.telemetry).toMatchObject({
+        attempts: 2,
+        exit_code: 0,
+        attempt_results: [
+          { outcome: "failure", failure_classes: ["rate_limit_error"] },
+          { outcome: "success", backoff_ms: 1000 },
+        ],
+      });
+    });
+
+    it("fails fast when Retry-After exceeds the remaining timeout", () => {
+      const result = runRetry(`printf 'HTTP/1.1 429 Too Many Requests\nRetry-After: 257\n' >&2; exit 1`, { GH_AW_TIMEOUT_MINUTES: "2" });
+      expect(result.status).toBe(1);
+      expect(result.invocations).toBe(1);
+      expect(result.telemetry.attempt_results).toMatchObject([{ outcome: "failure", failure_classes: ["rate_limit_wait_exceeded"] }]);
+    });
+
+    it("retries transient provider errors with backoff", () => {
+      const result = runRetry(`if [ $n -le 2 ]; then echo '503 Service Unavailable' >&2; exit 1; fi; echo done`);
+      expect(result.status).toBe(0);
+      expect(result.invocations).toBe(3);
+      expect(result.telemetry.attempt_results.map(entry => entry.backoff_ms)).toEqual([0, 10, 20]);
+    });
+
+    it.each([
+      ["an unclassified failure", `echo 'compile error' >&2; exit 3`, 3],
+      ["an authentication failure", `echo 'HTTP 401 Unauthorized: authentication failed' >&2; echo '429 Too Many Requests' >&2; exit 1`, 1],
+      ["exhausted retries", `echo '429 Too Many Requests' >&2; exit 1`, 1],
+    ])("stops on %s", (_name, script, code) => {
+      const result = runRetry(script, { GH_AW_HARNESS_MAX_RETRIES: "1" });
+      expect(result.status).toBe(code);
+      expect(result.invocations).toBe(_name === "exhausted retries" ? 2 : 1);
+    });
+
+    it("does not retry after the attempt recorded safe outputs", () => {
+      const result = runRetry(`echo '{"type":"create_issue"}' >> "$SAFE_OUTPUTS"; echo '429 Too Many Requests' >&2; exit 1`);
+      expect(result.status).toBe(1);
+      expect(result.invocations).toBe(1);
+      expect(result.stderr).toContain("safe outputs were recorded");
+    });
+
+    it("does not retry when no safe-outputs path is configured", () => {
+      const result = runRetry(`echo '429 Too Many Requests' >&2; exit 1`, { GH_AW_SAFE_OUTPUTS: "" });
+      expect(result.status).toBe(1);
+      expect(result.invocations).toBe(1);
+      expect(result.stderr).toContain("retries disabled");
+    });
   });
 
   it("reports invalid invocations", () => {
@@ -21,5 +107,172 @@ describe("shell_harness.cjs", () => {
 
     expect(result.status).toBe(2);
     expect(result.stderr).toContain("Usage:");
+  });
+
+  it.each(["deny", "allow", "unknown", "api-error"].flatMap(outcome => ["command", "custom-harness", "pi-durable"].map(mode => [outcome, mode])))("gates the actual %s invocation through %s", (outcome, mode) => {
+    const root = fs.mkdtempSync(path.join(__dirname, "shell-decision-"));
+    try {
+      const preload = path.join(root, "fetch.cjs");
+      fs.writeFileSync(
+        preload,
+        `
+global.fetch = async url => {
+  if (url.endsWith("/reflect")) return new Response(JSON.stringify({ endpoints: [{ configured: true, provider: "github", models_url: "http://api-proxy:10002/v1/models" }] }));
+  if (${JSON.stringify(outcome)} === "api-error") return new Response("", { status: 503 });
+  return new Response(JSON.stringify({ answers: [{ name: "skip_1", type: "choice", choice: ${JSON.stringify(outcome)} }] }));
+};`
+      );
+      const customHarness = path.join(root, "custom_harness.cjs");
+      const nativeSession = { type: "session", version: 3, id: "12345678-1234-1234-1234-123456789abc", timestamp: "2026-11-08T00:00:00Z", cwd: root };
+      const durableDirectory = path.join(root, "durable");
+      const nativeTranscript = JSON.stringify(nativeSession) + "\n";
+      if (mode === "pi-durable") {
+        fs.mkdirSync(durableDirectory);
+        fs.writeFileSync(path.join(durableDirectory, "session.jsonl"), nativeTranscript);
+      }
+      fs.writeFileSync(customHarness, `process.stdout.write(${JSON.stringify("AGENT_INVOKED\n" + (mode === "pi-durable" ? nativeTranscript : ""))});`);
+      const command = mode === "command" ? "printf AGENT_INVOKED" : `"${process.execPath}" "${customHarness}"`;
+      const result = spawnSync(process.execPath, ["--require", preload, harnessPath, mode === "pi-durable" ? "pi" : "test", command], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          GH_AW_SKIP_IF_DECISION: '["Is work complete?"]',
+          AWF_REFLECT_ENABLED: "1",
+          GH_AW_PHASE: "agent",
+          GH_AW_HARNESS_TELEMETRY_DIR: root,
+          GH_AW_SAFE_OUTPUTS: path.join(root, "safeoutputs.jsonl"),
+          ...(mode === "pi-durable"
+            ? {
+                GH_AW_DURABLE_STORAGE: "artifact",
+                GH_AW_DURABLE_ENGINE: "pi",
+                GH_AW_DURABLE_SESSION_DIR: durableDirectory,
+                GH_AW_DURABLE_RESUMED: "true",
+                GH_AW_DURABLE_PARENT_RUN_ID: "100",
+                GH_AW_TMP_DIR: root,
+                GITHUB_RUN_ID: "123",
+                GITHUB_RUN_ATTEMPT: "2",
+              }
+            : {}),
+        },
+      });
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain(`[${mode === "pi-durable" ? "pi" : "test"}-harness] decision gate: harness initialized before decision evaluation`);
+      const skipped = outcome === "deny";
+      expect(result.stdout.includes("AGENT_INVOKED")).toBe(!skipped);
+      const telemetry = JSON.parse(fs.readFileSync(path.join(root, "harness_retry.json"), "utf8"));
+      expect(telemetry.attempts).toBe(skipped ? 0 : 1);
+      expect(telemetry.decision_results).toHaveLength(1);
+      expect(telemetry.decision_results[0]).toMatchObject({ outcome: outcome === "api-error" ? "unknown" : outcome, avoidedInvocation: skipped });
+      if (mode === "pi-durable") {
+        expect(fs.readFileSync(path.join(durableDirectory, "session.jsonl"), "utf8")).toBe(nativeTranscript);
+        const durableLog = path.join(root, "agent", "durable-session.jsonl");
+        expect(fs.existsSync(durableLog)).toBe(!skipped);
+        if (!skipped) expect(JSON.parse(fs.readFileSync(durableLog, "utf8")).data).toMatchObject({ status: "resumed", sessionId: nativeSession.id, parentRunId: "100" });
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects invalid durable preflight before evaluating a skip decision", () => {
+    const root = fs.mkdtempSync(path.join(__dirname, "shell-decision-preflight-"));
+    try {
+      const decisionMarker = path.join(root, "decision-called");
+      const preload = path.join(root, "fetch.cjs");
+      fs.writeFileSync(preload, `global.fetch = async () => { require("node:fs").writeFileSync(${JSON.stringify(decisionMarker)}, "called"); return new Response("{}"); };`);
+      const result = spawnSync(process.execPath, ["--require", preload, harnessPath, "pi", "printf AGENT_INVOKED"], {
+        encoding: "utf8",
+        env: { ...process.env, GH_AW_SKIP_IF_DECISION: '["Is work complete?"]', GH_AW_DURABLE_STORAGE: "artifact", GH_AW_DURABLE_ENGINE: "pi", GH_AW_DURABLE_SESSION_DIR: root, GH_AW_DURABLE_RESUMED: "true" },
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("Restored durable Pi session transcript is missing");
+      expect(result.stderr).not.toContain("[pi-harness]");
+      expect(result.stdout).not.toContain("AGENT_INVOKED");
+      expect(fs.existsSync(decisionMarker)).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["allow", "unknown", "api-error", "deny"].flatMap(outcome => ["command", "custom-harness"].flatMap(mode => ["relative", "absolute"].map(cwd => [outcome, mode, cwd]))))(
+    "shares a normalized cwd before %s decisions and %s invocation with %s paths",
+    (outcome, mode, cwd) => {
+      const root = fs.mkdtempSync(path.join(__dirname, "shell-decision-cwd-"));
+      try {
+        const engineCwd = path.join(root, "packages", "app");
+        fs.mkdirSync(engineCwd, { recursive: true });
+        const decisionCwd = path.join(root, "decision-cwd.json");
+        const preload = path.join(root, "fetch.cjs");
+        fs.writeFileSync(
+          preload,
+          `global.fetch = async url => {
+  require("node:fs").writeFileSync(${JSON.stringify(decisionCwd)}, JSON.stringify(process.env.GH_AW_ENGINE_CWD));
+  if (url.endsWith("/reflect")) return new Response(JSON.stringify({ endpoints: [{ configured: true, provider: "github", models_url: "http://api-proxy:10002/v1/models" }] }));
+  if (${JSON.stringify(outcome)} === "api-error") return new Response("", { status: 503 });
+  return new Response(JSON.stringify({ answers: [{ name: "skip_1", type: "choice", choice: ${JSON.stringify(outcome)} }] }));
+};`
+        );
+        const customHarness = path.join(root, "custom_harness.cjs");
+        fs.writeFileSync(
+          customHarness,
+          `const result = require("node:child_process").spawnSync(process.execPath, ["-e", "process.stdout.write(process.cwd())"], { cwd: process.env.GH_AW_ENGINE_CWD, encoding: "utf8" });
+if (result.error) throw result.error;
+process.stdout.write(result.stdout);
+process.exitCode = result.status;`
+        );
+        const command = mode === "command" ? 'cd "$GH_AW_ENGINE_CWD" && printf "%s" "$PWD"' : `"${process.execPath}" "${customHarness}"`;
+        const result = spawnSync(process.execPath, ["--require", preload, harnessPath, "test", command], {
+          cwd: root,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            GH_AW_ENGINE_CWD: cwd === "relative" ? "packages/app" : engineCwd,
+            GITHUB_WORKSPACE: root,
+            GH_AW_SKIP_IF_DECISION: '["Is work complete?"]',
+            AWF_REFLECT_ENABLED: "1",
+            GH_AW_PHASE: "agent",
+            GH_AW_HARNESS_TELEMETRY_DIR: root,
+            GH_AW_SAFE_OUTPUTS: path.join(root, "safeoutputs.jsonl"),
+          },
+        });
+        expect(result.status).toBe(0);
+        expect(JSON.parse(fs.readFileSync(decisionCwd, "utf8"))).toBe(engineCwd);
+        if (outcome === "deny") {
+          expect(result.stdout).toBe("");
+        } else {
+          expect(result.stdout.split("\n")).toContain(engineCwd);
+        }
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+  );
+
+  it("emits a startup marker before a decision request can terminate the sandbox", () => {
+    const root = fs.mkdtempSync(path.join(__dirname, "shell-decision-startup-"));
+    try {
+      const preload = path.join(root, "fetch.cjs");
+      fs.writeFileSync(
+        preload,
+        `global.fetch = async url => {
+  if (url.endsWith("/reflect")) return new Response(JSON.stringify({ endpoints: [{ configured: true, provider: "github", models_url: "http://api-proxy:10002/v1/models" }] }));
+  process.stderr.write("DECISION_REQUEST_STARTED\\n");
+  process.kill(process.pid, "SIGTERM");
+  await new Promise(() => {});
+};`
+      );
+      const result = spawnSync(process.execPath, ["--require", preload, harnessPath, "test", "printf AGENT_INVOKED"], {
+        encoding: "utf8",
+        env: { ...process.env, GH_AW_SKIP_IF_DECISION: '["Is work complete?"]', AWF_REFLECT_ENABLED: "1", GH_AW_PHASE: "agent", GH_AW_HARNESS_TELEMETRY_DIR: root },
+      });
+      expect(result.signal).toBe("SIGTERM");
+      expect(result.stderr).toContain("[test-harness] decision gate: harness initialized before decision evaluation");
+      expect(result.stderr).toContain("DECISION_REQUEST_STARTED");
+      expect(result.stderr.indexOf("[test-harness]")).toBeLessThan(result.stderr.indexOf("DECISION_REQUEST_STARTED"));
+      expect(result.stderr).not.toContain("spawning:");
+      expect(result.stdout).not.toContain("AGENT_INVOKED");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

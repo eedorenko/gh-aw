@@ -65,20 +65,12 @@ function digest(value) {
   return createHash("sha256").update(canonical(value), "utf8").digest("hex");
 }
 
-function fingerprint(actor, kind, parameters) {
-  if (kind === "finish" && parameters?.keep_open === false) {
-    parameters = { ...parameters };
-    delete parameters.keep_open;
-  }
-  return digest({ actor, kind, parameters });
-}
-
 // JSON.parse alone cannot detect duplicate (including escaped-equivalent) keys.
 /**
  * @param {string} text
- * @param {{maxBytes?: unknown}} [options]
+ * @param {{maxBytes?: unknown, finiteNumbersIn?: string | string[] | true, exactIntegerAt?: (path: (string | number)[]) => boolean}} [options]
  */
-function parseStrictJSON(text, { maxBytes = MAX_PARSE_BYTES } = {}) {
+function parseStrictJSON(text, { maxBytes = MAX_PARSE_BYTES, finiteNumbersIn, exactIntegerAt } = {}) {
   if (typeof maxBytes !== "number" || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_SNAPSHOT_PARSE_BYTES) throw queueError("resource_limit", "JSON parser byte limit must be a positive safe integer at most 161 MiB");
   if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > maxBytes) throw queueError("resource_limit", "JSON input exceeds parser limit");
   let i = 0;
@@ -107,7 +99,19 @@ function parseStrictJSON(text, { maxBytes = MAX_PARSE_BYTES } = {}) {
     }
     return fail();
   }
-  function read(depth) {
+  /** @param {string} literal @param {number} value */
+  function exactSafeInteger(literal, value) {
+    if (!Number.isSafeInteger(value)) return false;
+    const parts = /^-?([0-9]+)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?$/.exec(literal);
+    if (!parts) return false;
+    const digits = parts[1] + (parts[2] || "");
+    if (!/[1-9]/.test(digits)) return true;
+    let trailingZeros = 0;
+    while (digits[digits.length - 1 - trailingZeros] === "0") trailingZeros++;
+    return Number(parts[3] || 0) + trailingZeros >= (parts[2] || "").length;
+  }
+  /** @param {number} depth @param {boolean} finiteNumbers @param {(string | number)[]} path */
+  function read(depth, finiteNumbers, path) {
     if (depth > MAX_DEPTH) throw queueError("resource_limit", "JSON nesting exceeds 64");
     skip();
     const char = text[i];
@@ -127,7 +131,7 @@ function parseStrictJSON(text, { maxBytes = MAX_PARSE_BYTES } = {}) {
         if (Object.hasOwn(object, key)) throw queueError("duplicate_key", "duplicate JSON object key");
         skip();
         if (text[i++] !== ":") fail();
-        object[key] = read(depth + 1);
+        object[key] = read(depth + 1, finiteNumbers || (depth === 0 && (Array.isArray(finiteNumbersIn) ? finiteNumbersIn.includes(key) : key === finiteNumbersIn)), exactIntegerAt ? [...path, key] : path);
         skip();
         const end = text[i++];
         if (end === "}") return object;
@@ -144,7 +148,7 @@ function parseStrictJSON(text, { maxBytes = MAX_PARSE_BYTES } = {}) {
       }
       for (;;) {
         if (array.length >= 16384) throw queueError("resource_limit", "JSON array exceeds 16384 members");
-        array.push(read(depth + 1));
+        array.push(read(depth + 1, finiteNumbers, exactIntegerAt ? [...path, array.length] : path));
         skip();
         const end = text[i++];
         if (end === "]") return array;
@@ -155,10 +159,11 @@ function parseStrictJSON(text, { maxBytes = MAX_PARSE_BYTES } = {}) {
     if (!literal) return fail();
     i += literal[0].length;
     const value = JSON.parse(literal[0]);
-    if (typeof value === "number" && (!Number.isSafeInteger(value) || String(value) !== literal[0])) throw queueError("noncanonical_number", "use safe integer numbers or canonical decimal strings");
+    if (typeof value === "number" && (finiteNumbers ? !Number.isFinite(value) || (exactIntegerAt?.(path) && !exactSafeInteger(literal[0], value)) : !Number.isSafeInteger(value) || String(value) !== literal[0]))
+      throw queueError("noncanonical_number", "use safe integer numbers or canonical decimal strings");
     return value;
   }
-  const result = read(0);
+  const result = read(0, finiteNumbersIn === true, []);
   skip();
   if (i !== text.length) fail();
   return result;
@@ -189,9 +194,4 @@ function integer(value, min, max, name) {
   return value;
 }
 
-function validateReason(reason) {
-  if (typeof reason !== "string" || reason.length > 128 || !/^[A-Za-z0-9]/.test(reason) || /[^A-Za-z0-9_.:-]/.test(reason)) throw queueError("reason_invalid", "reason must be a bounded sanitized code");
-  return reason;
-}
-
-module.exports = { MAX_PARSE_BYTES, MAX_SNAPSHOT_PARSE_BYTES, canonical, canonicalBytes, closed, digest, fingerprint, identity, integer, parseStrictJSON, queueError, utf8Compare, validateReason, validString };
+module.exports = { MAX_PARSE_BYTES, MAX_SNAPSHOT_PARSE_BYTES, canonical, canonicalBytes, closed, digest, identity, integer, parseStrictJSON, queueError, utf8Compare, validString };

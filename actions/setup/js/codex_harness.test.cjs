@@ -6,6 +6,8 @@ import path from "path";
 import os from "node:os";
 
 const require = createRequire(import.meta.url);
+const { CYBERSECURITY_POLICY_REJECTION_PREFIX } = require("./github_provider_policy_rejection.cjs");
+const { prepareMarkdownFixtures } = require("../../../scripts/markdown_metadata_test_adapter.cjs");
 const {
   resolveCodexPromptFileArgs,
   resolveCodexPromptInput,
@@ -14,6 +16,7 @@ const {
   isRateLimitError,
   isTokenPerMinuteRateLimitError,
   isAuthenticationFailedError,
+  isCodexSessionProgress,
   isMissingApiKeyError,
   isServerError,
   isInvalidModelError,
@@ -26,7 +29,8 @@ const {
   extractDeniedCommands,
   buildMissingToolPermissionIssuePayload,
   buildCodexChildEnv,
-  hasCodexAzureOIDCProxy,
+  hasCodexOIDCProxy,
+  resolveSafeCodexConfigPath,
   extractPortFromURL,
   extractOpenAIProxyBaseURLFromToml,
   getConfiguredProviderPortFromReflect,
@@ -55,10 +59,19 @@ const {
   getCodexRoutingFailureCode,
   resolveCodexConfiguredModel,
 } = require("./codex_harness.cjs");
+const { TMP_GH_AW_PATH } = require("./constants.cjs");
 const reflectFixtures = require("./fixtures/model_resolution_reflect.cjs");
-const { detectNonRetryableHarnessGuard } = require("./harness_retry_guard.cjs");
+const { detectExhaustedAWFInvocationBudget, detectNonRetryableHarnessGuard } = require("./harness_retry_guard.cjs");
+const { normalizeHarnessRetryRecord } = require("./harness_retry_record.cjs");
 
-const agentTempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-harness-tests-"));
+let agentTempDir;
+function makeHarnessTempDir(name) {
+  const parent = agentTempDir || TMP_GH_AW_PATH;
+  fs.mkdirSync(parent, { recursive: true });
+  return fs.mkdtempSync(path.join(parent, name));
+}
+
+agentTempDir = makeHarnessTempDir("codex-harness-tests-");
 afterAll(() => fs.rmSync(agentTempDir, { recursive: true, force: true }));
 const preloadPath = path.join(agentTempDir, "isolated-audit.cjs");
 fs.writeFileSync(
@@ -70,11 +83,6 @@ const original=context.parseMaxAICreditsExceededFromAuditLog;
 context.parseMaxAICreditsExceededFromAuditLog=()=>original(path.join(path.dirname(process.env.GH_AW_AGENT_OUTPUT),"sandbox","firewall","audit","log.jsonl"));
 `
 );
-
-function makeHarnessTempDir(name) {
-  fs.mkdirSync(agentTempDir, { recursive: true });
-  return fs.mkdtempSync(path.join(agentTempDir, name));
-}
 
 function spawnSync(command, args, options) {
   const env = { ...options.env, HOME: path.join(agentTempDir, "home"), AWF_REFLECT_ENABLED: options.env.AWF_REFLECT_ENABLED || "0" };
@@ -143,6 +151,117 @@ function runHarnessFixture(script, { prompt = "fix the bug", args = [], env = {}
 }
 
 describe("codex_harness.cjs", () => {
+  describe("successful main-session progress", () => {
+    it.each([
+      { type: "thread.started" },
+      { type: "item.completed", item: { type: "error", message: "Authentication failed (Request ID: abc)" } },
+      { type: "item.completed", item: { type: "user_message", text: "Please fix this" } },
+      { type: "item.completed", item: { type: "todo_list", items: [] } },
+      { type: "item.completed", item: { type: "command_execution", exit_code: 1 } },
+      { type: "item.completed", item: { type: "mcp_tool_call", status: "completed", result: { isError: true } } },
+      { type: "item.completed", item: { type: "mcp_tool_call", status: "pending" } },
+      { type: "item.completed", item: { type: "collab_tool_call", status: "completed" } },
+      { type: "item.completed", parent_thread_id: "main", item: { type: "agent_message", text: "Subagent output" } },
+      { type: "item.completed", item: { type: "agent_message", error: "Runtime failure" } },
+    ])("does not count metadata, diagnostics, or failed work: %j", event => {
+      expect(isCodexSessionProgress(event)).toBe(false);
+    });
+
+    it.each([
+      { type: "turn.completed" },
+      { type: "item.completed", item: { type: "agent_message", text: "Working" } },
+      { type: "item.completed", item: { type: "reasoning", text: "Planning the fix" } },
+      { type: "item.completed", item: { type: "command_execution", exit_code: 0 } },
+      { type: "item.completed", item: { type: "mcp_tool_call", status: "completed" } },
+    ])("counts successful model/tool work: %j", event => {
+      expect(isCodexSessionProgress(event)).toBe(true);
+    });
+  });
+
+  it.each(["error", "user_message"])("does not retry startup authentication after an %s completion", itemType => {
+    const message = "Authentication failed (Request ID: abc)";
+    const { result, calls } = runHarnessFixture(`
+if (process.argv.includes("resume")) process.exit(0);
+console.log(JSON.stringify({type:"thread.started",thread_id:"12345678-1234-1234-1234-123456789abc"}));
+console.log(JSON.stringify({type:"item.completed",item:{id:"diagnostic",type:${JSON.stringify(itemType)},message:${JSON.stringify(message)},text:${JSON.stringify(message)}}}));
+console.log(JSON.stringify({type:"error",message:${JSON.stringify(message)}}));
+process.exit(1);`);
+    expect(result.status, result.stderr).toBe(1);
+    expect(calls).toHaveLength(1);
+  });
+
+  it.each([
+    { progress: true, challenge: true, retries: true },
+    { progress: true, challenge: false, retries: true },
+    { progress: false, challenge: false, retries: false },
+  ])("only stops on first-attempt credential errors before Codex progress: %j", ({ progress, challenge, retries }) => {
+    const threadId = "12345678-1234-1234-1234-123456789abc";
+    const message = challenge ? "Authentication failed: unexpected status 403 Forbidden: <html>Blocked</html>" : "Authentication failed (Request ID: abc)";
+    const { result, calls } = runHarnessFixture(`
+if (process.argv.includes("resume")) process.exit(0);
+console.log(JSON.stringify({type:"thread.started", thread_id:${JSON.stringify(threadId)}}));
+if (${progress}) console.log(JSON.stringify({type:"item.completed",item:{type:"agent_message",id:"1",text:"Working"}}));
+console.log(JSON.stringify({type:"error",message:${JSON.stringify(message)}}));
+process.exit(1);`);
+    expect(result.status, result.stderr).toBe(retries ? 0 : 1);
+    expect(calls).toHaveLength(retries ? 2 : 1);
+    if (retries) expect(calls[1].args).toEqual(expect.arrayContaining(["resume", threadId]));
+    expect(result.stderr).toContain(`isAuthenticationFailedError=${!challenge}`);
+  });
+
+  it.each([
+    ["1", "2000", 2, "rate_limit_error", true],
+    ["245", "60000", 1, "rate_limit_wait_exceeded", true],
+    ["1", "2000", 2, "rate_limit_error", false],
+    ["245", "60000", 1, "rate_limit_wait_exceeded", false],
+  ])("honors Retry-After=%s within timeout budget, backoff cap=%s, attempts=%i, class=%s, GitHub=%s", (delay, cap, attempts, failureClass, github) => {
+    const { result, calls, harnessRetry } = runHarnessFixture(
+      `
+        const attempts = fs.readFileSync(process.env.CODEX_HARNESS_STUB_CALLS, "utf8").trim().split("\\n").length;
+        if (attempts === 1) {
+          console.log(JSON.stringify({type:"error", error:{headers:{"retry-after":"${delay}"}, status:429}}));
+          console.log(JSON.stringify({type:"turn.failed", error:{message:"429 Too Many Requests"}}));
+          process.exit(1);
+        }
+      `,
+      { env: { GH_AW_HARNESS_MAX_DELAY_MS: cap, GH_AW_TIMEOUT_MINUTES: "2", GH_AW_LLM_PROVIDER: github ? "github" : "openai", ...(github ? { GH_AW_MODEL_AGENT_CODEX: "copilot/gpt-5" } : {}) } }
+    );
+    expect(result.status, result.stderr).toBe(attempts === 2 ? 0 : 1);
+    expect(calls).toHaveLength(attempts);
+    if (failureClass) expect(harnessRetry.attempt_results[0].failure_classes).toEqual([failureClass]);
+    else expect(harnessRetry.attempt_results[0].failure_classes || []).not.toContain("rate_limit_wait_exceeded");
+    if (attempts === 2) expect(harnessRetry.attempt_results[1].backoff_ms).toBe(1000);
+  });
+
+  it("does not use tool output as Retry-After timing evidence", () => {
+    const { result, calls, harnessRetry } = runHarnessFixture(`
+      if (fs.readFileSync(process.env.CODEX_HARNESS_STUB_CALLS, "utf8").trim().split("\\n").length === 1) {
+        console.log(JSON.stringify({type:"item.completed", item:{type:"command_execution", output:"HTTP 429\\nRetry-After: 245"}}));
+        process.exit(1);
+      }
+    `);
+    expect(result.status, result.stderr).toBe(0);
+    expect(calls).toHaveLength(2);
+    expect(harnessRetry.attempt_results[0].failure_classes).not.toContain("rate_limit_wait_exceeded");
+    expect(harnessRetry.attempt_results[1].backoff_ms).toBe(1);
+  });
+
+  it("handles repeated permission failures without replaying work", () => {
+    const directory = makeHarnessTempDir("permission-output-");
+    const safeOutputsPath = path.join(directory, "safe-outputs.jsonl");
+    const { result, calls, harnessRetry } = runHarnessFixture(
+      `
+        console.log("  | observed command\\nPermission denied\\npermission denied\\npermission denied");
+        process.exit(1);
+      `,
+      { env: { GH_AW_SAFE_OUTPUTS: safeOutputsPath, GH_AW_SAFEOUTPUTS_CLI: "true", GH_AW_HARNESS_MAX_RETRIES: "2" } }
+    );
+    expect(result.status, result.stderr).toBe(1);
+    expect(calls).toHaveLength(1);
+    expect(harnessRetry.attempt_results[0].failure_classes).toContain("permission_denied");
+    expect(result.stderr).toContain("classified as missing tool/permission issue");
+  });
+
   it("records an initial explicit Codex resume as continuation, not a retry", () => {
     const { result, calls, harnessRetry } = runHarnessFixture("", { args: ["resume", "00000000-0000-4000-8000-000000000001"] });
     expect(result.status, result.stderr).toBe(0);
@@ -179,6 +298,29 @@ describe("codex_harness.cjs", () => {
       );
       expect(result.status).toBe(0);
       expect(calls).toHaveLength(1);
+    });
+
+    describe("OpenAI WIF", () => {
+      const env = { CODEX_API_KEY: "", OPENAI_API_KEY: "", GH_AW_CODEX_OIDC_AUTH: "openai", AWF_REFLECT_ENABLED: "1", GH_AW_LLM_PROVIDER: "openai" };
+      const endpoint = { provider: "openai", configured: true, auth_type: "github-oidc/openai", port: 10000, models_url: "http://api-proxy:10000/v1/models", models: ["gpt-5.4"] };
+      const config = 'model_provider = "openai-proxy"\n[model_providers.openai-proxy]\nbase_url = "http://172.30.0.30:10000"\nwire_api = "responses"\nrequires_openai_auth = false\n';
+
+      it("runs without API keys through the configured OpenAI WIF proxy", () => {
+        const { result, calls } = runHarnessFixture(
+          'const config=fs.readFileSync(process.env.CODEX_HOME+"/config.toml","utf8");if(process.env.CODEX_API_KEY||process.env.OPENAI_API_KEY||config.includes("env_key")||!config.includes("http://api-proxy:10000"))process.exitCode=1;',
+          { env, reflectData: { endpoints: [endpoint] }, config }
+        );
+        expect(result.status).toBe(0);
+        expect(calls).toHaveLength(1);
+      });
+
+      it("requires the OpenAI WIF policy and endpoint authentication", () => {
+        expect(hasCodexOIDCProxy({ endpoints: [endpoint] }, env, "openai")).toBe(true);
+        expect(hasCodexOIDCProxy({ endpoints: [{ ...endpoint, auth_type: "static-key" }] }, env, "openai")).toBe(false);
+        expect(hasCodexOIDCProxy({ endpoints: [endpoint] }, { ...env, AWF_REFLECT_ENABLED: "0" }, "openai")).toBe(false);
+        expect(hasCodexOIDCProxy({ endpoints: [endpoint] }, { ...env, GH_AW_CODEX_OIDC_AUTH: "" }, "openai")).toBe(false);
+        expect(hasCodexOIDCProxy({ endpoints: [endpoint] }, env, "azure")).toBe(false);
+      });
     });
 
     it.each([
@@ -221,10 +363,10 @@ describe("codex_harness.cjs", () => {
     });
 
     it("requires the compiler policy and firewall even with OIDC reflection", () => {
-      expect(hasCodexAzureOIDCProxy({ endpoints: [endpoint] }, env)).toBe(true);
-      expect(hasCodexAzureOIDCProxy({ endpoints: [endpoint] }, { ...env, GH_AW_CODEX_OIDC_AUTH: "" })).toBe(false);
-      expect(hasCodexAzureOIDCProxy({ endpoints: [endpoint] }, { ...env, AWF_REFLECT_ENABLED: "0" })).toBe(false);
-      expect(hasCodexAzureOIDCProxy({ endpoints: [endpoint] }, { ...env, GH_AW_LLM_PROVIDER: "github" })).toBe(false);
+      expect(hasCodexOIDCProxy({ endpoints: [endpoint] }, env, "azure")).toBe(true);
+      expect(hasCodexOIDCProxy({ endpoints: [endpoint] }, { ...env, GH_AW_CODEX_OIDC_AUTH: "" }, "azure")).toBe(false);
+      expect(hasCodexOIDCProxy({ endpoints: [endpoint] }, { ...env, AWF_REFLECT_ENABLED: "0" }, "azure")).toBe(false);
+      expect(hasCodexOIDCProxy({ endpoints: [endpoint] }, { ...env, GH_AW_LLM_PROVIDER: "github" }, "azure")).toBe(false);
     });
 
     it("checks the endpoint that will actually be selected", () => {
@@ -854,6 +996,145 @@ fs.appendFileSync(process.env.GH_AW_SAFE_OUTPUTS, JSON.stringify(item) + "\\n");
     });
   });
 
+  describe("shared invocation budget (PureLock run 42217846868)", () => {
+    const runs = { enabled: true, max_runs: 60, invocation_count: 60, remaining_runs: 0 };
+    const failure = `process.stdout.write(JSON.stringify({type:"thread.started",thread_id:"budget-thread"})+"\\n");
+process.stdout.write(JSON.stringify({type:"turn.failed",error:{message:"exceeded retry limit, last status: 429 Too Many Requests"}})+"\\n");
+process.exit(1);`;
+
+    it("requires a complete, consistent exhausted counter", async () => {
+      const detectBudget = reflectData =>
+        detectExhaustedAWFInvocationBudget({
+          nativeTerminalRateLimitError: true,
+          env: { AWF_REFLECT_ENABLED: "1" },
+          fetchReflect: async () => ({ ok: true, reflectData }),
+        });
+      await expect(detectBudget({ runs })).resolves.toEqual({ invocationCount: 60, maxRuns: 60 });
+      await expect(detectBudget({ runs: { ...runs, invocation_count: 61 } })).resolves.toEqual({ invocationCount: 61, maxRuns: 60 });
+      for (const invalid of [
+        null,
+        {},
+        { runs: null },
+        { runs: { ...runs, enabled: false } },
+        { runs: { ...runs, invocation_count: 59 } },
+        { runs: { ...runs, max_runs: 0 } },
+        { runs: { ...runs, max_runs: "60" } },
+        { runs: { ...runs, invocation_count: 60.5 } },
+        { runs: { ...runs, remaining_runs: 1 } },
+        { runs: { enabled: true, max_runs: 60, invocation_count: 60 } },
+      ]) {
+        await expect(detectBudget(invalid)).resolves.toBeNull();
+      }
+    });
+
+    it("does not resume a generic terminal 429 when fresh reflection confirms exhaustion", () => {
+      const { result, calls, harnessRetry } = runHarnessFixture(failure, { env: { AWF_REFLECT_ENABLED: "1" }, reflectData: { runs } });
+      expect(result.status).toBe(1);
+      expect(calls).toHaveLength(1);
+      expect(result.stderr).toContain("AWF shared invocation budget exhausted (60/60)");
+      expect(result.stderr).not.toContain("rate_limit_exceeded (transient)");
+      expect(harnessRetry.attempt_results[0].failure_classes).toContain("invocation_cap_exceeded");
+      expect(normalizeHarnessRetryRecord(harnessRetry)?.attemptResults[0].failureClasses).toContain("invocation_cap_exceeded");
+    });
+
+    it("does not resume a generic terminal 429 emitted only on stderr", () => {
+      const { result, calls } = runHarnessFixture(`process.stderr.write("429 Too Many Requests\\n");process.exit(1);`, {
+        env: { AWF_REFLECT_ENABLED: "1" },
+        reflectData: { runs },
+      });
+      expect(result.status).toBe(1);
+      expect(calls).toHaveLength(1);
+      expect(result.stderr).toContain("AWF shared invocation budget exhausted (60/60)");
+    });
+
+    it("recognizes a terminal 429 in an oversized stdout event prefix", () => {
+      const script = `process.stdout.write(JSON.stringify({type:"turn.failed",error:{message:"429 Too Many Requests"},padding:"x".repeat(1024*1024)})+"\\n",()=>process.exit(1));`;
+      const { result, calls } = runHarnessFixture(script, { env: { AWF_REFLECT_ENABLED: "1" }, reflectData: { runs } });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("AWF shared invocation budget exhausted (60/60)");
+      expect(calls).toHaveLength(1);
+    });
+
+    it("preserves completed expected safe outputs after the reflected cap", () => {
+      const dir = makeHarnessTempDir("codex-reflected-cap-");
+      const safeOutputsPath = path.join(dir, "safe-outputs.jsonl");
+      const script = `require("fs").appendFileSync(process.env.GH_AW_SAFE_OUTPUTS, JSON.stringify({type:"add_comment",body:"Review complete"})+"\\n");\n${failure}`;
+      const { result, calls } = runHarnessFixture(script, { env: { AWF_REFLECT_ENABLED: "1", GH_AW_SAFE_OUTPUTS: safeOutputsPath }, reflectData: { runs } });
+      expect(result.status, result.stderr).toBe(0);
+      expect(calls).toHaveLength(1);
+      expect(result.stderr).toContain("invocation cap saturated but safe-outputs already contain expected output");
+      expect(fs.readFileSync(safeOutputsPath, "utf8")).not.toContain("incomplete");
+    });
+
+    it.each([
+      ["reflected", "create_pull_request_review_comment"],
+      ["reflected", "create-pull-request-review-comment"],
+      ["explicit", "create_pull_request_review_comment"],
+      ["explicit", "create-pull-request-review-comment"],
+    ])("preserves partial %s cap findings of type %s but fails without a final review", (cap, type) => {
+      const dir = makeHarnessTempDir("codex-partial-review-cap-");
+      const safeOutputsPath = path.join(dir, "safe-outputs.jsonl");
+      const safeOutputsCLI = path.join(dir, "safeoutputs.cjs");
+      fs.writeFileSync(
+        safeOutputsCLI,
+        `#!${process.execPath}
+const fs=require("fs");const args=process.argv.slice(2);const item={type:args[0]};
+for(let i=1;i<args.length;i+=2)item[args[i].slice(2)]=args[i+1];
+fs.appendFileSync(process.env.GH_AW_SAFE_OUTPUTS,JSON.stringify(item)+"\\n");`
+      );
+      fs.chmodSync(safeOutputsCLI, 0o700);
+      const terminalFailure = cap === "reflected" ? failure : `process.stderr.write('{"error":{"type":"max_runs_exceeded","message":"Maximum LLM invocations exceeded (60 / 60)."}}\\n');process.exit(1);`;
+      const script = `fs.appendFileSync(process.env.GH_AW_SAFE_OUTPUTS,JSON.stringify({type:${JSON.stringify(type)},body:"Partial finding",path:"a.go",line:1})+"\\n");\n${terminalFailure}`;
+      const { result, calls } = runHarnessFixture(script, {
+        env: { AWF_REFLECT_ENABLED: "1", GH_AW_SAFE_OUTPUTS: safeOutputsPath, GH_AW_SAFEOUTPUTS_CLI: safeOutputsCLI },
+        reflectData: { runs },
+      });
+      expect(result.status, result.stderr).toBe(1);
+      expect(calls).toHaveLength(1);
+      const items = fs
+        .readFileSync(safeOutputsPath, "utf8")
+        .trim()
+        .split("\n")
+        .map(line => JSON.parse(line));
+      expect(items).toHaveLength(2);
+      expect(items[0]).toMatchObject({ type, body: "Partial finding" });
+      expect(items[1]).toMatchObject({ type: "report_incomplete", reason: "infrastructure_error" });
+      expect(result.stderr).not.toContain("suppressing terminal verdict");
+    });
+
+    it("preserves a submitted final review after partial findings and the reflected cap", () => {
+      const dir = makeHarnessTempDir("codex-submitted-review-cap-");
+      const safeOutputsPath = path.join(dir, "safe-outputs.jsonl");
+      const script = `fs.appendFileSync(process.env.GH_AW_SAFE_OUTPUTS,[{type:"create_pull_request_review_comment",body:"Finding"},{type:"submit_pull_request_review",event:"COMMENT",body:"Review complete"}].map(item=>JSON.stringify(item)).join("\\n")+"\\n");\n${failure}`;
+      const { result, calls } = runHarnessFixture(script, { env: { AWF_REFLECT_ENABLED: "1", GH_AW_SAFE_OUTPUTS: safeOutputsPath }, reflectData: { runs } });
+      expect(result.status, result.stderr).toBe(0);
+      expect(calls).toHaveLength(1);
+      expect(fs.readFileSync(safeOutputsPath, "utf8")).not.toContain("report_incomplete");
+    });
+
+    it.each([
+      ["a remaining budget", { runs: { ...runs, invocation_count: 59, remaining_runs: 1 } }, true, "1"],
+      ["missing counter metadata", {}, true, "1"],
+      ["a failed fresh fetch despite a saved exhausted snapshot", { runs }, false, "1"],
+      ["disabled reflection", { runs }, true, "0"],
+    ])("preserves transient retries with %s", (_name, reflectData, reflectOk, enabled) => {
+      const { result, calls } = runHarnessFixture(failure, { env: { AWF_REFLECT_ENABLED: enabled }, reflectData, reflectOk });
+      expect(result.status).toBe(1);
+      expect(calls).toHaveLength(2);
+      expect(result.stderr).toContain("rate_limit_exceeded (transient)");
+    });
+
+    it.each(["command_execution", "agent_message"])("does not treat a %s quoted 429 as a native terminal error, including an oversized prefix", type => {
+      const script = `process.stdout.write(JSON.stringify({type:"thread.started",thread_id:"quote-thread"})+"\\n");
+process.stdout.write(JSON.stringify({type:"item.completed",item:{type:${JSON.stringify(type)},id:"1",aggregated_output:"429 Too Many Requests",exit_code:0},padding:"x".repeat(1024*1024)})+"\\n",()=>{
+process.exit(1);});`;
+      const { result, calls } = runHarnessFixture(script, { env: { AWF_REFLECT_ENABLED: "1" }, reflectData: { runs } });
+      expect(result.status).toBe(1);
+      expect(calls).toHaveLength(2);
+      expect(result.stderr).not.toContain("confirmed by fresh reflection");
+    });
+  });
+
   describe("isRateLimitError", () => {
     it("returns true for rate_limit_exceeded error", () => {
       expect(isRateLimitError("Error: rate_limit_exceeded")).toBe(true);
@@ -1091,6 +1372,18 @@ fs.appendFileSync(process.env.GH_AW_SAFE_OUTPUTS, JSON.stringify(item) + "\\n");
       }
     });
 
+    it.each([NaN, "12"])("does not treat output as current with an invalid offset: %s", safeOutputsByteOffset => {
+      const dir = makeHarnessTempDir("codex-rebuild-invalid-offset-");
+      const safeOutputsPath = path.join(dir, "safe-outputs.jsonl");
+      fs.writeFileSync(safeOutputsPath, '{"type":"noop","message":"old"}\n', "utf8");
+      try {
+        const decision = evaluateContextRebuildCircuitBreakerForAttempt({ rebuild_factor: 4, cumulative_input_tokens: 2000 }, { maxRebuildFactor: 4, minCumulativeInputTokens: 1000 }, { safeOutputsPath, safeOutputsByteOffset });
+        expect(decision.terminate).toBe(true);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     it("does not trip for null, empty, or non-finite working sets", () => {
       const config = { maxRebuildFactor: 4, minCumulativeInputTokens: 1000 };
       expect(evaluateContextRebuildCircuitBreaker(null, config).terminate).toBe(false);
@@ -1177,6 +1470,100 @@ fs.appendFileSync(process.env.GH_AW_SAFE_OUTPUTS, JSON.stringify(item) + "\\n");
           fs.rmSync(tmpDir, { recursive: true, force: true });
         }
       });
+
+      it("does not rewrite a Codex config outside the managed temporary directory", () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-provider-outside-"));
+        const configPath = path.join(tmpDir, "config.toml");
+        const reflectPath = path.join(tmpDir, "reflect.json");
+        const originalConfig = '[model_providers.openai-proxy]\nbase_url = "http://172.30.0.30:10000"\n';
+        fs.writeFileSync(configPath, originalConfig, "utf8");
+        fs.writeFileSync(reflectPath, JSON.stringify({ endpoints: [{ provider: "openai", configured: true, port: 10000 }] }), "utf8");
+        try {
+          const result = configureCodexProviderFromReflect({ codexConfigPath: configPath, reflectPath, provider: "openai" });
+          expect(result.configured).toBe(false);
+          expect(fs.readFileSync(configPath, "utf8")).toBe(originalConfig);
+        } finally {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+      });
+
+      it("does not rewrite a Codex config symlinked outside the managed temporary directory", () => {
+        const tmpDir = makeHarnessTempDir("codex-provider-symlink-");
+        const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-provider-target-"));
+        const configPath = path.join(tmpDir, "config.toml");
+        const outsideConfigPath = path.join(outsideDir, "config.toml");
+        const reflectPath = path.join(tmpDir, "reflect.json");
+        const originalConfig = '[model_providers.openai-proxy]\nbase_url = "http://172.30.0.30:10000"\n';
+        fs.writeFileSync(outsideConfigPath, originalConfig, "utf8");
+        fs.symlinkSync(outsideConfigPath, configPath);
+        fs.writeFileSync(reflectPath, JSON.stringify({ endpoints: [{ provider: "openai", configured: true, port: 10000 }] }), "utf8");
+        try {
+          const result = configureCodexProviderFromReflect({ codexConfigPath: configPath, reflectPath, provider: "openai" });
+          expect(result.configured).toBe(false);
+          expect(fs.readFileSync(outsideConfigPath, "utf8")).toBe(originalConfig);
+        } finally {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+          fs.rmSync(outsideDir, { recursive: true, force: true });
+        }
+      });
+
+      it("uses the canonical config path and supports a symlinked managed root", () => {
+        const tmpDir = makeHarnessTempDir("codex-provider-root-alias-");
+        const realParent = path.join(tmpDir, "real-parent");
+        const aliasParent = path.join(tmpDir, "alias-parent");
+        const managedRoot = path.join(aliasParent, "managed-root");
+        const realRoot = path.join(realParent, "managed-root");
+        const configDir = path.join(realRoot, "codex-home");
+        fs.mkdirSync(configDir, { recursive: true });
+        fs.symlinkSync(realParent, aliasParent, "dir");
+        const configPath = path.join(managedRoot, "codex-home", "config.toml");
+        fs.writeFileSync(path.join(configDir, "config.toml"), '[model_providers.openai-proxy]\nbase_url = "http://172.30.0.30:10000"\n');
+
+        expect(resolveSafeCodexConfigPath(configPath, managedRoot)).toBe(fs.realpathSync(path.join(configDir, "config.toml")));
+      });
+
+      it("rejects noncanonical paths containing symlink traversal", () => {
+        const tmpDir = makeHarnessTempDir("codex-provider-noncanonical-");
+        const home = path.join(tmpDir, "codex-home");
+        const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-provider-link-target-"));
+        fs.mkdirSync(home);
+        fs.mkdirSync(path.join(outsideDir, "child"));
+        fs.symlinkSync(path.join(outsideDir, "child"), path.join(home, "link"));
+        fs.writeFileSync(path.join(home, "config.toml"), "[model_providers.openai-proxy]\n");
+
+        expect(resolveSafeCodexConfigPath(`${home}/link/../config.toml`)).toBe("");
+        fs.rmSync(outsideDir, { recursive: true, force: true });
+      });
+
+      it("allows the staged ARC/DinD threat-detection Codex home", () => {
+        const runnerTemp = makeHarnessTempDir("codex-provider-arc-");
+        const threatRoot = path.join(runnerTemp, "gh-aw", "threat-detection");
+        const home = path.join(threatRoot, "codex-home");
+        const configPath = path.join(home, "config.toml");
+        const reflectPath = path.join(threatRoot, "reflect.json");
+        fs.mkdirSync(home, { recursive: true });
+        fs.writeFileSync(configPath, '[model_providers.openai-proxy]\nbase_url = "http://172.30.0.30:10000"\n');
+
+        const previousPhase = process.env.GH_AW_PHASE;
+        const previousRunnerTemp = process.env.RUNNER_TEMP;
+        process.env.GH_AW_PHASE = "detection";
+        process.env.RUNNER_TEMP = runnerTemp;
+        try {
+          const result = configureCodexProviderFromReflect({
+            codexConfigPath: configPath,
+            reflectPath,
+            provider: "openai",
+            reflectData: { endpoints: [{ provider: "openai", configured: true, port: 10000 }] },
+          });
+          expect(result.configured).toBe(true);
+          expect(fs.readFileSync(configPath, "utf8")).toContain('base_url = "http://api-proxy:10000"');
+        } finally {
+          if (previousPhase === undefined) delete process.env.GH_AW_PHASE;
+          else process.env.GH_AW_PHASE = previousPhase;
+          if (previousRunnerTemp === undefined) delete process.env.RUNNER_TEMP;
+          else process.env.RUNNER_TEMP = previousRunnerTemp;
+        }
+      });
     });
 
     it("extracts openai-proxy base_url from TOML", () => {
@@ -1225,15 +1612,14 @@ env_key = "OPENAI_API_KEY"
           { provider: "anthropic", port: 10001, configured: true },
         ],
       });
-      const files = {
-        "/tmp/codex-config.toml": toml,
-        "/tmp/awf-reflect.json": reflect,
-      };
-      const readFileSync = filePath => files[filePath];
+      const dir = makeHarnessTempDir("codex-provider-validation-");
+      const configPath = path.join(dir, "config.toml");
+      const reflectPath = path.join(dir, "awf-reflect.json");
+      fs.writeFileSync(configPath, toml);
+      fs.writeFileSync(reflectPath, reflect);
       const result = validateCodexOpenAIBaseURLFromReflect({
-        codexConfigPath: "/tmp/codex-config.toml",
-        reflectPath: "/tmp/awf-reflect.json",
-        readFileSync,
+        codexConfigPath: configPath,
+        reflectPath,
       });
       expect(result.ok).toBe(false);
       expect(result.reason).toContain("mismatch");
@@ -1244,58 +1630,56 @@ env_key = "OPENAI_API_KEY"
       const reflect = JSON.stringify({
         endpoints: [{ provider: "openai", port: 10000, configured: true }],
       });
-      const files = {
-        "/tmp/codex-config.toml": toml,
-        "/tmp/awf-reflect.json": reflect,
-      };
-      const readFileSync = filePath => files[filePath];
+      const dir = makeHarnessTempDir("codex-provider-validation-");
+      const configPath = path.join(dir, "config.toml");
+      const reflectPath = path.join(dir, "awf-reflect.json");
+      fs.writeFileSync(configPath, toml);
+      fs.writeFileSync(reflectPath, reflect);
       const result = validateCodexOpenAIBaseURLFromReflect({
-        codexConfigPath: "/tmp/codex-config.toml",
-        reflectPath: "/tmp/awf-reflect.json",
-        readFileSync,
+        codexConfigPath: configPath,
+        reflectPath,
       });
       expect(result.ok).toBe(true);
     });
 
     it("validates against the selected GitHub provider", () => {
-      const files = {
-        "/tmp/codex-config.toml": `[model_providers.openai-proxy]\nbase_url = "http://api-proxy:10002"\n`,
-        "/tmp/awf-reflect.json": JSON.stringify({ endpoints: [{ provider: "copilot", port: 10002, configured: true }] }),
-      };
+      const dir = makeHarnessTempDir("codex-provider-validation-");
+      const configPath = path.join(dir, "config.toml");
+      const reflectPath = path.join(dir, "awf-reflect.json");
+      fs.writeFileSync(configPath, `[model_providers.openai-proxy]\nbase_url = "http://api-proxy:10002"\n`);
+      fs.writeFileSync(reflectPath, JSON.stringify({ endpoints: [{ provider: "copilot", port: 10002, configured: true }] }));
       const result = validateCodexOpenAIBaseURLFromReflect({
-        codexConfigPath: "/tmp/codex-config.toml",
-        reflectPath: "/tmp/awf-reflect.json",
+        codexConfigPath: configPath,
+        reflectPath,
         provider: "github",
-        readFileSync: filePath => files[filePath],
       });
       expect(result.ok).toBe(true);
     });
 
     it("fails strictly when /reflect has configured endpoints but none for the selected provider", () => {
-      const files = {
-        "/tmp/codex-config.toml": `[model_providers.openai-proxy]\nbase_url = "http://172.30.0.30:10000"\n`,
-        "/tmp/awf-reflect.json": JSON.stringify({ endpoints: [{ provider: "anthropic", port: 10001, configured: true }] }),
-      };
+      const dir = makeHarnessTempDir("codex-provider-validation-");
+      const configPath = path.join(dir, "config.toml");
+      const reflectPath = path.join(dir, "awf-reflect.json");
+      fs.writeFileSync(configPath, `[model_providers.openai-proxy]\nbase_url = "http://172.30.0.30:10000"\n`);
+      fs.writeFileSync(reflectPath, JSON.stringify({ endpoints: [{ provider: "anthropic", port: 10001, configured: true }] }));
       const result = validateCodexOpenAIBaseURLFromReflect({
-        codexConfigPath: "/tmp/codex-config.toml",
-        reflectPath: "/tmp/awf-reflect.json",
+        codexConfigPath: configPath,
+        reflectPath,
         provider: "github",
-        readFileSync: filePath => files[filePath],
       });
       expect(result.ok).toBe(false);
       expect(result.reason).toContain("no configured endpoint for provider");
     });
 
     it("passes through when TOML lacks openai-proxy section", () => {
-      const files = {
-        "/tmp/codex-config.toml": `[history]\npersistence = "none"\n`,
-        "/tmp/awf-reflect.json": JSON.stringify({ endpoints: [{ provider: "openai", port: 10000, configured: true }] }),
-      };
-      const readFileSync = filePath => files[filePath];
+      const dir = makeHarnessTempDir("codex-provider-validation-");
+      const configPath = path.join(dir, "config.toml");
+      const reflectPath = path.join(dir, "awf-reflect.json");
+      fs.writeFileSync(configPath, `[history]\npersistence = "none"\n`);
+      fs.writeFileSync(reflectPath, JSON.stringify({ endpoints: [{ provider: "openai", port: 10000, configured: true }] }));
       const result = validateCodexOpenAIBaseURLFromReflect({
-        codexConfigPath: "/tmp/codex-config.toml",
-        reflectPath: "/tmp/awf-reflect.json",
-        readFileSync,
+        codexConfigPath: configPath,
+        reflectPath,
       });
       expect(result.ok).toBe(true);
     });
@@ -1871,6 +2255,35 @@ process.exit(1);`,
       // Harness exits 0 because noop means the work is done
       expect(result.status).toBe(0);
       expect(result.stderr).toContain("noop message found in safe-outputs — not retrying");
+    });
+
+    it("preserves failure and stops after a GitHub cybersecurity-policy rejection even when noop is written", () => {
+      const tempDir = makeHarnessTempDir("codex-provider-policy-noop-");
+      try {
+        const safeOutputsPath = path.join(tempDir, "safe-outputs.jsonl");
+        const { result, calls, harnessRetry } = runHarnessFixture(
+          `
+          fs.appendFileSync(process.env.GH_AW_SAFE_OUTPUTS, JSON.stringify({type:"noop",message:"nothing to do"}) + "\\n");
+          console.log(JSON.stringify({type:"turn.failed",error:{message:${JSON.stringify(`${CYBERSECURITY_POLICY_REJECTION_PREFIX} Try rephrasing your request.`)}}}));
+          process.exit(1);
+        `,
+          {
+            env: {
+              GH_AW_LLM_PROVIDER: "github",
+              GH_AW_MODEL_AGENT_CODEX: "copilot/gpt-5",
+              GH_AW_HARNESS_MAX_RETRIES: "2",
+              GH_AW_SAFE_OUTPUTS: safeOutputsPath,
+            },
+          }
+        );
+
+        expect(result.status, result.stderr).toBe(1);
+        expect(calls).toHaveLength(1);
+        expect(harnessRetry.attempt_results[0].failure_classes).toContain("content_filter");
+        expect(result.stderr).toContain("GitHub provider blocked the request for cybersecurity policy");
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
     });
 
     it("exits 0 without retrying when the LLM invocation cap is saturated but the expected safe-output was already produced", () => {
@@ -2550,6 +2963,9 @@ describe("Codex native sub-agent roles before spawn (github/gh-aw#70939)", () =>
     fs.mkdirSync(staged, { recursive: true });
     fs.mkdirSync(codexHome, { recursive: true });
     for (const [name, content] of Object.entries(agents)) fs.writeFileSync(path.join(staged, name), content);
+    const { metadataManifestFields } = require("./markdown_metadata.cjs");
+    fs.mkdirSync(recordsDir, { recursive: true });
+    fs.writeFileSync(path.join(recordsDir, "aw_info.json"), JSON.stringify(metadataManifestFields(prepareMarkdownFixtures(...Object.values(agents)))));
     const { result, calls } = runHarnessFixture(
       `const p=require("path");const d=p.join(process.env.CODEX_HOME,"agents");fs.writeFileSync(p.join(process.env.CODEX_HOME,"roles-at-spawn.json"),JSON.stringify(fs.existsSync(d)?Object.fromEntries(fs.readdirSync(d).filter(n=>n.endsWith(".toml")).sort().map(n=>[n,fs.readFileSync(p.join(d,n),"utf8")])):null));`,
       {
@@ -2584,7 +3000,7 @@ describe("Codex native sub-agent roles before spawn (github/gh-aw#70939)", () =>
     expect(Object.keys(rolesAtSpawn)).toEqual(["paper-screener.toml"]);
     const toml = rolesAtSpawn["paper-screener.toml"];
     expect(roleField(toml, "name")).toBe("paper-screener");
-    expect(roleField(toml, "description")).toBe("Fast relevance screening of arXiv paper abstracts for GitHub Agentic Workflows");
+    expect(roleField(toml, "description")).toBe("paper-screener");
     expect(roleField(toml, "developer_instructions")).toBe(agent.slice(agent.indexOf("\n---\n") + 5).trim());
     expect(roleField(toml, "model")).toBe("gpt-5-mini-2025-08-07");
     expect(records.filter(record => record.role !== "main")).toEqual([{ engine: "codex", role: "paper-screener", configured_model: "small", resolved_model: "gpt-5-mini-2025-08-07", provider: "openai", status: "resolved", cause: null }]);

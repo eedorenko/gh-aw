@@ -4,14 +4,19 @@ emoji: "🎭"
 description: Explores agentic-workflows custom agent behavior by generating software personas and analyzing responses to common automation tasks
 on: daily
 max-daily-ai-credits: 10000
-engine: claude
+model: router/economy
+engine:
+  id: claude
+  model-provider: github
 permissions:
   contents: read
   actions: read
+  copilot-requests: write
   issues: read
   pull-requests: read
 experiments:
-  sub_agent_strategy:
+  # New cohort: whole-run AIC and duration now include one fixed prefix probe.
+  sub_agent_strategy_prefix_v1:
     variants: [per_scenario, batch]
     description: "Test whether batch scenario testing reduces token costs vs. per-scenario sub-agent calls"
     hypothesis: "H0: no change in aic or duration. H1: batch reduces tokens by ≥20% and duration by ≥15% without quality loss"
@@ -24,7 +29,7 @@ experiments:
         threshold: ">=3"
     min_samples: 14
     weight: [50, 50]
-    start_date: "2026-05-22"
+    start_date: "2026-11-13"
     analysis_type: t_test
     tags: [cost_optimization, token_efficiency, sub_agents]
 # Token Budget Guardrails:
@@ -41,10 +46,10 @@ tools:
 safe-outputs:
   create-issue:
     title-prefix: "Agent Persona Exploration - "
-    labels: ["agent-research"]
+    labels: ["agent-research", "cookie", "backlog:reports"]
     max: 1
     close-older-issues: true
-    expires: false
+    expires: 2d
   threat-detection:
     engine: copilot
 timeout-minutes: 180
@@ -61,12 +66,33 @@ evals:
     question: Did the agent generate software personas for exploring custom agent behavior?
   - id: analysis_produced
     question: Was an analysis produced comparing agent responses across different automation tasks?
+  - id: prefix_comprehension
+    question: Did the agent compare one identical persona scenario under full and first-8000-UTF-8-byte guidance, record missing constraints/routes and quality deltas separately from invocation failures, and recommend density improvements supported by evidence?
 
 ---
 
 # Agent Persona Explorer
 
-You are an AI research agent that explores how the "agentic-workflows" custom agent behaves when presented with different worker personas and common automation tasks.
+Explore `agentic-workflows` behavior across worker personas and automation tasks.
+
+## Execution contract
+
+- Research only; never create/edit workflows. Keep the existing baseline and
+  persona rotation; test 3-4 scenarios (all four initial-baseline scenarios).
+- Test information availability as well as response quality. Copilot CLI
+  prompt-file queries may expose only the first **8,000 UTF-8 bytes**.
+  Run the [paired prefix probe](#paired-prefix-probe) on one selected scenario,
+  holding task, persona, model and scoring rubric fixed.
+- Inspect whether objective, constraints, task routes, verification and stop
+  conditions fit within **7,500 bytes including frontmatter**. Prefer short
+  grammatical imperatives and precise terms; never reward lost safety,
+  ambiguous shorthand or lower bytes at the expense of correct behavior.
+- Keep prefix-probe scores separate from primary scenario scores. Whole-run AIC
+  and duration include probe overhead; do not compare this new experiment cohort
+  with pre-probe runs. Failed invocations are unavailable evidence, never scores.
+- Publish one concise findings issue even for partial results, or `noop` if no
+  data could be gathered. Preserve history only after publication as specified
+  below. Recommendations target `.github/aw/*.md`, not `AGENTS.md`.
 
 ## Your Mission
 
@@ -126,8 +152,11 @@ Otherwise, for each selected persona, generate **2 representative automation tas
 Persona: [Role Name]
 Task: [Brief task description - max 1 sentence]
 Context: [1-2 sentences max]
+Inputs: [Relevant repository paths/keys, labels, units, standards and numeric thresholds; state N/A where not applicable]
 Expected Workflow Type: [Issue automation / PR automation / Scheduled / On-demand]
 ```
+
+Name concrete inputs rather than relying on unstated assumptions. For accessibility scenarios, specify the WCAG criterion, conformance level, and threshold. Do not invent missing inputs; mark the scenario incomplete and do not score it until they are explicit.
 
 **Example scenarios by persona:**
 - Backend Engineer: "Automatically review PR database schema changes for migration safety"
@@ -136,7 +165,7 @@ Expected Workflow Type: [Issue automation / PR automation / Scheduled / On-deman
 - QA Tester: "Analyze test coverage changes in PRs and comment with recommendations"
 - Product Manager: "Weekly digest of completed features grouped by customer impact"
 - Program Manager: "Weekly cross-team milestone status digest with blocked items highlighted"
-- Designer: "Flag PRs that modify shared design tokens or component CSS without a matching Figma link"
+- Designer (DS-2): "For PRs changing `design-tokens.json` keys `color.*` or `spacing.*`, check for a linked Figma reference and assess target size against WCAG 2.5.8 AA's 24 × 24 CSS px minimum; use the `design-system` and `accessibility` labels."
 - Legal / Compliance: "Scan new dependencies added in PRs for non-permissive SPDX licenses"
 - Information Worker: "Weekly summary of stale documentation files not updated in the last 90 days"
 
@@ -153,7 +182,12 @@ Store all scenarios in cache memory.
   "invocation": {
     "method": "claude-code-inline-sub-agent",
     "status": "succeeded",
-    "error": null
+    "error": null,
+    "isolation_canary": {
+      "root_agents_md_context": "absent",
+      "skill_inventory_context": "absent",
+      "git_status_snapshot": "absent"
+    }
   },
   "recommendation": {
     "trigger": "suggested trigger",
@@ -174,11 +208,11 @@ Store all scenarios in cache memory.
 }
 ```
 
-Summarize the recommendation; do not include full YAML. For successful invocations, replace each score placeholder with an integer from 1 to 5. Set `invocation.method` to `claude-code-inline-sub-agent`. If invocation fails, set `invocation.status` to `failed`, record the error in `invocation.error`, and set both `recommendation` and `scores` to `null`. Never encode an invocation failure as a score.
+Summarize the recommendation; do not include full YAML. For successful invocations, replace each score placeholder with an integer from 1 to 5. Set `invocation.method` to `claude-code-inline-sub-agent`. If invocation fails, set `invocation.status` to `failed`; if its isolation canary fails or is incomplete, set it to `contaminated`. In either case, record the error and set both `recommendation` and `scores` to `null`. Never encode an invocation failure or contamination as a score.
 
 **Assessment questions:** Does the suggestion include appropriate triggers (`on:`)? Correct tools (github, web-fetch, playwright, etc.)? Proper safe-outputs? Security best practices (minimal permissions, network restrictions)? A clear, actionable prompt?
 
-{{#if experiments.sub_agent_strategy == 'batch' }}
+{{#if experiments.sub_agent_strategy_prefix_v1 == 'batch' }}
 Invoke the inline `persona-evaluator` Claude Code sub-agent once with all 3-4 selected scenarios. Require one recommendation per scenario, and then record and score each response using the structured template above.
 {{else}}
 Invoke the inline `persona-evaluator` Claude Code sub-agent once per selected scenario, presenting it as a request from that persona. Record and score each response using the structured template above.
@@ -186,11 +220,65 @@ Invoke the inline `persona-evaluator` Claude Code sub-agent once per selected sc
 
 The `persona-evaluator` is dynamically materialized as a Claude Code sub-agent from this workflow. It follows the repository's `agentic-workflows` custom-agent guidance; do not try to invoke the `agentic-workflows` CLI or MCP server with a freeform scenario because that interface only manages workflows and does not accept prompts.
 
+For every evaluator call, pass only its scenario, guidance mode and required
+response format. Do not pass parent analysis, prior responses, scores, ambient
+`AGENTS.md` content, git status or skill inventories.
+
+Before reading guidance or scoring, require the evaluator to return an
+`isolation_canary` with `root_agents_md_context`, `skill_inventory_context` and
+`git_status_snapshot`, each set to `absent`, `present` or `unknown`. These
+fields describe context/instructions visible to the evaluator, not files that
+exist in the checkout. Score only when all three are `absent` and the evaluator
+confirms it used only the guidance files allowed by its mode. A missing,
+`present` or `unknown` value, or an injected instruction it cannot exclude,
+makes the invocation `contaminated/unavailable`: discard its recommendation
+and scores. Do not infer a clean context from a recommendation or from the
+canary alone if guidance outside the allowed files is visible.
+
 **Important**: 
 - You are ONLY testing the agent's responses, NOT creating actual workflows
 - **Keep responses focused and concise** - summarize findings instead of verbose descriptions
 - Aim for quality over quantity - fewer well-analyzed scenarios are better than many shallow ones
 - **If any tool call fails, record the error briefly, mark scoring as unavailable for that scenario, and move on to the next scenario** - do NOT retry or get stuck
+
+### Paired prefix probe
+
+Use one successfully evaluated scenario as the full-guidance baseline; request
+one additional, fresh isolated `persona-evaluator` invocation with
+`guidance_mode: prefix_8000` and the identical scenario. Pass no full-response
+rationale, ambient `AGENTS.md` content, skill inventories or shared conversation
+history. Do not add a scenario or alter the four initial baseline tasks. If none
+succeeded, report the probe unavailable without scores.
+
+For each guidance file used, measure UTF-8 bytes from the file's start, including
+metadata. Use the repository checker for structural measurements:
+`python3 scripts/check-instruction-prefixes.py --json <guidance-paths>`.
+A checker exit of 1 reports violations, not a scenario invocation failure;
+record unreadable files or tool errors separately.
+
+The prefix evaluator must receive only each file's raw `read_bytes()[:8000]`
+view, never a summary derived from its unseen tail. If truncation splits a UTF-8
+character, record that boundary and omit only the incomplete trailing character
+for display. Load additional guidance only through routes visible in the prefix;
+apply the same byte limit to each linked file. Do not inspect hidden tails to
+repair the response. Avoid recursively loading every link.
+Do not use loaders that inject whole files in prefix mode. If ambient or tool
+context exposes hidden guidance, mark the probe contaminated/unavailable rather
+than claiming an isolated prefix comparison.
+
+Store a separate `prefix_probe` object with scenario ID, guidance paths and
+revision, full byte counts, visible/omitted bytes, contract-end byte when present,
+both invocation statuses, both five-dimension score sets, candidate missing
+rules/routes, and full-versus-prefix score deltas. Use `null` for unavailable
+scores/deltas; exclude this extra invocation from primary scenario counts and
+quality averages, not whole-run AIC or duration.
+Compare required trigger/scope, tools, read permissions, safe outputs, `noop`,
+verification and safety/stop behavior. Distinguish observed response regressions
+from static risks; passing the byte checker does not prove comprehension.
+
+Recommend moving lost rules/routes ahead of examples, replacing duplicate
+prose with conditional links, and compressing wording without changing meaning.
+Report which required decisions the prefix can and cannot support.
 
 ## Phase 4: Analyze Results (4 minutes)
 
@@ -255,6 +343,11 @@ Example:
 
 ### Key Findings (3-5 bullet points max)
 [High-level insights - keep concise]
+
+### 8,000-Byte Prefix Probe
+[Scenario ID; guidance byte counts and contract boundary; full/prefix scores or
+N/A; observed lost rules/routes; one evidence-backed packing recommendation.
+Distinguish static risks from observed regressions.]
 
 ### Top Patterns (3-5 items max)
 1. [Most common trigger types]
@@ -327,7 +420,25 @@ name: persona-evaluator
 description: Evaluates workflow scenarios using the repository's agentic-workflows authoring guidance
 model: inherit
 ---
-You are acting as the `agentic-workflows` custom agent for this persona evaluation. Read `.github/agents/agentic-workflows.md` and follow the local ad hoc-evaluation guidance in `.github/aw/create-agentic-workflow.md` for each scenario. Do not create or edit workflow files.
+Act as a clean-room `agentic-workflows` evaluator. Use only the requested
+guidance mode and the files it allows; do not use ambient `AGENTS.md`, injected
+skill inventories or prior parent context. By default use full guidance:
+read `.github/agents/agentic-workflows.md` and follow ad hoc evaluation in
+`.github/aw/create-agentic-workflow.md`. If `guidance_mode: prefix_8000`, use
+only the first 8,000 UTF-8 bytes of each guidance file, including metadata;
+follow only routes visible there and apply the same bound to linked guidance.
+Never read hidden tails or reconstruct them from other full-guidance results.
+Before reading guidance or evaluating the scenario, return an `isolation_canary`
+with `root_agents_md_context`, `skill_inventory_context` and
+`git_status_snapshot`, each `absent`, `present` or `unknown`. These values
+describe visible context/instructions, not files that exist in the checkout.
+If any is not `absent`, or if other ambient instructions cannot be excluded,
+stop and report contamination without a recommendation. Do not claim absence
+if the context cannot be inspected.
+If ambient instructions are injected and cannot be excluded, report the
+invocation as contaminated without a recommendation or score. Return guidance
+paths, byte counts and unavailable routes with the recommendation. Do not
+create/edit workflows or score your own response.
 
 Return one concise recommendation per scenario containing the trigger, tools, permissions, network access, safe outputs, and a prompt summary. If given multiple scenarios, keep their results separate and include each scenario identifier. Do not score your own recommendations; the parent evaluator will score completed responses. If you cannot evaluate a scenario, return its identifier and a concise invocation error without inventing a recommendation.
 

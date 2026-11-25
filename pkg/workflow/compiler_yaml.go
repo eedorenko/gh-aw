@@ -1,15 +1,109 @@
 package workflow
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
+	"unicode/utf16"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
 )
 
 var compilerYamlLog = logger.New("workflow:compiler_yaml")
+
+const maxActivationMetadataBytes = 4 * 1024 * 1024
+const activationMetadataChunkSize = 16000
+const activationMetadataFile = "${{ runner.temp }}/gh-aw-markdown-metadata.json"
+const awInfoStepEnvAnchor = "        id: generate_aw_info\n        env:\n"
+
+// Embed after job construction so rewritten prompt sources are included. Only
+// the step generating run info reads the catalog, and it needs no callee
+// repository token. Repository agent records are omitted: activation recovers
+// them from the checkout's lock headers after checking out .github.
+func (c *Compiler) embedActivationMarkdownMetadata(metadata *GHAWMarkdownMetadata) error {
+	metadata = nonEmptyMarkdownMetadata(metadata)
+	if len(metadata.Records) == 0 {
+		return nil
+	}
+	activation, ok := c.jobManager.GetJob(string(constants.ActivationJobName))
+	if !ok {
+		return errors.New("activation job missing: cannot embed Markdown metadata")
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("cannot embed activation Markdown metadata: %w", err)
+	}
+	// The runtime bounds the escaped payload it reads, not the raw JSON.
+	payload := inertJSON(encoded)
+	if len(payload) > maxActivationMetadataBytes {
+		return fmt.Errorf("activation Markdown metadata exceeds the %d-byte limit; reduce the workflow's agent metadata", maxActivationMetadataBytes)
+	}
+	stepIndex := slices.IndexFunc(activation.Steps, func(step string) bool { return strings.Contains(step, awInfoStepEnvAnchor) })
+	if stepIndex < 0 || stepIndex >= len(activation.Steps) {
+		return errors.New("activation run info step missing: cannot embed Markdown metadata")
+	}
+	step := &activation.Steps[stepIndex]
+	env := "          GH_AW_INFO_MARKDOWN_METADATA: '" + payload + "'\n"
+	if len(payload) > activationMetadataChunkSize {
+		// Keep both run strings and environment entries below runner limits.
+		env = "          GH_AW_INFO_MARKDOWN_METADATA_FILE: " + activationMetadataFile + "\n"
+		var steps []string
+		for offset := 0; offset < len(payload); offset += activationMetadataChunkSize {
+			chunk := payload[offset:min(offset+activationMetadataChunkSize, len(payload))]
+			redirect := ">>"
+			if offset == 0 {
+				redirect = ">"
+			}
+			steps = append(steps, fmt.Sprintf("      - name: Write activation metadata chunk %d\n        shell: bash\n        run: |\n          printf '%%s' '%s' %s \"$RUNNER_TEMP/gh-aw-markdown-metadata.json\"\n", offset/activationMetadataChunkSize+1, chunk, redirect))
+		}
+		*step = strings.Replace(*step, awInfoStepEnvAnchor, awInfoStepEnvAnchor+env, 1)
+		activation.Steps = append(steps, activation.Steps...)
+		return nil
+	}
+	*step = strings.Replace(*step, awInfoStepEnvAnchor, awInfoStepEnvAnchor+env, 1)
+	return nil
+}
+
+// inertJSON takes compact JSON from json.Marshal and escapes dollar signs,
+// apostrophes, and non-printable or non-ASCII characters. Printable ASCII
+// keeps the YAML valid and lets shell chunks split at any byte boundary.
+func inertJSON(encoded []byte) string {
+	var out strings.Builder
+	for _, r := range string(encoded) {
+		switch {
+		case r == '$' || r == '\'' || r < ' ' || r == '\x7f':
+			fmt.Fprintf(&out, `\u%04x`, r) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+		case r <= '~':
+			out.WriteRune(r)
+		default:
+			for _, unit := range utf16.Encode([]rune{r}) {
+				fmt.Fprintf(&out, `\u%04x`, unit) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+			}
+		}
+	}
+	return out.String()
+}
+
+// The runtime reads a missing record as empty metadata, matching the lock
+// header's agent_metadata, so empty error-free records are redundant.
+func nonEmptyMarkdownMetadata(metadata *GHAWMarkdownMetadata) *GHAWMarkdownMetadata {
+	result := &GHAWMarkdownMetadata{Version: metadata.Version, Records: make([]GHAWMarkdownMetadataRecord, 0, len(metadata.Records))}
+	for _, record := range metadata.Records {
+		if record.Error == "" && len(record.References) == 0 {
+			switch strings.TrimSpace(string(record.Value)) {
+			case "{}", "null", "":
+				continue
+			}
+		}
+		result.Records = append(result.Records, record)
+	}
+	return result
+}
 
 // buildJobsAndValidate builds all workflow jobs and validates their dependencies.
 // It resets the job manager, builds jobs from the workflow data, and performs
@@ -58,7 +152,6 @@ func (c *Compiler) buildJobsAndValidate(data *WorkflowData, markdownPath string)
 	if err := c.guardCustomJobDetection(data); err != nil {
 		return err
 	}
-	c.ensureAdmissionSkipSafeConditions()
 
 	if err := c.guardGatewayProvenanceJobs(data); err != nil {
 		return err
@@ -80,7 +173,7 @@ func (c *Compiler) buildJobsAndValidate(data *WorkflowData, markdownPath string)
 // permissions, concurrency, run-name, environment variables, cache comments, and jobs.
 func (c *Compiler) generateWorkflowBody(yaml *strings.Builder, data *WorkflowData) {
 	// Write basic workflow structure
-	fmt.Fprintf(yaml, "name: \"%s\"\n", data.Name) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	fmt.Fprintf(yaml, "name: %q\n", data.Name) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 
 	// Inject on.workflow_call.outputs when workflow_call is configured and safe-outputs are present
 	onSection := data.On
@@ -134,6 +227,10 @@ func (c *Compiler) generateWorkflowBody(yaml *strings.Builder, data *WorkflowDat
 
 func (c *Compiler) generateYAML(data *WorkflowData, markdownPath string) (string, []string, []string, error) { //nolint:largefunc // Existing workflow YAML assembly keeps generation steps in order.
 	compilerYamlLog.Printf("Generating YAML for workflow: %s", data.Name)
+	data.dynamicSecretReferences = CollectDynamicSecretReferences(data.FrontmatterYAML)
+	if len(data.dynamicSecretReferences) > 0 && hasWorkflowCallTrigger(data.On) && len(workflowCallSecretNames(data.On)) == 0 {
+		return "", nil, nil, errors.New("computed secret selection in a workflow_call requires explicitly declared on.workflow_call.secrets names to bound the secret inventory")
+	}
 
 	repoConfig, err := c.loadRepoConfig()
 	if err != nil {
@@ -210,11 +307,19 @@ func (c *Compiler) generateYAML(data *WorkflowData, markdownPath string) (string
 	}
 	// Appending failures can replace a slice's backing array; generatedActionRefs
 	// is a shared map and needs no copy-back.
-	defer func() { sourceData.ActionResolutionFailures = data.ActionResolutionFailures }()
+	defer func() {
+		sourceData.ActionResolutionFailures = data.ActionResolutionFailures
+		sourceData.dynamicSecretReferences = data.dynamicSecretReferences
+	}()
 
 	// Build all jobs and validate dependencies
 	if err := c.buildJobsAndValidate(data, markdownPath); err != nil {
 		return "", nil, nil, fmt.Errorf("workflow compilation requires valid jobs and dependencies; check job definitions and needs references: %w", err)
+	}
+	fullMetadata, workflowMetadata := c.collectMarkdownMetadataCatalogs(data)
+	data.compiledMarkdownMetadata = fullMetadata
+	if err := c.embedActivationMarkdownMetadata(workflowMetadata); err != nil {
+		return "", nil, nil, err
 	}
 	repoConfig, err = resolvedArtifactRetentionConfig(repoConfig, data)
 	if err != nil {
@@ -250,6 +355,17 @@ func (c *Compiler) generateYAML(data *WorkflowData, markdownPath string) (string
 	// These are returned to the caller so they can be used for safe update enforcement
 	// without requiring a second scan of the full YAML content.
 	secrets := CollectSecretReferences(bodyContent)
+	data.dynamicSecretReferences = append(data.dynamicSecretReferences, CollectDynamicSecretReferences(bodyContent)...)
+	slices.Sort(data.dynamicSecretReferences)
+	data.dynamicSecretReferences = slices.Compact(data.dynamicSecretReferences)
+	if len(data.dynamicSecretReferences) > 0 && hasWorkflowCallTrigger(data.On) && len(workflowCallSecretNames(data.On)) == 0 {
+		return "", nil, nil, errors.New("computed secret selection in a workflow_call requires explicitly declared on.workflow_call.secrets names to bound the secret inventory")
+	}
+	if hasWorkflowCallTrigger(data.On) {
+		secrets = append(secrets, workflowCallSecretNames(data.On)...)
+		slices.Sort(secrets)
+		secrets = slices.Compact(secrets)
+	}
 
 	// If this workflow has a workflow_call trigger, inject on.workflow_call.secrets:
 	// declarations so callers can map secrets explicitly instead of using secrets: inherit.
@@ -307,6 +423,12 @@ func (c *Compiler) generateYAML(data *WorkflowData, markdownPath string) (string
 	yamlContent, err = finalizeRunnerTempSafety(yamlContent)
 	if err != nil {
 		return "", nil, nil, fmt.Errorf("runner temp safety rewriting could not complete; ensure generated run/script steps are valid shell or JavaScript commands: %w", err)
+	}
+	documentedYAML, err := documentPermissionComments(yamlContent, data.FrontmatterYAML)
+	if err != nil {
+		compilerYamlLog.Printf("Could not document permission comments for workflow %s: %v", data.Name, err)
+	} else {
+		yamlContent = documentedYAML
 	}
 
 	// Normalize assembled YAML whitespace. This clears indentation-only blank lines

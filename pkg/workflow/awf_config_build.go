@@ -136,19 +136,23 @@ func BuildAWFConfigJSON(config AWFCommandConfig) (string, error) { //nolint:larg
 		maxTurnCacheMisses = config.WorkflowData.EngineConfig.GetMaxTurnCacheMisses()
 	}
 
-	// Token steering is enabled by default. Setting max-ai-credits to a negative
-	// value (-1) omits that budget from the AWF config and disables token steering.
-	// When maxAICredits is 0 (runtime default), token steering stays enabled here.
+	// Token steering (AWF budget notices) is enabled by default. Setting
+	// max-ai-credits to a negative value (-1) omits that budget and the
+	// enableTokenSteering setting from the AWF config; AWF releases after v0.29.11
+	// turn notices on by default, so only sandbox.agent.token-steering: false
+	// turns them off. When maxAICredits is 0 (runtime default), token steering
+	// stays enabled here.
 	enableTokenSteering := maxAICredits >= 0
 	if config.WorkflowData != nil && config.WorkflowData.SandboxConfig != nil && config.WorkflowData.SandboxConfig.Agent != nil && config.WorkflowData.SandboxConfig.Agent.TokenSteering != nil {
 		enableTokenSteering = *config.WorkflowData.SandboxConfig.Agent.TokenSteering
 	}
-	if maxAICredits < 0 {
+	tokenSteeringDisabledByBudget := maxAICredits < 0
+	if tokenSteeringDisabledByBudget {
 		// Negative signals "disabled" — omit the budget from the AWF config.
 		maxAICredits = 0
 	}
 	var tokenSteeringEnabled *bool
-	if awfSupportsTokenSteering(firewallConfig) && (enableTokenSteering || (config.WorkflowData != nil && config.WorkflowData.SandboxConfig != nil && config.WorkflowData.SandboxConfig.Agent != nil && config.WorkflowData.SandboxConfig.Agent.TokenSteering != nil)) {
+	if awfSupportsTokenSteering(firewallConfig) && (enableTokenSteering || tokenSteeringDisabledByBudget || (config.WorkflowData != nil && config.WorkflowData.SandboxConfig != nil && config.WorkflowData.SandboxConfig.Agent != nil && config.WorkflowData.SandboxConfig.Agent.TokenSteering != nil)) {
 		tokenSteeringEnabled = &enableTokenSteering
 	}
 
@@ -179,8 +183,8 @@ func BuildAWFConfigJSON(config AWFCommandConfig) (string, error) { //nolint:larg
 		awfConfigLog.Printf("Skipping apiProxy.enableTokenSteering: AWF version %q requires at least %s", getAWFImageTag(firewallConfig), constants.AWFTokenSteeringMinVersion)
 	}
 
-	if config.WorkflowData != nil && config.WorkflowData.EngineConfig != nil && len(config.WorkflowData.EngineConfig.FallbackModels) > 0 {
-		// An explicit ordered chain must not silently insert a catalog-selected model.
+	if usesConnectorInference(config.WorkflowData) || (config.WorkflowData != nil && config.WorkflowData.EngineConfig != nil && len(config.WorkflowData.EngineConfig.FallbackModels) > 0) {
+		// An exact connector grant or explicit chain must not silently insert a catalog-selected model.
 		disabled := TemplatableBool("false")
 		apiProxy.ModelFallback = &AWFModelFallbackConfig{Enabled: &disabled}
 	} else if mf := extractModelFallback(config.WorkflowData); mf != nil {
@@ -665,12 +669,12 @@ func extractDefaultAiCreditsPricing(workflowData *WorkflowData) *AiCreditsPricin
 }
 
 func extractModelCostProviders(workflowData *WorkflowData) map[string]any {
-	if workflowData == nil || len(workflowData.ModelCosts) == 0 {
+	if workflowData == nil || len(workflowData.ModelCostOverrides) == 0 {
 		return nil
 	}
-	providers, ok := workflowData.ModelCosts["providers"].(map[string]any)
+	providers, ok := workflowData.ModelCostOverrides["providers"].(map[string]any)
 	if !ok {
-		awfConfigLog.Printf("API proxy: models.providers has unexpected type %T; skipping provider overlay", workflowData.ModelCosts["providers"])
+		awfConfigLog.Printf("API proxy: authored models.providers has unexpected type %T; skipping provider overlay", workflowData.ModelCostOverrides["providers"])
 		return nil
 	}
 	if len(providers) == 0 {

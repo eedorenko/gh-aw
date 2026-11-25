@@ -75,7 +75,7 @@ func isThreatDetectionExplicitlyDisabledInConfigs(configs []string) bool {
 }
 
 func getThreatDetectionAdditionalAllowedDomains(data *WorkflowData, engineID string) []string {
-	if data == nil || data.NetworkPermissions == nil {
+	if data == nil {
 		return []string{}
 	}
 
@@ -91,8 +91,11 @@ func getThreatDetectionAdditionalAllowedDomains(data *WorkflowData, engineID str
 		effectiveEnv["ANTHROPIC_BASE_URL"] != "" ||
 		effectiveEnv[constants.CopilotProviderBaseURL] != ""
 
-	additional := make([]string, 0, len(data.NetworkPermissions.Allowed))
+	additional := make([]string, 0)
 	seen := make(map[string]struct{})
+	if data.NetworkPermissions == nil {
+		return additional
+	}
 	for _, entry := range data.NetworkPermissions.Allowed {
 		if entry == "" || strings.Contains(entry, "${{") {
 			continue
@@ -173,6 +176,11 @@ func buildExternalDetectorWorkflowData(data *WorkflowData, engineID string) *Wor
 		"bash": []any{"*"},
 	}
 	d.EngineConfig = resolveExternalDetectorEngineConfig(data, engineID)
+	if d.EngineConfig.Auth == nil && data.EngineConfig != nil &&
+		ResolveEngineID(data) == engineID && data.EngineConfig.Auth != nil {
+		auth := *data.EngineConfig.Auth
+		d.EngineConfig.Auth = &auth
+	}
 	// threat-detect currently resolves the selected engine by its standard
 	// executable name and has no custom-command option. Keep the standard
 	// Copilot CLI installed for external detection rather than propagating a
@@ -185,6 +193,9 @@ func buildExternalDetectorWorkflowData(data *WorkflowData, engineID string) *Wor
 		d.EngineConfig.LLMProvider = LLMProviderOpenAI
 	}
 	d.EngineConfig.Env = mergeThreatDetectionEngineEnv(data, engineID, d.EngineConfig.Env)
+	if d.EngineConfig.Auth == nil && isOpenAIWIFWithAWF(d) {
+		d.EngineConfig.Auth = resolveOpenAIWIFAuth(d.EngineConfig)
+	}
 	if d.EngineConfig.APITarget == "" && data.EngineConfig != nil &&
 		ResolveEngineID(data) == engineID {
 		d.EngineConfig.APITarget = data.EngineConfig.APITarget
@@ -245,6 +256,7 @@ func resetDetectionEngineTaskSettings(config *EngineConfig) {
 	config.Cwd = ""
 	config.Concurrency = ""
 	config.CopilotSDK = false
+	config.CopilotSDKPin = nil
 	config.ModelRouting = nil
 }
 
@@ -259,6 +271,8 @@ func cloneThreatDetectionEngineConfig(engineID string, source *EngineConfig) *En
 	cloned := *source
 	cloned.ID = engineID
 	cloned.ModelRouting = nil
+	cloned.Durable = nil
+	cloned.durableError = nil
 	if source.ID != "" && source.ID != engineID {
 		threatLog.Printf("Resetting runtime settings when normalizing %q to detection engine %q", source.ID, engineID)
 		cloned.Version = ""
@@ -315,17 +329,24 @@ func engineCoreSecretVarNames(engineID string) []string {
 // otherwise the enterprise override or runtime-aware engine detection default.
 func resolveThreatDetectionModel(data *WorkflowData, engineID string, engine CodingAgentEngine) string {
 	model := inheritedDetectionModel(data, engineID)
-	if data != nil && data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil && data.SafeOutputs.ThreatDetection.Model != "" {
+	explicit := data != nil && data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil && data.SafeOutputs.ThreatDetection.Model != ""
+	if explicit {
 		model = data.SafeOutputs.ThreatDetection.Model
 	}
-	if model == "" {
+	defaultModel := func() string {
 		if engine != nil {
-			model = defaultDetectionModel(engine)
-		} else if defaultModel := compilerenv.ResolveDefaultDetectionModel(""); defaultModel != "" {
-			model = defaultModel
-		} else {
-			model = "detection"
+			return defaultDetectionModel(engine, data != nil && resolveExternalDetectorEngineConfig(data, engineID).ModelCatalogDisabled)
 		}
+		if defaultModel := compilerenv.ResolveDefaultDetectionModel(""); defaultModel != "" {
+			return defaultModel
+		}
+		return "detection"
+	}
+	if model == "" {
+		return defaultModel()
+	}
+	if !explicit && isModelRoutingDynamic(data) {
+		return guardDynamicRoutingDetectionModel(model, defaultModel())
 	}
 	return model
 }
@@ -353,18 +374,41 @@ func inheritedDetectionModel(data *WorkflowData, detectionEngineID string) strin
 // organization/repository variables override the built-in detection default. The fallback
 // was accidentally removed from inline detection in a93e36ea4; sharing it here keeps inline
 // and external detection from diverging again.
-func defaultDetectionModel(engine CodingAgentEngine) string {
+//
+// Without a live model catalogue (`engine.model-catalog: false`) the `detection` alias
+// cannot resolve and would reach the provider verbatim, so the built-in fallback is the
+// engine's main-agent default instead.
+func defaultDetectionModel(engine CodingAgentEngine, catalogDisabled bool) string {
 	if model := compilerenv.ResolveDefaultDetectionModel(""); model != "" {
 		return model
 	}
-	model := engine.GetDefaultDetectionModel()
-	if model == "" {
-		model = "detection"
-	}
 	suffix := strings.ToUpper(engine.GetID())
-	return compilerenv.BuildModelOverrideExpression(
-		"GH_AW_MODEL_DETECTION_"+suffix,
-		"GH_AW_DEFAULT_MODEL_"+suffix,
-		model,
-	)
+	primaryVar := "GH_AW_MODEL_DETECTION_" + suffix
+	enterpriseVar := "GH_AW_DEFAULT_MODEL_" + suffix
+	var model string
+	if catalogDisabled {
+		model = catalogFreeDefaultModel(engine.GetID())
+		if model == "" {
+			return compilerenv.BuildModelOverrideExpressionEmptyFallback(primaryVar, enterpriseVar)
+		}
+	} else {
+		model = engine.GetDefaultDetectionModel()
+		if model == "" {
+			model = "detection"
+		}
+	}
+	return compilerenv.BuildModelOverrideExpression(primaryVar, enterpriseVar, model)
+}
+
+// catalogFreeDefaultModel returns the built-in default model the engine's main agent job
+// uses when no model is configured, or "" when the engine chooses its own default.
+func catalogFreeDefaultModel(engineID string) string {
+	switch engineID {
+	case string(constants.CopilotEngine):
+		return constants.CopilotBYOKDefaultModel
+	case string(constants.ClaudeEngine):
+		return constants.SonnetDefaultModel
+	default:
+		return ""
+	}
 }

@@ -15,10 +15,10 @@ permissions:
 concurrency:
   group: windows-grower
   cancel-in-progress: false
+model: router/economy
 engine:
   id: codex
-  model-provider: openai
-model: openai/gpt-5.6-terra
+  model-provider: github
 network: {}
 tools:
   cache-memory:

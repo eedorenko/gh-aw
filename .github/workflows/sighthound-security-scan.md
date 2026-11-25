@@ -11,10 +11,10 @@ permissions:
   issues: read
   actions: read
   copilot-requests: write
+model: router/economy
 engine:
   id: codex
   model-provider: github
-model: copilot/gpt-6-sol
 strict: true
 if: needs.sighthound_scan.outputs.actionable_findings_detected == 'true'
 jobs:
@@ -154,8 +154,9 @@ mcp-scripts:
     run: cat /tmp/gh-aw/agent/sighthound/summary.md
 safe-outputs:
   create-issue:
+    expires: 2d
     max: 1
-    labels: [security, sighthound, cookie]
+    labels: [security, sighthound, cookie, "backlog:security"]
     close-older-issues: true
     title-prefix: "[sighthound] "
   noop:

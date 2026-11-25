@@ -8,10 +8,13 @@ on:
 permissions:
   contents: read
   actions: read
+  copilot-requests: write
 max-ai-credits: 1500
 max-daily-ai-credits: 5000
+model: router/economy
 engine:
   id: claude
+  model-provider: github
   mcp:
     tool-timeout: 10m
 tools:

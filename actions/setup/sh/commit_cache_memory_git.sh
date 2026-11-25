@@ -17,6 +17,27 @@ set -euo pipefail
 CACHE_DIR="${GH_AW_CACHE_DIR:-/tmp/gh-aw/cache-memory}"
 RUN_ID="${GITHUB_RUN_ID:-unknown}"
 
+path_has_symlink_component() {
+  local path="$1"
+  case "$path" in
+    /*) ;;
+    *) path="$PWD/$path" ;;
+  esac
+  while [ "$path" != "/" ] && [[ "$path" == */ ]]; do
+    path="${path%/}"
+  done
+  while [ "$path" != "/" ]; do
+    if [ -L "$path" ]; then return 0; fi
+    path="$(dirname "$path")"
+  done
+  return 1
+}
+
+if path_has_symlink_component "$CACHE_DIR"; then
+  echo "Refusing to commit through a symlinked cache-memory path: $CACHE_DIR" >&2
+  exit 1
+fi
+
 if [ ! -d "$CACHE_DIR/.git" ]; then
   echo "No git repository found at $CACHE_DIR — skipping git commit"
   exit 0
@@ -37,7 +58,7 @@ scrub_git_config_entries() {
 }
 
 has_symlinked_git_metadata() {
-  [ -L .git ] || [ -n "$(find .git -type l -print -quit 2>/dev/null)" ]
+  [ -L .git ] || [ -n "$(find -P .git -type l -print -quit 2>/dev/null)" ]
 }
 
 if has_symlinked_git_metadata; then
@@ -75,7 +96,7 @@ git config core.fsmonitor false
 
 # --- Log cache directory contents before commit ---
 echo "=== Cache directory: non-git files being committed ==="
-_commit_files=$(find . -not -path './.git/*' -type f 2>/dev/null | sort || true)
+_commit_files=$(find -P . -not -path './.git/*' -type f 2>/dev/null | sort || true)
 if [ -n "$_commit_files" ]; then
   echo "$_commit_files"
 else
@@ -87,15 +108,20 @@ git add -A
 
 # Commit on the current integrity branch; allow empty commits in case
 # the agent made no changes (idempotent).
-if git -c commit.gpgSign=false commit --no-verify --allow-empty -m "run-${RUN_ID}" -q 2>/tmp/gh-aw-commit-err; then
+COMMIT_TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/gh-aw-commit.XXXXXX")
+COMMIT_ERROR_FILE="$COMMIT_TEMP_DIR/stderr"
+trap 'rm -f -- "$COMMIT_ERROR_FILE"; rmdir -- "$COMMIT_TEMP_DIR"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if git -c commit.gpgSign=false commit --no-verify --allow-empty -m "run-${RUN_ID}" -q 2>"$COMMIT_ERROR_FILE"; then
   echo "Cache memory git commit complete (run: $RUN_ID)"
 else
   # Distinguish "nothing to commit" (benign) from real errors
-  if grep -qiE "nothing to commit|nothing added" /tmp/gh-aw-commit-err 2>/dev/null; then
+  if grep -qiE "nothing to commit|nothing added" "$COMMIT_ERROR_FILE" 2>/dev/null; then
     echo "Cache memory git: nothing to commit (run: $RUN_ID)"
   else
     echo "Warning: git commit encountered an issue:" >&2
-    cat /tmp/gh-aw-commit-err >&2
+    cat "$COMMIT_ERROR_FILE" >&2
   fi
 fi
 

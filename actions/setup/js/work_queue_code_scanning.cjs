@@ -3,25 +3,12 @@
 const { SAFE_OUTPUT_E001 } = require("./error_codes.cjs");
 // @safe-outputs-exempt SEC-005 — runtime repository fallbacks are checked by assertClaimAuthorized against authorizeWorkerClaim's profile.effect_scope allowlist (E004); the guarded effect client reauthorizes SARIF writes.
 
-const crypto = require("crypto");
 const path = require("path");
 const zlib = require("zlib");
-const { canonical } = require("./work_queue_codec.cjs");
-const {
-  currentClaimHandle,
-  assertClaimAuthorized,
-  claimArtifactPath,
-  claimIdentity,
-  assertClaimIdentity,
-  receiptMatchesClaim,
-  withClaimResourceEffects,
-  createClaimResourceVerification,
-  withClaimResourceVerification,
-} = require("./work_queue_claim_scope.cjs");
+const { currentClaimHandle, assertClaimAuthorized, claimArtifactPath, claimIdentity, assertClaimIdentity, withClaimResourceEffects, markClaimEffects } = require("./work_queue_claim_scope.cjs");
 const { resolveRepositoryTarget, canonicalResourceTarget } = require("./work_queue_effect_resource.cjs");
 const { wrapClaimEffectClient } = require("./work_queue_effect_client.cjs");
 const { isStagedMode } = require("./safe_output_helpers.cjs");
-const privateReceipts = new WeakMap();
 
 /** @param {{ "target-repo"?: string, "target-ref"?: string, driver?: string, max?: number, workflow_filename?: string, staged?: boolean }} [config] @param {import("./types/work-queue-native-client").ClaimNativeClient} [suppliedClient] */
 async function main(config = {}, suppliedClient) {
@@ -70,7 +57,8 @@ async function main(config = {}, suppliedClient) {
     const target = canonicalResourceTarget({ repository, ref, path: message.file });
     const getCommit = github.rest?.repos?.getCommit;
     const uploadSarif = github.rest?.codeScanning?.uploadSarif;
-    if (typeof getCommit !== "function" || typeof uploadSarif !== "function") throw new Error("Queue code scanning requires its native read and write endpoints");
+    const getSarif = github.rest?.codeScanning?.getSarif;
+    if (typeof getCommit !== "function" || typeof uploadSarif !== "function" || typeof getSarif !== "function") throw new Error("Queue code scanning requires its native read and write endpoints");
     const resolved = await getCommit({ owner, repo, ref });
     if (resolved.data.sha !== revision) throw new Error("Trusted code scanning ref differs from the immutable worker revision");
     const category = `${prefix}/${number}`;
@@ -90,70 +78,12 @@ async function main(config = {}, suppliedClient) {
       uploadSarif({ owner, repo, commit_sha: revision, ref, sarif: zlib.gzipSync(Buffer.from(JSON.stringify(report))).toString("base64"), tool_name: driver, validate: true })
     );
     if (typeof upload.data.id !== "string" || !upload.data.id) throw new Error("Queue code scanning has no exact service receipt");
-    const result = { success: true, sarif_id: upload.data.id, repo: repository, ref, commit_sha: revision };
-    privateReceipts.set(result, { ...factoryIdentity, repository, revision, ref, driver, category, finding, sarif_id: upload.data.id, authorityResource });
-    return result;
+    // One status read, no polling: still-pending uploads are recorded as unverified.
+    const { data: status } = await getSarif({ owner, repo, sarif_id: upload.data.id });
+    if (status?.processing_status === "pending") markClaimEffects("sarif", { status: "unverified" });
+    else if (status?.processing_status !== "complete" || status.errors?.length) throw new Error(`Queue code scanning SARIF ${upload.data.id} failed processing`);
+    return { success: true, sarif_id: upload.data.id, repo: repository, ref, commit_sha: revision };
   };
 }
 
-async function verifyCodeScanningDelivery(options) {
-  const { claim, result, github } = options;
-  const receipt = result && privateReceipts.get(result);
-  if (!receiptMatchesClaim(receipt, claim)) return { verified: false };
-  const [owner, repo] = receipt.repository.split("/");
-  let status;
-  for (let attempt = 0; attempt < 8; attempt++) {
-    status = (await github.rest.codeScanning.getSarif({ owner, repo, sarif_id: receipt.sarif_id })).data;
-    if (status.processing_status !== "pending") break;
-    if (attempt < 7) await new Promise(resolve => setTimeout(resolve, 500));
-  }
-  if (status.processing_status !== "complete" || status.errors?.length) return { verified: false };
-  const url = new URL(status.analyses_url);
-  const base = new URL(process.env.GITHUB_API_URL || "https://api.github.com");
-  if (url.origin !== base.origin || url.pathname !== `${base.pathname.replace(/\/$/, "")}/repos/${receipt.repository}/code-scanning/analyses` || url.searchParams.get("sarif_id") !== receipt.sarif_id) return { verified: false };
-  const { data: analyses } = await github.request(`GET ${url.href}`);
-  if (!Array.isArray(analyses) || analyses.length !== 1) return { verified: false };
-  const analysis = analyses[0];
-  if (
-    analysis.sarif_id !== receipt.sarif_id ||
-    analysis.commit_sha !== receipt.revision ||
-    analysis.ref !== receipt.ref ||
-    analysis.category !== receipt.category ||
-    analysis.tool?.name !== receipt.driver ||
-    analysis.error ||
-    analysis.results_count !== 1 ||
-    !Number.isSafeInteger(analysis.id)
-  )
-    return { verified: false };
-  const { data: report } = await github.rest.codeScanning.getAnalysis({ owner, repo, analysis_id: analysis.id, headers: { accept: "application/sarif+json" } });
-  if (report.version !== "2.1.0" || report.runs?.length !== 1 || report.runs[0].tool?.driver?.name !== receipt.driver || report.runs[0].results?.length !== 1) return { verified: false };
-  const finding = report.runs[0].results[0];
-  if (finding.locations?.length !== 1) return { verified: false };
-  const location = finding.locations[0].physicalLocation;
-  const projected = {
-    ruleId: finding.ruleId,
-    message: { text: finding.message?.text },
-    level: finding.level,
-    locations: [{ physicalLocation: { artifactLocation: { uri: location?.artifactLocation?.uri }, region: { startLine: location?.region?.startLine, startColumn: location?.region?.startColumn } } }],
-  };
-  if (canonical(projected) !== canonical(receipt.finding)) return { verified: false };
-  const proof = createClaimResourceVerification({
-    verified: true,
-    claim_handle: claim.handle,
-    resource: {
-      kind: "sarif",
-      repository: receipt.repository,
-      id: receipt.sarif_id,
-      analysis_id: analysis.id,
-      ref: receipt.ref,
-      commit_sha: receipt.revision,
-      category: receipt.category,
-      path: receipt.finding.locations[0].physicalLocation.artifactLocation.uri,
-    },
-    authority_resource: await resolveRepositoryTarget(github, receipt.authorityResource),
-    evidence: { source: "github_code_scanning_api", sarif_id: receipt.sarif_id, analysis_id: analysis.id, result_sha256: crypto.createHash("sha256").update(canonical(receipt.finding)).digest("hex") },
-  });
-  return withClaimResourceVerification(proof, () => proof, { authorize: options.authorize, context: options.context, github });
-}
-
-module.exports = { main, verifyCodeScanningDelivery };
+module.exports = { main };

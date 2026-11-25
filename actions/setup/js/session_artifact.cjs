@@ -20,21 +20,27 @@ function removeFailedSessionArtifacts(files, originalError) {
  * Redact decoded string values before JSON serialization, including correlation IDs.
  * @param {import("./types/agent_session").AgentSession} events
  * @param {string[]} [maskedValues]
- * @param {{rejectStructuralRedaction?: boolean}} [options]
+ * @param {{rejectStructuralRedaction?: boolean, secretValues?: string[]}} [options]
  * @returns {string}
  */
 function serializeSessionArtifact(events, maskedValues = [], options = {}) {
-  const redacted = redactManifestValue(events, collectArtifactSecretValues());
+  const secretValues = options.secretValues ?? collectArtifactSecretValues();
+  const redacted = redactManifestValue(events, secretValues);
   if (!Array.isArray(redacted)) throw new Error(`${ERR_VALIDATION}: Expected a session event array`);
-  const serialized = redacted.map(event =>
-    JSON.stringify(event, (_key, value) => {
+  const maskedSourceClocks = redacted.map((event, index) => {
+    const sourceTimestamp = events[index]?.timestamp;
+    return typeof sourceTimestamp === "string" && (redacted[index]?.timestamp !== sourceTimestamp || redactMaskedValues(sourceTimestamp, maskedValues) !== sourceTimestamp);
+  });
+  const serialized = redacted.map((event, index) => {
+    const serializableEvent = maskedSourceClocks[index] && event?.provenance && typeof event.provenance === "object" ? { ...event, provenance: { ...event.provenance, timestampMs: undefined } } : event;
+    return JSON.stringify(serializableEvent, (_key, value) => {
       if (typeof value === "string") return redactMaskedValues(value, maskedValues);
       if (options.rejectStructuralRedaction && value && typeof value === "object" && !Array.isArray(value)) {
         return Object.fromEntries(Object.entries(value).map(([key, nested]) => [redactMaskedValues(key, maskedValues), nested]));
       }
       return value;
-    })
-  );
+    });
+  });
   if (options.rejectStructuralRedaction) {
     try {
       events.forEach((event, index) => {
@@ -57,7 +63,7 @@ const sessionPayloadFields = new Map([
   ["assistant.reasoning", ["content"]],
   ["assistant.refusal", ["content", "explanation"]],
   ["tool.execution_start", ["input", "parameters", "command"]],
-  ["tool.execution_complete", ["output", "result", "error", "fileEdits"]],
+  ["tool.execution_complete", ["output", "structuredContent", "result", "error", "fileEdits"]],
 ]);
 
 /** @param {unknown} original @param {unknown} redacted @param {string[]} maskedValues @param {string} eventType @param {string[]} [fields] */

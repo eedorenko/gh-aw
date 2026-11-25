@@ -85,9 +85,7 @@ func TestActivationStepsAddSafeOutputSecretValidationSteps(t *testing.T) {
 	ctx := newActivationStepsTestContext(&WorkflowData{
 		AI: "copilot",
 		SafeOutputs: &SafeOutputsConfig{
-			JiraCreateIssue:   &JiraSafeOutputConfig{},
-			LinearCreateIssue: &LinearCreateIssueConfig{},
-			CreateWorkItems:   &CreateWorkItemConfig{},
+			CreateIssues: &CreateIssuesConfig{},
 		},
 	})
 	ctx.engine = engine
@@ -95,15 +93,15 @@ func TestActivationStepsAddSafeOutputSecretValidationSteps(t *testing.T) {
 	compiler.addActivationSecretValidationStep(ctx)
 
 	steps := strings.Join(ctx.steps, "")
-	assert.Contains(t, steps, "JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}")
-	assert.Contains(t, steps, "JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}")
-	assert.Contains(t, steps, "LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}")
-	assert.Contains(t, steps, "LINEAR_TEAM_ID: ${{ secrets.LINEAR_TEAM_ID }}")
-	assert.Contains(t, steps, "AZURE_DEVOPS_EXT_PAT: ${{ secrets.AZURE_DEVOPS_EXT_PAT }}")
-	assert.Contains(t, steps, "'Jira safe outputs'")
-	assert.Contains(t, steps, "'Linear safe outputs'")
-	assert.Contains(t, steps, "'Azure DevOps safe outputs'")
-	assert.Contains(t, ctx.outputs["secret_verification_result"], "steps.validate-safe-output-secret-5.outcome == 'failure'")
+	assert.NotContains(t, steps, "JIRA_USER_EMAIL")
+	assert.NotContains(t, steps, "JIRA_API_TOKEN")
+	assert.NotContains(t, steps, "LINEAR_API_KEY")
+	assert.NotContains(t, steps, "LINEAR_TEAM_ID")
+	assert.NotContains(t, steps, "AZURE_DEVOPS_EXT_PAT")
+	assert.NotContains(t, steps, "'Jira safe outputs'")
+	assert.NotContains(t, steps, "'Linear safe outputs'")
+	assert.NotContains(t, steps, "'Azure DevOps safe outputs'")
+	assert.NotContains(t, ctx.outputs["secret_verification_result"], "steps.validate-safe-output-secret-")
 }
 
 func TestActivationStepsAddOAuthTokenCheckStep(t *testing.T) {
@@ -187,13 +185,13 @@ func TestActivationStepsAddRepositoryAndOutputSteps(t *testing.T) {
 		t.Cleanup(func() { isReleaseBuild = originalIsRelease })
 
 		compiler := newActivationStepsTestCompiler("v1.2.3")
-		ctx := newActivationBuildContext(&WorkflowData{}, false, "", "test.lock.yml")
+		ctx := newActivationBuildContext(&WorkflowData{Permissions: "contents: read"}, false, "", "test.lock.yml")
 
 		err := compiler.addActivationRepositoryAndOutputSteps(ctx)
 
 		require.NoError(t, err)
 		steps := strings.Join(ctx.steps, "")
-		assert.Contains(t, steps, "Checkout .github and .agents folders")
+		assert.Contains(t, steps, "Checkout base repository snapshot")
 		assert.Contains(t, steps, "Check workflow lock file")
 		assert.Contains(t, steps, "Check compile-agentic version")
 		assert.Equal(t, `""`, ctx.outputs["comment_id"])
@@ -220,14 +218,32 @@ func TestActivationStepsAddCheckoutAndBaseRestoreStep(t *testing.T) {
 	compiler := newActivationStepsTestCompiler("")
 
 	t.Run("adds checkout and save-base steps", func(t *testing.T) {
-		ctx := newActivationStepsTestContext(&WorkflowData{})
+		ctx := newActivationStepsTestContext(&WorkflowData{Permissions: "contents: read"})
 
 		compiler.addActivationCheckoutAndBaseRestoreStep(ctx)
 
 		steps := strings.Join(ctx.steps, "")
-		assert.Contains(t, steps, "Checkout .github and .agents folders")
+		assert.Contains(t, steps, "Checkout base repository snapshot")
 		assert.Contains(t, steps, "Save agent config folders for base branch restoration")
 		assert.Contains(t, steps, "save_base_github_folders.sh")
+		assert.NotContains(t, steps, "GH_AW_STAGE_COPILOT_SDK_AGENTS")
+	})
+
+	t.Run("stages SDK agents even when the PR checkout is disabled", func(t *testing.T) {
+		prCheckout := false
+		ctx := newActivationStepsTestContext(&WorkflowData{
+			On:              "on:\n  pull_request:\n  workflow_call:\n",
+			InlinedImports:  true,
+			EngineConfig:    &EngineConfig{ID: "copilot", CopilotSDK: true},
+			CheckoutConfigs: []*CheckoutConfig{{PullRequest: &prCheckout}},
+		})
+
+		compiler.addActivationCheckoutAndBaseRestoreStep(ctx)
+
+		steps := strings.Join(ctx.steps, "")
+		assert.Contains(t, steps, "repository: ${{ steps.resolve-host-repo.outputs.target_repo }}")
+		assert.Contains(t, steps, "steps.resolve-host-repo.outputs.target_repo == github.repository && "+pullRequestBaseSHAExpression)
+		assert.Contains(t, steps, `GH_AW_STAGE_COPILOT_SDK_AGENTS: "true"`)
 	})
 
 	t.Run("skips when checkout is disabled by action tag", func(t *testing.T) {

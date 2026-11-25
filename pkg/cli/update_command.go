@@ -58,7 +58,7 @@ Note: In GitHub Enterprise repos, shorthand source specs resolve on your enterpr
   ` + string(constants.CLIExtensionPrefix) + ` update repo-assist.md     # Same (alternative format)
   ` + string(constants.CLIExtensionPrefix) + ` update https://github.com/owner/package  # Reapply an installed package
   ` + string(constants.CLIExtensionPrefix) + ` update --org my-org       # Preview workflow updates across an organization
-  ` + string(constants.CLIExtensionPrefix) + ` update --org my-org --interactive --pr  # Select repositories and watch PR creation
+  ` + string(constants.CLIExtensionPrefix) + ` update --org my-org --interactive --create-pull-request  # Select repositories and watch PR creation
   ` + string(constants.CLIExtensionPrefix) + ` update --enterprise my-enterprise --dry-run  # Preview across accessible enterprise organizations
   ` + string(constants.CLIExtensionPrefix) + ` update --org my-org --repos '*-service'  # Limit org mode to matching repositories
   ` + string(constants.CLIExtensionPrefix) + ` update --org my-org --create-issue  # Open issues in repos with pending updates
@@ -73,8 +73,8 @@ Note: In GitHub Enterprise repos, shorthand source specs resolve on your enterpr
   ` + string(constants.CLIExtensionPrefix) + ` update --dir custom/workflows  # Update workflows in custom directory
   ` + string(constants.CLIExtensionPrefix) + ` update --repo owner/repo        # Update workflows in another repository
   ` + string(constants.CLIExtensionPrefix) + ` update --create-pull-request   # Update and open a pull request
-  ` + string(constants.CLIExtensionPrefix) + ` update --pr --auto-merge       # Open a pull request and enable auto-merge
-  ` + string(constants.CLIExtensionPrefix) + ` update --org my-org --pr --auto-merge --yes  # Enable auto-merge for org update pull requests
+  ` + string(constants.CLIExtensionPrefix) + ` update --create-pull-request --auto-merge       # Open a pull request and enable auto-merge
+  ` + string(constants.CLIExtensionPrefix) + ` update --org my-org --create-pull-request --auto-merge --yes  # Enable auto-merge for org update pull requests
   ` + string(constants.CLIExtensionPrefix) + ` update --cool-down 0           # Disable cooldown and apply all pending releases immediately
   ` + string(constants.CLIExtensionPrefix) + ` update --cool-down 3d          # Apply a custom 3-day cooldown period`,
 		RunE: func(cmd *cobra.Command, args []string) error { //nolint:largefunc
@@ -175,7 +175,7 @@ Note: In GitHub Enterprise repos, shorthand source specs resolve on your enterpr
 			var summary *updatePRSummary
 			if createPR {
 				var err error
-				summary, err = newUpdatePRSummary(cmd.Context(), opts.WorkflowsDir)
+				summary, err = newUpdatePRSummary(cmd.Context(), opts.WorkflowsDir, opts.WorkflowNames...)
 				if err != nil {
 					return err
 				}
@@ -189,8 +189,9 @@ Note: In GitHub Enterprise repos, shorthand source specs resolve on your enterpr
 				if err != nil {
 					return err
 				}
+				prBody = appendUpdatePRReleaseHighlights(cmd.Context(), prBody, "", "")
 				_, err = createPRWithChanges(cmd.Context(), "update-workflows", "chore: update workflows",
-					"Update workflows from source", prBody, verbose, opts.AutoMerge)
+					updatePRTitle("Update workflows from source"), prBody, verbose, opts.AutoMerge)
 				return err
 			}
 			return nil
@@ -217,7 +218,7 @@ Note: In GitHub Enterprise repos, shorthand source specs resolve on your enterpr
 	addRepoFlag(cmd)
 	cmd.Flags().Bool("create-pull-request", false, "Create a pull request with the update changes")
 	cmd.Flags().Bool("pr", false, "Alias for --create-pull-request")
-	cmd.Flags().Bool("auto-merge", false, "Enable auto-merge on the created pull request (requires --pr or --create-pull-request)")
+	cmd.Flags().Bool("auto-merge", false, "Enable auto-merge on the created pull request (requires --create-pull-request)")
 	addPRMessageFlag(cmd)
 	cmd.Flags().Bool("create-issue", false, "Open a GitHub issue in each org repository that has pending workflow updates (requires --org)")
 	cmd.Flags().BoolP("yes", "y", false, "Auto-accept org-mode update confirmations (required in CI)")
@@ -228,13 +229,28 @@ Note: In GitHub Enterprise repos, shorthand source specs resolve on your enterpr
 	cmd.ValidArgsFunction = CompleteWorkflowNames
 	RegisterEngineFlagCompletion(cmd)
 	RegisterDirFlagCompletion(cmd, "dir")
+	addUpdateJSONLFlag(cmd)
 
 	return cmd
 }
 
 // RunUpdateWorkflows updates workflows from their source repositories.
 // Each workflow is compiled immediately after update.
-func RunUpdateWorkflows(ctx context.Context, opts UpdateWorkflowsOptions) error { //nolint:largefunc
+func RunUpdateWorkflows(ctx context.Context, opts UpdateWorkflowsOptions) (runErr error) { //nolint:largefunc
+	var snapshotTargets []string
+	if updateReporter(ctx) != nil {
+		var err error
+		snapshotTargets, err = updatePRPackageSnapshotTargets(ctx, opts.WorkflowNames)
+		if err != nil {
+			reportUpdateWarning(ctx, "change_observation", err)
+			snapshotTargets = nil
+		}
+	}
+	finish, err := observeUpdateChanges(ctx, opts.WorkflowsDir, snapshotTargets...)
+	if err != nil {
+		return err
+	}
+	defer func() { runErr = errors.Join(runErr, finish()) }()
 	if opts.Verbose {
 		ctx = ctxutil.WithOperationReporter(ctx, reportUpdateNetworkOperation)
 	}
@@ -245,7 +261,9 @@ func RunUpdateWorkflows(ctx context.Context, opts UpdateWorkflowsOptions) error 
 	actionDeps := defaultActionUpdateDeps()
 
 	if err := UpdateWorkflows(ctx, opts); err != nil {
-		firstErr = fmt.Errorf("workflow update failed: %w", err)
+		// Preserved sources have no conflict markers, so scanning later phases
+		// cannot prevent them from rewriting a workflow whose update failed.
+		return fmt.Errorf("workflow update failed: %w", err)
 	}
 
 	// Update GitHub Actions versions in actions-lock.json.
@@ -253,6 +271,7 @@ func RunUpdateWorkflows(ctx context.Context, opts UpdateWorkflowsOptions) error 
 	// Pass --no-release-bump to revert to only forcing updates for core (actions/*) actions.
 	updateLog.Printf("Updating GitHub Actions versions in actions-lock.json: allowMajor=%v, disableReleaseBump=%v", opts.AllowMajor, opts.DisableReleaseBump)
 	if err := updateActions(ctx, actionDeps, opts.AllowMajor, opts.Verbose, opts.DisableReleaseBump, opts.CoolDown); err != nil {
+		reportUpdateWarning(ctx, "actions", err)
 		// Non-fatal: warn but don't fail the update
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Could not update actions-lock.json: %v", err)))
 	}
@@ -278,6 +297,7 @@ func RunUpdateWorkflows(ctx context.Context, opts UpdateWorkflowsOptions) error 
 				firstErr = errors.Join(firstErr, compileErr)
 			}
 		} else {
+			reportUpdateWarning(ctx, "workflow_actions", err)
 			// Non-fatal: warn but don't fail the update
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Could not update action references in workflow files: %v", err)))
 		}
@@ -289,15 +309,18 @@ func RunUpdateWorkflows(ctx context.Context, opts UpdateWorkflowsOptions) error 
 	// and new versions are resolved in a single pass.
 	updateLog.Print("Updating container image digest pins")
 	newContainerPins := false
-	var err error
-	if conflictedWorkflow, scanErr := findWorkflowWithMergeConflictMarkers(opts.WorkflowsDir); scanErr == nil && conflictedWorkflow != "" {
-		message := fmt.Sprintf("Skipping container pin updates and recompilation because merge conflict markers are present in %s", conflictedWorkflow)
+	err = nil
+	if conflictedWorkflow, scanErr := findWorkflowWithMergeConflictMarkers(opts.WorkflowsDir); scanErr != nil {
+		firstErr = errors.Join(firstErr, fmt.Errorf("unable to scan workflows for merge conflicts: %w", scanErr))
+	} else if conflictedWorkflow != "" {
+		message := "Skipping container pin updates and recompilation because merge conflict markers are present in " + conflictedWorkflow
 		updateLog.Print(message)
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(message))
 	} else {
 		newContainerPins, err = updateContainerPins(ctx, defaultContainerPinUpdateDeps(), opts.WorkflowsDir, opts.Verbose, containerPinUpdateOptions{refreshExisting: true})
 	}
 	if err != nil {
+		reportUpdateWarning(ctx, "containers", err)
 		// Non-fatal: Docker may not be available in all environments.
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Could not update container pins: %v", err)))
 	}
@@ -344,6 +367,7 @@ func recompileAllWorkflows(ctx context.Context, workflowsDir, engineOverride str
 }
 
 func runUpdateForTargetRepo(ctx context.Context, targetRepo string, opts UpdateWorkflowsOptions, createPR bool, verbose bool) error { //nolint:largefunc
+	ctx = withUpdateRepository(ctx, targetRepo)
 	if rollout := orgRolloutFromContext(ctx); rollout != nil && rollout.worker {
 		ctx = withUpdateGitHubClient(ctx, verbose)
 	}
@@ -352,7 +376,7 @@ func runUpdateForTargetRepo(ctx context.Context, targetRepo string, opts UpdateW
 		if err != nil {
 			return err
 		}
-		return emitOrgRolloutPreview(preview, len(preview.Workflows) > 0)
+		return emitOrgRolloutPreview(preview, len(preview.Workflows) > 0, ctx)
 	}
 	existing, skip, err := prepareOrgRolloutWorker(ctx, targetRepo, ghawUpdateMarkerPrefix)
 	if err != nil || skip {
@@ -379,7 +403,7 @@ func runUpdateForTargetRepo(ctx context.Context, targetRepo string, opts UpdateW
 			return err
 		}
 		if len(preview.Workflows) == 0 {
-			return emitOrgRolloutResult(orgRolloutResult{Status: "unchanged"})
+			return emitOrgRolloutResult(orgRolloutResult{Status: "unchanged"}, ctx)
 		}
 	}
 
@@ -407,7 +431,7 @@ func runUpdateForTargetRepo(ctx context.Context, targetRepo string, opts UpdateW
 
 	var summary *updatePRSummary
 	if createPR {
-		summary, err = newUpdatePRSummary(ctx, opts.WorkflowsDir)
+		summary, err = newUpdatePRSummary(ctx, opts.WorkflowsDir, opts.WorkflowNames...)
 		if err != nil {
 			return err
 		}
@@ -423,7 +447,7 @@ func runUpdateForTargetRepo(ctx context.Context, targetRepo string, opts UpdateW
 				return err
 			}
 			if !changed {
-				return emitOrgRolloutResult(orgRolloutResult{Status: "unchanged"})
+				return emitOrgRolloutResult(orgRolloutResult{Status: "unchanged"}, ctx)
 			}
 		}
 		xmlMarker := buildOrgXMLMarker(ghawUpdateMarkerPrefix, normalizeDisplayVersion(GetVersion()))
@@ -432,7 +456,7 @@ func runUpdateForTargetRepo(ctx context.Context, targetRepo string, opts UpdateW
 		if err != nil {
 			return err
 		}
-		prBody += "\n" + xmlMarker
+		prBody = appendUpdatePRReleaseHighlights(ctx, prBody, "", xmlMarker)
 		if err := validatePRBody(prBody); err != nil {
 			return err
 		}
@@ -443,13 +467,13 @@ func runUpdateForTargetRepo(ctx context.Context, targetRepo string, opts UpdateW
 		}
 
 		prURL, err := createPRWithChanges(ctx, "update-workflows", "chore: update workflows",
-			"Update workflows from source", prBody, verbose, opts.AutoMerge)
+			updatePRTitle("Update workflows from source"), prBody, verbose, opts.AutoMerge)
 		if prURL != "" {
 			addLabelToOrgPR(ctx, prURL, agenticWorkflowsLabel, verbose)
 		}
 		if err != nil {
 			if rollout := orgRolloutFromContext(ctx); rollout != nil && rollout.worker && prURL != "" {
-				return errors.Join(err, emitOrgRolloutResult(orgRolloutResult{Status: "created", URL: prURL}))
+				return errors.Join(err, emitOrgRolloutResult(orgRolloutResult{Status: "created", URL: prURL}, ctx))
 			}
 			return err
 		}

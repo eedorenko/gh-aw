@@ -2,7 +2,9 @@ package workflow
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"regexp"
@@ -20,6 +22,31 @@ type CopilotModelRoutingConfig struct {
 	Goal          string
 	Mode          string
 	AllowedModels []string
+	// implicit marks the compiler's cost/auto default, as opposed to an
+	// authored or imported engine.model-routing block. It is never emitted.
+	implicit bool
+	// requested is the router value (for example router/economy) that selected
+	// routing through the main agent's model, or "" for engine.model-routing.
+	requested string
+	// selector is the main agent's model expression, in its downstream-job form,
+	// when the activation job decides from it at run time whether routing applies
+	// and with which mode. It is never emitted.
+	selector string
+}
+
+func decodeModelRoutingJSONDocument(raw string, value any) error {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("unexpected trailing JSON value")
+		}
+		return err
+	}
+	return nil
 }
 
 func isModelRoutingEnabled(data *WorkflowData) bool {
@@ -28,7 +55,10 @@ func isModelRoutingEnabled(data *WorkflowData) bool {
 
 func applyModelRoutingEnv(env map[string]string, data *WorkflowData) {
 	if isModelRoutingEnabled(data) {
-		env["GH_AW_MODEL_ROUTING"] = "1"
+		env["GH_AW_MODEL_ROUTING"] = modelRoutingRuntimeFlag(data)
+	}
+	if isModelRoutingDynamic(data) {
+		env[modelRoutingModeEnvVar] = "${{ " + modelRoutingModeDownstream + " }}"
 	}
 }
 
@@ -132,58 +162,60 @@ func walkModelPatterns(request string, aliases map[string][]string, defaultProvi
 }
 
 func (c *Compiler) warnRoutedSubAgentModels(data *WorkflowData) {
-	if !isModelRoutingEnabled(data) {
-		return
+	for _, warning := range modelRoutingCompileWarnings(data) {
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(warning))
+		c.IncrementWarningCount()
 	}
-	c.warnRoutedModelOverrides(data)
+}
+
+// modelRoutingCompileWarnings returns the compile-time warnings for a routed
+// main agent: fixed model overrides, allowed-models excluded by policy, and
+// sub-agent model compatibility.
+func modelRoutingCompileWarnings(data *WorkflowData) []string {
+	if !isModelRoutingEnabled(data) {
+		return nil
+	}
+	var warnings []string
+	if warning := modelRoutingOverrideWarning(data); warning != "" {
+		warnings = append(warnings, warning)
+	}
 	allowed, blocked := resolveModelPolicyForAWFConfig(data)
 	if groups, err := resolveModelRoutingCandidateGroups(data, data.EngineConfig.ID); err == nil && len(groups) > 0 {
 		_, excluded, err := intersectModelRoutingPolicy(groups, allowed, blocked, !apiProxySupportsRoutingCandidateModels(data))
 		if err == nil && len(excluded) > 0 {
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(
-				"engine.model-routing.allowed-models entries excluded by models.allowed or models.blocked will not be selected: "+strings.Join(excluded, ", ")))
-			c.IncrementWarningCount()
+			warnings = append(warnings, "engine.model-routing.allowed-models entries excluded by models.allowed or models.blocked will not be selected: "+strings.Join(excluded, ", "))
 		}
 	}
 	if len(data.SubAgentModels) == 0 {
-		return
+		return warnings
 	}
 	namespace := modelRoutingNamespace(data, data.EngineConfig.ID)
 	for _, agent := range data.SubAgentModels {
 		for _, model := range expandSubagentModelPatterns(agent.Model, data, namespace) {
 			if !modelRoutingEngineSupportsModel(data.EngineConfig.ID, model) {
-				warning := fmt.Sprintf("sub-agent %q model %q may be incompatible with the %s engine's model-routing API", agent.Name, agent.Model, data.EngineConfig.ID)
-				fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(warning))
-				c.IncrementWarningCount()
+				warnings = append(warnings, fmt.Sprintf("sub-agent %q model %q may be incompatible with the %s engine's model-routing API", agent.Name, agent.Model, data.EngineConfig.ID))
 				break
 			}
 		}
 	}
 	firewall := getFirewallConfig(data)
 	if !awfVersionAtLeast(firewall, constants.AWFRoutingCandidateModelsMinVersion) {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(
-			fmt.Sprintf("sub-agent models are limited to engine.model-routing.allowed-models with AWF %s; use AWF %s or newer to apply models.allowed and models.blocked instead",
-				getAWFImageTag(firewall), constants.AWFRoutingCandidateModelsMinVersion)))
-		c.IncrementWarningCount()
-		return
+		return append(warnings, fmt.Sprintf("sub-agent models are limited to engine.model-routing.allowed-models with AWF %s; use AWF %s or newer to apply models.allowed and models.blocked instead",
+			getAWFImageTag(firewall), constants.AWFRoutingCandidateModelsMinVersion))
 	}
 	if !apiProxySupportsRoutingCandidateModels(data) {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(
-			"sub-agent model routing requires an AWF apiProxy image with routing.candidateModels support (v0.28.33+); the configured image is older or its version is unknown. Pin a compatible image in sandbox.agent.images."))
-		c.IncrementWarningCount()
+		warnings = append(warnings, "sub-agent model routing requires an AWF apiProxy image with routing.candidateModels support (v0.28.33+); the configured image is older or its version is unknown. Pin a compatible image in sandbox.agent.images.")
 	}
-	for _, warning := range subAgentModelPolicyWarnings(data, allowed, blocked) {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(warning))
-		c.IncrementWarningCount()
-	}
+	return append(warnings, subAgentModelPolicyWarnings(data, allowed, blocked)...)
 }
 
-func (c *Compiler) warnRoutedModelOverrides(data *WorkflowData) {
+func modelRoutingOverrideWarning(data *WorkflowData) string {
 	if !isModelRoutingEnabled(data) {
-		return
+		return ""
 	}
 	var warnings []string
-	if data.Model != "" {
+	// A dynamic model expression is the routing selector, not a fixed model.
+	if data.Model != "" && !isModelRoutingDynamic(data) {
 		warnings = append(warnings, "model")
 	}
 	if data.EngineConfig != nil {
@@ -198,17 +230,15 @@ func (c *Compiler) warnRoutedModelOverrides(data *WorkflowData) {
 					DefaultThinkingLevel string `json:"defaultThinkingLevel"`
 				} `json:"settings"`
 			}
-			if json.Unmarshal([]byte(data.EngineConfig.Config), &config) == nil && config.Settings.DefaultThinkingLevel != "" {
+			if decodeModelRoutingJSONDocument(data.EngineConfig.Config, &config) == nil && config.Settings.DefaultThinkingLevel != "" {
 				warnings = append(warnings, "engine.config.settings.defaultThinkingLevel")
 			}
 		}
 	}
 	if len(warnings) == 0 {
-		return
+		return ""
 	}
-	fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(
-		"model-routing selection overrides fixed model or effort settings: "+strings.Join(warnings, ", ")))
-	c.IncrementWarningCount()
+	return "model-routing selection overrides fixed model or effort settings: " + strings.Join(warnings, ", ")
 }
 
 func isModelRoutingOverrideEnvKey(key string) bool {
@@ -292,7 +322,7 @@ func modelRoutingDefaultCandidatesPolicyError(engineName, namespace string, allo
 }
 
 func splitModelPolicyRule(rule string) (string, string) {
-	if i := strings.LastIndex(rule, "/"); i >= 0 {
+	if i := strings.Index(rule, "/"); i >= 0 {
 		return rule[:i], rule[i+1:]
 	}
 	return "", rule
@@ -414,11 +444,19 @@ func validateModelRouting(workflowData *WorkflowData, engineName string) error {
 	if !isFirewallEnabled(workflowData) {
 		return NewValidationError("engine.model-routing", "", "task-level model routing requires the AWF firewall", "Enable the AWF firewall for this workflow.")
 	}
+	if workflowData.EngineConfig.ModelCatalogDisabled {
+		return NewValidationError("engine.model-routing", "", "task-level model routing requires the live model catalogue, which engine.model-catalog: false disables",
+			"Remove model-routing (or set it to false), or remove engine.model-catalog: false.")
+	}
 	if err := validateModelRoutingProviderTarget(workflowData, engineName); err != nil {
 		return err
 	}
-	if routing.Goal != "cost" && routing.Goal != "cost-speed" {
-		return NewValidationError("engine.model-routing.goal", routing.Goal, "unsupported model-routing goal", "Use cost or cost-speed.")
+	if routing.requested != "" && len(routing.AllowedModels) > 0 && !apiProxySupportsRoutingCandidateModels(workflowData) {
+		return NewValidationError("model-routing.allowed-models", "", "the configured firewall cannot restrict only the router's candidates",
+			fmt.Sprintf("Use AWF and an apiProxy image with routing.candidateModels support (%s or newer).", constants.AWFRoutingCandidateModelsMinVersion))
+	}
+	if err := validateModelRoutingGoal(workflowData, routing.Goal); err != nil {
+		return err
 	}
 	if routing.Mode != "economy" && routing.Mode != "balanced" && routing.Mode != "robust" && routing.Mode != "auto" {
 		return NewValidationError("engine.model-routing.mode", routing.Mode, "unsupported model-routing mode", "Use economy, balanced, robust, or auto.")
@@ -454,10 +492,22 @@ func validateModelRouting(workflowData *WorkflowData, engineName string) error {
 	} else if err := modelRoutingDefaultCandidatesPolicyError(engineName, modelRoutingNamespace(workflowData, engineName), allowed, blocked); err != nil {
 		return NewValidationError("engine.model-routing.allowed-models", "", "model-routing candidates violate model policy", err.Error())
 	}
-	firewallConfig := getFirewallConfig(workflowData)
-	version := getAWFImageTag(firewallConfig)
+	version := getAWFImageTag(getFirewallConfig(workflowData))
 	if !versionAtLeast(version, string(constants.DefaultFirewallVersion), string(constants.AWFModelRoutingMinVersion)) {
 		return NewValidationError("engine.model-routing", version, fmt.Sprintf("task-level model routing requires AWF %s or newer", constants.AWFModelRoutingMinVersion), fmt.Sprintf("The effective AWF version is %s. Set sandbox.agent.version or firewall.version to %s or newer.", version, constants.AWFModelRoutingMinVersion))
+	}
+	return validateModelRoutingRuntimeCompatibility(workflowData)
+}
+
+func validateModelRoutingGoal(workflowData *WorkflowData, goal string) error {
+	if goal != "cost" && goal != "cost-speed" {
+		return NewValidationError("engine.model-routing.goal", goal, "unsupported model-routing goal",
+			fmt.Sprintf("Use cost. The deprecated cost-speed goal requires an AWF pin older than %s.", constants.AWFCostOnlyModelRoutingMinVersion))
+	}
+	if goal == "cost-speed" && awfVersionAtLeast(getFirewallConfig(workflowData), constants.AWFCostOnlyModelRoutingMinVersion) {
+		return NewValidationError("engine.model-routing.goal", goal,
+			fmt.Sprintf("AWF %s and newer support only cost routing", constants.AWFCostOnlyModelRoutingMinVersion),
+			"Set engine.model-routing.goal to cost and choose economy, balanced, robust, or auto for engine.model-routing.mode. The retired cost-speed goal is not an alias for cost.")
 	}
 	return nil
 }
@@ -469,6 +519,9 @@ func generateModelRoutingConversationStep(yaml *strings.Builder, data *WorkflowD
 	promptFilePath := constants.AwPromptsUserFile
 	fallbackFilePath := constants.AwPromptsFile
 	yaml.WriteString("      - name: Prepare model-routing conversation\n")
+	if isModelRoutingRuntimeGuarded(data) {
+		yaml.WriteString("        if: " + modelRoutingActiveDownstream + "\n")
+	}
 	yaml.WriteString("        env:\n")
 	yaml.WriteString("          GH_AW_ROUTING_PROMPT: " + promptFilePath + "\n")
 	yaml.WriteString("          GH_AW_ROUTING_PROMPT_FALLBACK: " + fallbackFilePath + "\n")

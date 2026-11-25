@@ -287,6 +287,95 @@ Please check the repository for any open issues and create a summary.
 	t.Logf("Successfully compiled workflow to %s", lockFilePath)
 }
 
+func TestCompileSafeOutputsGitHubAppPersistedPRCheckoutTokenIntegration(t *testing.T) {
+	setup := setupIntegrationTest(t)
+	defer setup.cleanup()
+
+	testWorkflow := `---
+name: Safe Outputs PR App Token
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+engine: copilot
+safe-outputs:
+  github-app:
+    app-id: ${{ vars.APP_ID }}
+    private-key: ${{ secrets.APP_PRIVATE_KEY }}
+  create-pull-request:
+    max: 1
+---
+
+Compile a safe-output workflow that can create a pull request.
+`
+	testWorkflowPath := filepath.Join(setup.workflowsDir, "safe-outputs-app-pr-checkout.md")
+	if err := os.WriteFile(testWorkflowPath, []byte(testWorkflow), 0600); err != nil {
+		t.Fatalf("Failed to write test workflow file: %v", err)
+	}
+
+	cmd := exec.Command(setup.binaryPath, "compile", testWorkflowPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI compile command failed: %v\nOutput: %s", err, string(output))
+	}
+
+	lockFilePath := filepath.Join(setup.workflowsDir, "safe-outputs-app-pr-checkout.lock.yml")
+	lockContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockContentStr := string(lockContent)
+	safeOutputsJob := extractYAMLJobSection(lockContentStr, "safe_outputs")
+	if safeOutputsJob == "" {
+		t.Fatalf("Could not find safe_outputs job in lock file\nLock file content:\n%s", lockContentStr)
+	}
+	agentJob := extractYAMLJobSection(lockContentStr, "agent")
+	if agentJob == "" {
+		t.Fatalf("Could not find agent job in lock file\nLock file content:\n%s", lockContentStr)
+	}
+
+	const checkoutMarker = "      - name: Checkout repository (gh-aw default)"
+	checkoutStep := func(job string) string {
+		start := strings.Index(job, checkoutMarker)
+		if start == -1 {
+			return ""
+		}
+		rest := job[start:]
+		if next := strings.Index(rest[len(checkoutMarker):], "\n      - name: "); next != -1 {
+			return rest[:len(checkoutMarker)+next]
+		}
+		return rest
+	}
+
+	safeOutputCheckout := checkoutStep(safeOutputsJob)
+	if safeOutputCheckout == "" {
+		t.Fatalf("Could not find default checkout in safe_outputs job\nJob:\n%s", safeOutputsJob)
+	}
+	if !strings.Contains(safeOutputCheckout, "token: ${{ steps.safe-outputs-app-token.outputs.token }}") {
+		t.Errorf("safe_outputs checkout should use the global GitHub App token\nCheckout:\n%s", safeOutputCheckout)
+	}
+	if !strings.Contains(safeOutputCheckout, "persist-credentials: true") {
+		t.Errorf("safe_outputs checkout should persist credentials for PR pushes\nCheckout:\n%s", safeOutputCheckout)
+	}
+
+	appTokenIndex := strings.Index(safeOutputsJob, "id: safe-outputs-app-token")
+	checkoutIndex := strings.Index(safeOutputsJob, checkoutMarker)
+	if appTokenIndex == -1 || checkoutIndex == -1 || appTokenIndex >= checkoutIndex {
+		t.Errorf("safe_outputs should mint the App token before checkout (mint=%d, checkout=%d)", appTokenIndex, checkoutIndex)
+	}
+
+	agentCheckout := checkoutStep(agentJob)
+	if agentCheckout == "" {
+		t.Fatalf("Could not find default checkout in agent job\nJob:\n%s", agentJob)
+	}
+	if strings.Contains(agentCheckout, "steps.safe-outputs-app-token") {
+		t.Errorf("agent checkout should not use the safe-outputs App token\nCheckout:\n%s", agentCheckout)
+	}
+	if !strings.Contains(agentCheckout, "persist-credentials: false") {
+		t.Errorf("agent checkout should retain its existing credential behavior\nCheckout:\n%s", agentCheckout)
+	}
+}
+
 func TestCompileGHESArtifactPinsIntegration(t *testing.T) {
 	setup := setupIntegrationTest(t)
 	defer setup.cleanup()
@@ -1621,8 +1710,11 @@ engine: copilot
 safe-outputs:
   actions:
     add-label:
-      uses: actions-ecosystem/action-add-labels@v1
+      uses: actions-ecosystem/action-add-labels@18f1af5e3544586314bbe15c0273249c770b2daf
       description: Add a label to the current PR
+      inputs:
+        labels:
+          required: true
       env:
         GITHUB_TOKEN: ${{ github.token }}
 ---
@@ -1985,18 +2077,24 @@ engine: copilot
 safe-outputs:
   actions:
     add-bug-label:
-      uses: actions-ecosystem/action-add-labels@v1
+      uses: actions-ecosystem/action-add-labels@18f1af5e3544586314bbe15c0273249c770b2daf
       description: Add a bug label
+      inputs:
+        labels:
+          required: true
       env:
         GITHUB_TOKEN: ${{ github.token }}
-    close-issue:
-      uses: peter-evans/close-issue@v3
+    close-bug-issue:
+      uses: peter-evans/close-issue@05dff7ca07116e5707cfb3a3cd4af7bb5e43524c
       description: Close the issue
+      inputs:
+        comment:
+          description: Comment before closing the issue
 ---
 
 # Test Multiple Safe Output Actions
 
-Call add_bug_label or close_issue as appropriate.
+Call add_bug_label or close_bug_issue as appropriate.
 `
 	testWorkflowPath := filepath.Join(setup.workflowsDir, "test-multi-safe-output-actions.md")
 	if err := os.WriteFile(testWorkflowPath, []byte(testWorkflow), 0644); err != nil {
@@ -2020,24 +2118,24 @@ Call add_bug_label or close_issue as appropriate.
 	if !strings.Contains(lockContentStr, "id: action_add_bug_label") {
 		t.Errorf("Lock file should contain step 'id: action_add_bug_label'\nLock file content:\n%s", lockContentStr)
 	}
-	if !strings.Contains(lockContentStr, "id: action_close_issue") {
-		t.Errorf("Lock file should contain step 'id: action_close_issue'\nLock file content:\n%s", lockContentStr)
+	if !strings.Contains(lockContentStr, "id: action_close_bug_issue") {
+		t.Errorf("Lock file should contain step 'id: action_close_bug_issue'\nLock file content:\n%s", lockContentStr)
 	}
 
 	// Both payloads must appear in if-conditions
 	if !strings.Contains(lockContentStr, "action_add_bug_label_payload") {
 		t.Errorf("Lock file should contain 'action_add_bug_label_payload'\nLock file content:\n%s", lockContentStr)
 	}
-	if !strings.Contains(lockContentStr, "action_close_issue_payload") {
-		t.Errorf("Lock file should contain 'action_close_issue_payload'\nLock file content:\n%s", lockContentStr)
+	if !strings.Contains(lockContentStr, "action_close_bug_issue_payload") {
+		t.Errorf("Lock file should contain 'action_close_bug_issue_payload'\nLock file content:\n%s", lockContentStr)
 	}
 
 	// GH_AW_SAFE_OUTPUT_ACTIONS must mention both tools
 	if !strings.Contains(lockContentStr, "add_bug_label") {
 		t.Errorf("Lock file should contain 'add_bug_label' in GH_AW_SAFE_OUTPUT_ACTIONS\nLock file content:\n%s", lockContentStr)
 	}
-	if !strings.Contains(lockContentStr, "close_issue") {
-		t.Errorf("Lock file should contain 'close_issue' in GH_AW_SAFE_OUTPUT_ACTIONS\nLock file content:\n%s", lockContentStr)
+	if !strings.Contains(lockContentStr, "close_bug_issue") {
+		t.Errorf("Lock file should contain 'close_bug_issue' in GH_AW_SAFE_OUTPUT_ACTIONS\nLock file content:\n%s", lockContentStr)
 	}
 }
 
@@ -2064,8 +2162,11 @@ safe-outputs:
     allowed: [bug, enhancement]
   actions:
     apply-fix:
-      uses: actions-ecosystem/action-add-labels@v1
+      uses: actions-ecosystem/action-add-labels@18f1af5e3544586314bbe15c0273249c770b2daf
       description: Apply fix label
+      inputs:
+        labels:
+          required: true
       env:
         GITHUB_TOKEN: ${{ github.token }}
 ---
@@ -2123,8 +2224,11 @@ engine: copilot
 safe-outputs:
   actions:
     pin-pr:
-      uses: actions-ecosystem/action-add-labels@v1
+      uses: actions-ecosystem/action-add-labels@18f1af5e3544586314bbe15c0273249c770b2daf
       description: Pin the PR
+      inputs:
+        labels:
+          required: true
 ---
 
 # Actions Only Safe Outputs

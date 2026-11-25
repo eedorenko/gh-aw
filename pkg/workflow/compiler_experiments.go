@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
@@ -33,6 +34,9 @@ const (
 	// ExperimentsStorageRepo uses a git branch (repo-memory) to persist experiment state.
 	// This is the default because experiment data is valuable and repo storage is more durable.
 	ExperimentsStorageRepo ExperimentStorageMode = "repo"
+
+	// ExperimentsStorageBroker delegates assignment and reporting to an OIDC-authenticated broker.
+	ExperimentsStorageBroker ExperimentStorageMode = "broker"
 )
 
 // experimentsBranchPrefix is the git branch prefix used when storage: repo is selected.
@@ -110,7 +114,7 @@ func extractExperimentsStorageFromFrontmatter(frontmatter map[string]any) Experi
 		if s, ok := storageRaw.(string); ok {
 			storage := ExperimentStorageMode(s)
 			switch storage {
-			case ExperimentsStorageCache, ExperimentsStorageRepo:
+			case ExperimentsStorageCache, ExperimentsStorageRepo, ExperimentsStorageBroker:
 				return storage
 			default:
 				experimentsLog.Printf("Unknown experiments storage %q; falling back to %q", s, ExperimentsStorageRepo)
@@ -189,6 +193,9 @@ func applyExperimentConfigMetadata(cfg *ExperimentConfig, raw map[string]any) {
 	}
 	if m, ok := raw["metric"].(string); ok {
 		cfg.Metric = m
+	}
+	if window, ok := raw["adoption_window"].(string); ok {
+		cfg.OutcomeWindow = window
 	}
 	if sd, ok := raw["start_date"].(string); ok {
 		cfg.StartDate = sd
@@ -469,8 +476,25 @@ func ParseExperimentMetricGraderReference(metric string) (string, bool) {
 	return "", false
 }
 
-// validateExperimentMetricReferences ensures experiment metrics that reference evals
-// or graders point to declared IDs.
+// ParseExperimentMetricOutcomeReference returns the adoption kind for a supported
+// adoption:<kind> metric. An unrecognized kind retains the prefix match with an empty kind.
+func ParseExperimentMetricOutcomeReference(metric string) (string, bool) {
+	kind, ok := strings.CutPrefix(strings.TrimSpace(metric), "adoption:")
+	if !ok {
+		return "", false
+	}
+	switch strings.TrimSpace(kind) {
+	case "accepted":
+		return "accepted", true
+	case "zero_touch":
+		return "zero_touch", true
+	default:
+		return "", true
+	}
+}
+
+// validateExperimentMetricReferences validates outcome kinds and maturity windows,
+// and ensures metrics that reference evals or graders point to declared IDs.
 func validateExperimentMetricReferences(configs map[string]*ExperimentConfig, evals *EvalsConfig, graders *GradersConfig) error {
 	if len(configs) == 0 {
 		return nil
@@ -498,6 +522,12 @@ func validateExperimentMetricReferences(configs map[string]*ExperimentConfig, ev
 		if cfg == nil {
 			continue
 		}
+		if cfg.OutcomeWindow != "" && cfg.OutcomeWindow != "auto" {
+			window, err := time.ParseDuration(cfg.OutcomeWindow)
+			if err != nil || window <= 0 {
+				return fmt.Errorf("experiments.%s.adoption_window: invalid value %q. Expected \"auto\" or a positive Go duration. Example: adoption_window: 72h", experimentName, cfg.OutcomeWindow)
+			}
+		}
 		if cfg.Continual != nil {
 			if len(cfg.Variants) != 2 {
 				return fmt.Errorf("experiments.%s.continual: exactly two variants are required (control, candidate)", experimentName)
@@ -508,6 +538,11 @@ func validateExperimentMetricReferences(configs map[string]*ExperimentConfig, ev
 		}
 		if err := validateExperimentMetricReference(experimentName, "metric", cfg.Metric, evalIDs, graderIDs); err != nil {
 			return err
+		}
+		for _, metric := range cfg.SecondaryMetrics {
+			if err := validateExperimentMetricReference(experimentName, "secondary_metrics", metric, evalIDs, graderIDs); err != nil {
+				return err
+			}
 		}
 		for _, guardrail := range cfg.GuardrailMetrics {
 			if err := validateExperimentMetricReference(
@@ -525,6 +560,12 @@ func validateExperimentMetricReference(
 	experimentName, field, metric string,
 	evalIDs, graderIDs map[string]struct{},
 ) error {
+	if strings.HasPrefix(strings.TrimSpace(metric), "outcome:") {
+		return fmt.Errorf("experiments.%s.%s: outcome: metrics have been removed; use adoption:accepted or adoption:zero_touch", experimentName, field)
+	}
+	if kind, referencesOutcome := ParseExperimentMetricOutcomeReference(metric); referencesOutcome && kind == "" {
+		return fmt.Errorf("experiments.%s.%s: unknown adoption metric %q. Expected adoption:accepted or adoption:zero_touch. Example: metric: adoption:accepted", experimentName, field, metric)
+	}
 	referencedEvalID, referencesEval := ParseExperimentMetricEvalReference(metric)
 	if referencesEval {
 		if referencedEvalID == "" {
@@ -586,6 +627,14 @@ func (c *Compiler) generateExperimentSteps(data *WorkflowData) []string {
 	experimentNames := sortedExperimentNames(data.Experiments)
 	experimentsLog.Printf("Generating experiment steps for %d experiment(s): %v (storage=%s)", len(experimentNames), experimentNames, data.ExperimentsStorage)
 
+	if data.ExperimentsStorage == ExperimentsStorageBroker {
+		if data.DryRun {
+			steps := []string{initializeBrokerExperimentStateStep()}
+			steps = append(steps, c.generatePickExperimentStep(data, experimentNames)...)
+			return append(steps, c.generateExperimentArtifactUploadStep(data, SanitizeWorkflowIDForCacheKey(data.WorkflowID))...)
+		}
+		return c.generateBrokerExperimentSteps(data, experimentNames)
+	}
 	if data.ExperimentsStorage == ExperimentsStorageCache {
 		return c.generateExperimentCacheSteps(data, experimentNames)
 	}
@@ -817,7 +866,10 @@ func rewriteDeclaredExperimentNames(s string, experiments map[string][]string, p
 func rewriteExpressionReferences(s string, prefix []string, replace func(string) (string, bool)) string {
 	var b strings.Builder
 	last := 0
-	spans, _ := actionslanguageservice.ExtractExpressions(s)
+	spans, err := actionslanguageservice.ExtractExpressions(s)
+	if err != nil {
+		return s
+	}
 	for _, span := range spans {
 		expression, err := actionslanguageservice.ParseSyntax(span.Content)
 		if err != nil {
@@ -828,8 +880,9 @@ func rewriteExpressionReferences(s string, prefix []string, replace func(string)
 			if !ok {
 				return true
 			}
-			if len(path) == len(prefix)+1 && referenceHasPrefix(path, prefix) {
-				if replacement, changed := replace(path[len(prefix)]); changed {
+			index := len(prefix)
+			if index >= 0 && index < len(path) && len(path) == index+1 && referenceHasPrefix(path, prefix) {
+				if replacement, changed := replace(path[index]); changed {
 					start, end := span.Start+3+node.Start, span.Start+3+node.End
 					b.WriteString(s[last:start])
 					b.WriteString(replacement)
@@ -948,7 +1001,7 @@ func (c *Compiler) buildPushExperimentsStateSteps(data *WorkflowData) []string {
 	var steps []string
 	steps = append(steps, c.buildPushExperimentsStateSetupSteps(data)...)
 	steps = append(steps, buildPushExperimentsStateCheckoutStep())
-	steps = append(steps, c.generateGitConfigurationSteps()...)
+	steps = append(steps, c.generateGitConfigurationStepsWithToken("${{ github.token }}", "${{ github.repository }}")...)
 	steps = append(steps, c.buildPushExperimentsStateDownloadStep(data))
 	steps = append(steps, buildPushExperimentsStateScriptStep(data))
 	if c.actionMode.IsDev() {

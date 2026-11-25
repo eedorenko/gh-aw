@@ -17,13 +17,14 @@ model: copilot/gpt-6-luna
 imports:
   - uses: shared/meta-analysis-base.md
     with:
-      toolsets: [default]
+      toolsets: [default, discussions, actions]
   - shared/otlp.md
   - shared/reporting.md
 tools:
   github:
     mode: local
   repo-memory:
+  - id: default
     branch-name: memory/meta-orchestrators
     file-glob: "metrics/**"
     allowed-extensions: [".json"]
@@ -43,6 +44,45 @@ tools:
         if (!snapshot.workflows || Array.isArray(snapshot.workflows) ||
             typeof snapshot.workflows !== "object" || Object.keys(snapshot.workflows).length === 0) {
           throw new Error("Latest metrics must contain workflow records.");
+        }
+        if (!["complete", "partial"].includes(snapshot.collection_status) ||
+            !Array.isArray(snapshot.unclassified_conclusions)) {
+          throw new Error("Metrics must declare collection status and unclassified conclusions.");
+        }
+        if (snapshot.collection_status === "partial" &&
+            (typeof snapshot.collection_note !== "string" || snapshot.collection_note.trim() === "")) {
+          throw new Error("Partial metrics must include a collection note.");
+        }
+        if (snapshot.unclassified_conclusions.length > 0 && snapshot.collection_status !== "partial") {
+          throw new Error("Unclassified conclusions require partial collection status.");
+        }
+        for (const item of snapshot.unclassified_conclusions) {
+          if (!item || typeof item.workflow !== "string" || !snapshot.workflows[item.workflow] ||
+              typeof item.conclusion !== "string" || item.conclusion.trim() === "" ||
+              !Number.isSafeInteger(item.count) || item.count <= 0) {
+            throw new Error("Unclassified conclusions must identify a workflow, conclusion, and positive count.");
+          }
+          if (!snapshot.collection_note.includes(`${item.workflow} (${item.conclusion}: ${item.count})`)) {
+            throw new Error("Collection note must identify each unclassified conclusion and count.");
+          }
+        }
+        for (const [name, workflow] of Object.entries(snapshot.workflows)) {
+          const runs = workflow?.workflow_runs;
+          const counts = ["total", "successful", "failed", "skipped", "action_required"];
+          if (!runs || counts.some(field => !Number.isSafeInteger(runs[field]) || runs[field] < 0)) {
+            throw new Error(`Workflow run counts must be non-negative integers: ${name}.`);
+          }
+          const outcomeTotal = runs.successful + runs.failed + runs.skipped + runs.action_required;
+          if (runs.total !== outcomeTotal) {
+            throw new Error(`Workflow run total does not match outcome counts: ${name}.`);
+          }
+          if (runs.executed !== runs.successful + runs.failed ||
+              (runs.executed === 0
+                ? runs.success_rate !== null
+                : !Number.isFinite(runs.success_rate) ||
+                  runs.success_rate !== runs.successful / runs.executed)) {
+            throw new Error(`Workflow executed count or success rate is inconsistent: ${name}.`);
+          }
         }
         const day = timestamp.toISOString().slice(0, 10);
         const dailyPath = path.join(root, "daily", `${day}.json`);
@@ -94,7 +134,20 @@ tools:
         if (artifactBytes > maxArtifactBytes || artifactFiles > maxArtifactFiles) {
           throw new Error("Metrics upload exceeds the 16MiB or 100-file artifact budget.");
         }
+  - id: lifecycle
+    branch-name: memory/output-lifecycle
+    file-glob: ["lifecycle.jsonl", "collection.json"]
+    allowed-extensions: [".jsonl", ".json"]
+    max-file-size: 16777216
+    max-file-count: 2
+    max-patch-size: 1048576
 pre-agent-steps:
+  - name: Collect and refresh retained delivery lifecycle
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      EXPR_GITHUB_REPOSITORY: ${{ github.repository }}
+    run: node actions/setup/js/collect_lifecycle.cjs
   - name: Record metrics baseline timestamp
     run: |
       set -euo pipefail
@@ -191,6 +244,22 @@ As an infrastructure agent, you collect and persist performance data that enable
 - **Collection Time**: $(date +%H:%M:%S) UTC
 - **Storage Path**: `/tmp/gh-aw/repo-memory/default/metrics/`
 
+#### Retained lifecycle snapshot
+
+The deterministic pre-agent collector prepares `metrics/lifecycle.json` before
+you start. Preserve it unchanged. It contains per-workflow and fleet delivery,
+human/fallback adoption, and snapshot-survival counts for retained deliveries,
+including outputs from older runs. Workflow keys are source workflow paths.
+Read its `coverage`, discovery checkpoint, deferred count, and errors before
+interpreting it. This retained population is separate from the recent-run cohort
+below; do not add its counts to that cohort or call them attributed value.
+
+The separate `/tmp/gh-aw/repo-memory/lifecycle/` memory holds the authoritative
+per-item ledger and discovery checkpoint. Do not edit that directory. Collection
+resumes saved windows after missed runs and retries unavailable execution evidence;
+bounded or incomplete work stays explicit. No webhooks or agent classification
+are required for this refresh.
+
 #### Pre-flight: Clean Memory Directory
 
 **MANDATORY FIRST STEP** — Run this bash command before doing anything else. It removes any non-metrics files that may be present from previous failed runs and ensures only `metrics/**` files exist in your working directory:
@@ -217,12 +286,13 @@ If you see any `.md` files at the root (e.g. `agent-performance-latest.md`, `sha
   - start_date: "-1d" (last 24 hours)
   - count: 20
   - timeout: 1
+  - adoption: true
   - Include all workflows (no workflow_name filter)
   ```
 - **Pagination loop (required)**: the `logs` tool returns a `continuation` field when it stops
   early (timeout or count limit). While a `continuation` field is present in the returned data,
   issue another `logs` call using the parameters it provides (notably `before_run_id`, plus the
-  original `start_date`) with `count: 20` and `timeout: 1`, and accumulate the runs from every
+  original `start_date`) with `count: 20`, `timeout: 1`, and `adoption: true`, and accumulate the runs from every
   batch. Stop only when there is no `continuation` field **and** the oldest collected run is at or
   before the 24h window start. Do not stop after a fixed number of batches if the oldest collected
   run is still newer than the window start; that produces a partial ~10h snapshot.
@@ -235,13 +305,20 @@ If you see any `.md` files at the root (e.g. `agent-performance-latest.md`, `sha
 - Never issue a single `logs` call with `count >= 100` for the full `-1d` window: that request
   has repeatedly exceeded the 60s tool timeout and yields truncated data.
 - From the logs data, extract for each workflow:
-  - Total runs in last 24 hours
+  - Count completed runs by conclusion, and set `total` to the sum of the reported outcome counts:
+    `successful + failed + skipped + action_required`. Do not count a run twice or include queued
+    or in-progress runs in `total`.
   - Successful runs (conclusion: "success")
-  - Failed runs (conclusion: "failure", "cancelled", "timed_out")
+  - Failed runs (conclusion: "failure", "cancelled", "timed_out", "startup_failure"). Treat
+    `startup_failure` as failed because it is a completed run that did not succeed.
   - Skipped runs (conclusion: "skipped")
   - Approval-gated runs (conclusion: "action_required")
   - Executed runs: `successful + failed`
   - Calculate success rate: `successful / executed`; use `null` when `executed` is 0
+  - For every completed run with an unclassified conclusion, add its workflow, conclusion, and
+    count to the top-level `unclassified_conclusions` array. Set `collection_status` to `partial`
+    and include `<workflow> (<conclusion>: <count>)` in `collection_note`; do not silently include it
+    in `total`.
   - Token usage and costs (if available in logs)
   - Execution duration statistics
 
@@ -252,17 +329,26 @@ If you see any `.md` files at the root (e.g. `agent-performance-latest.md`, `sha
   - Comments added by workflows
   - Discussions created by workflows
 - Extract and count these for each workflow
-- Extract typed safe-output counts as well:
+- Keep execution activity, delivery, and adoption separate:
   - `safe_outputs_by_type`: aggregate usage activity `safe_outputs.items_by_type` from each run
-    (for example `create_issue`, `create_pull_request`, `add_comment`, `create_discussion`)
-  - `safe_output_outcomes`: aggregate outcome fields from logs summaries and outcome reports:
-    `accepted`, `rejected`, `ignored`, `pending`, `lifecycle`, and `lifecycle_close`
-  - Never leave these fields absent; use empty objects/zero counts only when the full data source
-    was checked and no matching items exist.
+    (for example `create_issue`, `create_pull_request`, `add_comment`, `create_discussion`).
+    Activity is not proof of delivery.
+  - `safe_output_delivery`: aggregate `.delivery[]` by workflow, counting unique delivery IDs.
+    Record `delivered` and `coverage`; only complete execution evidence establishes zero.
+  - `safe_output_adoption`: aggregate `.adoption[].summary` by workflow, deduplicating
+    the same run/attempt and delivery IDs across batches. Record `coverage`, `accepted`,
+    `accepted_human`, `accepted_automation`, `accepted_delivery_fallback`, `rejected`,
+    `not_applicable`, `pending`, `lifecycle`, and `unknown`. Human, automation, and fallback
+    counts must sum to `accepted`.
+  - Keep these lifecycle objects present at workflow and ecosystem levels. Preserve valid partial
+    observations with `coverage: "partial"`; use `null` counts and `coverage: "unavailable"` when
+    evidence is absent. Never infer pending adoption or zero delivery from missing evidence.
+  - Adoption is the observed snapshot for the selected run cohort, not a count of all decisions
+    made during the collection window. Neither adoption counts nor snapshot survival are attributed value.
 - **If the accumulated log batches still do not cover the full 24h window** (i.e. the oldest run
   collected is newer than 24h ago), do **not** report `safe_outputs`, `safe_outputs_by_type`, or
-  `safe_output_outcomes` as zero. Instead compute safe-output counts from the GitHub API fallback
-  described below and mark the source accordingly.
+  lifecycle counts as zero. The GitHub API fallback below can supply resource/activity counts,
+  but cannot replace gh-aw delivery or adoption evidence.
 
 **Safe Outputs Fallback (GitHub API)**:
 
@@ -278,25 +364,28 @@ API instead of zeroing them:
 Attribute each result to a workflow and type via its `gh-aw-workflow-call-id` footer marker and
 item shape, aggregate the counts per workflow, and set `"safe_outputs_source":
 "github_api_fallback"` alongside a `collection_note` explaining the truncation. When API fallback
-cannot determine outcome status, set those items to `"pending"` rather than omitting the
-`safe_output_outcomes` breakdown. The same fallback applies to `engagement` fields.
+cannot establish delivery or adoption, retain any gh-aw observations with partial coverage or
+set the corresponding lifecycle counts to `null` with unavailable coverage. Do not classify
+resources independently or fabricate pending adoption. The same fallback applies to `engagement`
+activity fields, not lifecycle decisions.
 
 **Workflow Runs Fallback (GitHub API)**:
 
 When the logs-based path is truncated or unavailable, paginate `list_workflow_runs` across the full
-collection window and classify each run by its `conclusion`. Count `success` as `successful`;
-`failure`, `cancelled`, and `timed_out` as `failed`; and count `skipped` and `action_required`
-separately. Set `executed` to `successful + failed` and calculate `success_rate` as
-`successful / executed`; when `executed` is 0, set `success_rate` to `null`. Never treat skipped or
-approval-gated runs as failures. Include all counts in every workflow's `workflow_runs` object,
-including zero values, and set `"data_source": "github_api_fallback"` plus a `collection_note`
-describing why fallback was used.
+collection window and apply the same conclusion mapping and unknown-conclusion handling as the
+logs path. Count completed `success` as `successful`; `failure`, `cancelled`, `timed_out`, and
+`startup_failure` as `failed`; and count `skipped` and `action_required` separately. Set `total` to
+`successful + failed + skipped + action_required`, excluding queued and in-progress runs. Set
+`executed` to `successful + failed` and calculate `success_rate` as `successful / executed`; when
+`executed` is 0, set `success_rate` to `null`. Never treat skipped or approval-gated runs as
+failures. Include all counts in every workflow's `workflow_runs` object, including zero values, and
+set `"data_source": "github_api_fallback"` plus a `collection_note` describing why fallback was used.
 
 **Additional Metrics via GitHub API**:
-- Use GitHub MCP server (default toolset) to supplement with:
+- Use GitHub MCP server (`default`, `discussions`, and `actions` toolsets) to supplement with:
   - Engagement metrics: reactions on issues created by workflows
   - Comment counts on PRs created by workflows
-  - Discussion reply counts
+  - Discussion reply counts (`list_discussions`, then `get_discussion_comments`)
   
 **Quality Indicators**:
 - For merged PRs: Calculate merge time (created_at to merged_at)
@@ -312,6 +401,8 @@ Create a JSON object following this schema:
   "timestamp": "2024-12-24T00:00:00Z",
   "period": "daily",
   "collection_status": "complete",
+  "collection_note": "",
+  "unclassified_conclusions": [],
   "collection_window": {
     "start": "2024-12-23T00:00:00Z",
     "end": "2024-12-24T00:00:00Z",
@@ -333,13 +424,21 @@ Create a JSON object following this schema:
         "add_comment": 10,
         "create_discussion": 1
       },
-      "safe_output_outcomes": {
-        "accepted": 9,
+      "safe_output_delivery": {
+        "delivered": 18,
+        "coverage": "complete"
+      },
+      "safe_output_adoption": {
+        "coverage": "complete",
+        "accepted": 11,
+        "accepted_human": 1,
+        "accepted_automation": 0,
+        "accepted_delivery_fallback": 10,
         "rejected": 1,
-        "ignored": 2,
+        "not_applicable": 0,
         "pending": 6,
         "lifecycle": 0,
-        "lifecycle_close": 0
+        "unknown": 0
       },
       "workflow_runs": {
         "total": 7,
@@ -348,7 +447,7 @@ Create a JSON object following this schema:
         "skipped": 0,
         "action_required": 0,
         "executed": 7,
-        "success_rate": 0.857,
+        "success_rate": 0.8571428571428571,
         "avg_duration_seconds": 180,
         "total_tokens": 45000,
         "total_cost_usd": 0.45
@@ -375,13 +474,21 @@ Create a JSON object following this schema:
       "add_comment": 15,
       "create_discussion": 2
     },
-    "safe_output_outcomes": {
+    "safe_output_delivery": {
+      "delivered": 45,
+      "coverage": "complete"
+    },
+    "safe_output_adoption": {
+      "coverage": "complete",
       "accepted": 24,
+      "accepted_human": 10,
+      "accepted_automation": 0,
+      "accepted_delivery_fallback": 14,
       "rejected": 5,
-      "ignored": 6,
-      "pending": 10,
+      "not_applicable": 0,
+      "pending": 16,
       "lifecycle": 0,
-      "lifecycle_close": 0
+      "unknown": 0
     },
     "overall_success_rate": 0.892,
     "total_tokens": 1250000,
@@ -413,9 +520,9 @@ Create a JSON object following this schema:
 - Repo-memory uploads the retained directory as one Actions artifact, not a safe-output
   `upload-artifact` operation. Its dated-snapshot portion is at most 31 files
   and 15.5MiB at the file cap, below the default 100-changed-file persistence limit.
-  Supplemental JSON (for example an existing `daily/summary.json`) is preserved and remains
-  subject to file/count/patch checks; it is not a dated snapshot. The complete eligible
-  metrics upload, including supplemental JSON, is capped at 16MiB and 100 files by the validator.
+  Supplemental JSON is preserved and remains subject to file/count/patch checks; it is not a
+  dated snapshot. The complete eligible metrics upload is capped at 16MiB and 100 files by the
+  validator.
 
 **Create Directory Structure**:
 ```bash
@@ -473,6 +580,11 @@ Consumers can still read older backing-branch snapshots; branch cleanup is a sep
 
 ### 5. Calculate Ecosystem Aggregates
 
+Include the `ecosystem` object from the schema in every daily snapshot and in `latest.json`.
+Keep its keys and value types consistent across snapshots, including when a value is zero or
+unavailable; use `null` for an unavailable rate instead of omitting the field. Do not write a
+separate aggregate file in place of the dated snapshots.
+
 **Total Workflows**:
 - Use the agentic-workflows `status` tool to get count of all workflows
 
@@ -483,8 +595,9 @@ Consumers can still read older backing-branch snapshots; branch cleanup is a sep
 - Sum of all safe outputs (issues + PRs + comments + discussions) across all workflows
 
 **Overall Success Rate**:
-- Calculate: `(sum of successful runs across all workflows) / (sum of executed runs across all workflows)`
+- Calculate from the per-workflow counts: `(sum of successful runs) / (sum of executed runs)`
 - Set it to `null` when the ecosystem has no executed runs
+- Do not average per-workflow or daily success rates to produce the ecosystem rate
 
 **Total Resource Usage**:
 - Sum total tokens used across all workflows
@@ -496,12 +609,12 @@ Consumers can still read older backing-branch snapshots; branch cleanup is a sep
 
 **Primary data source**: Use the agentic-workflows tool for all workflow run metrics:
 1. Start with `status` tool to get workflow inventory
-2. Use `logs` tool with `start_date: "-1d"`, `count: 20`, and `timeout: 1`, then follow the
+2. Use `logs` tool with `start_date: "-1d"`, `count: 20`, `timeout: 1`, and `adoption: true`, then follow the
    `continuation` field (using its `before_run_id`) until the oldest collected run reaches the
    24h window start. On a 60-second context-deadline error, switch directly to the GitHub API
    fallback instead of retrying smaller counts.
 3. Extract metrics from the accumulated log data (success/failure/skipped/action-required, tokens,
-   costs, safe outputs, typed safe-output counts, and outcome breakdowns)
+   costs, safe-output activity, delivery evidence, and adoption breakdowns).
 
 **Secondary data source**: Use GitHub MCP server for engagement metrics only:
 - Reactions on issues/PRs created by workflows
@@ -511,7 +624,8 @@ Consumers can still read older backing-branch snapshots; branch cleanup is a sep
 ### Handling Missing Data
 
 - If a workflow has no runs in the last 24 hours, set all run metrics to 0
-- If a workflow has no safe outputs, set all safe output counts to 0
+- Set delivery and adoption counts to 0 only when complete gh-aw evidence establishes no
+  deliveries. Unavailable lifecycle evidence stays `null`, including when the logs tool is unavailable.
 - **Never report `safe_outputs` or `engagement` as 0 merely because the `logs` tool timed out or
   returned a truncated window** — use the GitHub API safe-outputs fallback above and set
   `"safe_outputs_source": "github_api_fallback"`. Only report 0 when the data source actually
@@ -520,9 +634,11 @@ Consumers can still read older backing-branch snapshots; branch cleanup is a sep
 - Always include workflows in the metrics even if they have no activity (helps detect stalled workflows)
 - **If the agentic-workflows `logs` tool is unavailable**, collect what you can from the GitHub API directly using the Workflow Runs Fallback rules above and set `"data_source": "github_api_fallback"` in the JSON
 - Set `"collection_status": "complete"` only when workflow run counts and safe-output breakdowns
-  cover the full 24h window through logs data and/or the GitHub API fallback. Set
-  `"collection_status": "partial"` only when both logs pagination and fallback collection fail to
-  cover the window, and include a precise `collection_note` plus `collection_window.coverage_hours`.
+  cover the full 24h window, delivery and adoption coverage are complete, and
+  `unclassified_conclusions` is empty. Set `"collection_status": "partial"` when either coverage is
+  incomplete or any completed run has an unclassified conclusion, even if time coverage is complete.
+  Include a precise `collection_note` and list each unclassified workflow, conclusion, and count in
+  `unclassified_conclusions`.
 - **NEVER write a partial stub file like `{"date": "...", "status": "no-data"}`** — if you can't collect data, write a minimal valid metrics JSON with zeros instead:
   ```json
   {
@@ -530,11 +646,28 @@ Consumers can still read older backing-branch snapshots; branch cleanup is a sep
     "period": "daily",
     "collection_status": "partial",
     "collection_note": "Description of what could not be collected",
+    "unclassified_conclusions": [],
     "workflows": {},
     "ecosystem": {
       "total_workflows": 0,
       "active_workflows": 0,
       "total_safe_outputs": 0,
+      "safe_output_delivery": {
+        "delivered": null,
+        "coverage": "unavailable"
+      },
+      "safe_output_adoption": {
+        "coverage": "unavailable",
+        "accepted": null,
+        "accepted_human": null,
+        "accepted_automation": null,
+        "accepted_delivery_fallback": null,
+        "rejected": null,
+        "not_applicable": null,
+        "pending": null,
+        "lifecycle": null,
+        "unknown": null
+      },
       "overall_success_rate": 0,
       "total_tokens": 0,
       "total_cost_usd": 0
@@ -563,20 +696,48 @@ The agentic-workflows logs tool provides structured data with workflow names alr
 
 #### Output Format
 
+When producing a reader-facing Markdown collection summary, use this format:
+
+- Use `###` or lower for all report headings; reserve `#` and `##` for the
+  surrounding GitHub page.
+- Structure the summary as overview → key metrics and collection issues →
+  collapsible detail → next actions and/or limitations. Keep decision-relevant
+  metrics and limitations visible before any collapsible section.
+- Put long tables, item lists, raw evidence, and detailed findings in
+  `<details><summary><b>...</b></summary>...</details>` blocks.
+- When referencing workflow runs, use
+  `[§RUN_ID](https://github.com/owner/repo/actions/runs/RUN_ID)`, replacing the
+  placeholders with the actual owner, repository, and run ID.
+- This formatting applies only to summaries in logs or safe-output messages.
+  Continue storing metrics as JSON under `metrics/`; do not create Markdown
+  files, issues, PRs, or comments.
+
 At the end of collection:
 
 1. **Summary Log**:
    ```
-   ✅ Metrics collection completed
-   
-   📊 Collection Summary:
-   - Workflows analyzed: 120
-   - Active workflows: 85
-   - Total safe outputs: 45
-   - Overall success rate: 89.2%
-   - Storage: /tmp/gh-aw/repo-memory/default/metrics/daily/2024-12-24.json
-   
-   ⏱️  Collection took: 45 seconds
+   ### Overview
+   Metrics collection completed for the UTC reporting window.
+
+   ### Key Metrics and Issues
+
+   | Metric | Value |
+   |---|---:|
+   | Workflows analyzed | 120 |
+   | Active workflows | 85 |
+   | Overall success rate | 89.2% |
+
+   Collection status: complete. If partial, state the specific limitations here.
+
+   <details>
+   <summary><b>Detailed metrics</b></summary>
+
+   Long tables, workflow-level item lists, raw evidence, and detailed findings.
+
+   </details>
+
+   ### Next Actions
+   - Downstream meta-orchestrators can analyze the persisted metrics.
    ```
 
 2. **File Operations Log**:
@@ -649,16 +810,23 @@ echo "Stored date: $STORED_DATE | Today: $TODAY"
 # Step 5: Validate workflow-run classification and success-rate semantics
 jq -e '
   all(.workflows[]?.workflow_runs;
-    has("skipped") and
-    has("action_required") and
-    has("executed") and
-    .executed == ((.successful // 0) + (.failed // 0)) and
-    (if .executed == 0 then
-       .success_rate == null
+    . as $runs |
+    ["total", "successful", "failed", "skipped", "action_required", "executed"] as $fields |
+    all($fields[]; . as $field |
+      ($runs[$field] | if type == "number" then . >= 0 and floor == . else false end)
+    ) and
+    $runs.total == ($runs.successful + $runs.failed + $runs.skipped + $runs.action_required) and
+    $runs.executed == ($runs.successful + $runs.failed) and
+    (if $runs.executed == 0 then
+       $runs.success_rate == null
      else
-       ((.success_rate - (.successful / .executed)) | fabs) < 0.001
+       $runs.success_rate == ($runs.successful / $runs.executed)
      end)
-  )
+  ) and
+  (.collection_status == "complete" or .collection_status == "partial") and
+  (.unclassified_conclusions | type == "array") and
+  ((.unclassified_conclusions | length) == 0 or .collection_status == "partial") and
+  (.collection_status != "partial" or (.collection_note | type == "string" and length > 0))
 ' /tmp/gh-aw/repo-memory/default/metrics/latest.json >/dev/null || {
   echo "ERROR: workflow run classifications or success rates are inconsistent"
   exit 1

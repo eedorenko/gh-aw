@@ -35,6 +35,7 @@ Configure the authentication method your AI engine needs before running your fir
 
 - **Standard:** [`OPENAI_API_KEY`](#openai_api_key) or `CODEX_API_KEY`; the runtime checks `CODEX_API_KEY` first
 - **Keyless alternative:** [Azure Entra OIDC](#codex-azure-entra-oidc) through the AWF API proxy
+- **Keyless alternative:** [OpenAI Workload Identity Federation](#codex-openai-workload-identity-federation) through the AWF API proxy
 
 ### Gemini
 
@@ -59,9 +60,9 @@ Workflows using the following **read** operations from GitHub require [Additiona
 - **Read from projects**
 - **GitHub tools remote mode**
 
-Workflows using the following features of [Safe Outputs](/gh-aw/reference/safe-outputs/) require additional authentication, via either a secret containing a PAT or GitHub App:
+Workflows using the following features of [Safe Outputs](/gh-aw/reference/safe-outputs/) require additional authentication. Use a PAT or GitHub App unless noted otherwise:
 - [**Safe outputs writing cross-repo**](/gh-aw/reference/safe-outputs/#cross-repository-operations)
-- [**Safe outputs assigning Copilot coding agent to issues/PRs**](/gh-aw/reference/copilot-cloud-agent/)
+- [**Safe outputs assigning Copilot coding agent to issues/PRs**](/gh-aw/reference/copilot-cloud-agent/) — **PAT required; GitHub App tokens are not supported.** Configure `github-token:` under `assign-to-agent` or at the `safe-outputs` level, or set the `GH_AW_AGENT_TOKEN` secret. Without an explicit token, resolution tries `GH_AW_AGENT_TOKEN || GH_AW_GITHUB_TOKEN || GITHUB_TOKEN`. See the [Copilot Cloud Agent authentication caution](/gh-aw/reference/copilot-cloud-agent/#using-a-github-app).
 - [**Safe outputs updating GitHub Projects**](/gh-aw/patterns/project-ops/#project-token-authentication)
 - [**Safe outputs triggering CI on PRs**](/gh-aw/reference/triggering-ci/)
 
@@ -120,7 +121,7 @@ permissions:
 When this permission is present, gh-aw automatically uses the GitHub Actions token for Copilot inference. Any value set for `COPILOT_GITHUB_TOKEN` or `GH_AW_GITHUB_TOKEN` is **ignored** for inference — those tokens are not passed to the Copilot engine.
 
 > [!NOTE]
-> `copilot-requests: write` requires that your organization has a Copilot subscription and that centralized billing is enabled. If the Actions token does not have Copilot access, the workflow will fail at the inference step — configure `COPILOT_GITHUB_TOKEN` instead.
+> `copilot-requests: write` requires an organization-owned repository, a Copilot subscription with centralized billing enabled, and an Actions token with Copilot access. It is not available in personal repositories. If organization billing is unavailable, omit the permission and use `COPILOT_GITHUB_TOKEN` if PAT-based Copilot inference is approved.
 
 **Why this is preferred**:
 
@@ -380,7 +381,73 @@ is available. Inherited Codex threat detection and same-provider OpenAI fallback
 models use the same authentication. Other fallback providers still require
 their own credentials.
 
+OIDC-authenticated threat detection requires AWF `v0.25.3` or newer so that
+Actions OIDC request credentials are excluded from the detector container.
+The compiler rejects older versions before granting the detection job
+`id-token: write`.
+
 See also [AI Engines](/gh-aw/reference/engines/#built-in-ai-engines) for additional configuration needed when using Codex with GitHub MCP.
+
+---
+
+### Codex OpenAI Workload Identity Federation
+
+Codex can use an OpenAI service account with GitHub Actions Workload Identity
+Federation through the AWF API proxy, without a long-lived `OPENAI_API_KEY`.
+The proxy exchanges the GitHub OIDC token for an OpenAI access token and keeps
+both credentials outside the agent container.
+
+Configure an OpenAI Workload Identity Provider and service account in the OpenAI
+admin console. Restrict its GitHub claims to the intended repository, ref,
+environment, and workflow. Set the OIDC audience to the exact audience configured
+for that OpenAI provider. The workflow also needs `permissions.id-token: write`.
+
+```aw wrap
+permissions:
+  contents: read
+  id-token: write
+engine:
+  id: codex
+  model: openai/gpt-6.1-sol
+  auth:
+    type: github-oidc
+    provider: openai
+    identity-provider-id: ${{ vars.OPENAI_IDENTITY_PROVIDER_ID }}
+    service-account-id: ${{ vars.OPENAI_SERVICE_ACCOUNT_ID }}
+    audience: https://api.openai.com/v1
+network:
+  allowed:
+    - defaults
+    - api.openai.com
+```
+
+`identity-provider-id`, `service-account-id`, and `audience` are required for
+`provider: openai`. This authentication mode requires Codex, the OpenAI inference
+provider, and an enabled firewall; `sandbox.agent: false` is not supported.
+The compiler maps these values to `AWF_AUTH_OPENAI_*` and
+`AWF_AUTH_OIDC_AUDIENCE` for the AWF API proxy. OpenAI WIF requires AWF
+`v0.29.11` or newer; this is also the current default pin. An explicit
+`sandbox.agent.version` or `network.firewall.version` must use a full semantic
+version at or above that minimum, not a moving tag such as `latest`. If
+`sandbox.agent.images.api-proxy` overrides the proxy image, its semantic-version
+tag must also be `v0.29.11` or newer; digest-only references and non-version tags
+such as `stable` are rejected. The version gate also applies when WIF is
+configured through `engine.env.AWF_AUTH_*` instead of `engine.auth`.
+The proxy uses its dedicated egress path
+for the `auth.openai.com` token exchange, so do not add that host to
+`network.allowed`; the optional `codex-vendor` network opt-in is not required
+for WIF. Codex startup verifies that fresh AWF reflection reports the
+configured OpenAI WIF endpoint before launching.
+
+Codex threat detection inherits the main Codex engine's auth unless its engine
+configuration supplies its own auth, including with a same-engine detector
+override. The generated detection job receives `id-token: write`. This does not
+apply to [evals](/gh-aw/reference/experiments/#analyze-an-eval-backed-metric), which call Decisions
+directly and still require `CODEX_API_KEY` or `OPENAI_API_KEY` for OpenAI models.
+Complete OpenAI WIF settings supplied through `engine.env.AWF_AUTH_*` also
+produce a keyless Codex detector; setting only the auth type and provider does
+not grant OIDC permission. Detector validation checks the effective proxy image,
+including container-pin redirects from `aw.json`.
 
 ---
 
@@ -488,7 +555,7 @@ The `ANTHROPIC_API_KEY` secret is missing, expired, or invalid. Verify the key i
 
 **`401 Unauthorized` or `403 Forbidden` (Codex)**
 
-The `OPENAI_API_KEY` (or `CODEX_API_KEY`) secret is missing, expired, or has insufficient quota. Verify the key at https://platform.openai.com/api-keys. If using a custom endpoint, confirm `OPENAI_BASE_URL` points to a reachable host and that the host is listed under `network.allowed`.
+The `OPENAI_API_KEY` (or `CODEX_API_KEY`) secret is missing, expired, or has insufficient quota. Verify the key at https://platform.openai.com/api-keys. If using a custom endpoint, confirm `OPENAI_BASE_URL` points to a reachable host. The firewall allows the configured host automatically (including `${{ vars.* }}`/`${{ secrets.* }}` values resolved at runtime), so broad `network.allowed` entries are unnecessary. If `sandbox.agent.version` pins an older AWF version, list the exact host in `network.allowed`.
 
 **`401 Unauthorized` (Gemini)**
 
@@ -500,7 +567,7 @@ If the token is correctly configured but Copilot fails at the inference step, th
 
 **`Error loading models: 400 Bad Request` (Copilot on GHES)**
 
-Copilot is not licensed at the enterprise level or the API proxy is routing incorrectly. See [Copilot Engine Prerequisites on GHES](/gh-aw/troubleshooting/common-issues/#copilot-engine-prerequisites-on-ghes) for the full checklist.
+Possible endpoint, account, model, or policy mismatch; this error alone does not prove a GitHub Connect issue. See [Copilot Engine Prerequisites on GHES](/gh-aw/troubleshooting/common-issues/#copilot-engine-prerequisites-on-ghes) for the full checklist.
 
 ---
 
@@ -508,7 +575,7 @@ Copilot is not licensed at the enterprise level or the API proxy is routing inco
 
 For enhanced security with short-lived tokens, you may configure a GitHub App instead of using PATs.
 
-This does not apply to `COPILOT_GITHUB_TOKEN`, which must currently be a PAT. A single GitHub App can be used for all other GitHub authentication needs in GitHub Agentic Workflows, including tool authentication and safe outputs.
+This does not apply to `COPILOT_GITHUB_TOKEN`, which must currently be a PAT. A single GitHub App can be used for other GitHub authentication needs in GitHub Agentic Workflows, including tool authentication and safe outputs that support GitHub App tokens.
 
 After creating your app, configure it in your workflow:
 

@@ -12,8 +12,9 @@ set +o histexpand
 #   --sha256-amd64      - Compiler-pinned SHA256 digest for the Linux amd64 binary
 #   --sha256-arm64      - Compiler-pinned SHA256 digest for the Linux arm64 binary
 #   --artifact-base-url - HTTPS mirror base URL; defaults to GitHub Releases
-#   --rootless          - Install to ~/.local/bin without sudo; appends that directory
-#                         to $GITHUB_PATH for subsequent steps
+#   --rootless          - Install to $RUNNER_TEMP/gh-aw/bin without sudo; appends
+#                         that directory to $GITHUB_PATH for subsequent steps.
+#                         Selected automatically when neither root nor passwordless sudo is available.
 #
 # Platform support:
 #   - Linux (x64, arm64): Downloads pre-built binary
@@ -121,21 +122,15 @@ if [[ ! "$THREAT_DETECT_SHA256_ARM64" =~ ^[0-9a-f]{64}$ ]]; then
   exit 1
 fi
 
-# In rootless mode, install into the user's home directory instead of /usr/local/bin
-# so that ARC/DinD runners with allowPrivilegeEscalation: false can run without sudo.
-if [ "$ROOTLESS" = "true" ]; then
-  THREAT_DETECT_INSTALL_DIR="${HOME}/.local/bin"
-fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=actions/setup/sh/install_privileges.sh
+source "${SCRIPT_DIR}/install_privileges.sh"
+configure_install_privileges
 
-# maybe_sudo runs a command with sudo unless --rootless was specified.
-# In rootless mode, sudo is not available or needed.
-maybe_sudo() {
-  if [ "$ROOTLESS" = "true" ]; then
-    "$@"
-  else
-    sudo "$@"
-  fi
-}
+# In rootless mode, install under the job-scoped gh-aw tree, which AWF mounts read-only.
+if [ "$ROOTLESS" = "true" ]; then
+  THREAT_DETECT_INSTALL_DIR="$(prepare_rootless_install_dir)"
+fi
 
 # Rootless mode preflight: create and verify write access to the install directory.
 if [ "$ROOTLESS" = "true" ]; then
@@ -227,7 +222,9 @@ install_linux_binary() {
 
   local binary_url="${BASE_URL}/${binary_name}"
   echo "Downloading binary from \"${binary_url}\"..."
-  curl --proto '=https' --proto-redir '=https' -fsSL --retry 5 --retry-delay 10 --retry-max-time 180 --retry-all-errors -o "${TEMP_DIR}/${binary_name}" "${binary_url}"
+  # Exponential backoff spans longer gateway outages than six fixed-delay attempts.
+  # Bound connection setup without imposing a total timeout on large binaries.
+  curl --proto '=https' --proto-redir '=https' -fsSL --retry 8 --retry-max-time 180 --connect-timeout 15 --retry-all-errors -o "${TEMP_DIR}/${binary_name}" "${binary_url}"
 
   # Verify checksum
   verify_checksum "${TEMP_DIR}/${binary_name}" "${binary_name}" "${expected_checksum}"

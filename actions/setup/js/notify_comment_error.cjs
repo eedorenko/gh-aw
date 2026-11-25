@@ -1,12 +1,13 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
+// @safe-outputs-exempt USE-003 — completion notifier, not a safe-output handler; staged mode only withholds agent-authored report content and no staged preview is generated.
 
 // This script updates an existing comment created by the activation job
 // to notify about the workflow completion status (success or failure).
-// It also adds the categorized, privacy-safe noop body to the activation comment.
+// Agent-authored explanations are published only after a clean detection verdict.
 
 const { loadAgentOutput } = require("./load_agent_output.cjs");
-const { getRunSuccessMessage, getRunFailureMessage, getDetectionFailureMessage, getDetectionWarningMessage } = require("./messages_run_status.cjs");
+const { getRunSuccessMessage, getRunFailureMessage, getDetectionFailureBlocks, getDetectionWarningBlocks } = require("./messages_run_status.cjs");
 const { getMessages } = require("./messages_core.cjs");
 const { getErrorMessage, isLockedError } = require("./error_helpers.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
@@ -16,8 +17,10 @@ const { resolveTopLevelDiscussionCommentId } = require("./github_api_helpers.cjs
 const { assembleReportBodyParts } = require("./markdown_body_helpers.cjs");
 const { parseReportMarkdown } = require("./report_markdown.cjs");
 const { renderSizedReport } = require("./report_size.cjs");
-const { normalizeReportAllowedURL } = require("./report_ast.cjs");
+const { normalizeReport, normalizeReportAllowedURL, normalizeReportText } = require("./report_ast.cjs");
+const { containsSensitiveContent } = require("./redact_secrets.cjs");
 const { buildNoopConclusionSummary } = require("./conclusion_summary.cjs");
+const { generateHistoryUrl } = require("./generate_history_link.cjs");
 
 /**
  * Collect generated asset URLs from safe output jobs
@@ -112,6 +115,71 @@ function getRunFailureStatusText(agentConclusion, assignToAgentErrorCount, safeO
   }
 }
 
+/**
+ * @param {import("./report_ast.cjs").ReportBlock[]} children
+ * @param {Array<{type?: string, message?: unknown, reason?: unknown} | null>} items
+ */
+function appendAgentReports(children, items) {
+  const maxReports = 50;
+  let reportCount = 0;
+  let omitted = false;
+  /** @type {import("./report_ast.cjs").ReportBlock[]} */
+  const reports = [];
+  for (const item of items) {
+    let summary;
+    let text;
+    switch (item?.type) {
+      case "noop":
+        summary = "No-op message";
+        text = item.message;
+        break;
+      case "request_continuation":
+        summary = "Continuation requested";
+        text = item.message;
+        break;
+      case "report_incomplete":
+        summary = "Incomplete work";
+        text = item.reason;
+        break;
+      case "report_missing_tool":
+        summary = "Missing tool";
+        text = item.reason;
+        break;
+      case "report_missing_data":
+        summary = "Missing data";
+        text = item.reason;
+        break;
+      default:
+        continue;
+    }
+    if (typeof text !== "string" || !text.trim()) continue;
+    try {
+      // Withhold explanations still flagged after the shared report redaction.
+      if (containsSensitiveContent(normalizeReportText(text))) {
+        core.warning("Omitting an agent explanation flagged by credential screening");
+        continue;
+      }
+      const blocks = parseReportMarkdown(sanitizeContent(text), { agentTainted: true });
+      if (!blocks.length) continue;
+      normalizeReport({ type: "report", title: "Workflow status", children: blocks });
+      if (reportCount === maxReports) {
+        omitted = true;
+        break;
+      }
+      reports.push({ type: "paragraph", children: [{ type: "strong", children: [{ type: "text", value: summary, agentTainted: false }], agentTainted: false }], agentTainted: false }, ...blocks);
+      reportCount++;
+    } catch {
+      core.warning("Omitting an invalid agent explanation from the completion comment");
+    }
+  }
+  if (reports.length) {
+    children.push({ type: "heading", level: 2, children: [{ type: "text", value: "Agent messages", agentTainted: false }], agentTainted: false }, ...reports);
+    if (omitted) {
+      children.push({ type: "paragraph", children: [{ type: "text", value: "Additional agent messages omitted.", agentTainted: false }], agentTainted: false });
+    }
+  }
+}
+
 async function main() {
   const commentId = process.env.GH_AW_COMMENT_ID;
   const commentRepo = process.env.GH_AW_COMMENT_REPO;
@@ -125,6 +193,14 @@ async function main() {
     throw new Error(`${ERR_VALIDATION}: GH_AW_ASSIGNMENT_ERROR_COUNT must be a non-negative integer`);
   }
   const safeOutputsResult = process.env.GH_AW_SAFE_OUTPUTS_RESULT;
+  const staged = (process.env.GH_AW_SAFE_OUTPUTS_STAGED ?? "false") !== "false";
+  const protectedReports = new Set((process.env.GH_AW_AUTHORIZATION_PROTECTED_REPORTS || "").split(","));
+  /** @param {string | undefined} type */
+  const canPublishReport = type => {
+    if (typeof type !== "string" || !type || protectedReports.has(type)) return false;
+    // An authored staging expression must explicitly resolve to false to allow publication.
+    return (process.env[`GH_AW_COMPLETION_STAGED_${type.toUpperCase()}`] ?? "false") === "false";
+  };
   const noopCommentBody = process.env.GH_AW_NOOP_COMMENT_BODY || "";
   const activationCommentLinks = (process.env.GH_AW_ACTIVATION_COMMENT_LINKS || "").trim();
 
@@ -152,11 +228,11 @@ async function main() {
     core.info(`Safe Outputs Result: ${safeOutputsResult}`);
   }
 
-  // Load agent output to check for noop messages
+  // Load agent output for the step-summary fallback and vetted reports.
   let noopMessages = [];
   const agentOutputResult = loadAgentOutput();
   if (agentOutputResult.success) {
-    const noopItems = agentOutputResult.items.filter(item => item.type === "noop");
+    const noopItems = agentOutputResult.items.filter(item => item?.type === "noop");
     if (noopItems.length > 0) {
       core.info(`Found ${noopItems.length} noop message(s)`);
       noopMessages = noopItems.map(item => item.message);
@@ -192,14 +268,16 @@ async function main() {
 
   // Determine the message based on agent conclusion using custom messages if configured
   let message;
-  let detectionWarningMessage = "";
+  let detectionBlocks = [];
 
   // Check if detection job failed (if detection job exists)
   if (detectionConclusion && detectionConclusion === "failure") {
     // Detection job failed in error mode - report this prominently
-    message = getDetectionFailureMessage({
-      workflowName: "{workflow_name}",
-      runUrl: "{run_url}",
+    message = "";
+    detectionBlocks = getDetectionFailureBlocks({
+      workflowName: sanitizeContent(workflowName),
+      runUrl,
+      reason: detectionReason,
     });
   } else if (detectionConclusion && detectionConclusion === "warning") {
     // Detection job produced a warning (continue-on-error mode)
@@ -217,9 +295,9 @@ async function main() {
       });
     }
     // Build the caution section for detection warning
-    detectionWarningMessage = getDetectionWarningMessage({
-      workflowName: "{workflow_name}",
-      runUrl: "{run_url}",
+    detectionBlocks = getDetectionWarningBlocks({
+      workflowName: sanitizeContent(workflowName),
+      runUrl,
       reason: detectionReason,
     });
   } else if (agentConclusion === "success" && assignToAgentErrorCount === 0 && safeOutputsResult !== "failure") {
@@ -235,14 +313,20 @@ async function main() {
     });
   }
 
-  const templateContext = Object.fromEntries(Array.from((message + detectionWarningMessage).matchAll(/\{(\w+)\}/g), match => [match[1], match[0]]));
+  const templateContext = Object.fromEntries(Array.from(message.matchAll(/\{(\w+)\}/g), match => [match[1], match[0]]));
   Object.assign(templateContext, { workflow_name: sanitizeContent(workflowName), run_url: runUrl });
   const children = parseReportMarkdown(sanitizeContent(message), { context: templateContext, agentTainted: false, minimumHeadingLevel: 2 });
 
   // Import template and existing Markdown separately so an unclosed fence cannot
   // consume the following status sections or generated metadata.
-  if (detectionWarningMessage) {
-    children.push(...parseReportMarkdown(sanitizeContent(detectionWarningMessage), { context: templateContext, agentTainted: false, minimumHeadingLevel: 2 }));
+  children.push(...detectionBlocks);
+
+  // The detector may accept a skipped run, so also require an explicit clean verdict.
+  if (!staged && process.env.GH_AW_DETECTION_ACCEPTED === "true" && detectionConclusion === "success" && agentOutputResult.success) {
+    appendAgentReports(
+      children,
+      agentOutputResult.items.filter(item => typeof item?.type === "string" && canPublishReport(item.type))
+    );
   }
 
   // Preserve links (e.g. "Pull request created: #X") that safe outputs appended to the
@@ -251,11 +335,12 @@ async function main() {
     children.push(...parseReportMarkdown(sanitizeContent(activationCommentLinks), { agentTainted: false, minimumHeadingLevel: 2 }));
   }
 
-  // Never fall back to raw agent prose in a public comment if rendering failed.
-  if (noopCommentBody) {
-    children.push(...parseReportMarkdown(sanitizeContent(noopCommentBody), { agentTainted: true, minimumHeadingLevel: 2 }));
-  } else if (noopMessages.length > 0) {
-    core.warning("No categorized no-op comment body is available; omitting agent messages from the public comment");
+  if (!staged && canPublishReport("noop")) {
+    if (noopCommentBody) {
+      children.push(...parseReportMarkdown(sanitizeContent(noopCommentBody), { agentTainted: true, minimumHeadingLevel: 2 }));
+    } else if (noopMessages.length > 0) {
+      core.warning("No categorized no-op comment body is available; omitting the no-op category from the public comment");
+    }
   }
 
   // Collect generated asset URLs from safe output jobs
@@ -280,6 +365,13 @@ async function main() {
   const triggeringIssueNumber = context.payload?.issue?.number;
   const triggeringPRNumber = context.payload?.pull_request?.number;
   const triggeringDiscussionNumber = context.payload?.discussion?.number;
+  const historyUrl = generateHistoryUrl({
+    owner: context.repo.owner,
+    repo: context.repo.repo,
+    itemType: "comment",
+    workflowId: process.env.GH_AW_WORKFLOW_ID || "",
+    serverUrl: context.serverUrl,
+  });
   const markdownParts = assembleReportBodyParts({
     includeFooter: true,
     workflowName,
@@ -289,6 +381,7 @@ async function main() {
     triggeringIssueNumber,
     triggeringPRNumber,
     triggeringDiscussionNumber,
+    historyUrl: historyUrl || undefined,
   });
   const sanitizedMessage = renderSizedReport({ type: "report", title: "Workflow status", children: [...children, ...markdownParts.footer] }).body;
 

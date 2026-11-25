@@ -13,6 +13,7 @@ permissions:
   contents: read
   pull-requests: read
   copilot-requests: write
+model: router/economy
 engine:
   id: codex
   model-provider: github
@@ -32,7 +33,6 @@ safe-outputs:
     max: 1
     replace-older-comments: true
   noop:
-model: copilot/gpt-5.6-terra
 evals:
   - id: question-per-protected-file
     question: When protected-file changes are observed, does the proposed comment ask at least one explicit confirmation question for each changed protected file? Return UNKNOWN when neither protected file changed.

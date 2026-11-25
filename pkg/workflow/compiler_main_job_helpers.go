@@ -34,11 +34,25 @@ func (c *Compiler) buildMainJobCondition(data *WorkflowData, activationJobCreate
 	}
 	if activationJobCreated && hasMaxDailyAICGuardrail(data) {
 		compilerMainJobLog.Print("Applying daily-AIC guardrail to main job condition")
-		guard := &ExpressionNode{Expression: fmt.Sprintf("needs.%s.outputs.daily_ai_credits_exceeded != 'true'", constants.ActivationJobName)}
+		guardExpression := fmt.Sprintf("needs.%s.outputs.daily_ai_credits_exceeded != 'true'", constants.ActivationJobName)
+		if !data.MaxDailyAICContinueOnError {
+			// A handled GitHub API quota stop leaves accounting unverified. It skips
+			// the agent instead of failing activation; warning mode stays fail-open.
+			guardExpression += fmt.Sprintf(" && needs.%s.outputs.daily_ai_credits_guardrail_status != 'quota_blocked'", constants.ActivationJobName)
+		}
+		guard := &ExpressionNode{Expression: guardExpression}
 		if jobCondition == "" {
 			jobCondition = RenderCondition(guard)
 		} else {
 			jobCondition = RenderCondition(BuildAnd(&ExpressionNode{Expression: stripExpressionWrapper(jobCondition)}, guard))
+		}
+	}
+	if activationJobCreated && workQueueRequiresAssignment(data) {
+		open := workQueueAssignmentOpenCondition()
+		if jobCondition == "" {
+			jobCondition = RenderCondition(open)
+		} else {
+			jobCondition = RenderCondition(BuildAnd(&ExpressionNode{Expression: stripExpressionWrapper(jobCondition)}, open))
 		}
 	}
 	compilerMainJobLog.Printf("Built main job condition: activationJobCreated=%v, hasCondition=%v", activationJobCreated, jobCondition != "")
@@ -241,11 +255,10 @@ func (c *Compiler) buildMainJobOutputs(data *WorkflowData) map[string]string {
 		outputs["output"] = "${{ steps.collect_output.outputs.output }}"
 		outputs["output_types"] = "${{ steps.collect_output.outputs.output_types }}"
 		outputs["has_patch"] = "${{ steps.collect_output.outputs.has_patch }}"
+		if isRoutedRequestContinuation(data.SafeOutputs) {
+			outputs["continuation_evidence"] = "${{ steps." + continuationEvidenceStepID + ".outputs.continuation_evidence }}"
+		}
 	}
-	if isWorkQueueParticipant(data) {
-		outputs["work_queue_origin"] = "${{ steps.work_queue_intent_origin.outputs.work_queue_origin }}"
-	}
-
 	// Add checkout_pr_success output to track PR checkout status only if the checkout-pr step will be generated
 	// This is used by the conclusion job to skip failure handling when checkout fails
 	// (e.g., when PR is merged and branch is deleted)
@@ -269,6 +282,7 @@ func (c *Compiler) buildMainJobOutputs(data *WorkflowData) map[string]string {
 	}
 
 	c.addMainJobEngineErrorOutputs(outputs, data)
+	addRepoMemoryBaseCommitOutputs(outputs, data)
 	return outputs
 }
 
@@ -285,9 +299,6 @@ func (c *Compiler) buildMainJobEnv(data *WorkflowData) map[string]string { //nol
 		}
 		env["GH_AW_WORK_QUEUE_ENABLED"] = `"true"`
 		env["GH_AW_WORK_QUEUE_ROLE"] = fmt.Sprintf("%q", workQueueRuntimeRole(data))
-		if isWorkQueueParticipant(data) {
-			env["GH_AW_WORK_QUEUE_INTENT_ORIGIN"] = `"${{ needs.activation.outputs.work_queue_origin }}"`
-		}
 	}
 
 	// Disable the Chromium process sandbox for playwright CLI mode.

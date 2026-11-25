@@ -116,9 +116,33 @@ export interface PluginInstallationData {
   status: "installed";
 }
 
+/** Runner-observed durable state; restoration is distinct from native startup. */
+export interface DurableSessionMetadata {
+  engine: string;
+  storage: "artifact";
+  runId: string;
+  runAttempt: string;
+  parentRunId?: string;
+}
+
+export interface DurableRestoreData extends DurableSessionMetadata {
+  status: "restored" | "fresh" | "failed";
+  artifactId?: string;
+}
+
+export interface DurableStartupData extends DurableSessionMetadata {
+  status: "resumed" | "fresh";
+  sessionId: string;
+}
+
 /** AWF API proxy steering event-log observation. */
 export interface FirewallSteeringData extends RuntimeObservationData {
+  /** Budget percentage of the notice; null for a `little_left` notice. */
   threshold?: JsonValue;
+  /** Why AWF sent the notice: `threshold` or `little_left`; absent before per-conversation delivery. */
+  trigger?: JsonValue;
+  /** Opaque 12-character conversation key, comparable only within the run; null when AWF could not key the conversation. */
+  conversation?: JsonValue;
 }
 
 /** AWF steering notice delivered on a model request. */
@@ -126,6 +150,40 @@ export interface SteeringNotice {
   type: "ai_credit" | "timeout" | "token";
   threshold: 80 | 90 | 95 | 99;
 }
+
+interface SteeringDeliveryBase {
+  type: "ai_credit" | "timeout";
+  /**
+   * Opaque per-run conversation key; null when AWF could not key the conversation.
+   * @pattern ^[0-9a-f]{12}$
+   */
+  conversation: string | null;
+  /** Whether this was the run's first delivery of the notice. */
+  first: boolean;
+}
+
+/** Steering notice delivered because a budget percentage was crossed. */
+export interface SteeringThresholdDelivery extends SteeringDeliveryBase {
+  /** A budget percentage was crossed. */
+  trigger: "threshold";
+  /** Budget percentage that was crossed. */
+  threshold: 80 | 90 | 95 | 99;
+}
+
+/** Steering notice delivered because only a few requests' worth of credits, or a few minutes, remain. */
+export interface SteeringLittleLeftDelivery extends SteeringDeliveryBase {
+  /** Only a few requests' worth of credits, or a few minutes, remain. */
+  trigger: "little_left";
+  /** Always null: no budget percentage applies. */
+  threshold: null;
+}
+
+/**
+ * One delivery of an AWF steering notice to a conversation; AWF records one per conversation per notice.
+ * `threshold` is null exactly when `trigger` is `little_left`.
+ * @discriminator trigger
+ */
+export type SteeringDelivery = SteeringThresholdDelivery | SteeringLittleLeftDelivery;
 
 export interface ModelRoutingData {
   schema?: JsonValue;
@@ -202,6 +260,8 @@ export interface ModelConfigData {
     enabled: boolean;
     goal?: string;
     mode?: string;
+    /** Router value the workflow set as its model (for example `router/economy`); absent when routing comes from `engine.model-routing` or the implicit default. */
+    requested?: "router" | "router/economy" | "router/balanced" | "router/robust";
     /** Native routing provider (`anthropic` or `openai`) sent to AWF as `apiProxy.routing.provider`; absent for GitHub Copilot routing. */
     provider?: "anthropic" | "openai";
     /** Configured routing candidates as authored (exact ids or gh-aw aliases) without provider prefix; absent means the router default or unknown. */
@@ -241,6 +301,23 @@ export interface ModelBaselineEstimateData {
   /** True only when every agent-phase request was attributed and every main request was priced. */
   complete: boolean;
 }
+
+/** Why a routed run's result does not count as evidence about the selected pair. */
+export type RoutingSkipReason = "cancelled" | "infrastructure" | "rate_limited" | "pair_mismatch" | "unknown_evidence";
+
+/** A routed run whose result counts: the selected pair succeeded or failed on its own. */
+export interface RoutingCountedObservationData {
+  outcome: "success" | "failure";
+}
+
+/** A routed run whose result does not count, and why. */
+export interface RoutingSkippedObservationData {
+  outcome: "skip";
+  reason: RoutingSkipReason;
+}
+
+/** Collector-written verdict on a routed run (T-UAS-094). */
+export type RoutingObservationData = RoutingCountedObservationData | RoutingSkippedObservationData;
 
 export interface ModelRoutingRankedChoice {
   rank: number;
@@ -378,6 +455,7 @@ export interface UsageReportData extends UnifiedSessionContextData {
   premiumRequests?: JsonValue;
   durationMs?: JsonValue;
   steering?: SteeringNotice;
+  steeringDelivery?: SteeringDelivery;
   usage?: UnifiedSessionUsage | null;
 }
 
@@ -390,12 +468,48 @@ export interface SafeOutputData {
   url?: JsonValue;
   status?: JsonValue;
   errorCode?: JsonValue;
+  output_id?: string;
   messageIndex?: number;
   staged?: boolean;
+  /** The operation may have applied even though processing failed to confirm it. */
+  operation_outcome?: "indeterminate";
+  /**
+   * Ordered four-letter branch mnemonics joined by underscores, not a correlation ID.
+   * @pattern ^[A-Za-z]{4}(?:_[A-Za-z]{4})*$
+   * @minLength 4
+   * @maxLength 1024
+   */
+  execution_trace?: string;
 }
 
 export interface SafeOutputErrorData extends SafeOutputData {
   errors?: SafeOutputData[];
+}
+
+/** Post-run lifecycle supplement; never append this event to its source run session. */
+export interface LifecycleAdoptionData {
+  sourceRunId: string;
+  sourceWorkflow?: string;
+  repository?: string;
+  outputType: string;
+  deliveryState: "delivered";
+  deliverySignal: string;
+  deliveryAt: string;
+  deliveryObservedAt: string;
+  deliverySource: string;
+  adoptionState: "pending" | "accepted" | "rejected" | "lifecycle" | "not_applicable" | "unknown";
+  adoptionSignal: string;
+  adoptionAt?: string;
+  adoptionObservedAt: string;
+  adoptionSource: string;
+  adoptionRuleVersion: string;
+  acceptanceKind?: "explicit_human" | "automation" | "fallback_delivery";
+  humanVerified: boolean;
+  adoptionCoverage: "available" | "unobserved" | "unsupported" | "unavailable";
+  survivalState: "observed" | "reversed" | "unknown";
+  survivalSignal?: string;
+  survivalObservedAt?: string;
+  survivalCoverage: "snapshot" | "unobserved" | "unsupported" | "unavailable";
 }
 
 export interface ExperimentStateData {
@@ -496,6 +610,7 @@ export type HarnessFailureClass =
   | "null_type_tool_call"
   | "no_auth_info"
   | "authentication_failed"
+  | "transient_error"
   | "sdk_session_idle_timeout"
   | "mcp_gateway_shutdown"
   | "permission_denied"
@@ -505,6 +620,7 @@ export type HarnessFailureClass =
   | "copilot_model_verification"
   | "overloaded_error"
   | "rate_limit_error"
+  | "rate_limit_wait_exceeded"
   | "max_turns"
   | "no_deferred_marker"
   | "invalid_model"
@@ -547,12 +663,37 @@ export interface HarnessAttemptData extends HarnessRetryAttemptData {
   layer: "harness" | "startup";
 }
 
+export type HarnessDecisionOutcome = "allow" | "deny" | "unknown";
+export type HarnessDecisionError =
+  "invalid_configuration" | "sandbox_unavailable" | "proxy_unavailable" | "invalid_proxy_endpoint" | "model_unavailable" | "timeout" | "evaluation_failed" | "file_reference_failed" | "sensitive_content_blocked";
+
+/** Advisory decision preceding a proposed invocation, not authorization or an agent attempt. */
+export interface HarnessDecisionData {
+  /** @asType integer @minimum 1 @maximum 101 */
+  proposedAttempt: number;
+  /** @pattern ^startup:[1-9][0-9]{0,2}$ */
+  startupAttemptId?: string;
+  outcome: HarnessDecisionOutcome;
+  /** @maxItems 400 */
+  questions: {
+    /** One-based index in workflow skip-if-decision. @asType integer @minimum 1 @maximum 400 */
+    question: number;
+    outcome: HarnessDecisionOutcome;
+    error?: HarnessDecisionError;
+  }[];
+  latencyMs: SessionCount;
+  timestamp: SessionCount;
+  error?: HarnessDecisionError;
+  avoidedInvocation: boolean;
+}
+
 export interface HarnessRetryData {
   /** @asType integer @minimum 0 @maximum 101 */
   attempts: number;
   exitCode: HarnessRetryExitCode | null;
   attemptResults: HarnessRetryAttemptData[];
   startupAttemptResults?: HarnessRetryAttemptData[];
+  decisionResults?: HarnessDecisionData[];
 }
 
 /** Conclusion's dependency snapshot, not the still-running conclusion job. */
@@ -593,7 +734,7 @@ export interface AdmissionDecisionData {
 }
 
 export interface DailyAICDecisionData {
-  status: "disabled" | "skipped" | "under_budget" | "exceeded" | "structural_error" | "transient_error";
+  status: "disabled" | "skipped" | "under_budget" | "exceeded" | "structural_error" | "transient_error" | "quota_blocked";
   exceeded?: boolean;
   total?: number;
   estimated?: number;
@@ -716,19 +857,22 @@ export interface CollectionData {
 
 /** Known essential payloads. Unknown native extensions remain open. */
 export interface UnifiedSessionEventDataMap {
+  "durable.restore": DurableRestoreData;
+  "durable.session": DurableStartupData;
   "workflow.job_result": WorkflowJobResultData;
   "memory.push": MemorySaveResultData;
   "model.inventory": ModelInventoryData;
   "model.config": ModelConfigData;
   "model.baseline_estimate": ModelBaselineEstimateData;
+  "routing.observation": RoutingObservationData;
   "skill.inventory": SkillInventoryData;
   "skill.conflict": SkillConflictData;
   "skill.invoked": SkillInvokedData;
   "skill.context_delivered_ref": { interactionId?: JsonValue; source?: JsonValue; contentId?: JsonValue };
   "session.format": SessionFileFormatData;
   "agent.execution": AgentExecutionData;
-  "session.init": Pick<SessionInitData, "sourceEngine" | "model" | "sessionId" | "cwd" | "reasoningEffort"> & UnifiedSessionContextData;
-  "session.start": Pick<SessionInitData, "sourceEngine" | "model" | "sessionId" | "cwd" | "reasoningEffort"> & UnifiedSessionContextData;
+  "session.init": Pick<SessionInitData, "sourceEngine" | "agentVersion" | "provider" | "model" | "sessionId" | "cwd" | "reasoningEffort"> & UnifiedSessionContextData;
+  "session.start": Pick<SessionInitData, "sourceEngine" | "agentVersion" | "provider" | "model" | "sessionId" | "cwd" | "reasoningEffort"> & UnifiedSessionContextData;
   "session.error": {
     error?: JsonValue;
     message?: JsonValue;
@@ -769,6 +913,7 @@ export interface UnifiedSessionEventDataMap {
     errorReason?: JsonValue;
     premiumRequests?: JsonValue;
     totalNanoAiu?: JsonValue;
+    aiCreditsStatus?: "complete" | "partial" | "unavailable";
     totalApiDurationMs?: JsonValue;
     sessionStartTime?: JsonValue;
     currentModel?: JsonValue;
@@ -787,26 +932,46 @@ export interface UnifiedSessionEventDataMap {
     /** Observed native usage, not an additive accounting contribution. */
     usageSnapshot?: JsonValue;
   };
-  "tool.execution_start": Pick<ToolExecutionStartData, "toolCallId" | "stepIndex" | "toolName" | "input" | "inputTruncated" | "command" | "mcpServerName"> & UnifiedSessionContextData;
-  "tool.execution_update": Pick<ToolExecutionStartData, "toolCallId" | "stepIndex" | "toolName" | "input" | "mcpServerName"> & {
-    output?: JsonValue;
-    partial?: JsonValue;
-    delta?: JsonValue;
-    contentIndex?: JsonValue;
-    sourceType?: JsonValue;
-    /** Repeated observed metadata, never additive inference usage. */
-    usageSnapshot?: JsonValue;
-    durationMs?: JsonValue;
-    status?: JsonValue;
-    command?: JsonValue;
-    taskId?: string;
-    taskType?: string;
-    error?: JsonValue;
-  } & UnifiedSessionContextData;
+  "tool.execution_start": Pick<ToolExecutionStartData, "toolCallId" | "stepIndex" | "toolName" | "input" | "inputTruncated" | "command" | "mcpServerName"> & Pick<UnifiedMessageData, "messageId" | "model"> & UnifiedSessionContextData;
+  "tool.execution_update": Pick<ToolExecutionStartData, "toolCallId" | "stepIndex" | "toolName" | "input" | "mcpServerName"> &
+    Pick<UnifiedMessageData, "messageId" | "model"> & {
+      output?: JsonValue;
+      partial?: JsonValue;
+      delta?: JsonValue;
+      contentIndex?: JsonValue;
+      sourceType?: JsonValue;
+      /** Repeated observed metadata, never additive inference usage. */
+      usageSnapshot?: JsonValue;
+      durationMs?: JsonValue;
+      status?: JsonValue;
+      command?: JsonValue;
+      taskId?: string;
+      taskType?: string;
+      error?: JsonValue;
+    } & UnifiedSessionContextData;
   "tool.execution_complete": Pick<
     ToolExecutionCompleteData,
-    "toolCallId" | "stepIndex" | "toolName" | "success" | "output" | "result" | "error" | "fileEdits" | "durationMs" | "exitCode" | "status" | "mcpServerName" | "isError" | "taskId" | "taskType" | "workflowName" | "workflowRunId"
+    | "toolCallId"
+    | "stepIndex"
+    | "toolName"
+    | "success"
+    | "output"
+    | "outputTruncated"
+    | "structuredContent"
+    | "result"
+    | "error"
+    | "fileEdits"
+    | "durationMs"
+    | "exitCode"
+    | "status"
+    | "mcpServerName"
+    | "isError"
+    | "taskId"
+    | "taskType"
+    | "workflowName"
+    | "workflowRunId"
   > &
+    Pick<UnifiedMessageData, "messageId" | "model"> &
     UnifiedSessionContextData;
   "dynamicWorkflows.task_started": DynamicWorkflowObservationData;
   "dynamicWorkflows.task_progress": DynamicWorkflowObservationData;
@@ -833,8 +998,9 @@ export interface UnifiedSessionEventDataMap {
   "firewall.event": RuntimeObservationData;
   "safe_output.request": SafeOutputData;
   "safe_output.result": SafeOutputData;
-  "safe_output.outcome": SafeOutputData;
+  "safe_output.execution": SafeOutputData;
   "safe_output.error": SafeOutputErrorData;
+  "lifecycle.adoption": LifecycleAdoptionData;
   "experiment.state": ExperimentStateData;
   "experiment.assignment": ExperimentAssignmentData;
   "grader.manifest": GraderManifestData;
@@ -844,6 +1010,7 @@ export interface UnifiedSessionEventDataMap {
   "execution.result": ExecutionResultData;
   "harness.retry": HarnessRetryData;
   "harness.attempt": HarnessAttemptData;
+  "harness.decision": HarnessDecisionData;
   "detection.result": DetectionResultData;
   "guardrail.admission": AdmissionDecisionData;
   "guardrail.daily_aic": DailyAICDecisionData;

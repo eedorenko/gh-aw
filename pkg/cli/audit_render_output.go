@@ -24,37 +24,19 @@ func renderAuditReport(ctx context.Context, processedRun ProcessedRun, metrics L
 	runOutputDir := opts.OutputDir
 	auditLog.Printf("Rendering audit report for run %d (noBaseline=%t, group=%t)", runID, opts.NoBaseline, opts.Group)
 	processedRun.Run.SafeItemsCount = len(resolveCreatedItems(runOutputDir, processedRun.SafeOutputs))
-	auditData, ok := loadCachedAuditData(runOutputDir, processedRun.Run, auditCacheSourceFull)
-	if ok {
-		// A cached entry always carries the default (baseline) comparison, so drop it
-		// when the caller opted out of baseline comparison.
-		if opts.NoBaseline {
-			auditData.Comparison = noBaselineComparison()
-		}
-	} else {
-		var err error
-		auditData, err = buildRenderedAuditDataFromCache(ctx, processedRun, metrics, mcpToolUsage, runOutputDir, opts)
-		if err != nil {
-			return err
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		auditData.CacheSource = auditCacheSourceFull
-		auditData.SchemaVersion = auditSchemaVersion
-		// Never persist an opt-out result: it would be reused as the full cache entry
-		// by a later default audit and suppress its baseline comparison.
-		if !opts.NoBaseline {
-			if err := writeAuditData(runOutputDir, auditData); err != nil {
-				return err
-			}
-		}
+	auditData, err := loadOrBuildAuditData(ctx, processedRun, metrics, mcpToolUsage, runOutputDir, opts)
+	if err != nil {
+		return err
 	}
 	if auditData.Ledger == nil {
 		auditData.Ledger = processedRun.Ledger
 	}
+	// Reparse raw session evidence even when an older audit cache omitted it.
+	auditData.DurableSession = readDurableSessionReport(runOutputDir, processedRun.Run, hasDurableRestoreStep(processedRun.JobDetails))
 	// NoBaseline runs avoid writing audit-cache changes, including queue backfills.
-	if mergeWorkQueueReport(&auditData.WorkQueue, processedRun.WorkQueue) && !opts.NoBaseline {
+	continuationRequestsUpdated := mergeContinuationRequestsIntoAudit(&auditData, processedRun.ContinuationRequests)
+	workQueueUpdated := mergeWorkQueueReport(&auditData.WorkQueue, processedRun.WorkQueue)
+	if (continuationRequestsUpdated || workQueueUpdated) && !opts.NoBaseline {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -62,14 +44,55 @@ func renderAuditReport(ctx context.Context, processedRun ProcessedRun, metrics L
 			return err
 		}
 	}
+	if opts.Delivery || opts.Adoption {
+		processedRun.Run.LogsPath = runOutputDir
+		report, err := collectRunLifecycle(ctx, processedRun, nil, opts.Verbose, opts.Adoption)
+		if err != nil {
+			return err
+		}
+		auditData.Delivery = report.Delivery
+		if opts.Adoption {
+			auditData.Outcomes, auditData.OutcomeSummary = report.Items, &report.Summary
+		}
+	}
 	return renderPreparedAuditReport(ctx, auditData, opts)
+}
+
+// loadOrBuildAuditData returns the cached full audit data for the run, or builds
+// and persists it (unless baseline comparison was opted out).
+func loadOrBuildAuditData(ctx context.Context, processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage *MCPToolUsageData, runOutputDir string, opts AuditOptions) (AuditData, error) {
+	if auditData, ok := loadCachedAuditData(runOutputDir, processedRun.Run, auditCacheSourceFull); ok {
+		// A cached entry always carries the default (baseline) comparison, so drop it
+		// when the caller opted out of baseline comparison.
+		if opts.NoBaseline {
+			auditData.Comparison = noBaselineComparison()
+		}
+		return auditData, nil
+	}
+	auditData, err := buildRenderedAuditDataFromCache(ctx, processedRun, metrics, mcpToolUsage, runOutputDir, opts)
+	if err != nil {
+		return auditData, err
+	}
+	if err := ctx.Err(); err != nil {
+		return auditData, err
+	}
+	auditData.CacheSource = auditCacheSourceFull
+	auditData.SchemaVersion = auditSchemaVersion
+	// Never persist an opt-out result: it would be reused as the full cache entry
+	// by a later default audit and suppress its baseline comparison.
+	if !opts.NoBaseline {
+		if err := writeAuditData(runOutputDir, auditData); err != nil {
+			return auditData, err
+		}
+	}
+	return auditData, nil
 }
 
 func renderPreparedAuditReport(ctx context.Context, auditData AuditData, opts AuditOptions) error {
 	runID := auditData.Overview.RunID
 	runOutputDir := opts.OutputDir
 	if opts.Group {
-		parseAuditLogsIfRequested(runID, runOutputDir, opts)
+		parseAuditLogsIfRequested(ctx, runID, runOutputDir, opts)
 		return nil
 	}
 	// Query-specific evidence never enters the shared deterministic audit cache.
@@ -93,7 +116,7 @@ func renderPreparedAuditReport(ctx context.Context, auditData AuditData, opts Au
 	}
 	renderAuditGatewayMetrics(runOutputDir, opts.Verbose)
 	renderAuditUnifiedTimeline(runOutputDir, opts.Verbose)
-	parseAuditLogsIfRequested(runID, runOutputDir, opts)
+	parseAuditLogsIfRequested(ctx, runID, runOutputDir, opts)
 	renderAuditCompletion(runOutputDir, opts.JSONOutput)
 	return nil
 }
@@ -148,6 +171,18 @@ func renderAuditOutput(auditData AuditData, runOutputDir string, jsonOutput, ver
 		return nil
 	}
 	renderConsole(auditData, runOutputDir)
+	if auditData.Delivery != nil {
+		data := LogsData{Delivery: []DeliveryData{*auditData.Delivery}}
+		if auditData.OutcomeSummary != nil {
+			data.Outcomes = []OutcomesData{{
+				RunID: auditData.Overview.RunID, Workflow: auditData.Overview.WorkflowName,
+				Items: auditData.Outcomes, Summary: *auditData.OutcomeSummary,
+			}}
+		}
+		if err := renderLogsOutcomes(os.Stdout, data); err != nil {
+			return err
+		}
+	}
 	if verbose {
 		auditLog.Printf("Rendered console audit report for %s", runOutputDir)
 	}
@@ -178,17 +213,17 @@ func renderAuditUnifiedTimeline(runOutputDir string, verbose bool) {
 	}
 }
 
-func parseAuditLogsIfRequested(runID int64, runOutputDir string, opts AuditOptions) {
+func parseAuditLogsIfRequested(ctx context.Context, runID int64, runOutputDir string, opts AuditOptions) {
 	if !opts.Parse {
 		return
 	}
 	auditLog.Printf("Parsing agent and firewall logs for run %d", runID)
-	parseAgentLogIfRequested(runID, runOutputDir, opts.Verbose)
+	parseAgentLogIfRequested(ctx, runID, runOutputDir, opts.Verbose)
 	parseFirewallLogsIfRequested(runID, runOutputDir, opts.Verbose)
 }
 
-func parseAgentLogIfRequested(runID int64, runOutputDir string, verbose bool) {
-	rendered, err := parsePersistedAgentLog(runOutputDir)
+func parseAgentLogIfRequested(ctx context.Context, runID int64, runOutputDir string, verbose bool) {
+	rendered, err := parsePersistedAgentLog(ctx, runOutputDir)
 	if !rendered && err == nil {
 		awInfoPath := filepath.Join(runOutputDir, "aw_info.json")
 		engine := extractEngineFromAwInfo(awInfoPath, verbose)
@@ -198,7 +233,7 @@ func parseAgentLogIfRequested(runID int64, runOutputDir string, verbose bool) {
 			}
 			return
 		}
-		err = parseAgentLog(runOutputDir, engine, verbose)
+		err = parseAgentLog(ctx, runOutputDir, engine, verbose)
 	}
 	reportParseOutcome(runID, runOutputDir, "agent log", "log", "log.md", verbose, err)
 }

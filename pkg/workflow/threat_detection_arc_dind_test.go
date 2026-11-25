@@ -18,10 +18,12 @@ func TestCompileArcDindThreatDetectionStaging(t *testing.T) {
 		t.Run(engine, func(t *testing.T) {
 			var standardConclusion map[string]any
 			for _, tc := range []struct {
-				name, detectionRunner string
-				arc                   bool
+				name, detectionRunner, installation string
+				arc                                 bool
 			}{
 				{name: "standard"},
+				{name: "native rootless", installation: "rootless"},
+				{name: "native privileged", installation: "privileged"},
 				{name: "arc with default detection runner", arc: true},
 				{name: "arc detection runner", arc: true, detectionRunner: "    runs-on: arc-scale-set\n"},
 			} {
@@ -29,6 +31,8 @@ func TestCompileArcDindThreatDetectionStaging(t *testing.T) {
 					runner := ""
 					if tc.arc {
 						runner = "runs-on: arc-scale-set\nrunner:\n  topology: arc-dind\n"
+					} else if tc.installation != "" {
+						runner = "runs-on: linux64-selfhosted\nrunner:\n  installation: " + tc.installation + "\n"
 					}
 					source := fmt.Sprintf("---\non: workflow_dispatch\nengine: %s\n%ssafe-outputs:\n  create-issue:\n  threat-detection:\n%s    continue-on-error: true\nfeatures:\n  gh-aw-detection: true\n---\nReport a finding.\n", engine, runner, tc.detectionRunner)
 					path := filepath.Join(t.TempDir(), "detection.md")
@@ -59,13 +63,47 @@ func TestCompileArcDindThreatDetectionStaging(t *testing.T) {
 					upload, _ := find("Upload threat detection artifact")
 					_, conclusion := find("Conclude threat detection")
 					require.NotNil(t, conclusion)
+					executionEnv := execution["env"].(map[string]any)
+					if engine == "copilot" {
+						inputDir := "/tmp/gh-aw/threat-detection-inputs"
+						if tc.arc {
+							inputDir = "${{ runner.temp }}/gh-aw/threat-detection-inputs"
+						}
+						require.Equal(t, inputDir, executionEnv["GH_AW_DETECTION_INPUT_DIR"])
+						require.Equal(t, "detection", executionEnv["GH_AW_PHASE"])
+					} else {
+						require.NotContains(t, executionEnv, "GH_AW_DETECTION_INPUT_DIR")
+					}
+					rootless := tc.arc || tc.installation == "rootless"
+					installRun := installation["run"].(string)
+					require.Equal(t, rootless, strings.Contains(installRun, "--rootless"))
+					if engine == "copilot" {
+						_, copilotInstall := find("Install GitHub Copilot CLI")
+						require.NotNil(t, copilotInstall)
+						require.Equal(t, rootless, strings.Contains(copilotInstall["run"].(string), "--rootless"))
+						foundAgentInstaller := false
+						for _, step := range workflow.Jobs["agent"].Steps {
+							if step["name"] == "Install GitHub Copilot CLI" {
+								foundAgentInstaller = true
+								require.Equal(t, rootless, strings.Contains(step["run"].(string), "--rootless"))
+							}
+						}
+						require.True(t, foundAgentInstaller)
+					}
 					if !tc.arc {
 						standardConclusion = conclusion
 						require.Equal(t, -1, reset)
-						require.NotContains(t, installation["run"], "--rootless")
 						require.Equal(t, -1, collect)
 						require.NotContains(t, execution["run"], "stage_threat_detection_arc_dind.sh")
-						require.Contains(t, execution["run"], "--output /tmp/gh-aw/threat-detection/detection_result.json /tmp/gh-aw/threat-detection")
+						require.Contains(t, execution["run"], "--output /tmp/gh-aw/threat-detection/detection_result.json /tmp/gh-aw/threat-detection-inputs")
+						if rootless {
+							env := execution["env"].(map[string]any)
+							require.Equal(t, "${{ steps.threat_detect_install.outputs.binary-path }}", env["THREAT_DETECT_BINARY"])
+							require.Contains(t, execution["run"], `cp "$detector" "${RUNNER_TEMP}/gh-aw/bin/threat-detect"`)
+							require.Contains(t, execution["run"], `export PATH="${RUNNER_TEMP}/gh-aw/bin:$PATH"`)
+							require.NotContains(t, string(compiled), `"topology":"arc-dind"`)
+							require.NotContains(t, string(compiled), "Redirect tool cache to shared volume")
+						}
 						return
 					}
 					require.Equal(t, standardConclusion, conclusion, "conclusion step must remain unchanged")
@@ -90,7 +128,7 @@ func TestCompileArcDindThreatDetectionStaging(t *testing.T) {
 					require.Contains(t, run, `--mount "${RUNNER_TEMP}/gh-aw:${RUNNER_TEMP}/gh-aw:ro"`)
 					require.Contains(t, run, `--mount "${RUNNER_TEMP}/gh-aw/threat-detection:${RUNNER_TEMP}/gh-aw/threat-detection:rw"`)
 					require.NotContains(t, run, "--mount /tmp/gh-aw/threat-detection:")
-					require.Contains(t, run, `--output "${RUNNER_TEMP}/gh-aw/threat-detection/detection_result.json" "${RUNNER_TEMP}/gh-aw/threat-detection"`)
+					require.Contains(t, run, `--output "${RUNNER_TEMP}/gh-aw/threat-detection/detection_result.json" "${RUNNER_TEMP}/gh-aw/threat-detection-inputs"`)
 					if engine == "codex" {
 						_, config := find("Prepare Codex config for threat-detect")
 						require.Contains(t, config["run"], `"/tmp/gh-aw/threat-detection/codex-home/config.toml"`)

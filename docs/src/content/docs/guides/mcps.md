@@ -120,7 +120,7 @@ Compilation warns at configuration paths containing unsupported shell computatio
 > [!CAUTION]
 > Startup also rejects transported runtime values containing `${NAME}`, even when intended as literal template text. The pinned gateway expands that syntax again and cannot distinguish literal data from credential references. These runtime failures cannot all be predicted at compilation, and adding a backslash is not a supported escape for literal placeholder data.
 
-For inline expressions in shell steps, preview source migrations with `gh aw fix <workflow>`, review the diff after applying `--write`, and recompile. The codemod migrates expanding heredoc bodies, including hash-prefixed lines, but preserves proven quoted bodies and shell comments. An unproven heredoc boundary requires a manual fix before any changes to that workflow are written. Ordinary single-quoted shell strings still require manual quote review; quoted heredocs are not a safe transport for arbitrary multiline Actions values.
+For inline expressions in shell steps, preview source migrations with `gh aw fix <workflow>`, review the diff after applying `--write`, and recompile. The codemod migrates expanding heredoc bodies, including hash-prefixed lines, but preserves proven quoted bodies and shell comments. CTR-006 still rejects prohibited expressions in those preserved regions because Actions interpolates them before Bash parses the script; remove expressions from comments, and manually move heredoc values to `env:` and use an unquoted heredoc so Bash expands the shell variable. An unproven heredoc boundary requires a manual fix before any changes to that workflow are written. Ordinary single-quoted shell strings still require manual quote review; quoted heredocs are not a safe transport for arbitrary multiline Actions values.
 
 Deploy regenerated locks with the matching setup runtime. Recompilation does not repair earlier runs, and compiler-owned `GH_AW_MCP_*` placeholders are not authored configuration.
 
@@ -240,14 +240,13 @@ Pre-configured MCP server specifications are available in [`.github/workflows/sh
 | **Jupyter** | `shared/mcp/jupyter.md` | Execute code, manage notebooks, visualize data |
 | **AgentDB** | `shared/mcp/agentdb.md` | Semantic and hybrid retrieval over agent-collected corpora (e.g. discussions, issues), backed by a runtime store at `AGENTDB_PATH` |
 | **Azure Auth (OIDC bridge)** | `shared/azure-auth.md` | Re-authenticate Azure CLI inside the agent sandbox using GitHub OIDC |
-| **Azure DevOps MCP** *(experimental)* | `shared/mcp/azure-devops.md` | Azure DevOps MCP endpoint with org-scoped URL, auth header, and required domains |
+| **Azure DevOps connector** *(experimental)* | `".github/workflows/connectors/azure-devops.md"` | Explicit project-metadata reads; see [Connectors](/gh-aw/reference/connectors/#azure-devops) |
 | **Azure MCP** | `shared/mcp/azure.md` | Azure MCP server in read-only mode with an explicit tool allowlist |
 | **Others** | `shared/mcp/*.md` | AST-Grep, Azure, Brave Search, Context7, DataDog, DeepWiki, Fabric RTI, MarkItDown, Microsoft Docs, Notion, Sentry, Serena, Server Memory, Slack, Tavily |
 
 ### Azure shared imports (OIDC, Azure DevOps, Azure MCP)
 
-Use these shared imports together when your workflow needs Azure CLI auth plus
-Azure DevOps and Azure MCP tools:
+Use `shared/azure-auth.md` when Azure MCP needs Azure CLI authentication:
 
 ```aw wrap
 ---
@@ -260,9 +259,6 @@ imports:
     with:
       azure-client-id: ${{ vars.AZURE_CLIENT_ID }}
       azure-tenant-id: ${{ vars.AZURE_TENANT_ID }}
-  - uses: shared/mcp/azure-devops.md
-    with:
-      organization: YOUR_ORG
 
 mcp-servers:
   azure:
@@ -285,9 +281,9 @@ mcp-servers:
 
 `shared/azure-auth.md` sets `AZURE_CONFIG_DIR=/tmp/gh-aw/agent/.azure` and runs `az login` in a pre-agent step so `DefaultAzureCredential` can resolve `AzureCliCredential` inside the sandbox.
 
-Azure DevOps MCP support (`shared/mcp/azure-devops.md`) is still experimental, and its interfaces and required configuration may change. Set `ADO_MCP_AUTH_TOKEN` to the full `Authorization` header value, such as a bearer token string. In diagnostics and inspect output, the header is masked as `Authorization: ******`; this is expected.
-
-This shared Azure DevOps configuration also requires `*.dev.azure.com`, `*.visualstudio.com`, and `*.microsoftonline.com` in the network allowlist.
+Azure DevOps uses the separate [declarative connector](/gh-aw/reference/connectors/#azure-devops).
+Azure CLI authentication does not provision its Entra MCP credential. The old
+`shared/mcp/azure-devops.md` wildcard configuration is removed.
 
 Keep the command-based Azure MCP variant read-only with an explicit `allowed` list; do not switch to `allowed: ["*"]`.
 

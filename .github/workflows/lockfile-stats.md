@@ -7,9 +7,13 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  copilot-requests: write
   issues: read
   pull-requests: read
-engine: claude
+model: router/economy
+engine:
+  id: claude
+  model-provider: github
 tools:
   cli-proxy: true
   cache-memory: true

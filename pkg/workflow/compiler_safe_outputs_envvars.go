@@ -3,9 +3,11 @@ package workflow
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/sliceutil"
 )
 
 var consolidatedSafeOutputsEnvvarsLog = logger.New("workflow:compiler_safe_outputs_envvars")
@@ -13,13 +15,42 @@ var consolidatedSafeOutputsEnvvarsLog = logger.New("workflow:compiler_safe_outpu
 // buildJobLevelSafeOutputEnvVars builds environment variables that should be set at the job level
 // for the consolidated safe_outputs job. These are variables that are common to all safe output steps.
 func (c *Compiler) buildJobLevelSafeOutputEnvVars(data *WorkflowData, workflowID string) map[string]string {
-	envVars := make(map[string]string)
+	envVars := c.addIssueLabelEnv(make(map[string]string))
 	addObjectPackLimitEnv(envVars)
 	addJobLevelWorkQueueEnvVars(envVars, data)
 	c.addJobLevelWorkflowMetadata(envVars, data, workflowID)
 	addJobLevelEngineMetadata(envVars, data)
 	addJobLevelCommandMetadata(envVars, data)
 	c.addJobLevelSafeOutputConfig(envVars, data)
+	if data.SafeOutputs != nil && safeOutputAuthorizationEnabled(data.SafeOutputs) {
+		maps.Copy(envVars, safeOutputAuthorizationDefaultEnv(data.SafeOutputs))
+		envVars["GH_AW_AUTHORIZATION_WORKFLOW_HASH"] = fmt.Sprintf("%q", data.FrontmatterHash+":"+data.BodyHash)
+		config := make(map[string]any)
+		for name, builder := range handlerRegistry {
+			if builder(data.SafeOutputs) != nil {
+				config[name] = make(map[string]any)
+			}
+		}
+		if data.SafeOutputs.DispatchRepository != nil {
+			tools := make(map[string]any)
+			for name := range data.SafeOutputs.DispatchRepository.Tools {
+				tools[name] = make(map[string]any)
+			}
+			config["dispatch_repository"] = map[string]any{"tools": tools}
+		}
+		addSafeOutputAuthorizationRuntimeConfig(config, data.SafeOutputs)
+		if encoded, err := json.Marshal(config); err == nil {
+			envVars["GH_AW_SAFE_OUTPUTS_AUTHORIZATION_CONFIG"] = fmt.Sprintf("%q", string(encoded))
+		}
+		if encoded, err := json.Marshal(data.SafeOutputs.AuthorizationCoverage); err == nil {
+			envVars["GH_AW_SAFE_OUTPUTS_AUTHORIZATION_COVERAGE"] = fmt.Sprintf("%q", string(encoded))
+		}
+	}
+	for _, alias := range sliceutil.SortedKeys(data.Connectors) {
+		if plan := data.Connectors[alias].SafeOutputPlan; plan != "" {
+			envVars[connectorEnvPrefix(alias)+"PLAN"] = quoteYAMLEnvValue(plan)
+		}
+	}
 	return envVars
 }
 
@@ -27,9 +58,6 @@ func addJobLevelWorkQueueEnvVars(envVars map[string]string, data *WorkflowData) 
 	if isWorkQueueEnabled(data) {
 		envVars["GH_AW_WORK_QUEUE_ENABLED"] = `"true"`
 		envVars["GH_AW_WORK_QUEUE_ROLE"] = fmt.Sprintf("%q", workQueueRuntimeRole(data))
-		if isWorkQueueParticipant(data) {
-			envVars["GH_AW_WORK_QUEUE_INTENT_ORIGIN"] = `"${{ needs.agent.outputs.work_queue_origin }}"`
-		}
 		envVars["GH_AW_WORK_QUEUE_SNAPSHOT"] = fmt.Sprintf("%q", constants.WorkQueueSnapshotPath)
 	}
 }
@@ -164,6 +192,7 @@ func (c *Compiler) addJobLevelSafeOutputConfig(envVars map[string]string, data *
 	if IsDetectionJobEnabled(data.SafeOutputs) {
 		envVars["GH_AW_DETECTION_CONCLUSION"] = fmt.Sprintf("${{ needs.%s.outputs.detection_conclusion }}", constants.DetectionJobName)
 		envVars["GH_AW_DETECTION_REASON"] = fmt.Sprintf("${{ needs.%s.outputs.detection_reason }}", constants.DetectionJobName)
+		envVars["GH_AW_DETECTION_THREAT_KINDS"] = fmt.Sprintf("${{ needs.%s.outputs.detection_threat_kinds }}", constants.DetectionJobName)
 		envVars["GH_AW_RUN_DETECTION"] = fmt.Sprintf("${{ needs.%s.outputs.run_detection }}", constants.DetectionJobName)
 		envVars["GH_AW_THREAT_DETECTION_AIC"] = fmt.Sprintf("${{ needs.%s.outputs.aic }}", constants.DetectionJobName)
 	}

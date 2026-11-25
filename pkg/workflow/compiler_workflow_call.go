@@ -30,31 +30,14 @@ func hasWorkflowCallOrDispatchTrigger(onSection string) bool {
 	return onSectionHasAnyTrigger(onSection, "workflow_call", "workflow_dispatch")
 }
 
-// generateArtifactPrefixStep creates a step that computes a stable, unique artifact name
-// prefix from a hash of the workflow_call inputs and the run attempt. This ensures artifact
-// names do not clash when the same reusable workflow is called multiple times within a
-// single workflow run (e.g. two jobs in the calling workflow each invoking the same lock.yml).
-//
-// The computation is delegated to actions/setup/sh/compute_artifact_prefix.sh (copied to
-// ${RUNNER_TEMP}/gh-aw/actions/ at runtime by the Setup Scripts step) which:
-//   - Hashes INPUTS_JSON + GITHUB_RUN_ATTEMPT using sha256, taking the first 8 hex chars.
-//   - Logs what it is hashing so the prefix is traceable in workflow logs.
-//   - Yields a value like "a1b2c3d4-".
-//
-// Uniqueness guarantee:
-//   - Two calls with different inputs → different prefixes.
-//   - Two calls with the same inputs on different run attempts → different prefixes.
-//   - Two calls with identical inputs on the same run attempt → same prefix (conflict).
-//     Callers MUST provide different inputs to avoid this edge case.
-//
-// Security note: inputs are passed through an environment variable rather than being
-// interpolated directly into the shell script to prevent template injection.
+// generateArtifactPrefixStep binds artifacts to the activation job's check run,
+// which is unique even when several callers supply identical inputs.
 func generateArtifactPrefixStep() []string {
 	return []string{
 		"      - name: Compute artifact prefix\n",
 		"        id: artifact-prefix\n",
 		"        env:\n",
-		"          INPUTS_JSON: ${{ toJSON(inputs) }}\n",
+		"          GH_AW_ACTIVATION_CHECK_RUN_ID: ${{ job.check_run_id }}\n",
 		"        run: bash \"${RUNNER_TEMP}/gh-aw/actions/compute_artifact_prefix.sh\"\n",
 	}
 }
@@ -242,6 +225,31 @@ func buildWorkflowCallOutputsMap(safeOutputs *SafeOutputsConfig) map[string]work
 // workflowCallSecretEntry represents a single on.workflow_call.secrets entry.
 type workflowCallSecretEntry struct {
 	Required bool `yaml:"required"`
+}
+
+func workflowCallSecretNames(onSection string) []string {
+	var onData map[string]any
+	if err := yaml.Unmarshal([]byte(onSection), &onData); err != nil {
+		return nil
+	}
+	on, ok := onData["on"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	workflowCall, ok := on["workflow_call"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	secrets, ok := workflowCall["secrets"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	names := make([]string, 0, len(secrets))
+	for name := range secrets {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // injectWorkflowCallSecretsSection adds on.workflow_call.secrets declarations for secrets

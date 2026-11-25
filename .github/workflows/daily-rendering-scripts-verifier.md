@@ -10,11 +10,15 @@ on:
 permissions:
   contents: read
   actions: read
+  copilot-requests: write
   issues: read
   pull-requests: read
 
 tracker-id: daily-rendering-scripts-verifier
-engine: claude
+model: router/balanced
+engine:
+  id: claude
+  model-provider: github
 strict: true
 
 graders:
@@ -164,7 +168,7 @@ Use the agentic-workflows MCP "logs" tool with:
 - artifacts: ["agent", "usage"]
 ```
 
-The tool returns a JSON response with a `file_path` field pointing to a summary JSON in `/tmp/gh-aw/logs-cache/`.
+The tool returns a JSON response with a `file_path` field pointing to a summary JSON in an owner-only temporary directory.
 Record this `file_path` for use in Phase 2.
 If the MCP call appears to hang or times out, run a single `sleep 60`, then read the `file_path` result directly (no repeated polling loops).
 

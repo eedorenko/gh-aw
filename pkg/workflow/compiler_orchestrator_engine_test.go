@@ -746,7 +746,7 @@ imports:
 			assert.Equal(t, "anthropic", result.engineConfig.Auth.Provider)
 			assert.Equal(t, "fr_01ABC", result.engineConfig.Auth.AnthropicFederationRuleID)
 			assert.Equal(t, "org_01XYZ", result.engineConfig.Auth.AnthropicOrganizationID)
-			assert.Equal(t, "sa_01DEF", result.engineConfig.Auth.AnthropicServiceAccountID)
+			assert.Equal(t, "sa_01DEF", result.engineConfig.Auth.ServiceAccountID)
 			assert.Equal(t, "ws_01GHI", result.engineConfig.Auth.AnthropicWorkspaceID)
 			tt.verify(t, result)
 		})
@@ -899,6 +899,21 @@ func TestShouldScanImportedMarkdown(t *testing.T) {
 		{
 			name:           "scans regular markdown imports",
 			importFilePath: "shared/workflow.md",
+			want:           true,
+		},
+		{
+			name:           "scans pinned remote markdown imports",
+			importFilePath: "owner/repo/.github/workflows/connectors/tracker.md@1111111111111111111111111111111111111111",
+			want:           true,
+		},
+		{
+			name:           "does not infer markdown from the remote ref",
+			importFilePath: "owner/repo/workflow.yml@release.md",
+			want:           false,
+		},
+		{
+			name:           "preserves local at signs",
+			importFilePath: "shared/workflow@release.md",
 			want:           true,
 		},
 		{

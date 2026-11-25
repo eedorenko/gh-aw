@@ -8,6 +8,7 @@ const require = createRequire(import.meta.url);
 const piProvider = require("./pi_provider.cjs");
 const { runPiSubagent } = require("./pi_subagent_extension.cjs");
 const { runWithCopilotSDK } = require("./copilot_sdk_session.cjs");
+const { prepareMarkdownFixtures } = require("../../../scripts/markdown_metadata_test_adapter.cjs");
 const { resolveMultiProviderFromReflect } = require("./awf_reflect.cjs");
 const { normalizeRuntimeEvent } = require("./unified_session.cjs");
 const { normalizeUnifiedSessionEvent } = require("./unified_session_payload.cjs");
@@ -189,7 +190,7 @@ describe("AWF x-awf-caller attribution", () => {
 
     // Child Pi process: launched by the sub-agent extension with its own
     // environment; a real process loads pi_provider.cjs and fires the hook.
-    const executable = path.join(dir, "fake-pi");
+    const executable = path.join(dir, "pi");
     fs.writeFileSync(
       executable,
       `#!/usr/bin/env node
@@ -206,7 +207,8 @@ process.stdin.on("end", () => {
 `,
       { mode: 0o700 }
     );
-    vi.stubEnv("GH_AW_PI_COMMAND", executable);
+    vi.stubEnv("PATH", `${dir}${path.delimiter}${process.env.PATH || ""}`);
+    vi.stubEnv("GH_AW_PI_COMMAND", "");
     vi.stubEnv("RUNNER_TEMP", "");
     vi.stubEnv("PI_CODING_AGENT_DIR", dir);
     const write = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
@@ -233,8 +235,10 @@ process.stdin.on("end", () => {
     // and haiku-whoami share the copilot-completions provider and served model,
     // so any header would also label child traffic. The SDK sends none and
     // relies on native per-agent metrics instead.
-    fs.mkdirSync(path.join(dir, ".github/agents"), { recursive: true });
-    fs.writeFileSync(path.join(dir, ".github/agents/haiku-whoami.agent.md"), "---\nmodel: claude-haiku-4.5\n---\nSay which model you are.");
+    fs.mkdirSync(path.join(dir, "base/copilot-agents"), { recursive: true });
+    const agent = "---\nmodel: claude-haiku-4.5\n---\nSay which model you are.";
+    fs.writeFileSync(path.join(dir, "base/copilot-agents/haiku-whoami.agent.md"), agent);
+    prepareMarkdownFixtures(agent);
     vi.stubEnv("GH_AW_SESSION_STATE_BASE_DIR", dir);
     vi.stubEnv("GH_AW_ENGINE_CWD", dir);
     vi.stubEnv("COPILOT_MODEL", "");
@@ -269,17 +273,17 @@ process.stdin.on("end", () => {
       logger: () => {},
       workingDirectory: dir,
       agentsBaseDir: dir,
-      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forUri: () => ({}) }, approveAll: () => "allow" },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
     });
     expect(result.exitCode).toBe(0);
     const session = createSession.mock.calls[0][0];
     // Wire APIs, providers and model resolution are unchanged.
-    expect(session.providers).toEqual(config.providers);
-    expect(session.models).toEqual(config.models);
+    expect(session.inference.providers).toEqual(config.providers);
+    expect(session.inference.models).toEqual(config.models);
     expect(session.model).toBe("copilot-completions/claude-haiku-4.5");
-    expect(session.customAgents).toEqual([expect.objectContaining({ name: "haiku-whoami", model: "copilot-completions/claude-haiku-4.5" })]);
+    expect(session.agents.definitions).toEqual([expect.objectContaining({ name: "haiku-whoami", model: "copilot-completions/claude-haiku-4.5" })]);
     expect(JSON.stringify(session).toLowerCase()).not.toContain("x-awf-caller");
-    expect(session.providers.every(provider => provider.headers === undefined)).toBe(true);
+    expect(session.inference.providers.every(provider => provider.headers === undefined)).toBe(true);
     for (const call of sendAndWait.mock.calls) expect(JSON.stringify(call).toLowerCase()).not.toContain("x-awf-caller");
   });
 

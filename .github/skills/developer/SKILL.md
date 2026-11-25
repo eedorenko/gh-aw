@@ -19,41 +19,86 @@ Use this reference for gh-aw technical specs and development guidelines across c
 
 Use this section for the detailed day-to-day command flow that was intentionally removed from `AGENTS.md` to keep first-run ambient context small.
 
+### Sandbox-compatible commands
+
+- Run commands from the active worktree, never the main checkout or a sibling
+  worktree. Each shell starts fresh; specify the working directory in each
+  command. From the repository root, use `npm --prefix docs run <script>` for
+  docs scripts, not bare `npm run <script>`.
+- Use literal `$TMPDIR` paths for scratch files and writable caches, not
+  `/tmp`, resolved macOS temp paths, or system directories. When cache writes
+  need isolation, `make` defaults Go, golangci-lint, and npm caches under `$TMPDIR` when it is set,
+  preserving explicit cache overrides. Before direct tool commands, including
+  `go env` and `go version`, export:
+  ```bash
+  export GOCACHE="$TMPDIR/gh-aw-go-build" GOMODCACHE="$TMPDIR/gh-aw-go-mod"
+  export GOLANGCI_LINT_CACHE="$TMPDIR/gh-aw-golangci-lint"
+  export npm_config_cache="$TMPDIR/gh-aw-npm-cache"
+  ```
+  On macOS, canonicalize the existing temporary directory before path-sensitive
+  tests so the `/var` symlink does not trigger symlink-rejection guards:
+  ```bash
+  export TMPDIR="$(cd "$TMPDIR" && pwd -P)"
+  ```
+  Restore local dependencies only after a manifest change or missing-tool
+  failure; do not install tools globally.
+- Prefer the smallest focused check. Docs title changes use
+  `npm --prefix docs run test:titles`. Full docs builds also require the
+  `githubnext/agentics` workflow sources: set `AGENTICS_WORKFLOWS_DIR` to an
+  explicitly available dependency directory rather than relying on the
+  default sibling path outside the worktree. Missing sources are a dependency
+  blocker, not a sandbox denial; do not fabricate replacement workflows.
+- Attempt commands inside the sandbox. On a path denial, stop operations on
+  that path, report the sandbox restriction, and request a policy update.
+  Do not retry through another tool, change permissions, or rerun outside the
+  sandbox. Missing approvals and ordinary build errors are not path denials.
+
 ### Validation checkpoints
 
-Run validation in tiers — catch compile errors early, defer slow tests to the final pass only.
+Run validation in tiers. Keep formatting and focused tests in the inner loop;
+defer package-wide Go linting and workflow drift to the final pass.
 
-1. **After each significant code edit** (fast, <5s — catch compile errors immediately)
+1. **After each significant code edit** (format changed files, then run one focused check)
    ```bash
-   make build && make fmt
+   make fmt
+   go test ./pkg/cli -run '^TestRelevantBehavior' -count=1
    ```
-2. **Before every intermediate `report_progress` call** (fast, <30s — no tests)
+   Replace the package and test pattern with the behavior being changed. This
+   compiles the affected package too; do not add a CLI build unless the next
+   command needs `./gh-aw`. First builds after Go edits can exceed the warm-cache
+   budget because Go compiles the entire package, including its test files.
+2. **Before every intermediate `report_progress` call** (fast, no test bodies)
    ```bash
    make agent-report-progress-no-test
    ```
-3. **Before the FINAL `report_progress` call** (change-scoped, includes impacted Go tests)
+   This formats branch changes and compiles/vets changed Go packages. It does
+   not link the CLI or run package-wide Go linters or workflow recompilation.
+   Schema changes still rebuild the CLI; stale-lock and local-permission guards
+   still run. JavaScript/action-shell checks remain change-scoped.
+3. **Before the FINAL `report_progress` call** (build, lint, impacted tests, and workflow drift)
    ```bash
    make agent-report-progress
    ```
-4. **Before final handoff when time allows**
-   ```bash
-   make agent-finish
-   ```
+   This is the full pre-PR gate. Run it once, not after every focused test.
+   `make agent-finish` is an explicit repository-wide maintenance sweep, not an
+   inner-loop or routine handoff command.
 
-> **Key rule:** Run `test-unit` only before the **final** `report_progress` call, not before intermediate saves. The pre-PR targets scope formatting, linting, tests, and workflow drift checks to the branch changes.
+> **Key rule:** Run `test-unit` only before the **final** `report_progress` call, not before intermediate saves. Intermediate saves defer full Go lint and workflow drift; they do not replace the final gate.
 
-> **Timeout budget:** `make agent-report-progress` should normally finish in under 30 seconds. Workflow source or compiler changes additionally run the full workflow drift check. Set `TEST_UNIT_RUN_FULL=1` only when the full Go suite is required.
+Fast/slow suites: [timing and coverage contract](../../../CONTRIBUTING.md#cgo-unit-test-timing).
+
+> **Timeout budget:** Aim for warm-cache intermediate validation under 5 seconds. The 30-second `test-unit` budget covers selected test runtime, not compilation, linting, or full workflow drift; the final gate can take minutes. Set `TEST_UNIT_RUN_FULL=1` only when the full Go suite is required.
 
 ### Change-type command matrix
 
-- Go file changes: `make fmt`
+- Formatting: `make fmt` formats branch changes (including staged, unstaged, and untracked files). Go-only edits do not need npm. Use `make fmt-all` only for an explicit full-repository formatting sweep.
 - Workflow markdown changes: `make recompile`
-- JavaScript (`*.cjs`) changes: `make fmt-cjs && make lint-cjs`
+- JavaScript (`*.cjs`) changes: `make fmt`, then a focused runtime test. The intermediate gate runs changed-file JavaScript lint.
 
 ### Common focused checks from recent repository work
 
 - `pkg/workflow/` edits: run `go test ./pkg/workflow -count=1` during iteration; narrow with `-run` when only one workflow behavior is under active change.
-- `actions/setup/js/` edits: after `make fmt-cjs && make lint-cjs`, run the targeted `actions/setup/js/*.test.cjs` suites for the files you touched. Gateway changes commonly validate with `npx vitest run actions/setup/js/start_mcp_gateway.test.cjs`.
+- `actions/setup/js/` edits: after `make fmt`, run the targeted `actions/setup/js/*.test.cjs` suites for the files you touched. Gateway changes commonly validate with `npx vitest run actions/setup/js/start_mcp_gateway.test.cjs`.
 - Workflow source changes that also touch compiler or runtime code: run `make recompile`, then rerun the affected focused Go or JavaScript checks before the final `make agent-report-progress`.
 
 ### Merge-main playbook

@@ -43,6 +43,9 @@ const { globPatternToRegex } = require("./glob_pattern_helpers.cjs");
 const { ERR_VALIDATION, ERR_SYSTEM } = require("./error_codes.cjs");
 const { isTemporaryId, normalizeTemporaryId } = require("./temporary_id.cjs");
 const { lstatGuard } = require("./symlink_guard.cjs");
+const { copyFileExclusive, copyDirectoryExclusive } = require("./staging_conflicts.cjs");
+const { digestArtifactFiles, handlerAuthorizationRequired, requireAuthorization } = require("./safe_output_authorization_gate.cjs");
+const { canonicalDigest } = require("./safe_output_authorization.cjs");
 const {
   assertClaimAuthorized,
   currentClaimHandle,
@@ -54,10 +57,8 @@ const {
   recordClaimEffect,
   claimIdentity,
   assertClaimIdentity,
-  receiptMatchesClaim,
 } = require("./work_queue_claim_scope.cjs");
 const { expectedGitHubHost } = require("./work_queue_host.cjs");
-const privateDeliveryReceipts = new WeakMap();
 
 /**
  * Staging directory where the model places files to be uploaded.
@@ -250,13 +251,11 @@ function listFilesRecursive(dir, baseDir) {
  * @param {string} destRelPath - Relative path within the staging directory
  * @returns {{ error: string|null }}
  */
-function copySingleFileToStaging(sourcePath, destRelPath) {
-  const destPath = path.join(stagingDirectory(), destRelPath);
-  // Never overwrite a file that is already staged — the pre-staged version takes precedence.
-  if (fs.existsSync(destPath)) {
-    core.info(`Skipping auto-copy for ${destRelPath}: already exists in staging directory`);
-    return { error: null };
+function copySingleFileToStaging(sourcePath, destRelPath, destinationRoot = stagingDirectory()) {
+  if (path.basename(destRelPath).startsWith("-")) {
+    return { error: `filenames beginning with "-" are not allowed: ${destRelPath}` };
   }
+  const destPath = path.join(destinationRoot, destRelPath);
   const stat = lstatGuard(sourcePath);
   if (stat === null) {
     return { error: `symlinks are not allowed: ${sourcePath}` };
@@ -271,8 +270,15 @@ function copySingleFileToStaging(sourcePath, destRelPath) {
     throw new Error(`${ERR_SYSTEM}: Failed to create directory ${path.dirname(destPath)}: ${getErrorMessage(err)}`, { cause: err });
   }
   try {
-    fs.copyFileSync(sourcePath, destPath);
-    fs.chmodSync(destPath, 0o600);
+    const copyResult = copyFileExclusive(sourcePath, destPath);
+    if (copyResult === "conflict") {
+      return { error: `staging name conflict for ${destRelPath}; rename the file or use a distinct path` };
+    }
+    if (copyResult === "identical") {
+      core.info(`Skipping auto-copy for ${destRelPath}: identical file already exists in staging directory`);
+    } else {
+      fs.chmodSync(destPath, 0o600);
+    }
   } catch (err) {
     throw new Error(`${ERR_SYSTEM}: Failed to copy file ${sourcePath} to ${destPath}: ${getErrorMessage(err)}`, { cause: err });
   }
@@ -287,9 +293,62 @@ function copySingleFileToStaging(sourcePath, destRelPath) {
  * @param {string} destRelDir - Relative directory path within the staging directory
  * @returns {{ copiedCount: number, error: string|null }}
  */
-function copyDirectoryToStaging(sourceDir, destRelDir) {
+function copyDirectoryToStaging(sourceDir, destRelDir, destinationRoot = stagingDirectory(), transactional = true) {
   let copiedCount = 0;
-  const entries = fs.readdirSync(sourceDir, { withFileTypes: true });
+  const destDir = path.join(destinationRoot, destRelDir);
+  if (transactional) {
+    const validateDirectorySourcePaths = dir => {
+      let entries;
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch (err) {
+        return `failed to read directory ${dir}: ${getErrorMessage(err)}`;
+      }
+      for (const entry of entries) {
+        if (!entry.isDirectory() && !entry.isFile()) continue;
+        const sourcePath = path.join(dir, entry.name);
+        let canonicalSourcePath;
+        try {
+          canonicalSourcePath = fs.realpathSync(sourcePath);
+        } catch (err) {
+          return `failed to resolve canonical path for ${sourcePath}: ${getErrorMessage(err)}`;
+        }
+        const sensitiveError = validateSourcePath(canonicalSourcePath);
+        if (sensitiveError) return sensitiveError;
+        if (entry.isDirectory()) {
+          const nestedError = validateDirectorySourcePaths(sourcePath);
+          if (nestedError) return nestedError;
+        }
+      }
+      return null;
+    };
+    const validationError = validateDirectorySourcePaths(sourceDir);
+    if (validationError) return { copiedCount, error: validationError };
+    try {
+      const result = copyDirectoryExclusive(sourceDir, destDir, tempDir => {
+        const copyResult = copyDirectoryToStaging(sourceDir, "", tempDir, false);
+        if (copyResult.error) throw new Error(copyResult.error);
+        copiedCount = copyResult.copiedCount;
+      });
+      if (result === "conflict") {
+        return { copiedCount: 0, error: `staging name conflict for ${destRelDir}; rename the directory or use a distinct path` };
+      }
+      return { copiedCount: result === "identical" ? 0 : copiedCount, error: null };
+    } catch (err) {
+      return { copiedCount: 0, error: `failed to stage directory ${sourceDir} to ${destDir}: ${getErrorMessage(err)}` };
+    }
+  }
+  try {
+    fs.mkdirSync(destDir, { recursive: true });
+  } catch (err) {
+    return { copiedCount, error: `failed to create staging directory ${destDir}: ${getErrorMessage(err)}` };
+  }
+  let entries;
+  try {
+    entries = fs.readdirSync(sourceDir, { withFileTypes: true });
+  } catch (err) {
+    return { copiedCount, error: `failed to read source directory ${sourceDir}: ${getErrorMessage(err)}` };
+  }
   for (const entry of entries) {
     const srcFull = path.join(sourceDir, entry.name);
     const destRel = path.join(destRelDir, entry.name);
@@ -310,7 +369,7 @@ function copyDirectoryToStaging(sourceDir, destRelDir) {
       if (sensitiveErr) {
         return { copiedCount, error: sensitiveErr };
       }
-      const sub = copyDirectoryToStaging(srcFull, destRel);
+      const sub = copyDirectoryToStaging(srcFull, destRel, destinationRoot, false);
       if (sub.error) return sub;
       copiedCount += sub.copiedCount;
     } else if (stat.isFile()) {
@@ -325,7 +384,7 @@ function copyDirectoryToStaging(sourceDir, destRelDir) {
       if (sensitiveErr) {
         return { copiedCount, error: sensitiveErr };
       }
-      const result = copySingleFileToStaging(srcFull, destRel);
+      const result = copySingleFileToStaging(srcFull, destRel, destinationRoot);
       if (result.error) return { copiedCount, error: result.error };
       copiedCount++;
     }
@@ -524,6 +583,10 @@ function resolveFiles(request, allowedPaths, defaultInclude, defaultExclude) {
 
   // Deduplicate and sort deterministically.
   const unique = Array.from(new Set(candidateRelPaths)).sort();
+  const leadingDashFilename = unique.find(filename => path.basename(filename).startsWith("-"));
+  if (leadingDashFilename) {
+    return { files: [], error: `filenames beginning with "-" are not allowed: ${leadingDashFilename}` };
+  }
   if (currentClaimHandle()) for (const filename of unique) assertClaimArtifactFile(path.join(stagingDirectory(), filename), stagingDirectory());
   return { files: unique, error: null };
 }
@@ -636,7 +699,7 @@ async function main(config = {}) {
    * @param {Object} message - The upload_artifact message from the model
    * @param {Object} resolvedTemporaryIds - Map of already-resolved temporary IDs (unused here)
    * @param {Map<string, any>} temporaryIdMap - Shared temp-ID map; the handler does not modify it
-   * @returns {Promise<{success: boolean, error?: string, skipped?: boolean, tmpId?: string, temporaryId?: string, artifactName?: string, artifactId?: number, artifactUrl?: string, slotIndex?: number}>}
+   * @returns {Promise<{success: boolean, error?: string, skipped?: boolean, staged?: boolean, tmpId?: string, temporaryId?: string, artifactName?: string, artifactId?: number, artifactUrl?: string, slotIndex?: number}>}
    */
   return async function handleUploadArtifact(message, resolvedTemporaryIds, temporaryIdMap) {
     if (currentClaimHandle() !== factoryClaim) throw new Error(`${ERR_VALIDATION}: upload_artifact factory cannot escape its original Claim; create a handler for the current Claim`);
@@ -699,8 +762,6 @@ async function main(config = {}) {
     let artifactId;
     /** @type {string} */
     let artifactUrl = "";
-    let trustedDigest;
-    let trustedSize;
 
     if (!isStaged) {
       // Upload files directly via the internal artifact client.
@@ -720,6 +781,17 @@ async function main(config = {}) {
             throw new Error(`${ERR_VALIDATION}: Artifact upload repository identity differs from its native target; scoped effects remain blocked`);
           await assertClaimAuthorized({ ...message, repo: repository }, { effect: true, resource: { repository, host: expectedGitHubHost(), repository_id: String(nativeRepository.id), run_id: process.env.GITHUB_RUN_ID } });
         }
+        if (handlerAuthorizationRequired(config)) {
+          const artifacts = digestArtifactFiles(stagingDirectory(), absoluteFiles);
+          await requireAuthorization({
+            inputs: { artifactName, artifacts, retentionDays, skipArchive, repository, run_id: process.env.GITHUB_RUN_ID },
+            scope: { binding: "invocation", refs: [`sha256:${canonicalDigest(artifacts)}`] },
+          });
+          if (canonicalDigest(digestArtifactFiles(stagingDirectory(), absoluteFiles)) !== canonicalDigest(artifacts)) {
+            throw new Error("Safe-output authorization artifact changed after approval");
+          }
+          await assertClaimAuthorized({ ...message, repo: repository });
+        }
         const effect = recordClaimEffect({ kind: "artifact", repository, outcome: "unknown" });
         const uploadResult = await client.uploadArtifact(artifactName, absoluteFiles, stagingDirectory(), uploadOpts);
         if (effect) {
@@ -727,8 +799,6 @@ async function main(config = {}) {
           effect.id = String(uploadResult.id || "");
         }
         artifactId = uploadResult.id;
-        trustedDigest = uploadResult.digest;
-        trustedSize = uploadResult.size;
         core.info(`Uploaded artifact "${artifactName}" (id=${artifactId ?? "n/a"}, size=${uploadResult.size ?? totalSize}B)`);
 
         // Construct the artifact URL from the artifact ID and GitHub context.
@@ -794,7 +864,7 @@ async function main(config = {}) {
       core.warning(`Failed to write artifact resolver file: ${getErrorMessage(err)}`);
     }
 
-    const result = {
+    return {
       success: true,
       staged: isStaged,
       tmpId,
@@ -804,42 +874,7 @@ async function main(config = {}) {
       artifactUrl,
       slotIndex: i,
     };
-    if (factoryClaim && !isStaged && artifactId && typeof trustedDigest === "string" && /^(?:sha256:)?[a-f0-9]{64}$/.test(trustedDigest)) {
-      privateDeliveryReceipts.set(result, {
-        ...factoryIdentity,
-        repository: process.env.GITHUB_REPOSITORY,
-        run_id: process.env.GITHUB_RUN_ID,
-        name: artifactName,
-        id: artifactId,
-        digest: trustedDigest.replace(/^sha256:/, ""),
-        size: trustedSize,
-        url: artifactUrl,
-      });
-    }
-    return result;
   };
 }
 
-async function verifyArtifactDelivery({ claim, result, github }) {
-  const receipt = result && privateDeliveryReceipts.get(result);
-  if (!receiptMatchesClaim(receipt, claim) || !receipt.run_id) return { verified: false };
-  const [owner, repo] = receipt.repository.split("/");
-  const { data } = await github.rest.actions.getArtifact({ owner, repo, artifact_id: receipt.id });
-  if (
-    data.id !== receipt.id ||
-    data.name !== receipt.name ||
-    data.expired !== false ||
-    String(data.workflow_run?.id) !== receipt.run_id ||
-    data.digest !== `sha256:${receipt.digest}` ||
-    (receipt.size !== undefined && data.size_in_bytes !== receipt.size)
-  )
-    return { verified: false };
-  return {
-    verified: true,
-    claim_handle: claim.handle,
-    resource: { kind: "artifact", repository: receipt.repository, id: String(receipt.id), target_run_id: receipt.run_id, name: receipt.name, digest: data.digest, url: receipt.url },
-    evidence: { source: "github_artifact_api", digest: data.digest, run_id: receipt.run_id, size: data.size_in_bytes },
-  };
-}
-
-module.exports = { main, verifyArtifactDelivery };
+module.exports = { main };

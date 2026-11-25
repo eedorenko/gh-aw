@@ -13,24 +13,6 @@ var toolDescriptionEnhancerLog = logger.New("workflow:tool_description_enhancer"
 type toolConstraintBuilder func(*SafeOutputsConfig) []string
 
 var toolConstraintBuilders = map[string]toolConstraintBuilder{
-	"ado_create_work_item": func(safeOutputs *SafeOutputsConfig) []string {
-		return createWorkItemConstraints(safeOutputs.CreateWorkItems)
-	},
-	"ado_update_work_item": func(safeOutputs *SafeOutputsConfig) []string {
-		return updateWorkItemConstraints(safeOutputs.UpdateWorkItems)
-	},
-	"ado_comment_on_work_item": func(safeOutputs *SafeOutputsConfig) []string {
-		return commentOnWorkItemConstraints(safeOutputs.CommentOnWorkItems)
-	},
-	"ado_assign_work_item": func(safeOutputs *SafeOutputsConfig) []string {
-		return assignWorkItemConstraints(safeOutputs.AssignWorkItems)
-	},
-	"ado_link_work_items": func(safeOutputs *SafeOutputsConfig) []string {
-		return linkWorkItemsConstraints(safeOutputs.LinkWorkItems)
-	},
-	"ado_upload_workitem_attachment": func(safeOutputs *SafeOutputsConfig) []string {
-		return uploadWorkItemAttachmentConstraints(safeOutputs.UploadWorkItemAttachments)
-	},
 	"create_issue": func(safeOutputs *SafeOutputsConfig) []string { return createIssueConstraints(safeOutputs.CreateIssues) },
 	"set_issue_field": func(safeOutputs *SafeOutputsConfig) []string {
 		return setIssueFieldConstraints(safeOutputs.SetIssueField)
@@ -217,6 +199,12 @@ func createIssueConstraints(config *CreateIssuesConfig) []string {
 			*constraints = append(*constraints, fmt.Sprintf("Only these labels are allowed: %s.", formatStringList(config.AllowedLabels)))
 		}
 		appendAllowedIssueFieldsConstraint(constraints, config.AllowedFields)
+		if limit := config.maxIssueArtifacts(); limit > 0 {
+			*constraints = append(*constraints, fmt.Sprintf("Maximum %d artifact(s) can be attached per issue.", limit))
+			*constraints = append(*constraints, fmt.Sprintf("Maximum artifact body size: %d UTF-8 bytes.", config.maxIssueArtifactSize()))
+		} else {
+			*constraints = append(*constraints, "Issue artifacts are disabled; omit artifacts.")
+		}
 		if len(config.Assignees) > 0 {
 			*constraints = append(*constraints, fmt.Sprintf("Assignees %s will be automatically assigned.", formatStringList(config.Assignees)))
 		}
@@ -381,7 +369,31 @@ func submitPullRequestReviewConstraints(config *SubmitPullRequestReviewConfig) [
 		appendMaxConstraint(constraints, config.Max, "Maximum %d review(s) can be submitted.")
 		appendTargetConstraint(constraints, config.Target)
 		appendStringConstraint(constraints, config.TargetRepoSlug, "Reviews will be submitted in repository %q.")
+		appendAllowedReviewEventsConstraint(constraints, config.AllowedEvents)
 	})
+}
+
+// reviewEventValues lists every review event the submit_pull_request_review tool schema supports.
+var reviewEventValues = []string{"APPROVE", "COMMENT", "REQUEST_CHANGES"}
+
+// appendAllowedReviewEventsConstraint tells the agent which review events are permitted when
+// allowed-events narrows the set, and explicitly names the excluded ones so the base
+// description's references to APPROVE do not mislead the agent into a rejected call.
+func appendAllowedReviewEventsConstraint(constraints *[]string, allowedEvents []string) {
+	if len(allowedEvents) == 0 {
+		return
+	}
+	text := "Allowed review events: " + strings.Join(allowedEvents, ", ") + "."
+	var excluded []string
+	for _, event := range reviewEventValues {
+		if !slices.Contains(allowedEvents, event) {
+			excluded = append(excluded, event)
+		}
+	}
+	if len(excluded) > 0 {
+		text += " Events not listed (" + strings.Join(excluded, ", ") + ") are rejected; do not use them."
+	}
+	*constraints = append(*constraints, text)
 }
 
 func replyToPullRequestReviewCommentConstraints(config *ReplyToPullRequestReviewCommentConfig) []string {
@@ -476,6 +488,12 @@ func addReviewerConstraints(config *AddReviewerConfig) []string {
 func updateIssueConstraints(config *UpdateIssuesConfig) []string {
 	return buildConstraints(config, func(config *UpdateIssuesConfig, constraints *[]string) {
 		appendMaxConstraint(constraints, config.Max, "Maximum %d issue(s) can be updated.")
+		if limit := config.maxIssueArtifacts(); limit > 0 {
+			*constraints = append(*constraints, fmt.Sprintf("Maximum %d artifact(s) can be attached per issue.", limit))
+			*constraints = append(*constraints, fmt.Sprintf("Maximum artifact body size: %d UTF-8 bytes.", config.maxIssueArtifactSize()))
+		} else {
+			*constraints = append(*constraints, "Issue artifacts are disabled; omit artifacts.")
+		}
 		appendTargetConstraint(constraints, config.Target)
 		titlePrefix := config.TitlePrefix
 		if config.RequiredTitlePrefix != "" {

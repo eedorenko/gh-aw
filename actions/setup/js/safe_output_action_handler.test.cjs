@@ -29,6 +29,15 @@ describe("safe_output_action_handler", () => {
   });
 
   describe("handler — basic payload export", () => {
+    it("does not export an executable action payload in staged mode", async () => {
+      const handler = await main({ action_name: "my_action", staged: true });
+      const result = await handler({ type: "my_action", title: "preview" }, {}, new Map());
+
+      expect(result).toMatchObject({ success: true, staged: true, payload: '{"title":"preview"}' });
+      expect(result.delegated).not.toBe(true);
+      expect(global.core.setOutput).not.toHaveBeenCalled();
+    });
+
     it("should export the payload as a step output and return success", async () => {
       const handler = await main({ action_name: "add_label" });
 
@@ -82,6 +91,12 @@ describe("safe_output_action_handler", () => {
   });
 
   describe("handler — INTERNAL_MESSAGE_FIELDS filtering", () => {
+    it("does not forward dependency protocol metadata as action inputs", async () => {
+      const handler = await main({ action_name: "my_action" });
+      await handler({ type: "my_action", output_id: "so_operation", "depends-on": ["so_first"], depends_on: "so_first", title: "hello" }, {}, new Map());
+      expect(JSON.parse(global.core.setOutput.mock.calls[0][1])).toEqual({ title: "hello" });
+    });
+
     it("should strip 'type' from the exported payload", async () => {
       const handler = await main({ action_name: "my_action" });
       await handler({ type: "my_action", title: "hello" }, {}, new Map());

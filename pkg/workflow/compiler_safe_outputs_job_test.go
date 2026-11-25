@@ -3,6 +3,7 @@
 package workflow
 
 import (
+	"fmt"
 	"os"
 	"path"
 	"path/filepath"
@@ -16,6 +17,208 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestUploadArtifactStagingDownloadCondition(t *testing.T) {
+	stagedFileScript := &SafeScriptConfig{connectorInputSchema: map[string]any{
+		"properties": map[string]any{
+			"file": map[string]any{"x-gh-aw-staged-file": map[string]any{"max-bytes": 1024}},
+		},
+	}}
+	configurations := []struct {
+		name   string
+		config *SafeOutputsConfig
+		types  []string
+	}{
+		{"public artifacts", &SafeOutputsConfig{UploadArtifact: &UploadArtifactConfig{}}, []string{"upload_artifact"}},
+		{"connector files without public artifacts", &SafeOutputsConfig{
+			Scripts: map[string]*SafeScriptConfig{"provider.upload-attachment": stagedFileScript},
+		}, []string{"provider_upload_attachment"}},
+		{"shared staging", &SafeOutputsConfig{
+			UploadArtifact: &UploadArtifactConfig{},
+			Scripts: map[string]*SafeScriptConfig{
+				"provider.upload-attachment": stagedFileScript,
+				"unrelated-script":           {connectorInputSchema: map[string]any{}},
+			},
+		}, []string{"provider_upload_attachment", "upload_artifact"}},
+	}
+	for _, configuration := range configurations {
+		t.Run(configuration.name, func(t *testing.T) {
+			compiler := NewCompiler()
+			state := &safeOutputsHandlerOutputsAndActionState{}
+			data := &WorkflowData{SafeOutputs: configuration.config}
+			compiler.appendUploadArtifactStagingDownloadStep(data, "fixture-", state)
+			var parsed struct {
+				Steps []struct {
+					Name string         `yaml:"name"`
+					If   string         `yaml:"if"`
+					With map[string]any `yaml:"with"`
+				} `yaml:"steps"`
+			}
+			require.NoError(t, yaml.Unmarshal([]byte("steps:\n"+strings.Join(state.steps, "")), &parsed))
+			require.Len(t, parsed.Steps, 1)
+			step := parsed.Steps[0]
+			require.Equal(t, "fixture-"+SafeOutputsUploadArtifactStagingArtifactName, step.With["name"])
+			require.Equal(t, artifactStagingDirExpr, step.With["path"])
+			require.NotEmpty(t, step.If)
+			scenarios := []struct {
+				outputs string
+				result  string
+				allowed bool
+			}{
+				{"", "success", false},
+				{"noop", "success", false},
+				{"report_incomplete", "success", false},
+				{"create_issue,unrelated_script", "success", false},
+				{strings.Join(configuration.types, ","), "success", true},
+				{strings.Join(configuration.types, ","), "skipped", false},
+			}
+			for _, outputType := range configuration.types {
+				scenarios = append(scenarios, struct {
+					outputs string
+					result  string
+					allowed bool
+				}{outputType, "success", true})
+			}
+			for _, scenario := range scenarios {
+				condition := strings.ReplaceAll(step.If, "!cancelled()", "('true' == 'true')")
+				for _, outputType := range configuration.types {
+					condition = strings.ReplaceAll(condition,
+						"contains(needs.agent.outputs.output_types, '"+outputType+"')",
+						fmt.Sprintf("('%t' == 'true')", strings.Contains(scenario.outputs, outputType)))
+				}
+				assert.Equal(t, scenario.allowed, evaluateTestCondition(t, condition, map[string]string{
+					"needs.agent.result": scenario.result,
+				}), "%s/%s: %s", scenario.outputs, scenario.result, step.If)
+			}
+		})
+	}
+	t.Run("preamble offset includes the conditional staging block", func(t *testing.T) {
+		compiler := NewCompiler()
+		before := &WorkflowData{SafeOutputs: &SafeOutputsConfig{}}
+		after := &WorkflowData{SafeOutputs: &SafeOutputsConfig{
+			Scripts: map[string]*SafeScriptConfig{"provider.upload-attachment": stagedFileScript},
+		}}
+		state := &safeOutputsHandlerOutputsAndActionState{}
+		compiler.appendUploadArtifactStagingDownloadStep(after, "", state)
+		assert.Equal(t, len(state.steps),
+			compiler.calculatePreambleInsertIndex(nil, after, "")-compiler.calculatePreambleInsertIndex(nil, before, ""))
+	})
+	t.Run("no staged-file consumer emits no download", func(t *testing.T) {
+		compiler := NewCompiler()
+		state := &safeOutputsHandlerOutputsAndActionState{}
+		compiler.appendUploadArtifactStagingDownloadStep(&WorkflowData{SafeOutputs: &SafeOutputsConfig{
+			Scripts: map[string]*SafeScriptConfig{"unrelated": {}},
+		}}, "", state)
+		assert.Empty(t, state.steps)
+	})
+}
+
+func TestSafeOutputsHandlerActionResolutionError(t *testing.T) {
+	data := &WorkflowData{
+		ActionPinMappings: map[string]string{"actions/source@v1": "./invalid-mapped-action"},
+		SafeOutputs: &SafeOutputsConfig{Actions: map[string]*SafeOutputActionConfig{
+			"source": {Uses: "actions/source@v1"},
+		}},
+	}
+	steps, outputs, names, err := NewCompiler().buildSafeOutputsHandlerOutputsAndActionSteps(data, "", "workflow.md")
+	require.ErrorContains(t, err, "invalid action pin mapping")
+	require.Nil(t, steps)
+	require.Nil(t, outputs)
+	require.Nil(t, names)
+}
+
+func TestSafeOutputsRequireAgentSuccess(t *testing.T) {
+	for _, setting := range []string{"", "false", "true"} {
+		for _, detection := range []string{"false", "true", `"${{ vars.DETECT == 'true' }}"`} {
+			t.Run(fmt.Sprintf("setting=%s/detection=%s", setting, detection), func(t *testing.T) {
+				config := ""
+				if setting != "" {
+					config = "  require-agent-success: " + setting + "\n"
+				}
+				source := `---
+on: workflow_dispatch
+engine: copilot
+permissions:
+  contents: read
+tools:
+  repo-memory:
+    branch-name: memory/test
+post-steps:
+  - name: Deterministic gate
+    run: exit 1
+safe-outputs:
+` + config + `  threat-detection: ` + detection + `
+  add-comment:
+  upload-asset:
+  jobs:
+    publish:
+      if: always() || failure()
+      runs-on: ubuntu-latest
+      steps:
+        - run: echo publish
+---
+Test publication gate.
+`
+				compiler := NewCompiler()
+				path := filepath.Join(t.TempDir(), "workflow.md")
+				data, err := compiler.ParseWorkflowString(source, path)
+				require.NoError(t, err)
+				require.Equal(t, setting == "true", data.SafeOutputs.RequireAgentSuccess)
+				output, err := compiler.CompileToYAML(data, path)
+				require.NoError(t, err)
+				var compiled map[string]any
+				require.NoError(t, yaml.Unmarshal([]byte(output), &compiled))
+				jobs := compiled["jobs"].(map[string]any)
+				repoMemory := jobs["push_repo_memory"].(map[string]any)
+				repoMemorySteps, err := yaml.Marshal(repoMemory["steps"])
+				require.NoError(t, err)
+				assert.Contains(t, string(repoMemorySteps), "Download repo-memory artifact")
+				assert.Contains(t, string(repoMemorySteps), "Push repo-memory changes")
+				names := []string{"safe_outputs", "publish", "upload_assets", "push_repo_memory"}
+				if detection != "false" {
+					names = append(names, "detection")
+				}
+				for _, name := range names {
+					job := jobs[name].(map[string]any)
+					condition := strings.Join(strings.Fields(job["if"].(string)), " ")
+					if setting == "true" {
+						assert.Contains(t, condition, "needs.agent.result == 'success'", name)
+					} else {
+						assert.NotContains(t, condition, "needs.agent.result == 'success'", name)
+					}
+					// Substitute non-result predicates to exercise the agent-result gate
+					// with output present and all other publication checks passing.
+					condition = strings.NewReplacer(
+						"!cancelled()", "('true' == 'true')",
+						"always()", "('true' == 'true')",
+						"failure()", "('true' == 'false')",
+						"contains(needs.agent.outputs.output_types, 'publish')", "('true' == 'true')",
+						"contains(needs.agent.outputs.output_types, 'upload_asset')", "('true' == 'true')",
+					).Replace(condition)
+					for _, result := range []string{"success", "failure", "cancelled", "skipped"} {
+						for _, detectionResult := range []string{"success", "failure", "skipped"} {
+							if name == "upload_assets" && detection == "true" && detectionResult != "success" {
+								continue
+							}
+							allowed := (result != "skipped" || (name == "push_repo_memory" && detection == "false")) &&
+								(setting != "true" || result == "success")
+							if name != "detection" && detection != "false" {
+								allowed = allowed && (detectionResult == "success" || (detectionResult == "skipped" &&
+									(name == "push_repo_memory" || detection != "true")))
+							}
+							assert.Equal(t, allowed, evaluateTestCondition(t, condition, map[string]string{
+								"needs.agent.result":     result,
+								"needs.detection.result": detectionResult,
+								"vars.DETECT":            "true",
+							}), "%s agent=%s detection=%s", name, result, detectionResult)
+						}
+					}
+				}
+				assert.NotContains(t, jobs["conclusion"].(map[string]any)["if"], "needs.agent.result == 'success'")
+			})
+		}
+	}
+}
 
 func TestSafeOutputsPRLifecyclePermissions(t *testing.T) {
 	t.Parallel()
@@ -209,6 +412,10 @@ func TestBuildConsolidatedSafeOutputsJobConcurrencyGroup(t *testing.T) {
 		name              string
 		concurrencyGroup  string
 		expectConcurrency bool
+		commentMemory     *CommentMemoryConfig
+		features          map[string]any
+		expectQueue       bool
+		expectError       bool
 	}{
 		{
 			name:              "no concurrency group",
@@ -225,6 +432,41 @@ func TestBuildConsolidatedSafeOutputsJobConcurrencyGroup(t *testing.T) {
 			concurrencyGroup:  "safe-outputs-${{ github.repository }}",
 			expectConcurrency: true,
 		},
+		{
+			name:              "comment memory uses shared writer group",
+			commentMemory:     &CommentMemoryConfig{MemoryID: "default"},
+			expectConcurrency: true,
+			expectQueue:       true,
+		},
+		{
+			name: "dynamic comment memory targets use the same writer group",
+			commentMemory: &CommentMemoryConfig{
+				MemoryID:       "other",
+				Target:         "*",
+				TargetRepoSlug: "other/repo",
+			},
+			expectConcurrency: true,
+			expectQueue:       true,
+		},
+		{
+			name:              "comment memory respects queue feature opt out",
+			commentMemory:     &CommentMemoryConfig{},
+			features:          map[string]any{"group-concurrency-queue": false},
+			expectConcurrency: true,
+		},
+		{
+			name:             "comment memory rejects a conflicting user group",
+			commentMemory:    &CommentMemoryConfig{},
+			concurrencyGroup: "workflow-specific-group",
+			expectError:      true,
+		},
+		{
+			name:              "comment memory accepts an explicit shared writer group",
+			commentMemory:     &CommentMemoryConfig{},
+			concurrencyGroup:  "gh-aw-comment-memory",
+			expectConcurrency: true,
+			expectQueue:       true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -233,7 +475,9 @@ func TestBuildConsolidatedSafeOutputsJobConcurrencyGroup(t *testing.T) {
 			compiler.jobManager = NewJobManager()
 
 			workflowData := &WorkflowData{
-				Name: "Test Workflow",
+				Name:                tt.name,
+				CommentMemoryConfig: tt.commentMemory,
+				Features:            tt.features,
 				SafeOutputs: &SafeOutputsConfig{
 					CreateIssues:     &CreateIssuesConfig{TitlePrefix: "[Test] "},
 					ConcurrencyGroup: tt.concurrencyGroup,
@@ -241,6 +485,11 @@ func TestBuildConsolidatedSafeOutputsJobConcurrencyGroup(t *testing.T) {
 			}
 
 			job, _, err := compiler.buildConsolidatedSafeOutputsJob(workflowData, string(constants.AgentJobName), "test-workflow.md")
+			if tt.expectError {
+				require.ErrorContains(t, err, "remove concurrency-group")
+				assert.Nil(t, job)
+				return
+			}
 			require.NoError(t, err, "Should build job without error")
 			require.NotNil(t, job, "Job should not be nil")
 
@@ -248,9 +497,13 @@ func TestBuildConsolidatedSafeOutputsJobConcurrencyGroup(t *testing.T) {
 				assert.NotEmpty(t, job.Concurrency, "Job should have concurrency set")
 				assert.Contains(t, job.Concurrency, tt.concurrencyGroup, "Concurrency should contain the group value")
 				assert.Contains(t, job.Concurrency, "cancel-in-progress: false", "Concurrency should have cancel-in-progress: false")
+				if tt.commentMemory != nil {
+					assert.Contains(t, job.Concurrency, `group: "gh-aw-comment-memory"`)
+				}
 			} else {
 				assert.Empty(t, job.Concurrency, "Job should have no concurrency set")
 			}
+			assert.Equal(t, tt.expectQueue, strings.Contains(job.Concurrency, "queue: max"))
 		})
 	}
 }
@@ -806,6 +1059,30 @@ func TestBuildJobLevelSafeOutputEnvVarsIncludesCompiledProjectUTC(t *testing.T) 
 	assert.Equal(t, `"-07:00"`, envVars["GH_AW_PROJECT_UTC"])
 }
 
+func TestCompiledIssueLabelEnvironments(t *testing.T) {
+	for _, label := range []string{"", "area:agentic-workflows", `area: team's "workflows"`} {
+		t.Run(label, func(t *testing.T) {
+			compiler := NewCompiler()
+			compiler.repoConfigLoaded = true
+			compiler.repoConfig = &RepoConfig{IssueLabel: label}
+			data := &WorkflowData{Name: "Test", SafeOutputs: &SafeOutputsConfig{}}
+			safeOutputsEnv := compiler.buildJobLevelSafeOutputEnvVars(data, "test")
+			conclusion, err := compiler.buildConclusionJob(data, "agent", nil)
+			require.NoError(t, err)
+			require.NotNil(t, conclusion)
+			for _, env := range []map[string]string{safeOutputsEnv, conclusion.Env} {
+				if label == "" {
+					assert.NotContains(t, env, "GH_AW_ISSUE_LABEL")
+					continue
+				}
+				var parsed map[string]string
+				require.NoError(t, yaml.Unmarshal([]byte("GH_AW_ISSUE_LABEL: "+env["GH_AW_ISSUE_LABEL"]), &parsed))
+				assert.Equal(t, label, parsed["GH_AW_ISSUE_LABEL"])
+			}
+		})
+	}
+}
+
 // TestBuildDetectionSuccessCondition tests the detection condition builder
 func TestBuildDetectionSuccessCondition(t *testing.T) {
 	condition := buildDetectionSuccessCondition()
@@ -1052,7 +1329,7 @@ func TestWorkQueueOutcomeOutputIsWorkerOnly(t *testing.T) {
 			Tools:       map[string]any{"work-queue": map[string]any{"worker": worker}},
 		}, outputs)
 		if worker {
-			assert.Equal(t, "${{ steps.process_safe_outputs.outputs.work_queue_outcome }}", outputs["work_queue_outcome"])
+			assert.Equal(t, "${{ steps.work_queue_finish.outputs.work_queue_outcome }}", outputs["work_queue_outcome"])
 		} else {
 			assert.NotContains(t, outputs, "work_queue_outcome")
 		}
@@ -1195,6 +1472,63 @@ func TestGitHubAppWithPushToPRBranch(t *testing.T) {
 
 	// Verify step ID is set correctly
 	assert.Contains(t, stepsContent, "id: safe-outputs-app-token")
+}
+
+func TestSafeOutputsPRCheckoutPersistsGlobalGitHubAppToken(t *testing.T) {
+	signedCommits := false
+	app := &GitHubAppConfig{
+		AppID:      "${{ vars.APP_ID }}",
+		PrivateKey: "${{ secrets.APP_PRIVATE_KEY }}",
+	}
+	tests := []struct {
+		name        string
+		safeOutputs *SafeOutputsConfig
+	}{
+		{
+			name: "push-to-pull-request-branch",
+			safeOutputs: &SafeOutputsConfig{
+				GitHubApp: app,
+				PushToPullRequestBranch: &PushToPullRequestBranchConfig{
+					SignedCommits: &signedCommits,
+				},
+			},
+		},
+		{
+			name: "create-pull-request",
+			safeOutputs: &SafeOutputsConfig{
+				GitHubApp: app,
+				CreatePullRequests: &CreatePullRequestsConfig{
+					SignedCommits: &signedCommits,
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compiler := NewCompiler()
+			compiler.jobManager = NewJobManager()
+			data := &WorkflowData{Name: "Test Workflow", SafeOutputs: tt.safeOutputs}
+
+			job, _, err := compiler.buildConsolidatedSafeOutputsJob(data, string(constants.AgentJobName), "test.md")
+			require.NoError(t, err)
+			require.NotNil(t, job)
+			stepsContent := strings.Join(job.Steps, "")
+
+			tokenMintIndex := strings.Index(stepsContent, "id: safe-outputs-app-token")
+			checkoutIndex := strings.Index(stepsContent, "name: Checkout repository")
+			require.NotEqual(t, -1, tokenMintIndex, "safe-outputs app token must be minted")
+			require.NotEqual(t, -1, checkoutIndex, "safe_outputs must include the default checkout")
+			assert.Less(t, tokenMintIndex, checkoutIndex, "App token minting must precede checkout")
+			assert.Contains(t, stepsContent, "token: ${{ steps.safe-outputs-app-token.outputs.token }}")
+			assert.Contains(t, stepsContent, "persist-credentials: true")
+
+			var agentSteps strings.Builder
+			compiler.generateAppTokenAndDefaultCheckoutSteps(&agentSteps, data, NewCheckoutManager(nil), true)
+			assert.Contains(t, agentSteps.String(), "persist-credentials: false")
+			assert.NotContains(t, agentSteps.String(), "steps.safe-outputs-app-token.outputs.token")
+		})
+	}
 }
 
 func TestBuildSafeOutputJobPreStepsRunBeforeGitHubAppToken(t *testing.T) {
@@ -1594,6 +1928,7 @@ func TestCreateCodeScanningAlertUploadJob(t *testing.T) {
 		expectTokenInSteps     string // expected token expression in upload job steps
 		expectAppTokenMintStep bool   // expect a GitHub App token minting step in upload job
 		safeOutputsGitHubToken string
+		safeOutputsGitHubApp   *GitHubAppConfig
 	}{
 		{
 			name: "default config creates separate upload job with static token computed directly",
@@ -1621,6 +1956,15 @@ func TestCreateCodeScanningAlertUploadJob(t *testing.T) {
 			expectUploadJob:        true,
 			expectTokenInSteps:     "${{ secrets.SO_TOKEN }}",
 			safeOutputsGitHubToken: "${{ secrets.SO_TOKEN }}",
+		},
+		{
+			name: "safe-outputs GitHub App does not leak step token into upload job",
+			config: &CreateCodeScanningAlertsConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{},
+			},
+			expectUploadJob:      true,
+			expectTokenInSteps:   "${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}",
+			safeOutputsGitHubApp: &GitHubAppConfig{AppID: "${{ vars.APP_ID }}", PrivateKey: "${{ secrets.APP_PRIVATE_KEY }}"},
 		},
 		{
 			name: "checkout with github-app mints a fresh app token in the upload job",
@@ -1673,6 +2017,7 @@ func TestCreateCodeScanningAlertUploadJob(t *testing.T) {
 				SafeOutputs: &SafeOutputsConfig{
 					CreateCodeScanningAlerts: tt.config,
 					GitHubToken:              tt.safeOutputsGitHubToken,
+					GitHubApp:                tt.safeOutputsGitHubApp,
 				},
 				CheckoutConfigs: tt.checkoutConfigs,
 			}
@@ -1842,16 +2187,16 @@ func TestCreateCodeScanningAlertUploadJobWorkflowCallDependsOnActivation(t *test
 // TestBuildSafeOutputItemsManifestUploadStep verifies that the upload step includes
 // the manifest and temporary ID map but excludes process stdout/stderr logs.
 func TestBuildSafeOutputItemsManifestUploadStep(t *testing.T) {
-	steps := buildSafeOutputItemsManifestUploadStep("", func(action string) string {
+	steps := buildSafeOutputManifestUploadStep("", func(action string) string {
 		return action + "@test-pin"
-	}, false, &WorkflowData{})
+	}, false, &WorkflowData{}, true)
 
 	content := strings.Join(steps, "")
 
 	assert.Contains(t, content, "Upload Safe Outputs Items")
 	assert.Contains(t, content, "if: always()")
 	assert.Contains(t, content, "/tmp/gh-aw/safe-output-items.jsonl")
-	assert.Contains(t, content, "/tmp/gh-aw/safe-output-outcomes.jsonl")
+	assert.Contains(t, content, "/tmp/gh-aw/safe-output-executions.jsonl")
 	assert.NotContains(t, content, "process-safe-outputs.stdout.log")
 	assert.NotContains(t, content, "process-safe-outputs.stderr.log")
 	assert.NotContains(t, content, "merge-pull-request-decisions.jsonl")
@@ -1860,7 +2205,7 @@ func TestBuildSafeOutputItemsManifestUploadStep(t *testing.T) {
 func TestBuildMergePullRequestDecisionUploadStep(t *testing.T) {
 	for _, claims := range []bool{false, true} {
 		data := &WorkflowData{SafeOutputs: &SafeOutputsConfig{MergePullRequest: &MergePullRequestConfig{}}}
-		steps := buildSafeOutputItemsManifestUploadStep("", func(action string) string { return action + "@test-pin" }, claims, data)
+		steps := buildSafeOutputManifestUploadStep("", func(action string) string { return action + "@test-pin" }, claims, data, true)
 		content := strings.Join(steps, "")
 		assert.Contains(t, content, "if: always()")
 		assert.Contains(t, content, "/tmp/gh-aw/merge-pull-request-decisions.jsonl")
@@ -1928,7 +2273,7 @@ func TestMergePullRequestDecisionUploadsRequireRedactionInAllModes(t *testing.T)
 				suppressItems := mode == "global-staged" || mode == "trial"
 				assert.Equal(t, !suppressItems, strings.Contains(paths, "/tmp/gh-aw/safe-output-items.jsonl"))
 				if suppressItems {
-					assert.NotContains(t, paths, "safe-output-outcomes.jsonl")
+					assert.NotContains(t, paths, "safe-output-executions.jsonl")
 					assert.NotContains(t, paths, "temporary-id-map.json")
 					assert.NotContains(t, paths, "safe-output-errors.json")
 					assert.NotContains(t, paths, "claim-delivery-errors.json")
@@ -1968,7 +2313,7 @@ func TestSafeOutputClaimArtifactsRequireWorkerAndSuccessfulRedaction(t *testing.
 			require.NotContains(t, content, "/tmp/gh-aw/claims/*/delivery-receipt.json")
 			if test.worker {
 				require.Contains(t, content, "/tmp/gh-aw/claims/*/safe-output-items.jsonl")
-				require.Contains(t, content, "/tmp/gh-aw/claims/*/safe-output-outcomes.jsonl")
+				require.Contains(t, content, "/tmp/gh-aw/claims/*/safe-output-executions.jsonl")
 				require.Contains(t, content, "/tmp/gh-aw/claims/*/temporary-id-map.json")
 				require.Contains(t, content, "/tmp/gh-aw/claims/*/safe-output-errors.json")
 				require.Contains(t, content, "/tmp/gh-aw/claims/*/claim-delivery-errors.json")
@@ -1996,9 +2341,9 @@ func TestClaimDiagnosticRetentionPreservesRepositoryOverrides(t *testing.T) {
 		{name: "repository", config: &RepoConfig{ArtifactRetentionDays: new(TemplatableInt32("14"))}, want: 14},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			steps := buildSafeOutputItemsManifestUploadStep("", func(action string) string {
+			steps := buildSafeOutputManifestUploadStep("", func(action string) string {
 				return action + "@v4"
-			}, true, &WorkflowData{})
+			}, true, &WorkflowData{}, true)
 			output, err := applyArtifactRetention("jobs:\n  test:\n    steps:\n"+strings.Join(steps, ""), test.config)
 			require.NoError(t, err)
 			uploads := retentionTestSteps(t, output)
@@ -2008,4 +2353,75 @@ func TestClaimDiagnosticRetentionPreservesRepositoryOverrides(t *testing.T) {
 			assert.Contains(t, output, "/tmp/gh-aw/claims/*/claim-delivery-errors.json")
 		})
 	}
+}
+
+func TestSafeOutputsPRCheckoutGlobalAppTokenScoping(t *testing.T) {
+	app := &GitHubAppConfig{AppID: "${{ vars.APP_ID }}", PrivateKey: "${{ secrets.APP_PRIVATE_KEY }}"}
+	const appToken = "token: ${{ steps.safe-outputs-app-token.outputs.token }}"
+
+	t.Run("ignore-if-missing keeps fallback expression", func(t *testing.T) {
+		ignoring := *app
+		ignoring.IgnoreIfMissing = true
+		data := &WorkflowData{SafeOutputs: &SafeOutputsConfig{GitHubApp: &ignoring, CreatePullRequests: &CreatePullRequestsConfig{}}}
+		steps := strings.Join(NewCompiler().buildSharedPRCheckoutSteps(data), "")
+		assert.Contains(t, steps, "token: ${{ steps.safe-outputs-app-token.outputs.token || secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}")
+	})
+
+	t.Run("per-handler app keeps static default checkout token", func(t *testing.T) {
+		data := &WorkflowData{SafeOutputs: &SafeOutputsConfig{
+			GitHubApp:          app,
+			CreateIssues:       &CreateIssuesConfig{},
+			CreatePullRequests: &CreatePullRequestsConfig{BaseSafeOutputConfig: BaseSafeOutputConfig{GitHubApp: app}},
+		}}
+		steps := strings.Join(NewCompiler().buildSharedPRCheckoutSteps(data), "")
+		assert.NotContains(t, steps, appToken)
+	})
+
+	t.Run("additional checkouts keep static credentials", func(t *testing.T) {
+		data := &WorkflowData{
+			SafeOutputs: &SafeOutputsConfig{GitHubApp: app, CreatePullRequests: &CreatePullRequestsConfig{}},
+			CheckoutConfigs: []*CheckoutConfig{
+				{Repository: "org/static", Path: "./static"},
+			},
+		}
+		steps := strings.Join(NewCompiler().buildSharedPRCheckoutSteps(data), "")
+		assert.Equal(t, 1, strings.Count(steps, appToken), "only the default checkout persists the App token")
+	})
+
+	t.Run("target repo in another org keeps static default checkout token", func(t *testing.T) {
+		data := &WorkflowData{SafeOutputs: &SafeOutputsConfig{
+			GitHubApp:          app,
+			CreatePullRequests: &CreatePullRequestsConfig{TargetRepoSlug: "OrgB/target"},
+		}}
+		steps := strings.Join(NewCompiler().buildSharedPRCheckoutSteps(data), "")
+		assert.NotContains(t, steps, appToken)
+	})
+}
+
+func TestWorkQueueSafeOutputsPRCheckoutFollowsAppToken(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.jobManager = NewJobManager()
+	data := &WorkflowData{
+		Name: "Test Workflow",
+		SafeOutputs: &SafeOutputsConfig{
+			GitHubApp:          &GitHubAppConfig{AppID: "${{ vars.APP_ID }}", PrivateKey: "${{ secrets.APP_PRIVATE_KEY }}"},
+			CreatePullRequests: &CreatePullRequestsConfig{},
+		},
+		Tools:           map[string]any{"work-queue": map[string]any{"worker": true}},
+		WorkQueuePolicy: &WorkQueuePolicyConfig{PolicyJSON: `{"version":4}`},
+	}
+	job, _, err := compiler.buildConsolidatedSafeOutputsJob(data, string(constants.AgentJobName), "test.md")
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	steps := strings.Join(job.Steps, "")
+	mint := strings.Index(steps, "id: safe-outputs-app-token")
+	controls := strings.Index(steps, "id: work_queue_controls")
+	checkout := strings.Index(steps, "name: Checkout repository")
+	finish := strings.Index(steps, "id: work_queue_finish")
+	require.NotEqual(t, -1, mint)
+	require.NotEqual(t, -1, controls)
+	require.NotEqual(t, -1, checkout)
+	assert.Less(t, mint, controls)
+	assert.Less(t, controls, checkout)
+	assert.Less(t, checkout, finish)
 }

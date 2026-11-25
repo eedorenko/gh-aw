@@ -11,6 +11,7 @@ const { computeInferenceAIC } = req("./model_costs.cjs");
 const { estimateBaseline, persistModelConfigBaseline, projectModelConfig } = req("./routing_analytics.cjs");
 const fixtures = req("./fixtures/routing_analytics_runs.cjs");
 const { readJsonlFile } = req("./jsonl_helpers.cjs");
+const { useModelOverrides } = req("./fixtures/model_overrides.cjs");
 
 const { routed, unrouted, routedClaude } = fixtures.RUNS;
 const NEW_INFO_KEYS = ["engine_harness", "workflow_ref", "server_url", "model_config"];
@@ -47,7 +48,20 @@ async function generateAwInfo(run) {
     Object.assign(process.env, env, { GITHUB_RUN_ATTEMPT: recorded.run_attempt, GITHUB_WORKFLOW_REF: recorded.caller_workflow_ref, GITHUB_SERVER_URL: "https://github.com" });
     global.core = mockCore;
     const { main } = await import("./generate_aw_info.cjs");
-    await main(mockCore, fixtures.runContext(recorded));
+    const workflowPath = `.github/workflows/${run.workflow}.lock.yml`;
+    const contents = fs.readFileSync(path.resolve(__dirname, "../../..", workflowPath), "utf8");
+    const githubClient = {
+      rest: {
+        repos: {
+          getContent: vi.fn(async ({ path: requestedPath, ref }) => {
+            expect(requestedPath).toBe(workflowPath);
+            expect(ref).toBe(recorded.sha);
+            return { data: { type: "file", path: workflowPath, encoding: "base64", content: Buffer.from(contents).toString("base64") } };
+          }),
+        },
+      },
+    };
+    await main(mockCore, fixtures.runContext(recorded), githubClient);
     return JSON.parse(files.get("/tmp/gh-aw/aw_info.json"));
   } finally {
     for (const spy of spies) spy.mockRestore();
@@ -92,10 +106,13 @@ const proxyRouting = id => [...readJsonlFile(path.join(fixtures.runDir(id), "san
 
 describe("routing analytics in aw_session.jsonl", () => {
   let savedEnv;
+  let restoreModels;
   beforeEach(() => {
     savedEnv = { ...process.env };
+    restoreModels = useModelOverrides({ "github-copilot": { models: { "claude-sonnet-5.5": { cost: { input: "0.000002", output: "0.000004", cache_read: "0.0000002", cache_write: "0.0000025" } } } } });
   });
   afterEach(() => {
+    restoreModels();
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
     for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
     Object.assign(process.env, savedEnv);
@@ -142,7 +159,7 @@ describe("routing analytics in aw_session.jsonl", () => {
     expect(configs).toHaveLength(1);
     expect(configs[0].provenance).toMatchObject({ component: "workflow", phase: "agent" });
     expect(configs[0].data).toEqual({
-      routing: { enabled: true, goal: "cost", mode: "economy", allowedModels: ["gpt-5.6-luna"], candidateModels: ["github-copilot/gpt-5.6-luna"] },
+      routing: { enabled: true, goal: "cost", mode: "economy", requested: "router/economy", allowedModels: ["gpt-5.6-luna"], candidateModels: ["github-copilot/gpt-5.6-luna"] },
       models: { allowed: [], blocked: [] },
       maxAiCredits: 1000,
       maxAiCreditsSource: "default",
@@ -157,6 +174,9 @@ describe("routing analytics in aw_session.jsonl", () => {
     // Native routing records its provider; Copilot routing omits it and unknown values are dropped.
     expect(projectModelConfig({ routing: { enabled: true, provider: "anthropic", candidate_models: ["claude-sonnet-5"] } })).toEqual({ routing: { enabled: true, provider: "anthropic", candidateModels: ["claude-sonnet-5"] } });
     expect(projectModelConfig({ routing: { enabled: true, provider: "copilot" } })).toEqual({ routing: { enabled: true } });
+    // A router model value is recorded as requested; anything else is dropped.
+    expect(projectModelConfig({ routing: { enabled: true, goal: "cost", mode: "economy", requested: "router/economy" } })).toEqual({ routing: { enabled: true, goal: "cost", mode: "economy", requested: "router/economy" } });
+    expect(projectModelConfig({ routing: { enabled: true, requested: "router/fast" } })).toEqual({ routing: { enabled: true } });
   });
 
   it("model_config_records_unrouted_resolved_baseline", async () => {
@@ -176,7 +196,7 @@ describe("routing analytics in aw_session.jsonl", () => {
     const published = await generateAwInfo(routedClaude);
     expect(published.model_routing).toBeUndefined();
     expect(published.model_config).toEqual({
-      routing: { enabled: true, goal: "cost", mode: "economy", allowed_models: ["claude-haiku-4.5"], candidate_models: ["github-copilot/claude-haiku-4.5"] },
+      routing: { enabled: true, goal: "cost", mode: "economy", requested: "router/economy", allowed_models: ["claude-haiku-4.5"], candidate_models: ["github-copilot/claude-haiku-4.5"] },
       models: { allowed: [], blocked: [] },
       max_ai_credits: 1000,
       max_ai_credits_source: "default",
@@ -187,7 +207,7 @@ describe("routing analytics in aw_session.jsonl", () => {
     const configs = ofType(events, "model.config");
     expect(configs).toHaveLength(1);
     expect(configs[0].data).toEqual({
-      routing: { enabled: true, goal: "cost", mode: "economy", allowedModels: ["claude-haiku-4.5"], candidateModels: ["github-copilot/claude-haiku-4.5"] },
+      routing: { enabled: true, goal: "cost", mode: "economy", requested: "router/economy", allowedModels: ["claude-haiku-4.5"], candidateModels: ["github-copilot/claude-haiku-4.5"] },
       models: { allowed: [], blocked: [] },
       maxAiCredits: 1000,
       maxAiCreditsSource: "default",

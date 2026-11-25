@@ -15,12 +15,10 @@ permissions:
 tracker-id: agent-job-health
 
 
+model: router/economy
 engine:
   id: claude
   model-provider: github
-  model-routing:
-    goal: cost
-    mode: economy
   mcp:
     tool-timeout: 10m
 max-ai-credits: 1500
@@ -40,6 +38,7 @@ imports:
   - shared/aw-logs-24h-fetch.md
   - ../skills/jqschema/SKILL.md
   - shared/graders.md
+  - shared/reporting.md
 safe-outputs:
   mentions: false
   create-issue:

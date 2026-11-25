@@ -8,11 +8,11 @@ import { parse as parseToml } from "smol-toml";
 
 const require = createRequire(import.meta.url);
 global.core = { info: () => {}, warning: () => {}, error: () => {}, setFailed: () => {} };
-const { applyClaudeSubagentModels, applyCodexSubagentModels, isDetectionPhase, replaceAgentModel } = require("./engine_subagent_models.cjs");
+const { applyClaudeSubagentModels, applyCodexSubagentModels, isDetectionPhase, replaceAgentModel } = require("../../../scripts/markdown_metadata_test_adapter.cjs").withCompilerFixtures(require("./engine_subagent_models.cjs"));
 const { extractInlineSubAgents, writeInlineSubAgents } = require("./extract_inline_sub_agents.cjs");
 const { claudeBareCapabilities, removeClaudePlugin } = require("./claude_runtime.cjs");
 const { extractFrontmatterAndBody } = require("./frontmatter_hash_pure.cjs");
-const { parseDocument } = require("./work_queue_yaml.cjs");
+const { readDocumentMetadata, prepareMarkdownFixtures } = require("../../../scripts/markdown_metadata_test_adapter.cjs");
 const { recordModelResolution } = require("./resolve_model_alias.cjs");
 const runs = require("./fixtures/claude_codex_subagent_runs.cjs");
 
@@ -22,7 +22,7 @@ afterEach(() => {
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
-const frontmatterOf = content => parseDocument(extractFrontmatterAndBody(content).frontmatterText).toJS() || {};
+const frontmatterOf = content => readDocumentMetadata(extractFrontmatterAndBody(content).frontmatterText).value || {};
 const sha = content => crypto.createHash("sha256").update(content).digest("hex");
 
 /**
@@ -47,6 +47,7 @@ function layout() {
 /** Stage inline agents through the activation writer and restore them into the workspace. */
 function stageInline(run, engine, agents) {
   const markdown = ["# Workflow", "", "Main prompt.", ...Object.entries(agents).flatMap(([name, content]) => ["", `## agent: \`${name}\``, content.trimEnd()])].join("\n");
+  prepareMarkdownFixtures(markdown);
   writeInlineSubAgents(markdown, run.workspaceDir, run.agentsBaseDir, engine);
   const dir = engine === "claude" ? ".claude/agents" : ".codex/agents";
   fs.mkdirSync(path.join(run.workspaceDir, dir), { recursive: true });
@@ -115,6 +116,35 @@ describe("Claude sub-agent models (Typist run 39415087125)", () => {
 
     expect(outcome.ok).toBe(false);
     expect(run.records()).toEqual([expect.objectContaining({ role: "duplicate-type-finder", status: "failed", cause: "catalog_unavailable" })]);
+  });
+
+  it("passes declared models through verbatim with model-catalog false and no catalogue, keeping the provider check", async () => {
+    const run = layout();
+    run.env.GH_AW_MODEL_CATALOG = "false";
+    stageInline(run, "claude", { "duplicate-type-finder": typistAgent().replace("model: small", "model: claude-gateway-deployment"), "wrong-provider": typistAgent().replace("model: small", "model: openai/gpt-5") });
+    // Fixture mutation: a BYOK provider without a /models route (empty inventory).
+    const reflectData = runs.typistReflect();
+    reflectData.models_fetch_complete = false;
+    reflectData.endpoints.forEach(endpoint => (endpoint.models = null));
+    let refreshes = 0;
+
+    const outcome = await applyClaudeSubagentModels({
+      reflectData,
+      refetchReflectData: async () => (refreshes++, reflectData),
+      provider: "anthropic",
+      workspaceDir: run.workspaceDir,
+      agentsBaseDir: run.agentsBaseDir,
+      env: run.env,
+      logger: run.logger,
+    });
+
+    expect(outcome.ok).toBe(false);
+    expect(refreshes).toBe(0);
+    expect(outcome.resolutions).toEqual([{ name: "duplicate-type-finder", configuredModel: "claude-gateway-deployment", model: "claude-gateway-deployment", status: "exact" }]);
+    expect(run.records()).toEqual([
+      expect.objectContaining({ role: "duplicate-type-finder", resolved_model: "claude-gateway-deployment", status: "exact", cause: null }),
+      expect.objectContaining({ role: "wrong-provider", status: "failed", cause: "model_unavailable" }),
+    ]);
   });
 
   it("records every agent as catalog_unavailable when the /reflect refresh rejects", async () => {
@@ -347,8 +377,8 @@ describe("Claude sub-agent models (Typist run 39415087125)", () => {
     expect(fs.readFileSync(path.join(run.workspaceDir, ".claude/agents/main-agent.md"), "utf8")).toBe(repositoryAgent);
   });
 
-  it("replaces only the model scalar", () => {
-    expect(replaceAgentModel('---\nname: "a"\nmodel: small\ntools: Read\n---\nBody model: small\n', "claude-haiku-5-5")).toBe('---\nname: "a"\nmodel: "claude-haiku-5-5"\ntools: Read\n---\nBody model: small\n');
+  it("replaces the model scalar and derives Claude's description without changing instructions or tools", () => {
+    expect(replaceAgentModel('---\nname: "a"\nmodel: small\ntools: Read\n---\nBody model: small\n', "claude-haiku-5-5")).toBe('---\n{"model":"claude-haiku-5-5","name":"a","tools":"Read","description":"a"}\n---\nBody model: small\n');
   });
 });
 
@@ -375,6 +405,25 @@ describe("Codex sub-agent models (daily-arxiv-researcher run 39394965127)", () =
   };
   const bodyOf = content => extractFrontmatterAndBody(content).markdown.trim();
 
+  it.each([
+    ["ab-testing-advisor", ["field-presence-checker", "workflow-characterizer"]],
+    ["spec-enforcer", ["readme-spec-extractor", "rotation-state-recoverer", "test-output-classifier"]],
+  ])("%s helpers inherit the main model without unverifiable child endpoints", async (workflow, names) => {
+    const run = codexLayout();
+    const source = fs.readFileSync(path.join(repoRoot, `.github/workflows/${workflow}.md`), "utf8");
+    const agents = extractInlineSubAgents(extractFrontmatterAndBody(source).markdown).agents;
+    expect(agents.map(agent => agent.name).sort()).toEqual(names);
+    expect(agents.every(agent => frontmatterOf(agent.content).model === undefined)).toBe(true);
+    stageInline(run, "codex", Object.fromEntries(agents.map(agent => [agent.name, agent.content])));
+
+    const outcome = await apply(run, { reflectData: { endpoints: [{ provider: "openai", models: ["gpt-5-mini-2025-08-07"], models_fetch_status: "complete" }] } });
+
+    expect(outcome).toMatchObject({ ok: true, failures: [], resolutions: [] });
+    expect(run.records()).toEqual([]);
+    expect(roleFiles(run)).toEqual(names.map(name => `${name}.toml`));
+    for (const name of names) expect(readRole(run, name)).not.toHaveProperty("model");
+  });
+
   it("codex_declared_small_writes_native_toml_before_spawn", async () => {
     const run = codexLayout();
     // Fixture mutation: the recorded paper-screener with its selector changed to `small`.
@@ -388,7 +437,7 @@ describe("Codex sub-agent models (daily-arxiv-researcher run 39394965127)", () =
     expect(roleFiles(run)).toEqual(["paper-screener.toml"]);
     expect(readRole(run, "paper-screener")).toEqual({
       name: "paper-screener",
-      description: frontmatterOf(agent).description,
+      description: "paper-screener",
       developer_instructions: bodyOf(agent),
       model: "gpt-5-mini-2025-08-07",
     });
@@ -413,7 +462,7 @@ describe("Codex sub-agent models (daily-arxiv-researcher run 39394965127)", () =
     ]);
     expect(roleFiles(run)).toEqual(["opportunity-extractor.toml", "paper-screener.toml", "preliminary-investigator.toml", "relevance-ranker.toml"]);
     for (const [name, content] of Object.entries(agents)) {
-      expect(readRole(run, name)).toEqual({ name, description: frontmatterOf(content).description, developer_instructions: bodyOf(content), model: outcome.resolutions.find(resolution => resolution.name === name).model });
+      expect(readRole(run, name)).toEqual({ name, description: name, developer_instructions: bodyOf(content), model: outcome.resolutions.find(resolution => resolution.name === name).model });
     }
     // Same record fields as the run's recorded main-role model.resolution.
     for (const record of run.records()) {
@@ -422,9 +471,10 @@ describe("Codex sub-agent models (daily-arxiv-researcher run 39394965127)", () =
     }
     // The staged Markdown and its workspace copy are left unchanged.
     for (const [name, content] of Object.entries(agents)) {
-      const expected = content.endsWith("\n") ? content : `${content}\n`;
-      expect(fs.readFileSync(path.join(run.agentsBaseDir, ".codex/agents", `${name}.md`), "utf8")).toBe(expected);
-      expect(fs.readFileSync(path.join(run.workspaceDir, ".codex/agents", `${name}.md`), "utf8")).toBe(expected);
+      const staged = fs.readFileSync(path.join(run.agentsBaseDir, ".codex/agents", `${name}.md`), "utf8");
+      expect(frontmatterOf(staged)).toEqual(frontmatterOf(content));
+      expect(bodyOf(staged)).toBe(bodyOf(content));
+      expect(fs.readFileSync(path.join(run.workspaceDir, ".codex/agents", `${name}.md`), "utf8")).toBe(staged);
     }
   });
 
@@ -468,7 +518,7 @@ describe("Codex sub-agent models (daily-arxiv-researcher run 39394965127)", () =
     expect(Object.keys(role).sort()).toEqual(["description", "developer_instructions", "model", "name"]);
     expect(role.developer_instructions).toBe(bodyOf(agent));
     expect(role.developer_instructions.endsWith(extra)).toBe(true);
-    expect(role).toMatchObject({ name: "relevance-ranker", description: frontmatterOf(agent).description, model: "gpt-5.4-mini" });
+    expect(role).toMatchObject({ name: "relevance-ranker", description: "relevance-ranker", model: "gpt-5.4-mini" });
   });
 
   it("round-trips quotes, backslashes, multi-line instructions and a declared effort", async () => {
@@ -518,17 +568,17 @@ describe("Codex sub-agent models (daily-arxiv-researcher run 39394965127)", () =
     expect(roleFiles(run)).toEqual([]);
   });
 
-  it("fails closed for a staged agent without a description", async () => {
+  it("derives the required role description from the name without authored description", async () => {
     const run = codexLayout();
     // Fixture mutation: the recorded paper-screener without its description.
     stageInline(run, "codex", { "paper-screener": arxivAgents()["paper-screener"].replace(/^description:.*\n/m, "") });
 
     const outcome = await apply(run);
 
-    expect(outcome.ok).toBe(false);
-    expect(run.logs).toContainEqual(expect.stringContaining("no nonblank 'description'"));
-    expect(run.records()).toEqual([]);
-    expect(roleFiles(run)).toEqual([]);
+    expect(outcome.ok).toBe(true);
+    expect(readRole(run, "paper-screener")).toMatchObject({ name: "paper-screener", description: "paper-screener", model: "gpt-5.4-mini" });
+    expect(run.records()).toEqual([expect.objectContaining({ role: "paper-screener", status: "exact" })]);
+    expect(roleFiles(run)).toEqual(["paper-screener.toml"]);
   });
 
   it("fails closed when CODEX_HOME is unknown", async () => {
@@ -819,6 +869,22 @@ describe("Codex sub-agent endpoint compatibility (purelock run 39601756922)", ()
     expect(roleFiles(run)).toEqual([]);
   });
 
+  it("skips the endpoint metadata check with model-catalog false", async () => {
+    const run = codexLayout();
+    run.env.GH_AW_MODEL_CATALOG = "false";
+    // Fixture mutation: the recorded test-writer pinned to gpt-4o, whose recorded entry is incomplete.
+    stageInline(run, "codex", { "test-writer": purelockAgent().replace("model: large", "model: gpt-4o") });
+    const reflectData = runs.purelockReflect();
+    reflectData.models_fetch_complete = false;
+    reflectData.endpoints.forEach(endpoint => (endpoint.models = null));
+
+    const outcome = await apply(run, { reflectData });
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.resolutions).toEqual([{ name: "test-writer", configuredModel: "gpt-4o", model: "gpt-4o", status: "exact" }]);
+    expect(roleFiles(run)).toEqual(["test-writer.toml"]);
+  });
+
   it("keeps alias candidates with unknown endpoints and accepts them once a refresh verifies them", async () => {
     const run = codexLayout();
     // Fixture mutation: an alias whose first candidate has incomplete recorded metadata.
@@ -845,6 +911,50 @@ describe("Codex sub-agent endpoint compatibility (purelock run 39601756922)", ()
     expect(outcome.ok).toBe(true);
     expect(run.records()).toEqual([{ engine: "codex", role: "test-writer", configured_model: "copilot/gpt-5.6-terra", resolved_model: "gpt-5.6-terra", provider: "copilot", status: "exact", cause: null }]);
     expect(roleFiles(run)).toEqual(["test-writer.toml"]);
+  });
+});
+
+describe("Codex sub-agent endpoint names on native OpenAI (Spec Enforcer run 39771119523)", () => {
+  const specAgent = () => fs.readFileSync(path.join(runs.specEnforcerAgentsDir, "readme-spec-extractor.md"), "utf8");
+  const codexLayout = () => {
+    const run = layout();
+    return { ...run, codexHome: path.join(run.dir, "codex-home") };
+  };
+  const apply = (run, options = {}) => applyCodexSubagentModels({ reflectData: runs.specEnforcerReflect(), provider: "openai", codexHome: run.codexHome, agentsBaseDir: run.agentsBaseDir, env: run.env, logger: run.logger, ...options });
+  const entryOf = (reflect, model) => reflect.endpoints.flatMap(endpoint => (endpoint.configured ? endpoint.routing_models || [] : [])).find(candidate => candidate.model_id === model);
+  const roleFile = run => path.join(run.codexHome, "agents", "readme-spec-extractor.toml");
+
+  it("codex_small_resolves_when_native_openai_lists_responses_by_name", async () => {
+    const run = codexLayout();
+    stageInline(run, "codex", { "readme-spec-extractor": specAgent() });
+
+    const outcome = await apply(run);
+
+    // The run refused startup with catalog_unavailable: the recorded entry lists `responses`, not `/responses`.
+    expect(entryOf(runs.specEnforcerReflect(), "gpt-5-mini-2025-08-07")).toEqual({ model_id: "gpt-5-mini-2025-08-07", supported_endpoints: ["chat_completions", "responses"], candidate_metadata_complete: false });
+    expect(outcome.ok).toBe(true);
+    expect(outcome.resolutions).toEqual([{ name: "readme-spec-extractor", configuredModel: "small", model: "gpt-5-mini-2025-08-07", status: "resolved" }]);
+    expect(parseRoleToml(fs.readFileSync(roleFile(run), "utf8")).model).toBe("gpt-5-mini-2025-08-07");
+    expect(run.records()).toEqual([{ engine: "codex", role: "readme-spec-extractor", configured_model: "small", resolved_model: "gpt-5-mini-2025-08-07", provider: "openai", status: "resolved", cause: null }]);
+  });
+
+  it.each([
+    ["accepts it when they list responses", null, { resolved_model: "gpt-5.4", status: "exact", cause: null }],
+    ["fails it when they list only chat_completions", ["chat_completions"], { resolved_model: null, status: "failed", cause: "unsupported_endpoint" }],
+  ])("checks an exact model with complete endpoint names and %s", async (_label, endpoints, expected) => {
+    const run = codexLayout();
+    // Fixture mutation: the recorded agent pinned to gpt-5.4, whose recorded entry has complete
+    // metadata (`chat_completions`, `responses`); the second case also drops `responses`.
+    const reflect = runs.specEnforcerReflect();
+    expect(entryOf(reflect, "gpt-5.4")).toEqual({ model_id: "gpt-5.4", supported_endpoints: ["chat_completions", "responses"], candidate_metadata_complete: true });
+    if (endpoints) entryOf(reflect, "gpt-5.4").supported_endpoints = endpoints;
+    stageInline(run, "codex", { "readme-spec-extractor": specAgent().replace("model: small", "model: gpt-5.4") });
+
+    const outcome = await apply(run, { reflectData: reflect });
+
+    expect(outcome.ok).toBe(expected.status !== "failed");
+    expect(run.records()).toEqual([{ engine: "codex", role: "readme-spec-extractor", configured_model: "gpt-5.4", provider: "openai", ...expected }]);
+    expect(fs.existsSync(roleFile(run))).toBe(expected.status !== "failed");
   });
 });
 

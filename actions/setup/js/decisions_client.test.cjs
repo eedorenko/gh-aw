@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createRequire } from "module";
 import { createServer } from "node:http";
-const { invokeDecisions, validateQuestions } = createRequire(import.meta.url)("./decisions_client.cjs");
+const { invokeDecisions, validateQuestions, DecisionsModelUnavailableError } = createRequire(import.meta.url)("./decisions_client.cjs");
 
 const questions = [
   { type: "predicate", name: "relevant", instructions: "Is it relevant?" },
@@ -30,7 +30,7 @@ describe("generic Decisions client", () => {
     const server = createServer(async (request, response) => {
       let body = "";
       for await (const chunk of request) body += chunk;
-      requests.push({ method: request.method, url: request.url, body: JSON.parse(body) });
+      requests.push({ method: request.method, url: request.url, integrationId: request.headers["copilot-integration-id"], body: JSON.parse(body) });
       response.writeHead(200, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ answers }));
     });
@@ -38,6 +38,7 @@ describe("generic Decisions client", () => {
     try {
       const result = await invokeDecisions({
         baseURL: `http://127.0.0.1:${server.address().port}/v1`,
+        integrationId: "agentic-workflows",
         model: "decision-model",
         input: "Shared evidence",
         questions,
@@ -47,6 +48,7 @@ describe("generic Decisions client", () => {
       expect(requests[0]).toEqual({
         method: "POST",
         url: "/v1/decisions",
+        integrationId: "agentic-workflows",
         body: { model: "decision-model", input: "Shared evidence", questions },
       });
     } finally {
@@ -62,9 +64,20 @@ describe("generic Decisions client", () => {
     expect(url).toBe("https://example.com/v1/decisions");
     expect(request.method).toBe("POST");
     expect(request.redirect).toBe("error");
+    expect(request.headers).not.toHaveProperty("Copilot-Integration-Id");
     expect(request.headers.Authorization).toBe("Bearer test-key");
     expect(request.signal).toBeInstanceOf(AbortSignal);
     expect(JSON.parse(request.body)).toEqual({ model: config.model, input: config.input, questions });
+  });
+
+  it("sends the caller's Copilot integration identity without changing authentication", async () => {
+    const config = { ...options(), integrationId: "agentic-workflows" };
+    await invokeDecisions(config);
+    expect(config.fetchImpl.mock.calls[0][1].headers).toEqual({
+      "Content-Type": "application/json",
+      Authorization: ["Bearer", "test-key"].join(" "),
+      "Copilot-Integration-Id": "agentic-workflows",
+    });
   });
 
   it("supports credential-free proxies and named refusals", async () => {
@@ -128,13 +141,54 @@ describe("generic Decisions client", () => {
     await expect(invokeDecisions(options({ answers: invalid }))).rejects.toThrow();
   });
 
-  it.each([400, 401, 403, 429, 500])("surfaces HTTP %s without echoing response bodies or retrying", async status => {
+  it.each([400, 401, 403, 404, 422, 429, 500])("surfaces HTTP %s without echoing response bodies or retrying", async status => {
     const config = options();
     const text = vi.fn().mockResolvedValue("sensitive provider response");
-    config.fetchImpl.mockResolvedValue({ ok: false, status, text });
+    config.fetchImpl.mockResolvedValue({ ok: false, status, text, json: async () => ({ error: { message: "sensitive provider response", code: "invalid_request_error" } }) });
     await expect(invokeDecisions(config)).rejects.toThrow(`Decisions request failed (HTTP ${status})`);
     expect(text).not.toHaveBeenCalled();
     expect(config.fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    [400, { error: { code: "model_not_supported" } }],
+    [400, { error: { code: "model_not_found" } }],
+    [422, { code: "unsupported_model" }],
+    [400, { code: "model_not_available" }],
+    [400, { error: { code: "model_unavailable" } }],
+  ])("classifies explicit model availability codes without exposing provider text (%s, %j)", async (status, body) => {
+    const config = options();
+    config.fetchImpl.mockResolvedValue({ ok: false, status, json: async () => ({ ...body, message: "sensitive evidence and credentials" }) });
+    const request = invokeDecisions(config);
+    await expect(request).rejects.toThrow(DecisionsModelUnavailableError);
+    await expect(request).rejects.not.toThrow("sensitive");
+    expect(config.fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([401, 403, 404, 429, 500])("does not classify HTTP %s as model unavailability even with a model error code", async status => {
+    const config = options();
+    const json = vi.fn().mockResolvedValue({ error: { code: "model_not_supported" } });
+    config.fetchImpl.mockResolvedValue({ ok: false, status, json });
+    await expect(invokeDecisions(config)).rejects.toThrow(`HTTP ${status}`);
+    expect(json).not.toHaveBeenCalled();
+  });
+
+  it("preserves HTTP errors for non-JSON error responses", async () => {
+    const config = options();
+    config.fetchImpl.mockResolvedValue({
+      ok: false,
+      status: 422,
+      json: async () => {
+        throw new SyntaxError("sensitive non-JSON response");
+      },
+    });
+    await expect(invokeDecisions(config)).rejects.toThrow("Decisions request failed (HTTP 422)");
+  });
+
+  it("does not treat provider messages or arbitrary codes as model availability evidence", async () => {
+    const config = options();
+    config.fetchImpl.mockResolvedValue({ ok: false, status: 400, json: async () => ({ error: { code: "sensitive-model_not_found", message: "model_not_supported" } }) });
+    await expect(invokeDecisions(config)).rejects.toThrow("Decisions request failed (HTTP 400)");
   });
 
   it("propagates network failures", async () => {

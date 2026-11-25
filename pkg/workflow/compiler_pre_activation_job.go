@@ -62,7 +62,7 @@ func (c *Compiler) buildPreActivationJob(data *WorkflowData, needsPermissionChec
 
 	jobIfCondition := c.applyPreActivationIfConditionGuards(data, needsPermissionCheck, c.buildPreActivationBaseIfCondition(data))
 	if c.actionMode.IsScript() {
-		steps = append(steps, c.generateScriptModeCleanupStep())
+		steps = append(steps, c.generateScriptModeCleanupStep(data))
 	}
 
 	runsOn := c.formatFrameworkJobRunsOn(data)
@@ -110,6 +110,14 @@ func (c *Compiler) buildPreActivationPermissions(data *WorkflowData, setupAction
 		if perms == nil {
 			perms = NewPermissions()
 		}
+		perms.Set(PermissionPullRequests, PermissionRead)
+	}
+	// Search gates need read access to issues and pull requests in private/internal repositories.
+	if data.SkipIfMatch != nil || data.SkipIfNoMatch != nil {
+		if perms == nil {
+			perms = NewPermissions()
+		}
+		perms.Set(PermissionIssues, PermissionRead)
 		perms.Set(PermissionPullRequests, PermissionRead)
 	}
 	// Merge on.permissions into the pre-activation job permissions.
@@ -274,7 +282,7 @@ func (c *Compiler) buildPreActivationMemoryRestoreSteps(data *WorkflowData, step
 	}
 
 	var repoMemorySteps strings.Builder
-	generateRepoMemorySteps(&repoMemorySteps, data)
+	c.generateRepoMemorySteps(&repoMemorySteps, data, string(constants.PreActivationJobName))
 	if repoMemorySteps.Len() > 0 {
 		steps = append(steps, repoMemorySteps.String())
 	}

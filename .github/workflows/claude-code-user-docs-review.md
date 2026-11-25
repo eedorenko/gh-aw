@@ -18,12 +18,10 @@ permissions:
 
   copilot-requests: write
 tracker-id: claude-code-user-docs-review
+model: router/economy
 engine:
   id: claude
   model-provider: github
-  model-routing:
-    goal: cost
-    mode: economy
 strict: true
 
 network:
@@ -40,7 +38,6 @@ network:
 tools:
   cli-proxy: true
   cache-memory: true
-  web-search:
   github:
     mode: gh-proxy
     toolsets: [default, discussions]
@@ -48,10 +45,13 @@ tools:
     - "cat *"
     - "ls *"
     - "grep *"
+    - "safeoutputs *"
+    - "safeoutputs create_discussion *"
 
 timeout-minutes: 30
 
 imports:
+  - shared/reporting.md
   - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[claude-code-user-docs-review] "

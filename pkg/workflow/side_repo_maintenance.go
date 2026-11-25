@@ -274,6 +274,7 @@ func generateSideRepoMaintenanceWorkflow(
 	if err != nil {
 		return fmt.Errorf("failed to finalize side-repo maintenance workflow YAML: %w", err)
 	}
+	content += opts.repoConfig.issueLabelEnvYAML()
 	if opts.repoConfig != nil {
 		content, err = mapPinnedUsesInYAML(content, opts.repoConfig.ActionPins, opts.repoConfig.ActionPinPrefixes, opts.pinWarnings, opts.resolver)
 		if err != nil {
@@ -357,7 +358,7 @@ func buildSideRepoMaintenanceWorkflowYAML(renderCtx sideRepoMaintenanceRenderCon
 	if err != nil {
 		return "", fmt.Errorf("runner temp safety: %w", err)
 	}
-	return finalYAML, nil
+	return documentPermissionComments(finalYAML, "")
 }
 
 func buildSideRepoMaintenanceHeader(repoSlug string, logo bool) string {
@@ -660,13 +661,7 @@ func buildActivityReportCacheSteps(renderCtx sideRepoMaintenanceRenderContext) s
             --format markdown \
             --report-file ./.cache/gh-aw/activity-report-logs/report.md
 
-      - name: Save activity report logs cache
-        if: ${{ always() }}
-        uses: ` + getActionPin("actions/cache/save") + `
-        with:
-          path: ./.cache/gh-aw/activity-report-logs
-          key: ${{ steps.activity_report_logs_cache.outputs.cache-primary-key }}
-`
+` + activityReportSaveCacheStep()
 }
 
 func buildActivityReportIssueStep(renderCtx sideRepoMaintenanceRenderContext) string {
@@ -675,43 +670,18 @@ func buildActivityReportIssueStep(renderCtx sideRepoMaintenanceRenderContext) st
         with:
           github-token: ` + renderCtx.token + `
           script: |
-            const fs = require('node:fs');
-            const reportPath = './.cache/gh-aw/activity-report-logs/report.md';
-            if (!fs.existsSync(reportPath)) {
-              core.warning('Activity report markdown not found at ' + reportPath + '; skipping issue creation.');
-              return;
-            }
-            let reportBody = '';
-            try {
-              reportBody = fs.readFileSync(reportPath, 'utf8').trim();
-            } catch (error) {
-              core.warning('Failed to read activity report markdown at ' + reportPath + ': ' + error.message);
-              return;
-            }
-            if (!reportBody) {
-              core.warning('Activity report markdown is empty at ' + reportPath + '; skipping issue creation.');
-              return;
-            }
-            const repoSlug = process.env.GH_AW_TARGET_REPO_SLUG || '';
+` + activityReportReadScript + `            const repoSlug = process.env.GH_AW_TARGET_REPO_SLUG || '';
             const [owner, repo] = repoSlug.split('/');
             if (!owner || !repo) {
               core.setFailed('Invalid GH_AW_TARGET_REPO_SLUG: ' + repoSlug);
               return;
             }
-            const body = [
-              '### Agentic workflow activity report',
-              '',
-              'Repository: ' + repoSlug,
-              'Generated at: ' + new Date().toISOString(),
-              '',
-              reportBody,
-            ].join('\n');
-            const createdIssue = await github.rest.issues.create({
+` + activityReportBodyScript + `            const createdIssue = await github.rest.issues.create({
               owner,
               repo,
               title: '[aw] agentic status report',
               body,
-              labels: ['agentic-workflows'],
+              labels: [process.env.GH_AW_ISSUE_LABEL || 'agentic-workflows'],
             });
             core.info('Created issue #' + createdIssue.data.number + ': ' + createdIssue.data.html_url);
 `

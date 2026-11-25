@@ -19,40 +19,57 @@ import (
 
 var (
 	docBulletRe   = regexp.MustCompile(`^//\s+-\s+([a-z0-9_-]+)\s+—`)
-	readmeTableRe = regexp.MustCompile(`^\|\s+` + "`" + `([a-z0-9_-]+)` + "`" + `\s+\|`)
+	readmeTableRe = regexp.MustCompile(`^\|\s+` + "`" + `([a-z0-9_-]+)` + "`" + `(?:\s+\(` + "`" + `([a-z0-9_-]+)` + "`" + `\))?\s+\|`)
 	linterFlagsRe = regexp.MustCompile(`LINTER_FLAGS=["']([^"']+)["']`)
 )
 
 var notYetEnforced = map[string]string{
-	"blankassigncomma":            "existing production violations need remediation before enforcement; nolint suppression already works",
-	"bufferresetbeforereuse":      "new correctness analyzer needs an enforcement-readiness audit before native CI enables it",
-	"bufioscannererunchecked":     "existing scanner loops need Err handling before native CI enables it",
-	"closeerrorunchecked":         "existing production violations need remediation before enforcement; nolint suppression already works",
-	"deferrerrorunchecked":        "new deferred-error analyzer needs an enforcement-readiness audit before native and WebAssembly CI enable it",
-	"errorfwrapv":                 "requires an enforcement audit after the recent false-positive fix (#51928)",
-	"errormessage":                "dedicated lint-error-messages CI job is intentionally advisory (continue-on-error per #54800)",
-	"excessivefuncparams":         "existing production violations need remediation before enforcement; nolint suppression already works",
-	"formatintitoa":               "existing FormatInt conversions need remediation before CI enforcement",
-	"fprintferrorunchecked":       "existing production violations need remediation before enforcement; nolint suppression already works",
-	"goroutineresourceleak":       "requires an enforcement-readiness audit before native and WebAssembly CI enable it",
-	"hardcodedfilepath":           "requires an enforcement audit after the same-package constant fix (#52428)",
-	"largefunc":                   "existing production violations need remediation before enforcement; nolint suppression already works",
-	"lenstringzero":               "requires an enforcement audit after the diagnostic-message fix (#54717)",
-	"manualpathconcat":            "existing production violations need remediation",
-	"osisnotexist":                "existing os error predicates need case-by-case review before CI enforcement",
-	"osopenreadallpreferreadfile": "os.Open/ReadAll simplifications need an enforcement-readiness audit before CI enables it",
-	"packagelevelmutableslicemap": "existing production violations need remediation",
-	"readerstringconv":            "existing reader conversions need an enforcement-readiness audit before CI enables it",
-	"reflectdeepequalusage":       "existing reflect.DeepEqual uses need case-by-case review before CI enforcement",
-	"seenmapbool":                 "existing production violations need remediation",
-	"sprintferrdot":               "has not yet completed an enforcement-readiness audit",
-	"ssljson":                     "has not yet completed an enforcement-readiness audit",
-	"stringsconcatloop":           "has not yet completed an enforcement-readiness audit",
-	"typeassertionnil":            "needs a cross-platform enforcement-readiness audit before CI enables it",
-	"typeassertionokdiscarded":    "existing production violations need remediation before enforcement; nolint suppression already works",
-	"unchecked_deferredclose":     "existing deferred Close() findings need remediation before CI enforcement",
-	"uncheckedsliceindex":         "existing production violations need remediation before enforcement; nolint suppression already works",
-	"walkdirignoredeerror":        "existing discarded WalkDir errors in audit_threat_detection.go and model_routing.go need remediation before CI enforcement",
+	"blankassigncomma":                 "existing production violations need remediation before enforcement; nolint suppression already works",
+	"blankassignedcleanuperror":        "existing discarded cleanup errors need remediation before CI enforcement",
+	"bufferresetbeforereuse":           "new correctness analyzer needs an enforcement-readiness audit before native CI enables it",
+	"bufioscannererunchecked":          "existing scanner loops need Err handling before native CI enables it",
+	"closeerrorunchecked":              "existing production violations need remediation before enforcement; nolint suppression already works",
+	"deferrerrorunchecked":             "new deferred-error analyzer needs an enforcement-readiness audit before native and WebAssembly CI enable it",
+	"errorfwrapv":                      "requires an enforcement audit after the recent false-positive fix (#51928)",
+	"errormessage":                     "dedicated lint-error-messages CI job is intentionally advisory (continue-on-error per #54800)",
+	"errorsnewerrorstring":             "requires an enforcement-readiness audit before CI enables it",
+	"excessivefuncparams":              "existing production violations need remediation before enforcement; nolint suppression already works",
+	"execcommandoutputerrdiscard":      "existing exec output error handling needs review before CI enforcement",
+	"filepathwalkpreferwalkdir":        "existing filepath.Walk calls need remediation before CI enforcement",
+	"formatintitoa":                    "existing FormatInt conversions need remediation before CI enforcement",
+	"fprintferrorunchecked":            "existing production violations need remediation before enforcement; nolint suppression already works",
+	"goroutineresourceleak":            "requires an enforcement-readiness audit before native and WebAssembly CI enable it",
+	"hardcodedfilepath":                "requires an enforcement audit after the same-package constant fix (#52428)",
+	"hasprefixdotdotpathescape":        "existing parent-path checks need review and remediation before CI enforcement",
+	"httpclientnotimeout":              "the new HTTP client timeout analyzer needs an enforcement-readiness audit",
+	"ignoredlocalerror":                "existing ignored local errors need review before CI enforcement",
+	"jsondecodertrailingdataunchecked": "new JSON decoder correctness analyzer needs an enforcement-readiness audit before CI enables it",
+	"jsonunmarshalbytesconversion":     "existing production conversions need review before CI enforcement",
+	"largefunc":                        "existing production violations need remediation before enforcement; nolint suppression already works",
+	"lenstringzero":                    "requires an enforcement audit after the diagnostic-message fix (#54717)",
+	"manualpathconcat":                 "existing production violations need remediation",
+	"osisnotexist":                     "existing os error predicates need case-by-case review before CI enforcement",
+	"osopenreadallpreferreadfile":      "os.Open/ReadAll simplifications need an enforcement-readiness audit before CI enables it",
+	"osremoveuncheckedcleanup":         "existing cleanup error findings need remediation before CI enforcement",
+	"osstatignoredeerrorderef":         "new filesystem nil-dereference analyzer needs an enforcement-readiness audit before CI enables it",
+	"packagelevelmutableslicemap":      "existing production violations need remediation",
+	"prefercutprefix":                  "existing HasPrefix/TrimPrefix and HasSuffix/TrimSuffix findings need remediation before CI enforcement",
+	"readerstringconv":                 "existing reader conversions need an enforcement-readiness audit before CI enables it",
+	"reflectdeepequalusage":            "existing reflect.DeepEqual uses need case-by-case review before CI enforcement",
+	"seenmapbool":                      "existing production violations need remediation",
+	"sortbasicslices":                  "existing production violations need remediation before CI enforcement",
+	"splitindexzero":                   "existing production violations need remediation before CI enforcement",
+	"splitlinesonnewline":              "existing production violations need remediation before CI enforcement",
+	"stringssplitfirst":                "existing production violations need remediation before CI enforcement",
+	"sprintferrdot":                    "has not yet completed an enforcement-readiness audit",
+	"ssljson":                          "has not yet completed an enforcement-readiness audit",
+	"stringsconcatloop":                "has not yet completed an enforcement-readiness audit",
+	"typeassertionnil":                 "needs a cross-platform enforcement-readiness audit before CI enables it",
+	"typeassertionokdiscarded":         "existing production violations need remediation before enforcement; nolint suppression already works",
+	"unchecked_deferredclose":          "existing deferred Close() findings need remediation before CI enforcement",
+	"uncheckedsliceindex":              "existing production violations need remediation before enforcement; nolint suppression already works",
+	"walkdirignoredeerror":             "existing discarded WalkDir errors in audit_threat_detection.go and model_routing.go need remediation before CI enforcement",
+	"writefilepublicpermsensitive":     "heuristic findings need an enforcement-readiness audit before CI enables it",
 }
 
 // TestDocGo_CountMatchesBullets validates that the "All N active analyzers:"
@@ -264,10 +281,14 @@ func parseReadmeSubpackageSet(t *testing.T) map[string]struct{} {
 		if m == nil {
 			continue
 		}
-		if m[1] == "internal" {
+		label := m[1]
+		if m[2] != "" {
+			label = m[2]
+		}
+		if label == "internal" {
 			continue
 		}
-		readmeSet[m[1]] = struct{}{}
+		readmeSet[label] = struct{}{}
 	}
 
 	return readmeSet
@@ -285,6 +306,8 @@ func docSlugToAnalyzerName(slug string) string {
 	switch slug {
 	case "panic-in-library-code":
 		return "panicinlibrarycode"
+	case "splitlines-on-newline":
+		return "splitlinesonnewline"
 	default:
 		return slug
 	}

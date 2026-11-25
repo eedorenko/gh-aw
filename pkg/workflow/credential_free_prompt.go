@@ -3,9 +3,11 @@ package workflow
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/sliceutil"
+	"github.com/github/gh-aw/pkg/workflow/actionslanguageservice"
 	"github.com/goccy/go-yaml"
 )
 
@@ -13,11 +15,55 @@ import (
 const promptGitHubScriptToken = "no-authentication"
 
 func promptValueUsesCredentials(value string) bool {
-	for _, source := range interpolationReferences(value) {
-		if len(source) == 0 {
-			continue
+	return slices.ContainsFunc(interpolationReferences(value), isCredentialReference)
+}
+
+func isCredentialReference(path []string) bool {
+	return referenceHasPrefix(path, []string{"secrets"}) ||
+		referenceHasPrefix(path, []string{"github", "token"}) ||
+		referenceHasPrefix(path, []string{"github", "*"}) ||
+		slices.EqualFunc(path, []string{"github"}, strings.EqualFold)
+}
+
+func isSecretsSerializationCall(node *actionslanguageservice.Expression) bool {
+	if node.Kind != "call" || !strings.EqualFold(node.Token.Text, "toJSON") || len(node.Children) != 1 {
+		return false
+	}
+	argument := node.Child(0)
+	for argument.Kind == "group" && len(argument.Children) == 1 {
+		argument = argument.Child(0)
+	}
+	path, ok := actionslanguageservice.Reference(argument)
+	return ok && slices.EqualFunc(path, []string{"secrets"}, strings.EqualFold)
+}
+
+func expressionUsesCredentialReference(expression *actionslanguageservice.Expression, ignoreSecretsSerialization bool) bool {
+	found := false
+	actionslanguageservice.Walk(expression, func(node *actionslanguageservice.Expression) bool {
+		if ignoreSecretsSerialization && isSecretsSerializationCall(node) {
+			return false
 		}
-		if strings.EqualFold(source[0], "secrets") || (len(source) > 1 && strings.EqualFold(source[0], "github") && strings.EqualFold(source[1], "token")) { //nolint:uncheckedsliceindex // The context and property bounds are checked above.
+		path, ok := actionslanguageservice.Reference(node)
+		if !ok {
+			return true
+		}
+		found = found || isCredentialReference(path)
+		return false
+	})
+	return found
+}
+
+func valueUsesCredentialReference(value string) bool {
+	spans, err := actionslanguageservice.ExtractExpressions(value)
+	if err != nil {
+		return true
+	}
+	for _, span := range spans {
+		expression, err := actionslanguageservice.ParseSyntax(span.Content)
+		if err != nil || expression == nil {
+			return true
+		}
+		if expressionUsesCredentialReference(expression, false) {
 			return true
 		}
 	}
@@ -26,7 +72,7 @@ func promptValueUsesCredentials(value string) bool {
 
 func validatePromptSecretBindings(data *WorkflowData, localImports string) error {
 	env := parseEnvYAMLSection(data.Env)
-	prompt := removeXMLComments(data.MarkdownContent + "\n" + data.MainWorkflowMarkdown + "\n" + data.ImportedMarkdown + "\n" + localImports)
+	prompt := removeXMLComments(data.MarkdownContent + "\n" + data.MainWorkflowMarkdown + "\n" + data.PromptMarkdown + "\n" + data.ImportedMarkdown + "\n" + localImports)
 	for _, ref := range interpolationReferences(wrapExpressionsInTemplateConditionals(prompt)) {
 		if len(ref) < 2 || !strings.EqualFold(ref[0], "env") { //nolint:uncheckedsliceindex // Short-circuiting checks the context bounds.
 			continue
@@ -56,19 +102,7 @@ func configureCredentialFreePromptAction(step *WorkflowStep) error {
 	if !ok || !strings.HasPrefix(step.Uses, "actions/github-script@") {
 		return fmt.Errorf("prompt step %q requires an unsupported action", step.Name)
 	}
-	keys := map[string]string{
-		"PATH": "", "RUNNER_TEMP": "", "RUNNER_OS": "", "RUNNER_ARCH": "",
-		"GITHUB_WORKSPACE": "", "GITHUB_EVENT_PATH": "", "GITHUB_EVENT_NAME": "",
-		"GITHUB_REPOSITORY": "", "GITHUB_ACTOR": "", "GITHUB_SHA": "", "GITHUB_REF": "",
-		"GITHUB_RUN_ID": "", "GITHUB_RUN_NUMBER": "", "GITHUB_RUN_ATTEMPT": "",
-		"GITHUB_WORKFLOW": "", "GITHUB_JOB": "", "GITHUB_ACTION": "",
-		"GITHUB_SERVER_URL": "", "GITHUB_API_URL": "", "GITHUB_GRAPHQL_URL": "",
-		"GITHUB_STEP_SUMMARY": "", "GITHUB_OUTPUT": "", "GH_AW_ACTIONS_DIR": "",
-	}
-	for key := range step.Env {
-		keys[key] = ""
-	}
-	encoded, err := json.Marshal(sliceutil.SortedKeys(keys))
+	encoded, err := json.Marshal(sliceutil.SortedKeys(step.Env))
 	if err != nil {
 		return fmt.Errorf("encode prompt environment allowlist: %w", err)
 	}
@@ -83,16 +117,15 @@ func configureCredentialFreePromptAction(step *WorkflowStep) error {
 	script = strings.Join(lines, "\n")
 	script = strings.ReplaceAll(script, "'"+SetupActionDestination+"/", "process.env.GH_AW_ACTIONS_DIR + '/")
 	step.Env["GH_AW_ACTIONS_DIR"] = SetupActionDestination
+	step.Env["GH_AW_PROMPT_ENV"] = string(encoded)
 	step.With["github-token"] = promptGitHubScriptToken
-	step.With["script"] = "const promptEnvironment = new Set(" + string(encoded) + ");\n" +
-		"for (const name of Object.keys(process.env)) {\n" +
-		"  if (!promptEnvironment.has(name)) delete process.env[name];\n" +
-		"}\nglobal.core = core;\nglobal.context = context;\n" + script
+	step.With["script"] = "const { setupPromptGlobals } = require(process.env.GH_AW_ACTIONS_DIR + '/setup_prompt_globals.cjs');\n" +
+		"setupPromptGlobals(core, context);\n" + script
 	return nil
 }
 
 // Prompt modules receive no authenticated API client or inherited credentials.
-func writeCredentialFreePromptSteps(output *strings.Builder, content string, data *WorkflowData) error {
+func writeCredentialFreePromptSteps(output *strings.Builder, content string, data *WorkflowData, intendedPromptContent map[string]string) error {
 	var steps []WorkflowStep
 	comments := yaml.CommentMap{}
 	if err := yaml.UnmarshalWithOptions([]byte(content), &steps, yaml.CommentToMap(comments)); err != nil {
@@ -122,12 +155,50 @@ func writeCredentialFreePromptSteps(output *strings.Builder, content string, dat
 		}
 	}
 	options := append([]yaml.EncodeOption{yaml.WithComment(comments)}, DefaultMarshalOptions...)
-	encoded, err := yaml.MarshalWithOptions(steps, options...)
+	encoded, err := marshalYAMLWithOptions(steps, options...)
 	if err != nil {
 		return fmt.Errorf("encode credential-free prompt steps: %w", err)
 	}
+	if err := validatePromptContentRoundTrip(encoded, steps, intendedPromptContent); err != nil {
+		return err
+	}
 	for line := range strings.SplitSeq(strings.TrimRight(string(encoded), "\n"), "\n") {
 		output.WriteString("      " + line + "\n")
+	}
+	return nil
+}
+
+func validatePromptContentRoundTrip(encoded []byte, steps []WorkflowStep, intendedPromptContent map[string]string) error {
+	var decoded []WorkflowStep
+	if err := yaml.Unmarshal(encoded, &decoded); err != nil {
+		return fmt.Errorf("parse encoded prompt steps: %w", err)
+	}
+	if len(decoded) != len(steps) {
+		return fmt.Errorf("YAML round trip changed the prompt step count — expected %d, got %d", len(steps), len(decoded))
+	}
+	seenContent := make(map[string]struct{}, len(intendedPromptContent))
+	for _, step := range decoded {
+		for key, actual := range step.Env {
+			if !strings.HasPrefix(key, "GH_AW_PROMPT_CONTENT_") {
+				continue
+			}
+			expected, exists := intendedPromptContent[key]
+			if !exists {
+				return fmt.Errorf("YAML round trip produced unexpected %s in prompt step %q", key, step.Name)
+			}
+			if actual != expected {
+				return fmt.Errorf("YAML round trip changed %s in prompt step %q — expected prompt content to be preserved exactly", key, step.Name)
+			}
+			if _, duplicate := seenContent[key]; duplicate {
+				return fmt.Errorf("YAML round trip duplicated %s in prompt steps", key)
+			}
+			seenContent[key] = struct{}{}
+		}
+	}
+	for key := range intendedPromptContent {
+		if _, exists := seenContent[key]; !exists {
+			return fmt.Errorf("YAML round trip changed %s in prompt steps — expected prompt content to be preserved exactly", key)
+		}
 	}
 	return nil
 }

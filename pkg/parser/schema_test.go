@@ -109,7 +109,7 @@ func TestValidateMainWorkflowFrontmatter_IssueFieldActivityTypes(t *testing.T) {
 	frontmatter := map[string]any{
 		"on": map[string]any{
 			"issues": map[string]any{
-				"types": []any{"typed", "untyped", "field_added", "field_removed"},
+				"types": []any{"typed", "untyped", "field_added", "field_removed", "status_changed"},
 			},
 		},
 		"engine": "copilot",
@@ -119,6 +119,17 @@ func TestValidateMainWorkflowFrontmatter_IssueFieldActivityTypes(t *testing.T) {
 		t.Fatalf("expected issue field activity types to validate: %v", err)
 	}
 
+	invalidFrontmatter := map[string]any{
+		"on": map[string]any{
+			"issues": map[string]any{
+				"types": []any{"status_change"},
+			},
+		},
+		"engine": "copilot",
+	}
+	if err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(invalidFrontmatter, "workflow.md"); err == nil {
+		t.Fatal("expected misspelled issue activity type to fail validation")
+	}
 }
 
 func TestValidateMainWorkflowFrontmatter_MaxToolCalls(t *testing.T) {
@@ -138,6 +149,84 @@ func TestValidateMainWorkflowFrontmatter_MaxToolCalls(t *testing.T) {
 			err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(map[string]any{
 				"on":             "workflow_dispatch",
 				"max-tool-calls": test.value,
+			}, "workflow.md")
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validation error = %v, wantErr %t", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateMainWorkflowFrontmatter_MaxIssueArtifacts(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		value   any
+		wantErr bool
+	}{
+		{"positive", 3, false},
+		{"zero", 0, false},
+		{"negative", -3, false},
+		{"fraction", 1.5, true},
+		{"string", "3", true},
+		{"boolean", false, true},
+		{"expression", "${{ inputs.max }}", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(map[string]any{
+				"on": "workflow_dispatch",
+				"safe-outputs": map[string]any{
+					"create-issue": map[string]any{"max-issue-artifacts": test.value},
+				},
+			}, "workflow.md")
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validation error = %v, wantErr %t", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateMainWorkflowFrontmatter_MaxIssueArtifactsRejectsTypo(t *testing.T) {
+	for _, config := range []map[string]any{
+		{"max-isssue-artifacts": 3},
+		{"max-issue-artifacts": 3, "max-isssue-artifacts": 4},
+	} {
+		err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(map[string]any{
+			"on":           "workflow_dispatch",
+			"safe-outputs": map[string]any{"create-issue": config},
+		}, "workflow.md")
+		if err == nil {
+			t.Fatal("Expected the misspelled artifact count option to be rejected")
+		}
+	}
+}
+
+func TestValidateMainWorkflowFrontmatter_MaxIssueArtifactSize(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		value   any
+		wantErr bool
+	}{
+		{"positive", 1024, false},
+		{"one-mb", 1048576, false},
+		{"above-default", 2097152, false},
+		{"zero", 0, true},
+		{"negative", -1, true},
+		{"fraction", 1.5, true},
+		{"human-size", "1mb", false},
+		{"fractional-human-size", "1.5mb", false},
+		{"spaced-human-size", " 512 KiB ", false},
+		{"short-unit", "1m", false},
+		{"quoted-bytes", "1048576", false},
+		{"unknown-unit", "1xb", true},
+		{"missing-number", "mb", true},
+		{"boolean", false, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(map[string]any{
+				"on": "workflow_dispatch",
+				"safe-outputs": map[string]any{
+					"create-issue": map[string]any{"max-issue-artifact-size": test.value},
+				},
 			}, "workflow.md")
 			if (err != nil) != test.wantErr {
 				t.Fatalf("validation error = %v, wantErr %t", err, test.wantErr)
@@ -1621,6 +1710,18 @@ func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_WorkflowRunConclus
 func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_OperationalValueGrader(t *testing.T) {
 	t.Parallel()
 
+	scriptFrontmatter := map[string]any{
+		"on": "workflow_dispatch",
+		"graders": map[string]any{
+			"operational-value": map[string]any{
+				"script": `return [{id: "primary", value: 1}]`,
+			},
+		},
+	}
+	if err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(scriptFrontmatter, "/tmp/gh-aw/operational-value-grader-test.md"); err != nil {
+		t.Fatal(err)
+	}
+
 	for _, runPath := range []string{
 		".github/workflows/graders/example-operational-value.sh",
 		".github/workflows/graders/..secret.sh",
@@ -1636,8 +1737,13 @@ func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_OperationalValueGr
 				},
 			}
 
-			if err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/operational-value-grader-test.md"); err != nil {
-				t.Fatal(err)
+			err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/operational-value-grader-test.md")
+			if err == nil {
+				t.Fatal("expected removed operational-value.run to fail")
+			}
+			if !strings.Contains(err.Error(), "graders.operational-value.run has been removed") ||
+				!strings.Contains(err.Error(), "graders.operational-value.script") {
+				t.Fatalf("expected migration guidance, got: %v", err)
 			}
 		})
 	}
@@ -2607,7 +2713,7 @@ func TestValidateWithSchema_YAMLTypedSlice(t *testing.T) {
 
 func TestProtectedFilesExclusionsRequireScope(t *testing.T) {
 	t.Parallel()
-	for _, handler := range []string{"create-pull-request", "push-to-pull-request-branch", "approve-workflow-run"} {
+	for _, handler := range []string{"create-pull-request", "push-to-pull-request-branch", "merge-pull-request", "approve-workflow-run"} {
 		for _, pattern := range []string{"", "*", "**", "**/*", "*/**/*", "/**", "/**/*", "**.*", "/**.*", ".*/**", "/.*/**", ".", "/", " ", " docs/**", "docs/** ", "docs/a b.md", "docs/\tfile.md", "docs/\nfile.md", "AGENTS.md", ".agents/", "/pyproject.toml", "/.changeset/*.md", "/docs/**", "/**/*.md", "/_/**", "/-/**", "/1/**"} {
 			t.Run(handler+"/"+pattern, func(t *testing.T) {
 				config := map[string]any{
@@ -2615,6 +2721,9 @@ func TestProtectedFilesExclusionsRequireScope(t *testing.T) {
 				}
 				if handler == "approve-workflow-run" {
 					config["allowed-workflows"] = []any{"ci.yml"}
+				}
+				if handler == "merge-pull-request" {
+					config["allowed-base-branches"] = []any{"agent-work/*"}
 				}
 				frontmatter := map[string]any{
 					"on":           map[string]any{"workflow_dispatch": nil},

@@ -17,11 +17,11 @@ on:
 
 GitHub Agentic Workflows supports all standard GitHub Actions triggers plus additional enhancements for reactions, cost control, and advanced filtering.
 
-`on.admission: true` opts a workflow into the compiler-owned `admission` and `conclusion_admission` jobs. These jobs are omitted by default unless `.github/workflows/aw.json` sets `"admission": true` for the repository. Either opt-in enables both jobs; a workflow-level `false` does not override a repository-level `true`. This setting is not a GitHub Actions event. Recompile after changing it. See [Centralized Activation Admission](/gh-aw/reference/enterprise-configuration/#centralized-activation-admission) for the required runtime variables.
+Admission steps inside activation and conclusion are omitted by default. Set `"admission": true` in `.github/workflows/aw.json` to enable them repository-wide, or `on.admission: true` for a single workflow when no repository override is set. This setting controls code generation, not job permissions, and is not a GitHub Actions event. Recompile after changing it. See [Centralized Activation Admission](/gh-aw/reference/enterprise-configuration/#centralized-activation-admission) for the runtime variables and job-wide OIDC implications.
 
 **Experimental hosted CAO triggers:** `on.gateway-dispatch` and all its nested triggers are experimental. GitHub issue, pull-request, discussion, comment, and review/thread notifications are filtered by the server. `projects-items` requires `project_id`; paired `status-transitions` adds delivered Status predicates. Separate `code-scanning-alert` and `dependabot-alerts` triggers select their own events with independent `types`, `severity`, and `filters`; there is no bundled security event. Shared `repos` and wildcard `orgs` restrict independently approved GitHub sources without granting access; non-GitHub families ignore them. Named secret scanning is unsupported. Compilation requires `{"gateway-dispatch":true}` in `.github/workflows/aw.json` and generates a mandatory `gateway_provenance` job for approved CAO App identity, not generic repository-write authority. Configure central Actions secrets `GH_AW_GATEWAY_APP_ID` and `GH_AW_GATEWAY_APP_BOT_ID` (existing variables remain a fallback); every other job requires successful provenance. Integrations must remain nonactivating until the receiver token flow and approved destination revision enforce the [App-token contract](/gh-aw/specs/webhook-gateway-specification/#github-app-token-provenance). No other trigger may coexist with `gateway-dispatch`. Supported non-trigger settings such as `roles` and `bots` remain outside its mapping, and the compiler emits only its workflow-specific restricted `repository_dispatch` route. See [Webhook Triggers](/gh-aw/reference/webhook-triggers/) for syntax, payload filters, and integration requirements.
 
-**Experimental external issue triggers:** `on.gateway-dispatch.jira-issue`, `on.gateway-dispatch.linear-issue`, and `on.gateway-dispatch.azure-devops-issue` use GitHub-style activity names derived from native provider events and delivered transition evidence. Jira requires `project`, Linear requires `organization-id` and accepts optional `team-id`, and Azure DevOps requires `project_id`, all beside `types` without a `filters` wrapper. They share the repository opt-in, write-minimum role policy, and required App-token provenance contract above, but require a separately approved provider bridge and provider-specific credentials. Azure closure requires explicit `closed-states`; Jira label normalization is limited to unambiguous single-label changes. See [Provider Issue Triggers](/gh-aw/reference/provider-issue-triggers/) for supported activities, selectors, and receiver requirements.
+**External issue integrations:** Azure DevOps, Jira, and Linear use shared [connector declarations](/gh-aw/reference/connectors/). Their former native gateway aliases are removed. Select imported triggers under `on.gateway-dispatch.<id>` to use the protected gateway route. Receiver deployment and authenticated source enrollment remain external prerequisites; use `workflow_dispatch` until that integration is approved. See [Provider Issue Triggers](/gh-aw/reference/provider-issue-triggers/) for migration guidance.
 
 All gateway families forward only canonical resource URLs, event type arrays, and declared matching filter literals, never native resource bodies or unselected values. Workflows resolve any additional data with provider-authenticated clients so the provider enforces access. See the [Webhook Gateway Specification](/gh-aw/specs/webhook-gateway-specification/) for the closed payload contract.
 
@@ -147,6 +147,16 @@ on:
     types: [opened, edited, labeled]
 ```
 
+`types` also accepts `status_changed` for GitHub's preview issue-status activity:
+
+```yaml wrap
+on:
+  issues:
+    types: [status_changed]
+```
+
+Compilation accepts this activity type; event delivery depends on GitHub's availability of the preview.
+
 #### Issue Locking (`lock-for-agent:`)
 
 Prevent concurrent modifications to an issue during workflow execution by setting `lock-for-agent: true`:
@@ -209,7 +219,7 @@ Use `["owner/repo"]` for a specific repository, `["owner/*"]` for an entire org/
 
 Alternatively, use `forks: {author-association: [OWNER, MEMBER, COLLABORATOR]}` to allow fork PRs by the author's relationship to the base repository rather than the fork owner. Same-repository PRs remain allowed, and no association is implicitly included. See [author associations](/gh-aw/reference/fork-support/#author-associations) for trust and secret-availability considerations.
 
-`pull_request_target` also defaults to same-repository PRs only: omitting `forks:` is equivalent to `forks: []` in both strict and non-strict mode. To admit specific forks, list exact `owner/repo` entries or deliberately trusted `owner/*` patterns. Same-repository PRs remain allowed. `"*"` anywhere in a list permits all forks; strict mode warns and recommends restricting fork admission instead of rejecting compilation. `acknowledge-risk: true`, disabled checkout, and trusted checkouts do not suppress this fork warning. Actor authorization and checkout restrictions remain enforced independently; strict mode still rejects expressions and unsupported pattern forms.
+`pull_request_target` also defaults to same-repository PRs only: omitting `forks:` is equivalent to `forks: []` in both strict and non-strict mode. To admit specific forks, list exact `owner/repo` entries or deliberately trusted `owner/*` patterns. Same-repository PRs remain allowed. `"*"` anywhere in a list permits all forks; strict mode rejects this unless `features.dangerously-allow-pull-request-target-forks-all: true` is set, and non-strict mode warns. Even with that opt-in, the wildcard warning remains visible. `acknowledge-risk: true`, disabled checkout, and trusted checkouts do not suppress the diagnostic. Actor authorization and checkout restrictions remain enforced independently; strict mode still rejects expressions and unsupported pattern forms.
 
 Fork filters and `pull_request.names` compile into job conditions, not GitHub Actions trigger properties. Bounded fork admission is defense in depth, not proof of safe PR content: a trusted actor can label an attacker-controlled PR, and disabling checkout does not prevent an agent from reading malicious content with privileged capabilities.
 
@@ -506,6 +516,10 @@ on:
 
 Available roles: `admin`, `maintainer`/`maintain`, `write`, `triage`, `read`, `all`. Workflows with unsafe triggers (`push`, `issues`, `pull_request`) automatically enforce permission checks. Failed checks cancel the workflow with a warning.
 
+:::danger[`roles: all` admits untrusted actors]
+With `roles: all`, any GitHub user can reach the agent through triggers such as `issues`, `issue_comment`, or `pull_request`, and can inject prompts through the content they write. Keep [threat detection](/gh-aw/reference/threat-detection/) enabled for these workflows: strict mode rejects `roles: all` combined with `safe-outputs.threat-detection: false`, and `strict: false` reports a warning. See the [`untrusted-roles-detection`](/gh-aw/reference/workflow-linters/) linter. Also consider the [NVX microVM runtime](/gh-aw/reference/sandbox/) (`sandbox.agent.runtime: nvx`). The default container sandbox runs as the runner's user and shares the runner's `/tmp`.
+:::
+
 #### Custom organization repository roles
 
 GitHub organizations can define [custom repository roles](https://docs.github.com/en/organizations/managing-user-access-to-your-organizations-repositories/managing-repository-roles/about-custom-repository-roles) with an inherited standard role (for example `write` or `maintain`). Actors whose access comes from a custom role (e.g. `Security Champions`) are authorized against that **inherited standard role** — the custom role name itself cannot appear in `on.roles:`. For example, a user with the custom role `Security Champions` (inherited role: `write`) will be authorized when the required roles include `write`, while a custom role inherited from `maintain` will still be rejected by `roles: [write]`.
@@ -605,6 +619,19 @@ The reaction is added to the triggering item. Use `none` to disable reactions en
 
 **Available reactions:** `+1` 👍, `-1` 👎, `laugh` 😄, `confused` 😕, `heart` ❤️, `hooray` 🎉, `rocket` 🚀, `eyes` 👀
 
+Object form supports `remove-on-complete` (default: `false`) to remove the trigger reaction when the conclusion job runs, including after failure or an agent skip:
+
+```aw wrap
+on:
+  slash_command: review
+  reaction:
+    type: eyes
+    remove-on-complete: true
+  status-comment: false
+```
+
+Cleanup uses the same authentication configuration as activation (`on.github-token` or `on.github-app`) and works independently of status comments. For issues, pull requests, and comments, it removes the reaction ID recorded during activation. For discussions and discussion comments, GitHub's GraphQL API removes the authenticated user's reaction matching the configured content type; it does not accept a reaction ID. Cleanup only runs if activation recorded a reaction. Removal errors are warnings and do not fail the workflow. Cancellation that prevents conclusion from running cannot guarantee cleanup. Dry-run mode does not modify reactions.
+
 ### Status Comments (`status-comment:`)
 
 Post a started/completed comment on the triggering item with a link to the workflow run:
@@ -696,7 +723,7 @@ on:
 ```
 
 > [!NOTE]
-> `github-token` and `github-app` affect only the activation job (reactions, status comments, and skip-if searches). For the agent job, configure tokens via `tools.github.github-token`/`tools.github.github-app` or `safe-outputs.github-token`/`safe-outputs.github-app`. See [Authentication](/gh-aw/reference/auth/) for a full overview.
+> `github-token` and `github-app` affect the activation job (reactions, status comments, and skip-if searches) and optional trigger-reaction cleanup in conclusion. For the agent job, configure tokens via `tools.github.github-token`/`tools.github.github-app` or `safe-outputs.github-token`/`safe-outputs.github-app`. See [Authentication](/gh-aw/reference/auth/) for a full overview.
 
 ### Stop After Configuration (`stop-after:`)
 
@@ -744,6 +771,8 @@ on: weekly on monday
 ```
 
 A pre-activation check runs the query against the current repository. If matches reach or exceed the threshold (default `max: 1`), the workflow is skipped. All standard GitHub search qualifiers are supported (`is:`, `label:`, `in:title`, `author:`, etc.).
+
+To spare the search API's low rate limit, simple single-repository queries are evaluated with GraphQL or REST list endpoints instead. A query qualifies when it uses only `is:`/`type:`/`state:` (`issue`, `pr`, `open`, `closed`, `merged`), `label:` (no comma lists), `author:`, `assignee:`, `mentions:`, `sort:`, and one `repo:`. The check reads current rate limits, prefers GraphQL, then REST, then search, demotes any API with less than 10% quota remaining, and falls back to the next API on error. Free text, negations, `in:`, `org:`, and other qualifiers always use the search API.
 
 Use `scope: none` to remove the automatic repo qualifier and search org-wide. For cross-repo or org-wide searches that need elevated permissions, configure `github-token` or `github-app` at the top-level `on:` section — the same token is shared across all skip-if checks and the activation job:
 
@@ -879,7 +908,9 @@ if: needs.pre_activation.outputs.has_issues == 'true'
 
 Supported permission scopes: `actions`, `checks`, `contents`, `deployments`, `discussions`, `issues`, `packages`, `pages`, `pull-requests`, `repository-projects`, `security-events`, `statuses`.
 
-`on.permissions` is merged on top of any permissions already required by the pre-activation job (e.g., `contents: read` for dev-mode checkout, `actions: read` for rate limiting).
+When either [`skip-if-match`](#skip-if-match-condition-skip-if-match) or [`skip-if-no-match`](#skip-if-no-match-condition-skip-if-no-match) is configured, the compiler automatically grants `issues: read` and `pull-requests: read` to the pre-activation job so search gates can query private and internal repositories. These permissions do not grant access to other repositories.
+
+`on.permissions` is merged on top of permissions already required by the pre-activation job, including search-gate read scopes, `contents: read` for dev-mode checkout, and `actions: read` for rate limiting. Explicit scopes such as `issues: write` are preserved.
 
 ## Trigger Shorthands
 

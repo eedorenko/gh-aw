@@ -4,87 +4,27 @@ description: Safe-output reference for issue, discussion, comment, and pull requ
 
 # Safe Outputs: GitHub Content
 
-- Jira operations are explicitly namespaced and run through Jira Cloud REST API v3:
+- **[Experimental]** Jira uses a normal local or pinned remote
+  `.github/workflows/connectors/jira.md` import and shared connector runtime. Bind the
+  reviewed site, project, and issue grants through `with`, then select
+  `jira-create-issue`, `jira-update-issue`, `jira-add-comment`, or `jira-add-label`.
+  Tools use the `jira_` prefix; unqualified GitHub effects are unchanged.
+  Supply a separate encoded REST Basic credential; native email/token injection
+  is removed. Per-operation `max` and `staged` are supported. Explicit temporary IDs
+  support same-run follow-ups through trusted created-resource receipts, never
+  by treating an agent-supplied issue key as authority. See the single
+  [Connectors reference](../../docs/src/content/docs/reference/connectors.md#jira)
+  for exact inputs, credential routes, staging, and migration limitations.
 
-  ```yaml
-  safe-outputs:
-    jira-create-issue:
-      max: 1
-    jira-update-issue:
-      max: 1
-    jira-add-comment:
-      max: 1
-    jira-add-label:
-      max: 3
-  ```
+- **[Experimental]** Linear uses a normal local or pinned remote
+  `.github/workflows/connectors/linear.md` import and shared connector runtime. Select
+  `linear-create-issue`, `linear-update-issue`, or `linear-add-comment` only
+  after declaring approved resource arrays through `with`. Use separate read
+  and write credentials. Legacy destination options and implicit ID resolution
+  are removed; per-operation `max` and `staged` are supported. The reference is
+  [Connectors](https://github.github.com/gh-aw/reference/connectors/#linear).
 
-  | Frontmatter | Tool | Agent inputs |
-  |---|---|---|
-  | `jira-create-issue` | `jira_create_issue` | `project_key`, `issue_type`, `summary`, optional `description` |
-  | `jira-update-issue` | `jira_update_issue` | `issue_key` and at least one of `summary`, `description` |
-  | `jira-add-comment` | `jira_add_comment` | `issue_key`, `body` |
-  | `jira-add-label` | `jira_add_label` | `issue_key`, `label` |
-
-  Use the Jira-prefixed tool whenever the target is Jira. Unprefixed issue, comment, and label tools target GitHub. The compiler supplies `JIRA_BASE_URL` and supplies `JIRA_USER_EMAIL` and `JIRA_API_TOKEN` from same-named secrets; `safe-outputs.env` may override them. Description and comment strings are converted to ADF internally. Label addition is additive and preserves existing labels. Each Jira output supports `max` and `staged`; staged mode sends no HTTP request and does not require credentials.
-
-  Jira update, comment, and label operations require a known issue key. Same-run references to an issue created by `jira_create_issue` are not supported. The initial integration does not provide transitions, assignments, custom fields, label removal, JQL, bulk operations, or arbitrary REST calls.
-
-- **[Experimental]** Linear operations use the `LINEAR_API_KEY` secret and run through the Linear GraphQL API:
-
-  ```yaml
-  safe-outputs:
-    linear-create-issue:
-      max: 1
-      team-id: "TEAM_ID"
-      project-id: "PROJECT_ID"
-    linear-add-comment:
-      max: 1
-    linear-update-issue:
-      max: 1
-      title: true
-      body: true
-  ```
-
-  | Frontmatter | Tool | Agent inputs |
-  |---|---|---|
-  | `linear-create-issue` | `linear_create_issue` | `title`, `body` (team and optional project taken from config) |
-  | `linear-add-comment` | `linear_add_comment` | `body` (target issue) |
-  | `linear-update-issue` | `linear_update_issue` | `title`/`body`, gated by the matching `title:`/`body:` config flags |
-
-  `linear-token:` optionally overrides the `LINEAR_API_KEY` secret and is a top-level `safe-outputs:` field, not nested under `env:`. `linear-create-issue.team-id` accepts a Linear team UUID, key, or name; keys and names are resolved through Linear's API before issue creation. `linear-create-issue.project-id` optionally fixes created issues to a trusted Linear project identifier from its URL or model UUID. Each output supports `max` and `staged`. Only fields explicitly enabled in `update-issue` config (`title`, `body`) can be changed by the agent.
-
-- **[Experimental]** Azure DevOps work-item operations are namespaced `ado-*` and rely on an Azure DevOps MCP server (configured separately under `mcp-servers:`/`tools:`) for the underlying connection and credentials:
-
-  ```yaml
-  safe-outputs:
-    ado-create-work-item:
-      max: 1
-      work-item-type: "Bug"
-    ado-update-work-item:
-      max: 1
-      status: true
-      title: true
-    ado-comment-on-work-item:
-      max: 1
-      target: "*"
-    ado-assign-work-item:
-      max: 1
-    ado-link-work-items:
-      max: 5
-    ado-upload-workitem-attachment:
-      max: 1
-  ```
-
-  | Frontmatter | Tool | Agent inputs |
-  |---|---|---|
-  | `ado-create-work-item` | `ado_create_work_item` | `title`, `description`, optional `tags`, `temporary_id` |
-  | `ado-update-work-item` | `ado_update_work_item` | `id`, plus one of `title`/`body`/`state`/`area_path`/`iteration_path`/`assignee`/`tags` enabled via config |
-  | `ado-comment-on-work-item` | `ado_comment_on_work_item` | `work_item_id`, `body` |
-  | `ado-assign-work-item` | `ado_assign_work_item` | `work_item_id`, `assignee` (checked against `allowed`/`blocked`) |
-  | `ado-link-work-items` | `ado_link_work_items` | `source_id`, `target_id`, `link_type` (checked against `allowed-link-types`) |
-  | `ado-upload-workitem-attachment` | `ado_upload_workitem_attachment` | `work_item_id`, `file_path`, `staged_file` (checked against `max-file-size`/`allowed-extensions`) |
-
-  `ado-create-work-item` accepts a `temporary_id` (`#aw_xxxx`) so later outputs in the same run can reference a just-created work item. `target:` on update/comment/assign/link/attach constrains which work item IDs are addressable. Config-level allow-lists (`allowed-tags`, `allowed-area-prefixes`, `allowed-iteration-prefixes`, `allowed`, `blocked`, `allowed-link-types`, `allowed-extensions`) gate what the agent can set; unlisted values are rejected.
+- Azure DevOps operations use the normal `".github/workflows/connectors/azure-devops.md"` import and independently selected `azure-devops-*` safe outputs. The removed `ado-*` handlers, automatic PAT credentials, temporary IDs, and attachments are unsupported. See [Connectors](https://github.github.com/gh-aw/reference/connectors/#azure-devops) for exact capabilities and migration limits.
 
 - `create-issue:` - Safe GitHub issue creation (bugs, features)
 
@@ -113,6 +53,9 @@ description: Safe-output reference for issue, discussion, comment, and pull requ
       close-older-issues: true        # Optional: close previous issues from same workflow (default: false)
       close-older-key: "my-key"       # Optional: explicit deduplication key for close-older matching (uses gh-aw-close-key marker)
       deduplicate-by-title: true      # Optional: skip creating an issue when one with the same title exists; integer N allows fuzzy matches up to edit distance N (default: off)
+      deduplicate-by-labels: [triage] # Optional: drop when an open/recently closed issue has ALL labels; ANDed with deduplicate-by-title
+      max-issue-artifacts: 10         # Optional: max `artifacts` per issue (default: 10; <=0 disables)
+      max-issue-artifact-size: 1mb    # Optional: max UTF-8 size per artifact body (bytes or 512kb/1mb; default: 1mb)
       require-temporary-id: true      # Optional: require temporary_id on every create_issue call (default: false)
       normalize-closing-keywords: true # Optional: strip backticks around recognized issue-closing keywords in body text
       # create_issue output may set blocked_by to an issue reference or list of references
@@ -124,6 +67,8 @@ description: Safe-output reference for issue, discussion, comment, and pull requ
   `create_issue` output validation requires:
   - `body` minimum length: **20** characters
   - `body` maximum length: **65000** characters
+
+  **Issue artifacts**: `create_issue` accepts optional `artifacts: [{name, body | path, type?}]` (`type`: `generic`, `plan`, `link`, `embedded_html`). `path` must be a literal absolute path under the workspace or `/tmp/gh-aw/agent`; the unprivileged MCP backend reads it so content never enters the agent context. Oversized or over-limit requests are rejected before creation (no truncation). See [docs: Issue Artifacts](https://github.github.com/gh-aw/reference/safe-outputs/#issue-artifacts).
 
   **Auto-Expiration**: The `expires` field auto-closes issues after a time period. Supports integers (days) or relative formats (2h, 7d, 2w, 1m, 1y). Generates `agentics-maintenance.yml` workflow that runs at minimum required frequency based on shortest expiration time: 1 day or less → every 2 hours, 2 days → every 6 hours, 3-4 days → every 12 hours, 5+ days → daily.
   **Deduplication for Scheduled Workflows**: When `schedule:` is combined with `create-issue`, use `skip-if-match:` in the `on:` block to prevent opening a duplicate issue every run. Pair with `expires:` to clean up stale issues:
@@ -239,6 +184,8 @@ description: Safe-output reference for issue, discussion, comment, and pull requ
       allowed-repos: [owner/other]    # Optional: additional repos agent can target (agent uses `repo` field in output)
   ```
 
+  **Target Scope**: Avoid `target: "*"` when a workflow needs to act on the triggering issue/PR and one known tracker: `*` lets the agent choose any issue/PR, not only those two. Keep triggering-item operations at the default `target: "triggering"` and configure tracker-specific operations with the tracker's explicit issue/PR number. Because each `target` constrains an output to one item, use separate workflows when both scopes need the same output type rather than treating `*` as a two-item allowlist.
+
   **Hide Older Comments**: Set `hide-older-comments: true` to minimize previous comments from the same workflow before posting new ones. Useful for status updates. Allowed reasons: `spam`, `abuse`, `off_topic`, `outdated` (default), `resolved`.
 
   **Discussion Thread Replies**: Agents can include `reply_to_id` in their output to post a threaded reply within a GitHub Discussion (requires `discussions: true`):
@@ -318,7 +265,9 @@ description: Safe-output reference for issue, discussion, comment, and pull requ
 
   **Allowed Source Branches**: When `allowed-branches` is set, the branch used for PR creation (agent-provided `branch` or the current checkout branch when omitted) must match one of the configured glob patterns.
 
-  **File Restrictions**: **Always specify `allowed-files`** — this is the primary guardrail for `create-pull-request`. Scope it to specific file extensions (e.g., `"**/*.md"`, `"**/*.ts"`) or directory paths (e.g., `"src/**"`, `"docs/**"`) matching the workflow's purpose. Omitting `allowed-files` allows the agent to touch any file in the repository, which significantly expands blast radius. Use `excluded-files` to additionally strip specific files (e.g. lock files) from the patch before any checks. The `protected-files` field controls handling of sensitive files (package manifests, CI configs, agent instruction files): `request-review` (default — create the PR but submit a `REQUEST_CHANGES` review so a human approves before merge), `blocked` (hard-block), `fallback-to-issue` (push branch and create a review issue), or `allowed` (no restriction — use only when the workflow is explicitly designed to manage these files). Object form is also supported: `protected-files: { policy: fallback-to-issue, exclude: [AGENTS.md] }`. Repository-wide exemptions apply across every workflow: set `protected_files.exclude` (root-path globs) in `.github/workflows/aw.json`; these combine with any per-workflow `exclude` list and do not bypass `allowed-files` or change the policy.
+  **File Restrictions**: **Always specify `allowed-files`** — this is the primary guardrail for `create-pull-request`. Scope it to specific file extensions (e.g., `"**/*.md"`, `"**/*.ts"`) or directory paths (e.g., `"src/**"`, `"docs/**"`) matching the workflow's purpose. Omitting `allowed-files` allows the agent to touch any file in the repository, which significantly expands blast radius. Use `excluded-files` to additionally strip specific files (e.g. lock files) from the patch before any checks. The `protected-files` field controls handling of sensitive files (package manifests, CI configs, agent instruction files): `request-review` (default — create the PR but submit a `REQUEST_CHANGES` review so a human approves before merge), `blocked` (hard-block), `fallback-to-issue` (push branch and create a review issue labeled `pull-request-fallback` that expires with the PR's `expires`, default 7 days), or `allowed` (no restriction — use only when the workflow is explicitly designed to manage these files). Object form is also supported: `protected-files: { policy: fallback-to-issue, exclude: [AGENTS.md] }`. Repository-wide exemptions apply across every workflow: set `protected_files.exclude` (root-path globs) in `.github/workflows/aw.json`; these combine with any per-workflow `exclude` list and do not bypass `allowed-files` or change the policy.
+
+  **Review-First Auto-Merge**: Protected-files `request-review` and detection caution (including detection engine errors) disable `auto-merge`, even when reviewers are configured or `REQUEST_CHANGES` succeeds, because the handler does not verify enforceable repository review policy. A failed required review, including when the bot authored the PR, leaves auto-merge disabled and requires an independent reviewer; the handler does not downgrade that review to `COMMENT`.
 
   **Auto-Expiration**: The `expires` field auto-closes PRs after a time period. Supports integers (days) or relative formats (2h, 7d, 2w, 1m, 1y). Minimum duration: 2 hours. Only for same-repo PRs without target-repo. Generates `agentics-maintenance.yml` workflow.
 

@@ -113,26 +113,40 @@ func TestEngineDefaultDomainsExcludePackageRegistries(t *testing.T) {
 	}
 }
 
-// TestEngineDefaultDomainsKeepTransportDomains verifies that removing package registries did
-// not remove the transport domains each engine genuinely requires in its static defaults.
-// Claude's Anthropic API host is added dynamically when Anthropic is the effective provider.
+// TestEngineDefaultDomainsKeepTransportDomains verifies that the static engine sets retain
+// gateway/GitHub transport without granting direct vendor model API egress.
 func TestEngineDefaultDomainsKeepTransportDomains(t *testing.T) {
 	required := map[constants.EngineName][]string{
-		constants.CopilotEngine: {"api.githubcopilot.com", "host.docker.internal"},
+		constants.CopilotEngine: {"host.docker.internal"},
 		constants.ClaudeEngine:  {"host.docker.internal"},
-		constants.CodexEngine:   {"api.openai.com", "host.docker.internal"},
-		constants.GeminiEngine:  {"generativelanguage.googleapis.com", "host.docker.internal"},
-		constants.PiEngine:      {"api.githubcopilot.com", "host.docker.internal"},
+		constants.CodexEngine:   {"host.docker.internal"},
+		constants.GeminiEngine:  {"host.docker.internal"},
+		constants.PiEngine:      {"host.docker.internal"},
+	}
+	directAPIs := map[constants.EngineName]string{
+		constants.CopilotEngine: "api.githubcopilot.com",
+		constants.ClaudeEngine:  "api.anthropic.com",
+		constants.CodexEngine:   "api.openai.com",
+		constants.GeminiEngine:  "generativelanguage.googleapis.com",
+		constants.PiEngine:      "api.githubcopilot.com",
 	}
 
 	for engine, domains := range required {
 		t.Run(string(engine), func(t *testing.T) {
-			defaults, err := GetDefaultDomainsForEngine(engine, "")
-			require.NoError(t, err)
+			var defaults []string
+			if engine == constants.PiEngine {
+				defaults = PiDefaultDomains
+			} else {
+				var err error
+				defaults, err = GetDefaultDomainsForEngine(engine, "")
+				require.NoError(t, err)
+			}
 			for _, domain := range domains {
 				assert.Contains(t, defaults, domain,
 					"engine %q must keep required transport domain %q", engine, domain)
 			}
+			assert.NotContains(t, defaults, directAPIs[engine],
+				"engine %q transport defaults must not grant direct model API egress", engine)
 		})
 	}
 }
@@ -144,9 +158,9 @@ type engineEcosystemDomainOverlap struct {
 func engineDefaultEcosystemOverlaps(ecosystems, defaults map[string][]string) []engineEcosystemDomainOverlap {
 	// These categories describe shared transport or vendor services rather than
 	// gated package ecosystems. Chrome's broad Google vendor rules also cover
-	// Gemini's inference API; do not treat those as package registry rules.
+	// Gemini's inference API.
 	excludedEcosystems := []string{
-		"chrome", "codex-vendor", "copilot-vendor", "defaults", "dev-tools",
+		"chrome", "codex-vendor", "copilot-vendor", "defaults", "dev-tools", "gemini-vendor",
 		"fonts", "gh-aw", "github", "github-actions", "local", "threat-detection",
 	}
 
@@ -160,9 +174,6 @@ func engineDefaultEcosystemOverlaps(ecosystems, defaults map[string][]string) []
 				for _, rule := range rules {
 					if rule == "github.com" && slices.Contains(githubPackageRegistryDomains, domain) {
 						continue
-					}
-					if engine == "threat-detection" && rule == "registry.npmjs.org" {
-						continue // Detection intentionally permits read-only npm lockfile validation.
 					}
 					if awfDomainRulesOverlap(rule, domain) {
 						overlaps = append(overlaps, engineEcosystemDomainOverlap{engine, rule, ecosystem, domain})
@@ -217,7 +228,7 @@ func TestBehaviorDefinedEngineDefaultsDoNotOverlapEcosystems(t *testing.T) {
 		}
 	}
 	require.NotEmpty(t, defaults, "shared behavior-defined engines must be checked")
-	require.Equal(t, 8, checkedBehaviorDefinedEngines, "all behavior-defined engines with network policies must be checked")
+	require.Equal(t, 10, checkedBehaviorDefinedEngines, "all behavior-defined engines with network policies must be checked")
 	assert.Empty(t, engineDefaultEcosystemOverlaps(getLoadedDomainSets().Ecosystems, defaults),
 		"behavior-defined engine defaults and provider domains require the same package ecosystem opt-in as static engines")
 }
@@ -233,10 +244,15 @@ func TestEngineDefaultEcosystemOverlapGuard(t *testing.T) {
 		{"threat-detection", "*.docker.io", "containers", "*.docker.io"},
 		{"threat-detection", "*.debian.org", "linux-distros", "deb.debian.org"},
 		{"threat-detection", "*.npmjs.org", "node", "registry.npmjs.org"},
+		{"threat-detection", "registry.npmjs.org", "node", "registry.npmjs.org"},
 		{"threat-detection", "pypi.org", "python", "pypi.org"},
 		{"copilot", "registry.npmjs.org", "node", "registry.npmjs.org"},
 		{"copilot", "*.github.com", "node", "npm.pkg.github.com"},
 		{"threat-detection", "*.github.com", "node", "npm.pkg.github.com"},
+		{"mini-swe-agent", "pypi.org", "python", "pypi.org"},
+		{"mini-swe-agent", "files.pythonhosted.org", "python", "files.pythonhosted.org"},
+		{"shared/mini-swe-agent.md/defaults", "pypi.org", "python-native", "pypi.org"},
+		{"shared/mini-swe-agent.md/defaults", "files.pythonhosted.org", "python-native", "*.pythonhosted.org"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.engine+"/"+tt.rule, func(t *testing.T) {
@@ -259,7 +275,7 @@ func TestEngineDefaultEcosystemOverlapGuard(t *testing.T) {
 	t.Run("exact exceptions remain allowed", func(t *testing.T) {
 		defaults := map[string][]string{
 			"copilot":          {"github.com"},
-			"threat-detection": {"github.com", "registry.npmjs.org"},
+			"threat-detection": {"github.com"},
 		}
 		assert.Empty(t, engineDefaultEcosystemOverlaps(getLoadedDomainSets().Ecosystems, defaults))
 	})

@@ -28,6 +28,7 @@ sandbox:
   agent:
     id: awf
 imports:
+  - shared/pr-safe-output-defaults.md
   - shared/github-guard-policy.md
 
   - shared/otlp.md
@@ -44,13 +45,11 @@ tools:
       - pull_requests
 
 safe-outputs:
-  steer: true
   create-pull-request:
     expires: 7d
     title-prefix: "[spec-review] "
     labels: [documentation, safe-outputs, automation]
     reviewers: []
-    draft: false
     auto-merge: false
 
 timeout-minutes: 30
@@ -272,4 +271,8 @@ You have successfully completed this task when:
 
 ### Output Format
 
-Structure reports as: overview → key metrics/issues → collapsible detail → next actions.
+Use `###` or lower for every heading in the generated PR body; reserve h1/h2 for
+the platform-rendered title. Structure reports as: overview → key metrics/issues
+→ collapsible detail → next actions. Keep the conclusion, important results, and
+requested action visible; put lengthy test output and supporting evidence in
+`<details><summary><b>...</b></summary>...</details>`.

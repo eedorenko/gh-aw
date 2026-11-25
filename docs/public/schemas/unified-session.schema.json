@@ -77,6 +77,8 @@
         }
       },
       { "if": { "properties": { "type": { "const": "detection.result" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/DetectionResultData" } } } },
+      { "if": { "properties": { "type": { "const": "durable.restore" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/DurableRestoreData" } } } },
+      { "if": { "properties": { "type": { "const": "durable.session" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/DurableStartupData" } } } },
       { "if": { "properties": { "type": { "const": "dynamicWorkflows.background_tasks_changed" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/DynamicWorkflowObservationData" } } } },
       { "if": { "properties": { "type": { "const": "dynamicWorkflows.task_notification" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/DynamicWorkflowObservationData" } } } },
       { "if": { "properties": { "type": { "const": "dynamicWorkflows.task_progress" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/DynamicWorkflowObservationData" } } } },
@@ -99,7 +101,9 @@
       { "if": { "properties": { "type": { "const": "guardrail.admission" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/AdmissionDecisionData" } } } },
       { "if": { "properties": { "type": { "const": "guardrail.daily_aic" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/DailyAICDecisionData" } } } },
       { "if": { "properties": { "type": { "const": "harness.attempt" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/HarnessAttemptData" } } } },
+      { "if": { "properties": { "type": { "const": "harness.decision" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/HarnessDecisionData" } } } },
       { "if": { "properties": { "type": { "const": "harness.retry" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/HarnessRetryData" } } } },
+      { "if": { "properties": { "type": { "const": "lifecycle.adoption" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/LifecycleAdoptionData" } } } },
       { "if": { "properties": { "type": { "const": "mcp.configuration" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/McpConfigurationData" } } } },
       { "if": { "properties": { "type": { "const": "mcp.difc.filtered" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/McpObservationData" } } } },
       {
@@ -136,8 +140,9 @@
       { "if": { "properties": { "type": { "const": "plugin.installation" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/PluginInstallationData" } } } },
       { "if": { "properties": { "type": { "const": "prompt.system" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/Pick%3CMessageData%2C%22content%22%3E" } } } },
       { "if": { "properties": { "type": { "const": "prompt.user" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/Pick%3CMessageData%2C%22content%22%3E" } } } },
+      { "if": { "properties": { "type": { "const": "routing.observation" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/RoutingObservationData" } } } },
       { "if": { "properties": { "type": { "const": "safe_output.error" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/SafeOutputErrorData" } } } },
-      { "if": { "properties": { "type": { "const": "safe_output.outcome" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/SafeOutputData" } } } },
+      { "if": { "properties": { "type": { "const": "safe_output.execution" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/SafeOutputData" } } } },
       { "if": { "properties": { "type": { "const": "safe_output.request" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/SafeOutputData" } } } },
       { "if": { "properties": { "type": { "const": "safe_output.result" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/SafeOutputData" } } } },
       { "if": { "properties": { "type": { "const": "session.collection" } }, "required": ["type"] }, "then": { "properties": { "data": { "$ref": "#/definitions/CollectionData" } } } },
@@ -219,6 +224,8 @@
                 "parentToolCallId": { "$ref": "#/definitions/JsonValue" },
                 "agentId": { "$ref": "#/definitions/JsonValue" },
                 "sourceEngine": { "type": "string" },
+                "agentVersion": { "type": "string" },
+                "provider": { "type": "string" },
                 "model": { "type": "string" },
                 "cwd": { "type": "string" },
                 "reasoningEffort": { "type": "string" }
@@ -244,6 +251,7 @@
                 "errorReason": { "$ref": "#/definitions/JsonValue" },
                 "premiumRequests": { "$ref": "#/definitions/JsonValue" },
                 "totalNanoAiu": { "$ref": "#/definitions/JsonValue" },
+                "aiCreditsStatus": { "type": "string", "enum": ["complete", "partial", "unavailable"] },
                 "totalApiDurationMs": { "$ref": "#/definitions/JsonValue" },
                 "sessionStartTime": { "$ref": "#/definitions/JsonValue" },
                 "currentModel": { "$ref": "#/definitions/JsonValue" }
@@ -265,6 +273,8 @@
                 "parentToolCallId": { "$ref": "#/definitions/JsonValue" },
                 "agentId": { "$ref": "#/definitions/JsonValue" },
                 "sourceEngine": { "type": "string" },
+                "agentVersion": { "type": "string" },
+                "provider": { "type": "string" },
                 "model": { "type": "string" },
                 "cwd": { "type": "string" },
                 "reasoningEffort": { "type": "string" }
@@ -319,11 +329,15 @@
                 "parentToolUseId": { "$ref": "#/definitions/JsonValue" },
                 "parentToolCallId": { "$ref": "#/definitions/JsonValue" },
                 "agentId": { "$ref": "#/definitions/JsonValue" },
+                "messageId": { "$ref": "#/definitions/JsonValue" },
+                "model": { "$ref": "#/definitions/JsonValue" },
                 "toolCallId": { "type": "string" },
                 "stepIndex": { "$ref": "#/definitions/SessionCount" },
                 "toolName": { "type": "string" },
                 "success": { "type": "boolean" },
                 "output": { "$ref": "#/definitions/JsonValue" },
+                "outputTruncated": { "type": "boolean", "description": "Native output truncation, not a collector completeness guarantee." },
+                "structuredContent": { "$ref": "#/definitions/JsonValue" },
                 "result": { "$ref": "#/definitions/JsonValue" },
                 "error": { "$ref": "#/definitions/JsonValue" },
                 "fileEdits": { "$ref": "#/definitions/JsonValue" },
@@ -353,6 +367,8 @@
                 "parentToolUseId": { "$ref": "#/definitions/JsonValue" },
                 "parentToolCallId": { "$ref": "#/definitions/JsonValue" },
                 "agentId": { "$ref": "#/definitions/JsonValue" },
+                "messageId": { "$ref": "#/definitions/JsonValue" },
+                "model": { "$ref": "#/definitions/JsonValue" },
                 "toolCallId": { "type": "string" },
                 "stepIndex": { "$ref": "#/definitions/SessionCount" },
                 "toolName": { "type": "string" },
@@ -389,6 +405,8 @@
                 "taskId": { "type": "string" },
                 "taskType": { "type": "string" },
                 "error": { "$ref": "#/definitions/JsonValue" },
+                "messageId": { "$ref": "#/definitions/JsonValue" },
+                "model": { "$ref": "#/definitions/JsonValue" },
                 "toolCallId": { "type": "string" },
                 "stepIndex": { "$ref": "#/definitions/SessionCount" },
                 "toolName": { "type": "string" },
@@ -473,7 +491,7 @@
     "DailyAICDecisionData": {
       "type": "object",
       "properties": {
-        "status": { "type": "string", "enum": ["disabled", "skipped", "under_budget", "exceeded", "structural_error", "transient_error"] },
+        "status": { "type": "string", "enum": ["disabled", "skipped", "under_budget", "exceeded", "structural_error", "transient_error", "quota_blocked"] },
         "exceeded": { "type": "boolean" },
         "total": { "type": "number" },
         "estimated": { "type": "number" },
@@ -493,6 +511,34 @@
         "maliciousPatch": { "type": "boolean" }
       },
       "additionalProperties": {}
+    },
+    "DurableRestoreData": {
+      "type": "object",
+      "properties": {
+        "engine": { "type": "string" },
+        "storage": { "type": "string", "const": "artifact" },
+        "runId": { "type": "string" },
+        "runAttempt": { "type": "string" },
+        "parentRunId": { "type": "string" },
+        "status": { "type": "string", "enum": ["restored", "fresh", "failed"] },
+        "artifactId": { "type": "string" }
+      },
+      "required": ["engine", "runAttempt", "runId", "status", "storage"],
+      "additionalProperties": false
+    },
+    "DurableStartupData": {
+      "type": "object",
+      "properties": {
+        "engine": { "type": "string" },
+        "storage": { "type": "string", "const": "artifact" },
+        "runId": { "type": "string" },
+        "runAttempt": { "type": "string" },
+        "parentRunId": { "type": "string" },
+        "status": { "type": "string", "enum": ["resumed", "fresh"] },
+        "sessionId": { "type": "string" }
+      },
+      "required": ["engine", "runAttempt", "runId", "sessionId", "status", "storage"],
+      "additionalProperties": false
     },
     "DynamicWorkflowObservationData": {
       "type": "object",
@@ -633,7 +679,9 @@
         "message": { "$ref": "#/definitions/JsonValue" },
         "reason": { "$ref": "#/definitions/JsonValue" },
         "requestId": { "$ref": "#/definitions/JsonValue" },
-        "threshold": { "$ref": "#/definitions/JsonValue" }
+        "threshold": { "$ref": "#/definitions/JsonValue", "description": "Budget percentage of the notice; null for a `little_left` notice." },
+        "trigger": { "$ref": "#/definitions/JsonValue", "description": "Why AWF sent the notice: `threshold` or `little_left`; absent before per-conversation delivery." },
+        "conversation": { "$ref": "#/definitions/JsonValue", "description": "Opaque 12-character conversation key, comparable only within the run; null when AWF could not key the conversation." }
       },
       "additionalProperties": false,
       "description": "AWF API proxy steering event-log observation."
@@ -795,6 +843,40 @@
       "required": ["attempt", "exitCode", "failureClasses", "layer"],
       "additionalProperties": false
     },
+    "HarnessDecisionData": {
+      "type": "object",
+      "properties": {
+        "proposedAttempt": { "type": "integer", "minimum": 1, "maximum": 101 },
+        "startupAttemptId": { "type": "string", "pattern": "^startup:[1-9][0-9]{0,2}$" },
+        "outcome": { "$ref": "#/definitions/HarnessDecisionOutcome" },
+        "questions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "question": { "type": "integer", "description": "One-based index in workflow skip-if-decision.", "minimum": 1, "maximum": 400 },
+              "outcome": { "$ref": "#/definitions/HarnessDecisionOutcome" },
+              "error": { "$ref": "#/definitions/HarnessDecisionError" }
+            },
+            "required": ["question", "outcome"],
+            "additionalProperties": false
+          },
+          "maxItems": 400
+        },
+        "latencyMs": { "$ref": "#/definitions/SessionCount" },
+        "timestamp": { "$ref": "#/definitions/SessionCount" },
+        "error": { "$ref": "#/definitions/HarnessDecisionError" },
+        "avoidedInvocation": { "type": "boolean" }
+      },
+      "required": ["proposedAttempt", "outcome", "questions", "latencyMs", "timestamp", "avoidedInvocation"],
+      "additionalProperties": false,
+      "description": "Advisory decision preceding a proposed invocation, not authorization or an agent attempt."
+    },
+    "HarnessDecisionError": {
+      "type": "string",
+      "enum": ["invalid_configuration", "sandbox_unavailable", "proxy_unavailable", "invalid_proxy_endpoint", "model_unavailable", "timeout", "evaluation_failed", "file_reference_failed", "sensitive_content_blocked"]
+    },
+    "HarnessDecisionOutcome": { "type": "string", "enum": ["allow", "deny", "unknown"] },
     "HarnessFailureClass": {
       "type": "string",
       "enum": [
@@ -819,6 +901,7 @@
         "null_type_tool_call",
         "no_auth_info",
         "authentication_failed",
+        "transient_error",
         "sdk_session_idle_timeout",
         "mcp_gateway_shutdown",
         "permission_denied",
@@ -828,6 +911,7 @@
         "copilot_model_verification",
         "overloaded_error",
         "rate_limit_error",
+        "rate_limit_wait_exceeded",
         "max_turns",
         "no_deferred_marker",
         "invalid_model",
@@ -867,7 +951,8 @@
         "attempts": { "type": "integer", "minimum": 0, "maximum": 101 },
         "exitCode": { "anyOf": [{ "$ref": "#/definitions/HarnessRetryExitCode" }, { "type": "null" }] },
         "attemptResults": { "type": "array", "items": { "$ref": "#/definitions/HarnessRetryAttemptData" } },
-        "startupAttemptResults": { "type": "array", "items": { "$ref": "#/definitions/HarnessRetryAttemptData" } }
+        "startupAttemptResults": { "type": "array", "items": { "$ref": "#/definitions/HarnessRetryAttemptData" } },
+        "decisionResults": { "type": "array", "items": { "$ref": "#/definitions/HarnessDecisionData" } }
       },
       "required": ["attempts", "exitCode", "attemptResults"],
       "additionalProperties": false
@@ -882,6 +967,53 @@
         { "type": "array", "items": { "$ref": "#/definitions/JsonValue" } },
         { "type": "object", "additionalProperties": { "$ref": "#/definitions/JsonValue" } }
       ]
+    },
+    "LifecycleAdoptionData": {
+      "type": "object",
+      "properties": {
+        "sourceRunId": { "type": "string" },
+        "sourceWorkflow": { "type": "string" },
+        "repository": { "type": "string" },
+        "outputType": { "type": "string" },
+        "deliveryState": { "type": "string", "const": "delivered" },
+        "deliverySignal": { "type": "string" },
+        "deliveryAt": { "type": "string" },
+        "deliveryObservedAt": { "type": "string" },
+        "deliverySource": { "type": "string" },
+        "adoptionState": { "type": "string", "enum": ["pending", "accepted", "rejected", "lifecycle", "not_applicable", "unknown"] },
+        "adoptionSignal": { "type": "string" },
+        "adoptionAt": { "type": "string" },
+        "adoptionObservedAt": { "type": "string" },
+        "adoptionSource": { "type": "string" },
+        "adoptionRuleVersion": { "type": "string" },
+        "acceptanceKind": { "type": "string", "enum": ["explicit_human", "automation", "fallback_delivery"] },
+        "humanVerified": { "type": "boolean" },
+        "adoptionCoverage": { "type": "string", "enum": ["available", "unobserved", "unsupported", "unavailable"] },
+        "survivalState": { "type": "string", "enum": ["observed", "reversed", "unknown"] },
+        "survivalSignal": { "type": "string" },
+        "survivalObservedAt": { "type": "string" },
+        "survivalCoverage": { "type": "string", "enum": ["snapshot", "unobserved", "unsupported", "unavailable"] }
+      },
+      "required": [
+        "sourceRunId",
+        "outputType",
+        "deliveryState",
+        "deliverySignal",
+        "deliveryAt",
+        "deliveryObservedAt",
+        "deliverySource",
+        "adoptionState",
+        "adoptionSignal",
+        "adoptionObservedAt",
+        "adoptionSource",
+        "adoptionRuleVersion",
+        "humanVerified",
+        "adoptionCoverage",
+        "survivalState",
+        "survivalCoverage"
+      ],
+      "additionalProperties": false,
+      "description": "Post-run lifecycle supplement; never append this event to its source run session."
     },
     "McpConfigurationData": {
       "type": "object",
@@ -964,6 +1096,11 @@
             "enabled": { "type": "boolean" },
             "goal": { "type": "string" },
             "mode": { "type": "string" },
+            "requested": {
+              "type": "string",
+              "enum": ["router", "router/economy", "router/balanced", "router/robust"],
+              "description": "Router value the workflow set as its model (for example `router/economy`); absent when routing comes from `engine.model-routing` or the implicit default."
+            },
             "provider": { "type": "string", "enum": ["anthropic", "openai"], "description": "Native routing provider (`anthropic` or `openai`) sent to AWF as `apiProxy.routing.provider`; absent for GitHub Copilot routing." },
             "allowedModels": { "type": "array", "items": { "type": "string" }, "description": "Configured routing candidates as authored (exact ids or gh-aw aliases) without provider prefix; absent means the router default or unknown." },
             "candidateModels": {
@@ -1147,6 +1284,22 @@
       "additionalProperties": false
     },
     "Record<string,JsonValue>": { "type": "object", "additionalProperties": { "$ref": "#/definitions/JsonValue" } },
+    "RoutingCountedObservationData": {
+      "type": "object",
+      "properties": { "outcome": { "type": "string", "enum": ["success", "failure"] } },
+      "required": ["outcome"],
+      "additionalProperties": false,
+      "description": "A routed run whose result counts: the selected pair succeeded or failed on its own."
+    },
+    "RoutingObservationData": { "anyOf": [{ "$ref": "#/definitions/RoutingCountedObservationData" }, { "$ref": "#/definitions/RoutingSkippedObservationData" }], "description": "Collector-written verdict on a routed run (T-UAS-094)." },
+    "RoutingSkipReason": { "type": "string", "enum": ["cancelled", "infrastructure", "rate_limited", "pair_mismatch", "unknown_evidence"], "description": "Why a routed run's result does not count as evidence about the selected pair." },
+    "RoutingSkippedObservationData": {
+      "type": "object",
+      "properties": { "outcome": { "type": "string", "const": "skip" }, "reason": { "$ref": "#/definitions/RoutingSkipReason" } },
+      "required": ["outcome", "reason"],
+      "additionalProperties": false,
+      "description": "A routed run whose result does not count, and why."
+    },
     "RuntimeObservationData": {
       "type": "object",
       "properties": {
@@ -1171,8 +1324,11 @@
         "url": { "$ref": "#/definitions/JsonValue" },
         "status": { "$ref": "#/definitions/JsonValue" },
         "errorCode": { "$ref": "#/definitions/JsonValue" },
+        "output_id": { "type": "string" },
         "messageIndex": { "type": "number" },
-        "staged": { "type": "boolean" }
+        "staged": { "type": "boolean" },
+        "operation_outcome": { "type": "string", "const": "indeterminate", "description": "The operation may have applied even though processing failed to confirm it." },
+        "execution_trace": { "type": "string", "description": "Ordered four-letter branch mnemonics joined by underscores, not a correlation ID.", "pattern": "^[A-Za-z]{4}(?:_[A-Za-z]{4})*$", "minLength": 4, "maxLength": 1024 }
       },
       "additionalProperties": false
     },
@@ -1187,8 +1343,11 @@
         "url": { "$ref": "#/definitions/JsonValue" },
         "status": { "$ref": "#/definitions/JsonValue" },
         "errorCode": { "$ref": "#/definitions/JsonValue" },
+        "output_id": { "type": "string" },
         "messageIndex": { "type": "number" },
         "staged": { "type": "boolean" },
+        "operation_outcome": { "type": "string", "const": "indeterminate", "description": "The operation may have applied even though processing failed to confirm it." },
+        "execution_trace": { "type": "string", "description": "Ordered four-letter branch mnemonics joined by underscores, not a correlation ID.", "pattern": "^[A-Za-z]{4}(?:_[A-Za-z]{4})*$", "minLength": 4, "maxLength": 1024 },
         "errors": { "type": "array", "items": { "$ref": "#/definitions/SafeOutputData" } }
       },
       "additionalProperties": false
@@ -1249,12 +1408,51 @@
       },
       "additionalProperties": false
     },
+    "SteeringDelivery": {
+      "type": "object",
+      "properties": { "trigger": { "enum": ["threshold", "little_left"] } },
+      "required": ["trigger"],
+      "allOf": [
+        { "if": { "properties": { "trigger": { "type": "string", "const": "threshold", "description": "A budget percentage was crossed." } } }, "then": { "$ref": "#/definitions/SteeringThresholdDelivery" } },
+        {
+          "if": { "properties": { "trigger": { "type": "string", "const": "little_left", "description": "Only a few requests' worth of credits, or a few minutes, remain." } } },
+          "then": { "$ref": "#/definitions/SteeringLittleLeftDelivery" }
+        }
+      ],
+      "description": "One delivery of an AWF steering notice to a conversation; AWF records one per conversation per notice. `threshold` is null exactly when `trigger` is `little_left`."
+    },
+    "SteeringLittleLeftDelivery": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["ai_credit", "timeout"] },
+        "conversation": { "type": ["string", "null"], "description": "Opaque per-run conversation key; null when AWF could not key the conversation.", "pattern": "^[0-9a-f]{12}$" },
+        "first": { "type": "boolean", "description": "Whether this was the run's first delivery of the notice." },
+        "trigger": { "type": "string", "const": "little_left", "description": "Only a few requests' worth of credits, or a few minutes, remain." },
+        "threshold": { "type": "null", "description": "Always null: no budget percentage applies." }
+      },
+      "required": ["conversation", "first", "threshold", "trigger", "type"],
+      "additionalProperties": false,
+      "description": "Steering notice delivered because only a few requests' worth of credits, or a few minutes, remain."
+    },
     "SteeringNotice": {
       "type": "object",
       "properties": { "type": { "type": "string", "enum": ["ai_credit", "timeout", "token"] }, "threshold": { "type": "number", "enum": [80, 90, 95, 99] } },
       "required": ["type", "threshold"],
       "additionalProperties": false,
       "description": "AWF steering notice delivered on a model request."
+    },
+    "SteeringThresholdDelivery": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["ai_credit", "timeout"] },
+        "conversation": { "type": ["string", "null"], "description": "Opaque per-run conversation key; null when AWF could not key the conversation.", "pattern": "^[0-9a-f]{12}$" },
+        "first": { "type": "boolean", "description": "Whether this was the run's first delivery of the notice." },
+        "trigger": { "type": "string", "const": "threshold", "description": "A budget percentage was crossed." },
+        "threshold": { "type": "number", "enum": [80, 90, 95, 99], "description": "Budget percentage that was crossed." }
+      },
+      "required": ["conversation", "first", "threshold", "trigger", "type"],
+      "additionalProperties": false,
+      "description": "Steering notice delivered because a budget percentage was crossed."
     },
     "UnifiedMessageData": {
       "type": "object",
@@ -1353,6 +1551,7 @@
         "premiumRequests": { "$ref": "#/definitions/JsonValue" },
         "durationMs": { "$ref": "#/definitions/JsonValue" },
         "steering": { "$ref": "#/definitions/SteeringNotice" },
+        "steeringDelivery": { "$ref": "#/definitions/SteeringDelivery" },
         "usage": { "anyOf": [{ "$ref": "#/definitions/UnifiedSessionUsage" }, { "type": "null" }] }
       },
       "additionalProperties": false

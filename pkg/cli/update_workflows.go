@@ -207,8 +207,27 @@ func UpdateWorkflows(ctx context.Context, opts UpdateWorkflowsOptions) error { /
 		failedUpdates = append(failedUpdates, groupFailures...)
 	}
 
+	for _, failure := range failedUpdates {
+		event := updateJSONLEvent{Event: "warning", Kind: "workflow", Error: failure.Name + ": " + failure.Error}
+		for _, wf := range workflows {
+			if wf.Name == failure.Name {
+				event.Path = filepath.ToSlash(wf.Path)
+				break
+			}
+		}
+		if err := emitUpdateEvent(ctx, event); err != nil {
+			return err
+		}
+	}
+
 	// Show summary
 	showUpdateSummary(successfulUpdates, failedUpdates, opts.NoCompile)
+
+	// Fail closed even after partial success so callers cannot publish an
+	// incomplete update. Only transient rate-limit-only failures are exempt.
+	if len(failedUpdates) > 0 && !allFailuresAreRateLimited(failedUpdates) {
+		return fmt.Errorf("%d workflow(s) failed to update; review the errors above", len(failedUpdates))
+	}
 
 	if len(successfulUpdates) == 0 {
 		// If all failures were due to GitHub API rate limiting, treat as non-fatal.
@@ -310,10 +329,15 @@ func findWorkflowsWithSource(workflowsDir string, filterNames []string, verbose 
 			continue
 		}
 
+		var sourceSHA string
+		if sha, ok := result.Frontmatter["source-sha"].(string); ok {
+			sourceSHA = sha
+		}
 		workflows = append(workflows, &workflowWithSource{
 			Name:       workflowName,
 			Path:       workflowPath,
 			SourceSpec: strings.TrimSpace(source),
+			SourceSHA:  sourceSHA,
 		})
 	}
 
@@ -323,7 +347,15 @@ func findWorkflowsWithSource(workflowsDir string, filterNames []string, verbose 
 // resolveLatestRef resolves the latest ref for a workflow source
 type latestRefResolution struct {
 	Ref             string
+	CommitSHA       string
 	CoolDownBlocked bool
+}
+
+func (r latestRefResolution) downloadRef() string {
+	if IsCommitSHA(r.CommitSHA) {
+		return r.CommitSHA
+	}
+	return r.Ref
 }
 
 func resolveLatestRef(ctx context.Context, repo, currentRef string, allowMajor, verbose bool, coolDown time.Duration) (string, error) {
@@ -335,7 +367,20 @@ func resolveLatestRef(ctx context.Context, repo, currentRef string, allowMajor, 
 }
 
 func resolveLatestRefWithResult(ctx context.Context, repo, currentRef string, allowMajor, verbose bool, coolDown time.Duration) (latestRefResolution, error) {
-	return resolveLatestRefWithDeps(ctx, defaultWorkflowUpdateDeps(), repo, currentRef, allowMajor, verbose, coolDown)
+	result, err := resolveLatestRefWithDeps(ctx, defaultWorkflowUpdateDeps(), repo, currentRef, allowMajor, verbose, coolDown)
+	if err != nil || result.CoolDownBlocked {
+		return result, err
+	}
+	if IsCommitSHA(result.Ref) {
+		result.CommitSHA = result.Ref
+		return result, nil
+	}
+	commit, err := getLatestBranchCommitInfoCached(ctx, repo, result.Ref)
+	if err != nil {
+		return latestRefResolution{}, fmt.Errorf("failed to resolve source commit for %s@%s: %w", repo, result.Ref, err)
+	}
+	result.CommitSHA = commit.SHA
+	return result, nil
 }
 
 func resolveLatestRefWithDeps(ctx context.Context, deps workflowUpdateDeps, repo, currentRef string, allowMajor, verbose bool, coolDown time.Duration) (latestRefResolution, error) {
@@ -348,8 +393,7 @@ func resolveLatestRefWithDeps(ctx context.Context, deps workflowUpdateDeps, repo
 	// Check if current ref is a tag (looks like a semantic version)
 	if isSemanticVersionTag(currentRef) {
 		updateLog.Print("Current ref is semantic version tag, resolving latest release")
-		ref, err := resolveLatestReleaseWithDeps(ctx, deps, repo, currentRef, allowMajor, verbose, coolDown)
-		return latestRefResolution{Ref: ref}, err
+		return resolveLatestReleaseWithResult(ctx, deps, repo, currentRef, allowMajor, verbose, coolDown)
 	}
 
 	// Check if current ref is a commit SHA (40-character hex string)
@@ -623,6 +667,11 @@ func defaultWorkflowUpdateDeps() workflowUpdateDeps {
 }
 
 func resolveLatestReleaseWithDeps(ctx context.Context, deps workflowUpdateDeps, repo, currentRef string, allowMajor, verbose bool, coolDown time.Duration) (string, error) { //nolint:largefunc
+	result, err := resolveLatestReleaseWithResult(ctx, deps, repo, currentRef, allowMajor, verbose, coolDown)
+	return result.Ref, err
+}
+
+func resolveLatestReleaseWithResult(ctx context.Context, deps workflowUpdateDeps, repo, currentRef string, allowMajor, verbose bool, coolDown time.Duration) (latestRefResolution, error) { //nolint:largefunc
 	updateLog.Printf("Resolving latest release for repo %s (current: %s, allowMajor=%v)", repo, currentRef, allowMajor)
 
 	if verbose {
@@ -632,14 +681,14 @@ func resolveLatestReleaseWithDeps(ctx context.Context, deps workflowUpdateDeps, 
 	// Get all releases using gh CLI
 	output, err := deps.runReleasesAPI(ctx, repo)
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch releases: %w", err)
+		return latestRefResolution{}, fmt.Errorf("failed to fetch releases: %w", err)
 	}
 
 	trimmedReleases := strings.TrimSpace(string(output))
 	if trimmedReleases == "" {
-		return "", errors.New("no releases found")
+		return latestRefResolution{}, errors.New("no releases found")
 	}
-	releases := strings.Split(trimmedReleases, "\n")
+	releases := strings.Fields(trimmedReleases)
 
 	// Parse current version
 	currentVer := parseVersion(currentRef)
@@ -661,14 +710,14 @@ func resolveLatestReleaseWithDeps(ctx context.Context, deps workflowUpdateDeps, 
 		}
 
 		if latestStable == "" {
-			return "", fmt.Errorf("no stable releases found for %s", repo)
+			return latestRefResolution{}, fmt.Errorf("no stable releases found for %s", repo)
 		}
 
 		if verbose {
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Current version is not valid, using latest stable release: "+latestStable))
 		}
 
-		return latestStable, nil
+		return latestRefResolution{Ref: latestStable}, nil
 	}
 
 	// Find all compatible non-prerelease releases.
@@ -677,7 +726,7 @@ func resolveLatestReleaseWithDeps(ctx context.Context, deps workflowUpdateDeps, 
 	compatibleReleases := sortedCompatibleReleaseCandidates(releases, currentVer, allowMajor)
 
 	if len(compatibleReleases) == 0 {
-		return "", errors.New("no compatible release found")
+		return latestRefResolution{}, errors.New("no compatible release found")
 	}
 
 	// Collect upgrade candidates: releases strictly newer than current.
@@ -685,7 +734,7 @@ func resolveLatestReleaseWithDeps(ctx context.Context, deps workflowUpdateDeps, 
 
 	// No upgrade available – already at the latest compatible release.
 	if len(upgradeCandidates) == 0 {
-		return currentRef, nil
+		return latestRefResolution{Ref: currentRef}, nil
 	}
 
 	// If the repo is exempt from cooldown, return the best (newest) upgrade candidate.
@@ -694,7 +743,7 @@ func resolveLatestReleaseWithDeps(ctx context.Context, deps workflowUpdateDeps, 
 		if verbose {
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Found newer release: "+candidate.tag))
 		}
-		return candidate.tag, nil
+		return latestRefResolution{Ref: candidate.tag}, nil
 	}
 
 	// Iterate from newest to oldest upgrade candidate, stopping at the first release
@@ -708,7 +757,7 @@ func resolveLatestReleaseWithDeps(ctx context.Context, deps workflowUpdateDeps, 
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Found newer release: "+c.tag))
 			}
-			return c.tag, nil
+			return latestRefResolution{Ref: c.tag}, nil
 		}
 		cooldownSkippedCount++
 		cooldownLog.Printf("Workflow source %s: %s", repo, result.Message)
@@ -722,7 +771,7 @@ func resolveLatestReleaseWithDeps(ctx context.Context, deps workflowUpdateDeps, 
 	}
 
 	// All upgrade candidates are still within the cooldown window.
-	return currentRef, nil
+	return latestRefResolution{Ref: currentRef, CoolDownBlocked: true}, nil
 }
 
 // updateWorkflow updates a single workflow from its source
@@ -749,6 +798,9 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, opts UpdateWork
 
 	sourceSpec := resolvedLocation.sourceSpec
 	currentRef := resolvedLocation.currentRef
+	if IsCommitSHA(wf.SourceSHA) && len(resolvedLocation.redirectHistory) == 0 {
+		currentRef = wf.SourceSHA
+	}
 	latestRef := resolvedLocation.latestRef
 	sourceFieldRef := resolvedLocation.sourceFieldRef
 	newContent := resolvedLocation.content
@@ -809,7 +861,7 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, opts UpdateWork
 		}
 		if dlErr == nil {
 			localContent, readErr := os.ReadFile(wf.Path)
-			if readErr == nil && hasLocalModifications(string(baseContent), string(localContent), wf.SourceSpec, filepath.Dir(wf.Path), opts.Verbose) {
+			if readErr == nil && hasLocalModifications(string(baseContent), string(localContent), sourceSpecWithRef(sourceSpec, currentRef), filepath.Dir(wf.Path), opts.Verbose) {
 				updateLog.Printf("Local modifications detected in %s, merging to preserve changes", wf.Name)
 				fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Local modifications detected in %s, merging to preserve your changes", wf.Name)))
 			} else {
@@ -850,7 +902,7 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, opts UpdateWork
 
 		// Perform 3-way merge using git merge-file
 		updateLog.Printf("Performing 3-way merge for workflow: %s", wf.Name)
-		mergedContent, conflicts, err := MergeWorkflowContent(string(baseContent), string(currentContent), string(newContent), wf.SourceSpec, sourceSpecWithRef(sourceSpec, sourceFieldRef), wf.Path, opts.Verbose)
+		mergedContent, conflicts, err := MergeWorkflowContent(string(baseContent), string(currentContent), string(newContent), sourceSpecWithRef(sourceSpec, currentRef), sourceSpecWithRef(sourceSpec, latestRef), wf.Path, opts.Verbose)
 		if err != nil {
 			updateLog.Printf("Merge failed for workflow %s: %v", wf.Name, err)
 			return fmt.Errorf("failed to merge workflow content: %w", err)
@@ -900,6 +952,17 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, opts UpdateWork
 		}
 	}
 
+	finalContent, err = updateTopLevelFieldInFrontmatterRaw(finalContent, "source", sourceSpecWithRef(sourceSpec, sourceFieldRef))
+	if err != nil {
+		return fmt.Errorf("failed to update source frontmatter: %w", err)
+	}
+	if IsCommitSHA(latestRef) {
+		finalContent, err = updateTopLevelFieldInFrontmatterRaw(finalContent, "source-sha", fmt.Sprintf("%q", latestRef))
+		if err != nil {
+			return fmt.Errorf("failed to record installed source commit: %w", err)
+		}
+	}
+
 	// Handle stop-after field modifications
 	if opts.NoStopAfter {
 		// Remove stop-after field if requested
@@ -943,6 +1006,10 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, opts UpdateWork
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Security scanning disabled"))
 	}
 
+	if hasConflicts && !opts.NoCompile {
+		return fmt.Errorf("could not update %s due to merge conflicts; existing workflow left unchanged; resolve local and upstream changes before retrying", wf.Name)
+	}
+
 	// Preserve the pre-update content so it can be restored if the newly
 	// fetched content fails to compile. Without this, a broken upstream
 	// change (e.g. a dispatch-workflow target that doesn't exist locally)
@@ -958,8 +1025,7 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, opts UpdateWork
 	}
 
 	if hasConflicts {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Updated %s from %s to %s with CONFLICTS - please review and resolve manually", wf.Name, shortRef(currentRef), shortRef(latestRef))))
-		return nil // Not an error, but user needs to resolve conflicts
+		return fmt.Errorf("updated %s from %s to %s with merge conflicts; resolve the conflict markers before compiling", wf.Name, shortRef(currentRef), shortRef(latestRef))
 	}
 
 	updateLog.Printf("Successfully updated workflow %s from %s to %s", wf.Name, currentRef, latestRef)

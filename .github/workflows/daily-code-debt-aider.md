@@ -24,21 +24,19 @@ network:
   allowed: []
 runtimes:
   go:
-    version: "1.27.3"
+    version: "1.27.4"
 tools:
   edit:
   bash:
     - "*"
 safe-outputs:
-  steer: true
   create-pull-request:
-    expires: 2d
     title-prefix: "[aider] "
     labels: [automation, cleanup]
-    draft: false
   missing-tool:
 timeout-minutes: 30
 imports:
+  - shared/pr-safe-output-defaults.md
   - shared/aider.md
   - shared/otlp.md
   - shared/reporting.md

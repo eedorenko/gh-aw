@@ -4,7 +4,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const fs = require("fs");
 const path = require("path");
-const { lstatGuard, readGuardedFile, writeGuardedFile } = require("./symlink_guard.cjs");
+const os = require("os");
+const { execFileSync } = require("child_process");
+const { lstatGuard, readGuardedFile, writeGuardedFile, appendGuardedFile } = require("./symlink_guard.cjs");
 
 function setPlatform(platform) {
   vi.stubGlobal("process", new Proxy(process, { get: (target, key) => (key === "platform" ? platform : Reflect.get(target, key)) }));
@@ -107,7 +109,11 @@ describe("lstatGuard", () => {
     const inspected = vi.spyOn(fs, "lstatSync");
     const opened = vi.spyOn(fs, "openSync");
     const created = vi.spyOn(fs, "mkdirSync");
-    for (const operation of [() => readGuardedFile(path.join(tmpDir, "source.png")), () => writeGuardedFile(path.join(tmpDir, "staging", "target.png"), Buffer.from("safe"))]) {
+    for (const operation of [
+      () => readGuardedFile(path.join(tmpDir, "source.png")),
+      () => writeGuardedFile(path.join(tmpDir, "staging", "target.png"), Buffer.from("safe")),
+      () => appendGuardedFile(path.join(tmpDir, "target.png"), Buffer.from("safe")),
+    ]) {
       expect(operation).toThrow(expect.objectContaining({ code: "ERR_VALIDATION", message: expect.stringMatching(/^ERR_VALIDATION:.*requires Linux/) }));
     }
     expect(inspected).not.toHaveBeenCalled();
@@ -125,7 +131,7 @@ describe("lstatGuard", () => {
       restoreDescriptors?.();
     });
 
-    it("reads bounded regular files and exclusively stages their bytes", () => {
+    it("reads bounded regular files and exclusively stages their bytes privately", () => {
       const source = path.join(tmpDir, "source.png");
       const target = path.join(tmpDir, "staging", "chart.png");
       fs.writeFileSync(source, "chart");
@@ -134,8 +140,72 @@ describe("lstatGuard", () => {
       expect(() => readGuardedFile(source, 4)).toThrow("exceeds maximum allowed size");
       writeGuardedFile(target, content);
       expect(fs.readFileSync(target)).toEqual(content);
+      expect(fs.statSync(target).mode & 0o777).toBe(0o600);
       expect(() => writeGuardedFile(target, Buffer.from("overwrite"))).toThrow("EEXIST");
       expect(fs.readFileSync(target)).toEqual(content);
+    });
+
+    it("appends only to an isolated regular file", () => {
+      const target = path.join(tmpDir, "summary.md");
+      fs.writeFileSync(target, "before\n");
+      appendGuardedFile(target, Buffer.from("after\n"));
+      expect(fs.readFileSync(target, "utf8")).toBe("before\nafter\n");
+      const created = path.join(tmpDir, "created.md");
+      appendGuardedFile(created, Buffer.from("created\n"));
+      expect(fs.readFileSync(created, "utf8")).toBe("created\n");
+
+      const sentinel = path.join(tmpDir, "sentinel.md");
+      fs.writeFileSync(sentinel, "unchanged\n");
+      fs.symlinkSync(sentinel, path.join(tmpDir, "linked.md"));
+      expect(() => appendGuardedFile(path.join(tmpDir, "linked.md"), Buffer.from("unsafe\n"))).toThrow("Asset symlinks are not allowed");
+      expect(fs.readFileSync(sentinel, "utf8")).toBe("unchanged\n");
+
+      fs.mkdirSync(path.join(tmpDir, "external"));
+      fs.symlinkSync(path.join(tmpDir, "external"), path.join(tmpDir, "linked-directory"));
+      expect(() => appendGuardedFile(path.join(tmpDir, "linked-directory", "summary.md"), Buffer.from("unsafe\n"))).toThrow("Asset symlinks are not allowed");
+      expect(fs.existsSync(path.join(tmpDir, "external", "summary.md"))).toBe(false);
+    });
+
+    it.skipIf(process.platform !== "linux")("creates private files regardless of umask", () => {
+      for (const mask of ["000", "077", "777"]) {
+        const target = path.resolve(tmpDir, `mask-${mask}`);
+        execFileSync(process.execPath, ["-e", 'process.umask(parseInt(process.argv[1], 8)); require(process.argv[2]).writeGuardedFile(process.argv[3], Buffer.from("safe"));', mask, path.resolve(__dirname, "symlink_guard.cjs"), target]);
+        expect(fs.statSync(target).mode & 0o777).toBe(0o600);
+      }
+    });
+
+    it.skipIf(process.platform !== "linux")("creates private assets and directories despite restrictive umasks", () => {
+      for (const mask of ["000", "077"]) {
+        const target = path.resolve(tmpDir, `assets-${mask}`, "claims", "claim-1", "chart.png");
+        execFileSync(process.execPath, ["-e", 'process.umask(parseInt(process.argv[1], 8)); require(process.argv[2]).writeGuardedFile(process.argv[3], Buffer.from("chart"));', mask, path.resolve(__dirname, "symlink_guard.cjs"), target]);
+        const stat = fs.statSync(target);
+        expect(stat.mode & 0o777).toBe(0o600);
+        expect(stat.uid).toBe(process.getuid());
+        expect(stat.gid).toBe(process.getgid());
+        for (const directory of [path.dirname(target), path.dirname(path.dirname(target)), path.dirname(path.dirname(path.dirname(target))), path.resolve(tmpDir, `assets-${mask}`)]) {
+          expect(fs.statSync(directory).mode & 0o777).toBe(0o700);
+        }
+        expect(() => writeGuardedFile(target, Buffer.from("overwrite"))).toThrow("EEXIST");
+        expect(fs.readFileSync(target, "utf8")).toBe("chart");
+      }
+      expect(fs.statSync(tmpDir).mode & 0o777).toBe(0o700);
+    });
+
+    it("accepts only the private staging and published asset permission pairs", () => {
+      const publishTarget = path.join(tmpDir, "published", "chart.png");
+      writeGuardedFile(publishTarget, Buffer.from("chart"), { mode: 0o644, directoryMode: 0o755 });
+      expect(fs.statSync(publishTarget).mode & 0o777).toBe(0o644);
+      expect(fs.statSync(path.dirname(publishTarget)).mode & 0o777).toBe(0o755);
+
+      for (const options of [
+        { mode: 0o666, directoryMode: 0o777 },
+        { mode: 0o600, directoryMode: 0o755 },
+        { mode: 0o644, directoryMode: 0o700 },
+      ]) {
+        const target = path.join(tmpDir, "invalid", `${options.mode}-${options.directoryMode}`, "chart.png");
+        expect(() => writeGuardedFile(target, Buffer.from("chart"), options)).toThrow(expect.objectContaining({ code: "ERR_VALIDATION" }));
+        expect(fs.existsSync(path.dirname(target))).toBe(false);
+      }
     });
 
     it.each(["symlink", "regular"])("rejects a file swapped to a different %s between inspection and open", kind => {

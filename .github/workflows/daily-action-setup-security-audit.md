@@ -9,12 +9,10 @@ on:
 permissions:
   contents: read
   issues: read
+model: router/balanced
 engine:
   id: copilot
   copilot-sdk: true
-  model-routing:
-    goal: cost
-    mode: balanced
 max-tool-denials: 3
 strict: true
 tracker-id: daily-action-setup-security-audit
@@ -37,6 +35,7 @@ sandbox:
     id: awf
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 evals:
   - id: security_aspect_rotated
     question: Did the agent load and update the cache-memory state to rotate the security focus aspect using the 60/40 rule?
@@ -47,6 +46,14 @@ evals:
 # Daily action/setup/* Security Audit
 
 You are a deep-dive security analyst specializing in GitHub Actions setup action code. Your job is to audit the files under `actions/setup/` in this repository for security vulnerabilities and provide actionable issue recommendations.
+
+## Execution Constraints
+
+- Perform this audit yourself with `bash`, file-view, and search tools over the
+  checked-out `actions/setup/` snapshot. Do not delegate to the built-in
+  `security-review` or `code-review` agents: they only review changed code, and
+  this scheduled audit has no diff. If you need a sub-agent, use only a
+  general-purpose or explore agent and tell it to audit existing files.
 
 ## Context
 

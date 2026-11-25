@@ -3,7 +3,7 @@ package workflow
 import (
 	"fmt"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/setutil"
@@ -150,7 +150,7 @@ func (c *Compiler) getCustomJobsDependingOnPreActivation(customJobs map[string]a
 		}
 		return false
 	})
-	sort.Strings(deps)
+	slices.Sort(deps)
 	compilerJobsLog.Printf("Found %d custom jobs depending on pre_activation: %v", len(deps), deps)
 	return deps
 }
@@ -169,7 +169,7 @@ func (c *Compiler) getReferencedCustomJobs(content string, customJobs map[string
 	refs := sliceutil.FilterMapKeys(customJobs, func(jobName string, _ any) bool {
 		return strings.Contains(content, fmt.Sprintf("needs.%s.", jobName))
 	})
-	sort.Strings(refs)
+	slices.Sort(refs)
 	if len(refs) > 0 {
 		compilerJobsLog.Printf("Found %d custom job references: %v", len(refs), refs)
 	}
@@ -254,7 +254,7 @@ func (c *Compiler) getEngineEnvReferencedCustomJobsWithNoExplicitNeeds(data *Wor
 		result = append(result, jobName)
 		compilerJobsLog.Printf("Found custom job '%s' referenced in engine.env with no explicit needs: will run before activation", jobName)
 	}
-	sort.Strings(result)
+	slices.Sort(result)
 	return result
 }
 
@@ -280,7 +280,7 @@ func (c *Compiler) getActivationRenderedEngineEnvValues(data *WorkflowData) []st
 	for key := range envKeys {
 		keyList = append(keyList, key)
 	}
-	sort.Strings(keyList)
+	slices.Sort(keyList)
 
 	values := make([]string, 0, len(keyList))
 	for _, key := range keyList {
@@ -332,6 +332,14 @@ func (c *Compiler) buildJobs(data *WorkflowData, markdownPath string) error {
 
 	if err := c.buildMemoryManagementJobs(data); err != nil {
 		return err
+	}
+
+	if err := c.addReportExperimentsJob(data); err != nil {
+		return err
+	}
+
+	if err := c.addPushRoutingHistoryJob(data); err != nil {
+		return fmt.Errorf("push_routing_history job could not be built: %w", err)
 	}
 
 	if err := c.finalizeBuiltJobs(data); err != nil {
@@ -412,12 +420,14 @@ func (c *Compiler) finalizeBuiltJobs(data *WorkflowData) error {
 		return fmt.Errorf("built-in job needs augmentations could not be applied: %w. Check that jobs referenced in needs actually exist in the workflow", err)
 	}
 
-	if err := c.ensureConclusionIsLastJob(); err != nil {
+	if err := c.ensureConclusionIsLastJob(usesExperimentsBroker(data)); err != nil {
 		return err
 	}
 
 	c.ensureOTLPOIDCJobPermissions(data)
+	c.ensureConnectorOIDCJobPermissions(data)
 	c.ensureDriveMemoryJobPermissions(data)
+	c.ensureDurableArtifactJobPermissions(data)
 	c.annotateGeneratedJobs(data)
 	if err := c.finalizeConclusionJobInventory(); err != nil {
 		return err
@@ -428,6 +438,22 @@ func (c *Compiler) finalizeBuiltJobs(data *WorkflowData) error {
 	}
 
 	return nil
+}
+
+func (c *Compiler) ensureDurableArtifactJobPermissions(data *WorkflowData) {
+	if data.EngineConfig == nil || data.EngineConfig.Durable == nil {
+		return
+	}
+	for _, job := range c.jobManager.GetAllJobs() {
+		for _, step := range job.Steps {
+			if strings.Contains(step, "id: durable_checkpoint") {
+				perms := NewPermissionsParser(job.Permissions).ToPermissions()
+				perms.Set(PermissionActions, PermissionRead)
+				job.Permissions = perms.RenderToYAML()
+				break
+			}
+		}
+	}
 }
 
 // ensureOTLPOIDCJobPermissions grants id-token: write to every job that contains the
@@ -509,8 +535,12 @@ func (c *Compiler) buildPreActivationAndActivationJobs(data *WorkflowData, front
 	// Build activation job if needed (preamble job that handles runtime conditions)
 	if c.isActivationJobNeeded() {
 		compilerJobsLog.Print("Building activation job")
-		if err := c.buildActivationAndAdmissionJobs(data, preActivationJobCreated, workflowRunRepoSafety, lockFilename); err != nil {
-			return preActivationJobCreated, false, err
+		activation, err := c.buildActivationJob(data, preActivationJobCreated, workflowRunRepoSafety, lockFilename)
+		if err != nil {
+			return preActivationJobCreated, false, fmt.Errorf("activation job could not be built: %w. Check the workflow triggers and activation-related frontmatter fields", err)
+		}
+		if err := c.jobManager.AddJob(activation); err != nil {
+			return preActivationJobCreated, false, fmt.Errorf("activation job could not be added: %w. Check that no other job in the workflow reuses its name", err)
 		}
 		compilerJobsLog.Print("Successfully added activation job")
 		activationJobCreated = true
@@ -762,15 +792,15 @@ func (c *Compiler) updateConclusionJobDependencies(pushRepoMemoryJobName, pushLe
 }
 
 // ensureConclusionIsLastJob ensures the conclusion job depends on ALL other workflow jobs,
-// except its isolated admission callback, making the callback the final dependent job.
+// except jobs that must run before activation or consume conclusion's artifacts.
 // This is a final-pass check that catches any custom or auto-generated jobs that were not
 // explicitly added to conclusion's needs during the incremental build process.
 //
 // Jobs intentionally excluded:
 //   - "conclusion" itself
-//   - the isolated conclusion-admission callback, which runs after conclusion
+//   - "graders" – consumes conclusion's published session
 //   - "pre_activation" / "pre-activation" – runs at the very start, before activation
-func (c *Compiler) ensureConclusionIsLastJob() error {
+func (c *Compiler) ensureConclusionIsLastJob(hasBrokerReporter bool) error {
 	conclusionJob, exists := c.jobManager.GetJob("conclusion")
 	if !exists {
 		return nil
@@ -787,11 +817,15 @@ func (c *Compiler) ensureConclusionIsLastJob() error {
 	// Jobs that must never appear in conclusion's needs
 	exclude := map[string]struct {
 	}{
-		"conclusion": {},
-		string(constants.ConclusionAdmissionJobName): {},
-		string(constants.GradersJobName):             {},
-		string(constants.PreActivationJobName):       {},
-		"pre-activation":                             {},
+		"conclusion":                           {},
+		string(constants.GradersJobName):       {},
+		string(constants.PreActivationJobName): {},
+		"pre-activation":                       {},
+		// Records the verdict that conclusion's unified session holds.
+		pushRoutingHistoryJobName: {},
+	}
+	if hasBrokerReporter {
+		exclude[string(constants.ReportExperimentsJobName)] = struct{}{}
 	}
 
 	// Iterate over all jobs in alphabetical order for deterministic output

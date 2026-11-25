@@ -10,6 +10,8 @@ const { replaceTemporaryIdReferences } = require("./temporary_id.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { currentClaimHandle, claimIdentity, assertClaimIdentity } = require("./work_queue_claim_scope.cjs");
+const { isStagedMode } = require("./safe_output_helpers.cjs");
+const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 
 /**
  * Internal safe-output message fields that should not be forwarded as action inputs.
@@ -18,7 +20,7 @@ const { currentClaimHandle, claimIdentity, assertClaimIdentity } = require("./wo
  * forwarding them to external action `with:` inputs.
  * @type {Set<string>}
  */
-const INTERNAL_MESSAGE_FIELDS = new Set(["type"]);
+const INTERNAL_MESSAGE_FIELDS = new Set(["type", "output_id", "depends-on", "depends_on"]);
 const CLAIM_MESSAGE_FIELDS = new Set(["claim_handle", "claim_id", "work_id"]);
 
 /**
@@ -45,6 +47,7 @@ async function main(config = {}) {
   const outputKey = `action_${actionName}_payload`;
   const factoryClaim = currentClaimHandle();
   const factoryIdentity = factoryClaim ? claimIdentity(factoryClaim) : null;
+  const staged = isStagedMode(config);
 
   core.info(`Custom action handler initialized: action_name=${actionName}, output_key=${outputKey}`);
 
@@ -104,6 +107,10 @@ async function main(config = {}) {
 
       // Export the processed payload as a step output
       const payloadJSON = JSON.stringify(processedInputs);
+      if (staged) {
+        logStagedPreviewInfo(`Would invoke custom action "${actionName}" with ${Object.keys(processedInputs).length} prepared inputs.`);
+        return { success: true, staged: true, action_name: actionName, payload: payloadJSON };
+      }
       core.setOutput(outputKey, payloadJSON);
       core.info(`✓ Custom action "${actionName}": exported payload as "${outputKey}" (${payloadJSON.length} bytes)`);
 

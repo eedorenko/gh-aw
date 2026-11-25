@@ -175,8 +175,11 @@ func TestSessionParserEngines(t *testing.T) {
 		{"gemini", "agent-stdio.log", `{"type":"message","role":"assistant","content":"Engine session text"}`},
 		{"pi", "pi-streaming.jsonl", `{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Engine session text"}]}}`},
 		{"pi", "sandbox/agent/logs/pi-streaming.jsonl", `{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Engine session text"}]}}`},
+		{"pi", "agent-stdio.log", "{\"type\":\"session\",\"version\":4,\"id\":\"pi-session\",\"createdAt\":\"2026-11-12T02:45:30.124Z\",\"cwd\":\"/workspace\"}\n{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Engine session text\"}]}}"},
 		{"opencode", "agent-stdio.log", `{"type":"text","sessionID":"ses_fixture","timestamp":1790899201000,"part":{"id":"prt_fixture","type":"text","text":"Engine session text"}}`},
 		{"goose", "agent-stdio.log", `{"type":"message","message":{"id":"goose-native","role":"assistant","created":1790899201,"content":[{"type":"text","text":"Engine session text"}]}}`},
+		{"langgraph", "agent/langgraph.traj.json", `{"exit_status":"Completed","messages":[{"type":"ai","data":{"content":"Engine session text","usage_metadata":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}]}`},
+		{"langgraph", "agent-stdio.log", `{"exit_status":"Completed","messages":[{"type":"ai","data":{"content":"Engine session text"}}]}`},
 		{"custom", "agent-stdio.log", `{"type":"assistant.message","data":{"content":"Engine session text"}}`},
 	}
 	for _, test := range tests {
@@ -193,6 +196,9 @@ func TestSessionParserEngines(t *testing.T) {
 				expectedEventType = "claude.assistant.message"
 			}
 			require.Contains(t, string(session), `"type":"`+expectedEventType+`"`)
+			if test.engine == "pi" {
+				require.Contains(t, string(session), `"sourceEngine":"pi"`)
+			}
 		})
 	}
 }
@@ -326,7 +332,7 @@ func TestSessionParserDoesNotInferSubagentsFromStdio(t *testing.T) {
 			writeSessionTestFile(t, root, "agent-stdio.log",
 				"[INFO] container(s)\nclass RoutingProfile(StrictModel)\nlen(d)\n● "+dispatch+" Research routing\n")
 			writeSessionTestFile(t, root, "agent_usage.json", `{"primary_model":"opus","input_tokens":1000}`)
-			require.NoError(t, parseAgentLog(root, workflow.NewCopilotEngine(), false))
+			require.NoError(t, parseAgentLog(t.Context(), root, workflow.NewCopilotEngine(), false))
 			markdown, err := os.ReadFile(filepath.Join(root, "log.md"))
 			require.NoError(t, err)
 			require.Contains(t, string(markdown), "Research")
@@ -375,7 +381,7 @@ func TestParseAgentLogUsesSharedSessionParser(t *testing.T) {
 	requireSessionTestNode(t)
 	root := t.TempDir()
 	writeSessionTestFile(t, root, "agent-stdio.log", `{"type":"assistant","message":{"content":[{"type":"text","text":"Audit parser works"}]}}`+"\n")
-	require.NoError(t, parseAgentLog(root, workflow.NewClaudeEngine(), false))
+	require.NoError(t, parseAgentLog(t.Context(), root, workflow.NewClaudeEngine(), false))
 	markdown, err := os.ReadFile(filepath.Join(root, "log.md"))
 	require.NoError(t, err)
 	require.Contains(t, string(markdown), "Audit parser works")
@@ -427,7 +433,7 @@ func TestParseAgentLogUsesBehaviorDefinedParser(t *testing.T) {
 				},
 			})
 			require.NoError(t, err)
-			err = parseAgentLog(root, engine, false)
+			err = parseAgentLog(t.Context(), root, engine, false)
 			if test.wantError != "" {
 				require.ErrorContains(t, err, test.wantError)
 				return

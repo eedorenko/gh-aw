@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -45,6 +45,9 @@ func renderConsole(data AuditData, logsPath string) {
 		}
 	}
 	renderConsoleSession(data.SessionAnalysis)
+	if err := renderContinuationRequests(os.Stderr, data.ContinuationRequests); err != nil {
+		auditReportLog.Printf("Failed to render continuation requests: %v", err)
+	}
 	renderConsoleTokenUsage(data.FirewallTokenUsage)
 	renderConsoleDetectionModelUsage(data.DetectionModelUsage)
 	renderConsoleModelRouting(data.ModelRouting)
@@ -217,6 +220,11 @@ func renderConsoleSession(session *SessionAnalysis) {
 	if session.NoopCount > 0 {
 		line += fmt.Sprintf(" noops=%d", session.NoopCount)
 	}
+	if session.ContinuationRequestCount == nil {
+		line += " continuation_requests=unavailable"
+	} else {
+		line += fmt.Sprintf(" continuation_requests=%d", *session.ContinuationRequestCount)
+	}
 	fmt.Fprintln(os.Stderr, line)
 }
 
@@ -259,6 +267,13 @@ func renderConsoleModelRouting(routing *ModelRoutingSummary) {
 	if routing.Failure != nil {
 		fmt.Fprintf(os.Stderr, "    failure: code=%s detail=%s\n",
 			safeModelRoutingText(routing.Failure.Code), safeModelRoutingText(routing.Failure.Detail))
+	}
+	if observation := routing.Observation; observation != nil {
+		line := "    observation: outcome=" + observation.Outcome
+		if observation.Reason != "" {
+			line += " reason=" + observation.Reason
+		}
+		fmt.Fprintln(os.Stderr, safeModelRoutingText(line))
 	}
 	fmt.Fprintf(os.Stderr, "    cost_aic: classifier=%.3f selected_model=%.3f deviated=%.3f\n",
 		routing.ClassifierCost.AIC, routing.SelectedModelCost.AIC, routing.DeviatedTrafficCost.AIC)
@@ -352,7 +367,7 @@ func formatModelRoutingCounts(counts map[string]int) string {
 	for key := range counts {
 		keys = append(keys, key)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	parts := make([]string, 0, len(keys))
 	for _, key := range keys {
 		parts = append(parts, fmt.Sprintf("%s=%d", safeModelRoutingText(key), counts[key]))
@@ -529,10 +544,14 @@ func renderConsoleWarnings(warnings []ValidationIssue) {
 }
 
 func renderConsoleOperationalSections(data AuditData) {
+	if err := renderDurableSession(os.Stderr, data.DurableSession); err != nil {
+		auditReportLog.Printf("Failed to render durable session evidence: %v", err)
+	}
 	renderConsoleWorkQueue(data.WorkQueue)
 	renderConsoleSkillActivations(data.SkillActivations)
 	renderConsoleGatewaySteeringEvents(data.GatewaySteeringEvents)
 	renderConsoleSteeringNotices(data.SteeringNotices, data.SteeringNoticesUnavailable)
+	renderConsoleSteeringDeliveries(data.SteeringDeliveries)
 	renderConsoleMissingTools(data.MissingTools)
 	renderConsoleMCPFailures(data.MCPFailures)
 	renderCompactMCPHealth(data.MCPServerHealth)
@@ -619,9 +638,15 @@ func renderConsoleGatewaySteeringEvents(events []GatewaySteeringEvent) {
 	}
 	fmt.Fprintln(os.Stderr, "  gateway_steering_events:")
 	for _, event := range events {
-		line := fmt.Sprintf("    %s: %s", event.Type, event.Message)
+		line := fmt.Sprintf("    %s: %s", sanitizeControlChars(event.Type), sanitizeControlChars(event.Message))
+		if event.Trigger == steeringTriggerLittleLeft {
+			line += " [little left]"
+		}
+		if event.Conversation != "" {
+			line += " conversation=" + sanitizeControlChars(event.Conversation)
+		}
 		if event.Timestamp != "" {
-			line += " (" + event.Timestamp + ")"
+			line += " (" + sanitizeControlChars(event.Timestamp) + ")"
 		}
 		fmt.Fprintln(os.Stderr, line)
 	}
@@ -637,15 +662,52 @@ func renderConsoleSteeringNotices(notices []SteeringNotice, unavailable bool) {
 	}
 	fmt.Fprintln(os.Stderr, "  steering_notices:")
 	for _, notice := range notices {
-		line := fmt.Sprintf("    %s %d%%", notice.Type, notice.Threshold)
+		line := fmt.Sprintf("    %s %d%%", sanitizeControlChars(notice.Type), notice.Threshold)
 		if notice.RequestID != "" {
-			line += " request_id=" + notice.RequestID
+			line += " request_id=" + sanitizeControlChars(notice.RequestID)
 		}
 		if notice.Phase != "" && notice.Phase != "agent" {
-			line += " phase=" + notice.Phase
+			line += " phase=" + sanitizeControlChars(notice.Phase)
 		}
 		fmt.Fprintln(os.Stderr, line)
 	}
+}
+
+// renderConsoleSteeringDeliveries lists every AWF steering notice delivery with
+// its conversation; a little_left notice is shown as "little left" because it
+// has no threshold.
+func renderConsoleSteeringDeliveries(deliveries []SteeringDelivery) {
+	if len(deliveries) == 0 {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "  steering_deliveries:")
+	for _, delivery := range deliveries {
+		fmt.Fprintln(os.Stderr, "    "+formatSteeringDelivery(delivery))
+	}
+}
+
+func formatSteeringDelivery(delivery SteeringDelivery) string {
+	line := sanitizeControlChars(delivery.Type)
+	if delivery.Trigger == steeringTriggerLittleLeft || delivery.Threshold == nil {
+		line += " little left"
+	} else {
+		line += fmt.Sprintf(" %d%%", *delivery.Threshold)
+	}
+	if delivery.Conversation != nil {
+		line += " conversation=" + sanitizeControlChars(*delivery.Conversation)
+	} else {
+		line += " conversation=unknown"
+	}
+	if delivery.First {
+		line += " first"
+	}
+	if delivery.RequestID != "" {
+		line += " request_id=" + sanitizeControlChars(delivery.RequestID)
+	}
+	if delivery.Phase != "" && delivery.Phase != "agent" {
+		line += " phase=" + sanitizeControlChars(delivery.Phase)
+	}
+	return line
 }
 
 func renderConsoleSkillActivations(activations []SkillActivation) {
@@ -801,7 +863,7 @@ func renderConsoleExperiments(experiments *ExperimentData) {
 	for name, variant := range experiments.Assignments {
 		parts = append(parts, name+"="+variant)
 	}
-	sort.Strings(parts)
+	slices.Sort(parts)
 	fmt.Fprintf(os.Stderr, "  experiments: %s\n", strings.Join(parts, " "))
 }
 

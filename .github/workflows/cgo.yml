@@ -14,12 +14,16 @@ on:
     - 'actions/setup/sh/**'
     - '.github/workflows/ci.yml'
     - '.github/workflows/cgo.yml'
+    - '.github/workflows/requirements-pageindex.txt'
+    - '.github/workflows/shared/pageindex.md'
     - '.github/workflows/CWI.yml'
     - '.github/workflows/license-check.yml'
     - '.github/aw/releases.json'
     - '.github/aw/releases.schema.json'
     - '.github/aw/compat.json'
     - '.github/aw/compat.schema.json'
+    - '.github/ci/**'
+    - '.github/workflows/ci-front-door-researcher.*'
     - 'install-gh-aw.sh'
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -34,15 +38,42 @@ on:
     - 'actions/setup/sh/**'
     - '.github/workflows/ci.yml'
     - '.github/workflows/cgo.yml'
+    - '.github/workflows/requirements-pageindex.txt'
+    - '.github/workflows/shared/pageindex.md'
     - '.github/workflows/CWI.yml'
     - '.github/workflows/license-check.yml'
     - '.github/aw/releases.json'
     - '.github/aw/releases.schema.json'
     - '.github/aw/compat.json'
     - '.github/aw/compat.schema.json'
+    - '.github/ci/**'
+    - '.github/workflows/ci-front-door-researcher.*'
     - 'install-gh-aw.sh'
+  schedule:
+    # Independent full-suite control: never use the Decision API on scheduled runs.
+    - cron: '23 4 * * 1'
   workflow_dispatch:
 jobs:
+  test-pageindex-workflow:
+    name: PageIndex hash-locked install and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Set up uv
+      # zizmor: ignore[github_action_from_unverified_creator_used]
+      uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      with:
+        version: "0.13.7"
+        enable-cache: false
+    - name: Verify locked install and run PageIndex workflow tests
+      run: make test-pageindex-workflow
+
   checkout-cache:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -77,8 +108,95 @@ jobs:
         # Keep reservations and cleanup isolated from other runs of this commit.
         key: checkout-cgo-${{ github.run_id }}-${{ github.sha }}
 
+  front-door-decision:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      copilot-requests: write
+    outputs:
+      suite_ids: ${{ steps.validated.outputs.suite_ids }}
+      metrics: ${{ steps.front-door.outputs.metrics }}
+    steps:
+    - name: Checkout trusted selector
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      with:
+        ref: ${{ github.event.pull_request.base.sha }}
+        path: trusted
+        fetch-depth: 1
+        persist-credentials: false
+        sparse-checkout-cone-mode: false
+        sparse-checkout: |
+          /scripts/ci-front-door.cjs
+          /scripts/ci-front-door-diff.cjs
+          /actions/setup/js/decisions_client.cjs
+          /.github/ci/suite-catalog.json
+          /.github/ci/decision-prompt.txt
+    - name: Select CI suites with GitHub Decisions
+      # Never bootstrap a missing trusted selector from PR-controlled code.
+      if: hashFiles('trusted/scripts/ci-front-door.cjs') != ''
+      id: front-door
+      continue-on-error: true
+      working-directory: trusted
+      env:
+        CI_DECISION_TOKEN: ${{ github.token }}
+        # Compare immutable event SHAs without checking out PR-controlled files.
+        CI_DIFF_TOKEN: ${{ github.token }}
+        CI_DIFF_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        CI_DIFF_HEAD_SHA: ${{ github.sha }}
+      run: node scripts/ci-front-door.cjs
+    - name: Validate suite outputs
+      id: validated
+      env:
+        SELECTOR_OUTCOME: ${{ steps.front-door.outcome }}
+        RAW_SUITE_IDS: ${{ steps.front-door.outputs.suite_ids }}
+      run: |
+        node <<'NODE'
+        const fs = require('node:fs');
+        const known = ['front-door-conformance', 'verify-integration-build', 'test', 'test-slow', 'impacted-go-tests', 'native-javascript-tests', 'build', 'build-wasm', 'validate-yaml', 'check-validator-sizes', 'lint-go-format', 'lint-go-golangci', 'lint-go-govulncheck', 'lint-go-custom', 'lint-error-messages', 'actions-build', 'fuzz', 'security', 'security-scan', 'mcp-server-compile-test', 'cross-platform-build', 'alpine-container-test', 'safe-outputs-conformance'];
+        const dependencies = {test: ['verify-integration-build'], 'test-slow': ['verify-integration-build'], security: ['build'], 'security-scan': ['build'], 'cross-platform-build': ['build']};
+        let suiteIds = '';
+        try {
+          const raw = JSON.parse(process.env.RAW_SUITE_IDS);
+          if (process.env.SELECTOR_OUTCOME === 'success' && Array.isArray(raw) && new Set(raw).size === raw.length) {
+            // The trusted PR base can still return the retired PR suite during rollout.
+            const ids = raw.filter(id => id !== 'canary-go');
+            if (ids.includes('test') && ids.length <= known.length &&
+                ids.every(id => known.includes(id) && (dependencies[id] || []).every(dependency => ids.includes(dependency)))) {
+              suiteIds = JSON.stringify(ids);
+            }
+          }
+        } catch (error) {
+          if (!(error instanceof SyntaxError)) throw error;
+        }
+        if (!suiteIds) process.stderr.write('CI Front Door outputs unavailable or invalid; running all suites.\n');
+        fs.appendFileSync(process.env.GITHUB_OUTPUT, `suite_ids=${suiteIds}\n`);
+        NODE
+
+  front-door-conformance:
+    needs: [front-door-decision]
+    if: always() && !cancelled() && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'front-door-conformance'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      with:
+        fetch-depth: 2
+        persist-credentials: false
+    - name: Test CI Front Door conformance
+      run: |
+        node --test scripts/ci-front-door.test.cjs
+        node --test scripts/ci-front-door-researcher.test.cjs
+        node --test scripts/ci-front-door-workflow.test.cjs
+        node --test scripts/go-unit-suite.test.cjs
+
   verify-integration-build:
-    needs: [checkout-cache]
+    needs: [checkout-cache, front-door-decision]
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'verify-integration-build'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -164,38 +282,63 @@ jobs:
         go test -run='^$' -exec=true -tags=integration ./...
 
   test:
-    name: Unit tests (${{ matrix.name }})
-    if: github.event_name != 'pull_request' || needs.checkout-cache.outputs.dependencies-changed == 'true'
+    name: Fast unit tests (${{ matrix.name }})
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && needs.verify-integration-build.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'test'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs:
     - checkout-cache
     - verify-integration-build
+    - front-door-decision
     permissions:
       contents: read
+    env:
+      UNIT_TEST_SUITE: fast
+      UNIT_TEST_TIMEOUT: 3m
     strategy:
       fail-fast: false
       matrix:
         include:
-        - name: A-C
-          pattern: ^Test[A-C]
-          shard: a-c
-        - name: D-G
-          pattern: ^Test[D-G]
-          shard: d-g
-        - name: H-M
-          pattern: ^Test[H-M]
-          shard: h-m
+        - name: A
+          pattern: ^TestA
+          shard: a
+        - name: B
+          pattern: ^TestB
+          shard: b
+        - name: C
+          pattern: ^TestC
+          shard: c
+        - name: D
+          pattern: ^TestD
+          shard: d
+        - name: E-G
+          pattern: ^Test[E-G]
+          shard: e-g
+        - name: H-J
+          pattern: ^Test[H-J]
+          shard: h-j
+        - name: K-M
+          pattern: ^Test[K-M]
+          shard: k-m
         - name: N-R
           pattern: ^Test[N-R]
           shard: n-r
-        - name: S-Z and other
-          pattern: ^Test([S-Z]|[^A-R])
-          shard: s-z
+        - name: S
+          pattern: ^TestS
+          shard: s
+        - name: T
+          pattern: ^TestT
+          shard: t
+        - name: U-V
+          pattern: ^Test[U-V]
+          shard: u-v
+        - name: W-Z and other
+          pattern: ^Test([W-Z]|[^A-V])
+          shard: w-z
     concurrency:
       group: ci-${{ github.ref }}-test-${{ matrix.shard }}
       cancel-in-progress: true
-    steps:
+    steps: &unit-test-steps
     - name: Restore checkout
       id: restore-checkout
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
@@ -299,10 +442,22 @@ jobs:
 
     - name: Run unit tests with coverage
       id: run-unit-tests
+      env:
+        TEST_PATTERN: ${{ matrix.pattern }}
       run: |
         set -o pipefail
+        if [ "$UNIT_TEST_SUITE" = "fast" ]; then
+          slow_pattern=$(node scripts/go-unit-suite.cjs)
+          selection=(-run "$TEST_PATTERN" -skip "$slow_pattern")
+        elif [ "$UNIT_TEST_SUITE" = "slow" ]; then
+          slow_pattern=$(node scripts/go-unit-suite.cjs "$TEST_PATTERN")
+          selection=(-run "$slow_pattern")
+        else
+          echo "Unknown unit-test suite: $UNIT_TEST_SUITE" >&2
+          exit 1
+        fi
         # Run tests with JSON output for artifacts, but also show failures
-        if ! go test -v -parallel=8 -timeout=3m -run='${{ matrix.pattern }}' -tags '!integration' -coverprofile=coverage-${{ matrix.shard }}.out -json ./... > test-result-unit-${{ matrix.shard }}.json; then
+        if ! go test -v -parallel=8 -timeout="$UNIT_TEST_TIMEOUT" "${selection[@]}" -tags '!integration' -coverprofile=coverage-${{ matrix.shard }}.out -json ./... > test-result-unit-${{ matrix.shard }}.json; then
           cat test-result-unit-${{ matrix.shard }}.json
           exit 1
         fi
@@ -345,13 +500,49 @@ jobs:
         path: test-result-unit-${{ matrix.shard }}.json
         retention-days: 7
 
+  test-slow:
+    name: Slow unit tests (${{ matrix.name }})
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && needs.verify-integration-build.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'test-slow'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs:
+    - checkout-cache
+    - verify-integration-build
+    - front-door-decision
+    permissions:
+      contents: read
+    env:
+      UNIT_TEST_SUITE: slow
+      UNIT_TEST_TIMEOUT: 5m
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - name: Repository sweeps
+          pattern: repository
+          shard: slow-repository
+        - name: Azure runtime
+          pattern: workflow-azure
+          shard: slow-workflow-azure
+        - name: Workflow readers
+          pattern: workflow-readers
+          shard: slow-workflow-readers
+        - name: CLI, parser and workqueue
+          pattern: cli-parser-workqueue
+          shard: slow-cli-parser-workqueue
+    concurrency:
+      group: ci-${{ github.ref }}-test-${{ matrix.shard }}
+      cancel-in-progress: true
+    steps: *unit-test-steps
+
   canary-go:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs:
     - checkout-cache
     - test
-    if: always() && needs.test.result == 'success'  # Skip coverage check for cancelled/failed test runs
+    - test-slow
+    if: always() && !cancelled() && github.event_name != 'pull_request' && needs.checkout-cache.result == 'success' && needs.test.result == 'success' && needs.test-slow.result == 'success'
     permissions:
       contents: read
     steps:
@@ -423,7 +614,8 @@ jobs:
         retention-days: 7
 
   impacted-go-tests:
-    needs: [checkout-cache]
+    needs: [checkout-cache, front-door-decision]
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'impacted-go-tests'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -459,7 +651,8 @@ jobs:
 
   native-javascript-tests:
     name: Native JavaScript and Actions parser tests
-    needs: [checkout-cache]
+    needs: [checkout-cache, front-door-decision]
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'native-javascript-tests'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -506,7 +699,8 @@ jobs:
       run: make test-actions-parser-conformance
 
   build:
-    needs: [checkout-cache]
+    needs: [checkout-cache, front-door-decision]
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'build'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -607,7 +801,8 @@ jobs:
 
 
   build-wasm:
-    needs: [checkout-cache]
+    needs: [checkout-cache, front-door-decision]
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'build-wasm'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -714,7 +909,8 @@ jobs:
       run: node scripts/test-wasm-golden.mjs
 
   validate-yaml:
-    needs: [checkout-cache]
+    needs: [checkout-cache, front-door-decision]
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'validate-yaml'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -1176,185 +1372,10 @@ jobs:
 
           core.info(`✅ ${CONFIG_FILE} passes all structural and cross-row invariant checks`);
 
-  bench:
-    # Only run benchmarks on main branch for performance tracking
-    if: github.ref == 'refs/heads/main'
-    needs: [checkout-cache]
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      actions: read
-    concurrency:
-      group: ci-${{ github.ref }}-bench
-      cancel-in-progress: true
-    steps:
-    - name: Restore checkout
-      id: restore-checkout
-      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
-      with:
-        path: .
-        key: checkout-cgo-${{ github.run_id }}-${{ github.sha }}
-    - name: Checkout on cache miss
-      if: steps.restore-checkout.outputs.cache-hit != 'true'
-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
-      with:
-        ref: ${{ github.sha }}
-        fetch-depth: 2
-        persist-credentials: false
-
-    - name: Set up Go
-      id: setup-go
-      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v6
-      with:
-        go-version-file: go.mod
-        cache: true
-
-    - name: Report Go cache status
-      run: |
-        if [ "${{ steps.setup-go.outputs.cache-hit }}" == "true" ]; then
-          echo "✅ Go cache hit" >> $GITHUB_STEP_SUMMARY
-        else
-          echo "⚠️ Go cache miss" >> $GITHUB_STEP_SUMMARY
-        fi
-
-    - name: Download dependencies with retry
-      if: steps.setup-go.outputs.cache-hit != 'true'
-      run: |
-        set -e
-        MAX_RETRIES=3
-        RETRY_DELAY=5
-
-        for i in $(seq 1 $MAX_RETRIES); do
-          echo "Attempt $i of $MAX_RETRIES: Downloading Go modules..."
-          if go mod download; then
-            echo "✅ Successfully downloaded Go modules"
-            break
-          else
-            if [ $i -eq $MAX_RETRIES ]; then
-              echo "❌ Failed to download Go modules after $MAX_RETRIES attempts"
-              echo "This may indicate that proxy.golang.org is unreachable"
-              echo "Please check network connectivity or consider vendoring dependencies"
-              exit 1
-            fi
-            echo "⚠️ Download failed, retrying in ${RETRY_DELAY}s..."
-            sleep $RETRY_DELAY
-          fi
-        done
-
-    - name: Verify dependencies
-      run: go mod verify
-
-    - name: Install benchstat
-      run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260615155930-9e4b9ddef5b6
-
-    - name: Download previous benchmark baseline
-      id: baseline
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        set +e
-        echo "Looking for previous benchmark-results artifact..."
-        # The bench job only runs on main, so any benchmark-results artifact is from main.
-        # The artifacts API includes workflow_run.head_branch; filter for main as an extra safeguard.
-        artifact_id=$(gh api \
-          "repos/$GITHUB_REPOSITORY/actions/artifacts?name=benchmark-results&per_page=10" \
-          --jq '[.artifacts[] | select(.workflow_run.head_branch? == "main")] | .[0].id // empty' 2>/dev/null)
-
-        if [ -n "$artifact_id" ]; then
-          echo "Found artifact ID: $artifact_id"
-          mkdir -p baseline
-          if gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" \
-            --output baseline.zip 2>/dev/null; then
-            if unzip -q baseline.zip -d baseline 2>/dev/null && [ -f baseline/bench_results.txt ]; then
-              echo "✅ Downloaded baseline benchmark results"
-              echo "has_baseline=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "⚠️ Failed to extract baseline artifact or bench_results.txt not found"
-              echo "has_baseline=false" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "⚠️ Failed to download baseline artifact"
-            echo "has_baseline=false" >> "$GITHUB_OUTPUT"
-          fi
-        else
-          echo "ℹ️ No previous benchmark results found — skipping regression check on first run"
-          echo "has_baseline=false" >> "$GITHUB_OUTPUT"
-        fi
-
-    - name: Run benchmarks
-      run: make bench
-
-    - name: Run benchstat regression check
-      if: steps.baseline.outputs.has_baseline == 'true'
-      run: |
-        echo "## 📈 Benchmark Regression Check" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-
-        if ! benchstat_out=$(benchstat baseline/bench_results.txt bench_results.txt 2>&1); then
-          echo "$benchstat_out"
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "$benchstat_out" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "❌ **benchstat failed to compare benchmark results.** Check the output above." >> $GITHUB_STEP_SUMMARY
-          echo "::error::benchstat failed to compare benchmark results"
-          exit 1
-        fi
-
-        echo "$benchstat_out"
-
-        echo '```' >> $GITHUB_STEP_SUMMARY
-        echo "$benchstat_out" >> $GITHUB_STEP_SUMMARY
-        echo '```' >> $GITHUB_STEP_SUMMARY
-
-        # Fail if any benchmark regresses by more than 10%.
-        # benchstat uses + for slower time (regression) and - for faster time (improvement).
-        REGRESSION=false
-        while IFS= read -r line; do
-          if [[ "$line" =~ \+([0-9]+(\.[0-9]+)?)% ]]; then
-            pct="${BASH_REMATCH[1]}"
-            if awk -v p="$pct" 'BEGIN {exit !(p > 10)}'; then
-              echo "❌ Regression: $line"
-              REGRESSION=true
-            fi
-          fi
-        done <<< "$benchstat_out"
-
-        if [ "$REGRESSION" = "true" ]; then
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "❌ **Performance regression >10% detected.** See comparison above." >> $GITHUB_STEP_SUMMARY
-          echo "::error::Performance regression >10% detected — see benchstat output above"
-          exit 1
-        else
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "✅ No significant performance regressions detected." >> $GITHUB_STEP_SUMMARY
-          echo "✅ No regressions detected"
-        fi
-
-    - name: Display benchmark summary
-      run: |
-        echo "## 📊 Benchmark Results" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-        # Show compiler benchmarks from the results
-        grep "BenchmarkCompile" bench_results.txt | head -20 >> $GITHUB_STEP_SUMMARY || echo "No benchmark results found" >> $GITHUB_STEP_SUMMARY
-        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "📁 Full results saved to artifact: benchmark-results" >> $GITHUB_STEP_SUMMARY
-
-      # Benchmark results for performance trend analysis - 14 days allows comparison across multiple runs
-    - name: Save benchmark results
-      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
-      with:
-        name: benchmark-results
-        path: bench_results.txt
-        if-no-files-found: ignore
-        retention-days: 14
-
   check-validator-sizes:
     name: Check validator file sizes
-    needs: [checkout-cache]
+    needs: [checkout-cache, front-door-decision]
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'check-validator-sizes'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Non-blocking: report violations but don't fail the build until existing files are cleaned up
@@ -1398,7 +1419,8 @@ jobs:
         exit "$EXIT_CODE"
 
   lint-go-format:
-    needs: [checkout-cache]
+    needs: [checkout-cache, front-door-decision]
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'lint-go-format'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -1455,7 +1477,8 @@ jobs:
         echo "✅ Go formatting check passed" >> $GITHUB_STEP_SUMMARY
 
   lint-go-golangci:
-    needs: [checkout-cache]
+    needs: [checkout-cache, front-door-decision]
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'lint-go-golangci'))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -1575,7 +1598,8 @@ jobs:
         fi
 
   lint-go-govulncheck:
-    needs: [checkout-cache]
+    needs: [checkout-cache, front-door-decision]
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'lint-go-govulncheck'))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -1629,7 +1653,8 @@ jobs:
       run: make security-govulncheck
 
   lint-go-custom:
-    needs: [checkout-cache]
+    needs: [checkout-cache, front-door-decision]
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'lint-go-custom'))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -1678,15 +1703,17 @@ jobs:
 
     - name: Report unchecked printf errors as warnings
       run: |
-        set +e
-        /tmp/gh-aw-linters -fprintferrorunchecked -test=false ./cmd/... ./pkg/... > /tmp/fprintf-lint.log 2>&1
-        status=$?
-        set -e
+        linter_dir=$(mktemp -d)
+        trap 'rm -rf "$linter_dir"' EXIT
+        env -u GOOS -u GOARCH go build -o "$linter_dir/gh-aw-linters" ./cmd/linters
+        log_file="$linter_dir/fprintf-lint.log"
+        status=0
+        "$linter_dir/gh-aw-linters" -fprintferrorunchecked -test=false ./cmd/... ./pkg/... > "$log_file" 2>&1 || status=$?
         if [ "$status" -eq 0 ]; then
           exit 0
         fi
         if [ "$status" -ne 3 ]; then
-          cat /tmp/fprintf-lint.log
+          cat "$log_file"
           exit "$status"
         fi
         while IFS= read -r diagnostic; do
@@ -1695,7 +1722,7 @@ jobs:
           else
             echo "$diagnostic"
           fi
-        done < /tmp/fprintf-lint.log
+        done < "$log_file"
 
     - name: Run custom linters (wasm)
       run: GOOS=js GOARCH=wasm make golint-custom LINTER_FLAGS="-errstringmatch -panicinlibrarycode -manualmutexunlock -osexitinlibrary -rawloginlib -logfatallibrary -regexpcompileinfunction -fprintlnsprintf -strconvparseignorederror -jsonmarshalignoredeerror -uncheckedtypeassertion -fmterrorfnoverbs -tolowerequalfold -httpnoctx -httprespbodyclose -httpstatuscode -timeafterleak -errortypeassertion -execcommandwithoutcontext -sprintfint -stringsindexcontains -stringscountcontains -bytesbufferstring -ioutildeprecated -mapclearloop -mapdeletecheck -sprintfbool -appendoneelement -timenowsub -stringsjoinone -writebytestring -lenstringsplit -stringreplaceminusone -osgetenvlibrary -ossetenvlibrary -stringsindexhasprefix -contextcancelnotdeferred -ctxbackground -wgdonenotdeferred -goroutinemissingrecover -trimleftright -walkfuncerrshadow -uncheckedflushreturn -bytescomparestring -nilctxpassed -stringbytesroundtrip -fileclosenotdeferred -timesleepnocontext -sprintferrorsnew -globwalkignorederror -appendbytestring -slicemakezerolength -sortslice -deferinloop -regexpdynamicpattern -generatedyamlheredoc -test=false" LINTER_PACKAGES="./pkg/console ./pkg/parser ./pkg/styles ./pkg/tty ./pkg/workflow"
@@ -1708,7 +1735,8 @@ jobs:
       run: make lint-action-sh
 
   lint-error-messages:
-    needs: [checkout-cache]
+    needs: [checkout-cache, front-door-decision]
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'lint-error-messages'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -1743,7 +1771,8 @@ jobs:
       run: make lint-errors
 
   actions-build:
-    needs: [checkout-cache]
+    needs: [checkout-cache, front-door-decision]
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'actions-build'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -1815,9 +1844,8 @@ jobs:
       run: make actions-validate
 
   fuzz:
-    # Only run fuzz tests on main branch (10s is insufficient for PRs)
-    if: github.ref == 'refs/heads/main'
-    needs: [checkout-cache]
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'fuzz'))
+    needs: [checkout-cache, front-door-decision]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -1839,6 +1867,7 @@ jobs:
           tests: >-
             FuzzExpressionParser:./pkg/workflow/
             FuzzBashCommandParserModel:./pkg/workflow/
+            FuzzSkipIfQueryParser:./pkg/workflow/
             FuzzMentionsFiltering:./pkg/workflow/
             FuzzSanitizeOutput:./pkg/workflow/
             FuzzSanitizeIncomingText:./pkg/workflow/
@@ -1997,7 +2026,8 @@ jobs:
         retention-days: 7
 
   security:
-    needs: [checkout-cache, build]
+    needs: [checkout-cache, build, front-door-decision]
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && needs.build.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'security'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -2066,9 +2096,8 @@ jobs:
       run: make test-security
 
   security-scan:
-    # Only run security scans on main branch to reduce PR overhead
-    if: github.ref == 'refs/heads/main'
-    needs: [checkout-cache, build]
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && needs.build.result == 'success' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'security-scan'))
+    needs: [checkout-cache, build, front-door-decision]
     runs-on: ubuntu-latest
     timeout-minutes: 10  # Prevent jobs from hanging indefinitely
     permissions:
@@ -2116,7 +2145,8 @@ jobs:
       run: ./gh-aw compile poem-bot ${{ matrix.tool.flag }} --verbose
 
   mcp-server-compile-test:
-    needs: [checkout-cache]
+    needs: [checkout-cache, front-door-decision]
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'mcp-server-compile-test'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -2299,7 +2329,8 @@ jobs:
         echo "✅ Test completed successfully" >> $GITHUB_STEP_SUMMARY
 
   cross-platform-build:
-    needs: [checkout-cache, build]
+    needs: [checkout-cache, build, front-door-decision]
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && needs.build.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'cross-platform-build'))
     name: Build & Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
@@ -2308,9 +2339,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-        - macos-latest
-        - windows-latest
+        os: [macos-latest, windows-latest]
     concurrency:
       group: ci-${{ github.ref }}-cross-platform-${{ matrix.os }}
       cancel-in-progress: true
@@ -2693,8 +2722,9 @@ jobs:
         rm -f .github/workflows/test-cross-platform.lock.yml
 
   alpine-container-test:
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'alpine-container-test'))
     name: Alpine Container Test
-    needs: [checkout-cache]
+    needs: [checkout-cache, front-door-decision]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -2842,7 +2872,8 @@ jobs:
         rm -rf test-workspace
 
   safe-outputs-conformance:
-    needs: [checkout-cache]
+    needs: [checkout-cache, front-door-decision]
+    if: always() && !cancelled() && needs.checkout-cache.result == 'success' && (github.event_name != 'pull_request' || needs.front-door-decision.result != 'success' || !needs.front-door-decision.outputs.suite_ids || contains(fromJSON(needs.front-door-decision.outputs.suite_ids), 'safe-outputs-conformance'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -2908,16 +2939,19 @@ jobs:
   summarize-timing:
     name: Summarize workflow timing
     needs:
+    - front-door-decision
+    - front-door-conformance
+    - test-pageindex-workflow
     - checkout-cache
     - verify-integration-build
     - test
+    - test-slow
     - canary-go
     - impacted-go-tests
     - native-javascript-tests
     - build
     - build-wasm
     - validate-yaml
-    - bench
     - check-validator-sizes
     - lint-go-format
     - lint-go-golangci

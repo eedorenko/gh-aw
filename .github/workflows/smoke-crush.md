@@ -34,6 +34,8 @@ imports:
   - shared/smoke-test-brevity.md
 network:
   allowed: []
+runtimes:
+  go: {}
 tools:
   cache-memory: true
   github:
@@ -58,7 +60,7 @@ safe-outputs:
     expires: 2h
     close-older-issues: true
     close-older-key: "smoke-crush"
-    labels: [automation, testing]
+    labels: [automation, testing, "backlog:smoke-tests"]
   add-labels:
     allowed: [smoke-crush]
   messages:

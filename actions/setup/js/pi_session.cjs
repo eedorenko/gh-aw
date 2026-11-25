@@ -106,6 +106,11 @@ function messageIdentity(message) {
   return undefined;
 }
 
+/** @param {SessionEvent} event @param {any} message */
+function retainMessageTimestamp(event, message) {
+  if (["timestamp", "ts", "time", "created_at"].every(key => event[key] === undefined) && (typeof message?.timestamp === "string" || typeof message?.timestamp === "number")) event.timestamp = message.timestamp;
+}
+
 /** @returns {MessageState} */
 function newMessageState() {
   return { text: new Map(), thinking: new Map(), calls: new Map(), blocks: new Map(), errors: [], finalized: false };
@@ -129,9 +134,10 @@ function isPiResultError(result) {
  * are observations, whereas those envelopes are snapshots of the same message.
  * @param {Array<any>} records
  * @param {(event: SessionEvent) => SessionEvent} [mapLegacyEvent]
+ * @param {{sourceEngine?: string}} [options]
  * @returns {SessionEvent[]}
  */
-function transformPiV3Entries(records, mapLegacyEvent = event => event) {
+function transformPiV3Entries(records, mapLegacyEvent = event => event, { sourceEngine = "pi" } = {}) {
   records = records.filter(record => record && typeof record === "object" && !Array.isArray(record));
   /** @type {SessionEvent[]} */
   const events = [];
@@ -144,9 +150,13 @@ function transformPiV3Entries(records, mapLegacyEvent = event => event) {
   const executionEnds = new Set(records.filter(r => r.type === "tool_execution_end" && r.toolCallId !== undefined).map(r => r.toolCallId));
   const calls = new Map();
   const executionStarts = new Set();
-  const completions = new Set();
+  /** @type {Map<string, SessionEvent>} */
+  const completions = new Map();
+  const completionMessages = new Map();
   /** @type {Map<string, MessageState>} */
   const messageStates = new Map();
+  /** @type {Map<string, MessageState[]>} */
+  const identityStates = new Map();
   /** @type {Array<{message: any, state: MessageState}>} */
   const snapshots = [];
   let assistantState = newMessageState();
@@ -162,8 +172,9 @@ function transformPiV3Entries(records, mapLegacyEvent = event => event) {
   const emit = (raw, type, data, metadata = {}) => {
     const event = createSessionEvent(raw, type, data);
     Object.assign(event, metadata);
-    events.push(legacyObservation ? mapLegacyEvent(event) : event);
-    return event;
+    const mappedEvent = legacyObservation ? mapLegacyEvent(event) : event;
+    events.push(mappedEvent);
+    return mappedEvent;
   };
   const invocationIdentity = (raw, dispatch) => {
     const agentName = raw.agent ?? raw.agentName ?? "unknown";
@@ -174,10 +185,10 @@ function transformPiV3Entries(records, mapLegacyEvent = event => event) {
       return supplied;
     }
     if (!dispatch && subagentInvocations.has(agentName)) return subagentInvocations.get(agentName);
-    if (!dispatch) return `legacy:pi:${agentName}:unknown`;
+    if (!dispatch) return `legacy:${sourceEngine}:${agentName}:unknown`;
     const count = (subagentInvocationCounts.get(agentName) ?? 0) + 1;
     subagentInvocationCounts.set(agentName, count);
-    const identity = `legacy:pi:${agentName}:${count}`;
+    const identity = `legacy:${sourceEngine}:${agentName}:${count}`;
     subagentInvocations.set(agentName, identity);
     return identity;
   };
@@ -296,15 +307,26 @@ function transformPiV3Entries(records, mapLegacyEvent = event => event) {
 
   const emitCompletion = (raw, message) => {
     const id = message.toolCallId;
-    if (id !== undefined && (executionEnds.has(id) || completions.has(id))) return;
-    if (id !== undefined) completions.add(id);
-    emit(raw, "tool.execution_complete", {
+    if (id !== undefined) {
+      const previous = completions.get(id);
+      if (previous) {
+        retainMessageTimestamp(previous, message);
+        return;
+      }
+      if (executionEnds.has(id)) {
+        if (typeof completionMessages.get(id)?.timestamp !== "string" && typeof completionMessages.get(id)?.timestamp !== "number") completionMessages.set(id, message);
+        return;
+      }
+    }
+    const event = emit(raw, "tool.execution_complete", {
       ...message,
       toolCallId: id,
       toolName: message.toolName,
       output: message.content,
       success: message.isError === true || isPiResultError(message) ? false : message.isError === false ? true : undefined,
     });
+    retainMessageTimestamp(event, message);
+    if (id !== undefined) completions.set(id, event);
   };
 
   const emitMessage = (raw, message, fallback) => {
@@ -312,7 +334,7 @@ function transformPiV3Entries(records, mapLegacyEvent = event => event) {
     if (!["assistant", "user", "toolResult"].includes(message.role)) {
       if (!snapshots.some(snapshot => isDeepStrictEqual(snapshot.message, message))) {
         snapshots.push({ message: structuredClone(message), state: fallback });
-        emit(raw, "session.info", { sourceType: "message_snapshot", role: message.role, content: message });
+        retainMessageTimestamp(emit(raw, "session.info", { sourceType: "message_snapshot", role: message.role, content: message }), message);
       }
       return;
     }
@@ -324,8 +346,15 @@ function transformPiV3Entries(records, mapLegacyEvent = event => event) {
     const identity = messageID ?? (raw.id !== undefined && raw.type !== "agent_end" ? JSON.stringify(["record", raw.id]) : undefined);
     const duplicate = snapshots.some(snapshot => snapshot.state === fallback && snapshot.message.role === message.role && isDeepStrictEqual(snapshot.message.content, message.content));
     const distinct = fallback.finalized && ((messageID !== undefined && fallback.identity !== undefined && messageID !== fallback.identity) || (raw.type === "message_end" && !duplicate));
-    const state = (identity !== undefined && messageStates.get(identity)) || (distinct ? newMessageState() : fallback);
-    if (identity !== undefined) messageStates.set(identity, state);
+    const state = raw.type === "agent_end" ? fallback : (identity !== undefined && messageStates.get(identity)) || (distinct ? newMessageState() : fallback);
+    if (identity !== undefined) {
+      if (raw.type !== "agent_end") messageStates.set(identity, state);
+      const states = identityStates.get(identity) ?? [];
+      if (!states.includes(state)) {
+        states.push(state);
+        identityStates.set(identity, states);
+      }
+    }
     if (messageID !== undefined) state.identity = messageID;
     if (message.role === "assistant") assistantState = state;
     const content = typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content;
@@ -363,15 +392,20 @@ function transformPiV3Entries(records, mapLegacyEvent = event => event) {
       ...((message.id ?? message.responseId) !== undefined ? { messageId: message.id ?? message.responseId } : {}),
     };
     for (const segments of [...state.text.values(), ...state.thinking.values()]) {
-      for (const event of segments.segments) Object.assign(event.data, structuredClone(metadata));
+      for (const event of segments.segments) {
+        Object.assign(event.data, structuredClone(metadata));
+        retainMessageTimestamp(event, message);
+      }
     }
-    for (const event of state.calls.values()) Object.assign(event.data, structuredClone(metadata));
-    for (const event of state.blocks.values()) Object.assign(event.data, structuredClone(metadata));
+    for (const event of [...state.calls.values(), ...state.blocks.values()]) {
+      Object.assign(event.data, structuredClone(metadata));
+      retainMessageTimestamp(event, message);
+    }
     if (!snapshots.some(snapshot => snapshot.state === state && isDeepStrictEqual(snapshot.message, message))) snapshots.push({ message: structuredClone(message), state });
     if (raw.type === "message_end" || raw.type === "turn_end") state.finalized = true;
     if (message.errorMessage !== undefined && !state.errors.some(error => isDeepStrictEqual(error, message.errorMessage))) {
       state.errors.push(structuredClone(message.errorMessage));
-      emit(raw, "session.error", { error: message.errorMessage, model: message.responseModel ?? message.model });
+      retainMessageTimestamp(emit(raw, "session.error", { error: message.errorMessage, model: message.responseModel ?? message.model }), message);
     }
   };
 
@@ -415,7 +449,7 @@ function transformPiV3Entries(records, mapLegacyEvent = event => event) {
         const previous = subagentEvents.get(invocationId) ?? [];
         // Replay only this child's observations so repeated snapshots reconcile
         // without sharing tool/message identities with the parent or other children.
-        const childEvents = transformPiV3Entries(childRecords).map(event => ({
+        const childEvents = transformPiV3Entries(childRecords, undefined, { sourceEngine }).map(event => ({
           ...event,
           agentId: event.agentId ?? invocationId,
           data: { ...event.data, agentId: event.data.agentId ?? invocationId },
@@ -444,11 +478,16 @@ function transformPiV3Entries(records, mapLegacyEvent = event => event) {
       if (subagentInvocations.get(raw.agent ?? raw.agentName ?? "unknown") === invocationId) {
         subagentInvocations.delete(raw.agent ?? raw.agentName ?? "unknown");
       }
-    } else if (raw.type === "session") emit(raw, "session.init", { sourceEngine: "pi", sessionId: raw.id, cwd: raw.cwd, model: raw.model });
-    else if (raw.type === "turn_start") {
+    } else if (raw.type === "session") {
+      const init = emit(raw, "session.init", { sourceEngine, sessionId: raw.id, cwd: raw.cwd, model: raw.model });
+      retainMessageTimestamp(init, { timestamp: raw.createdAt });
+    } else if (raw.type === "turn_start") {
+      messageStates.clear();
       assistantState = activeState = newMessageState();
       partialAssistant = false;
     } else if (raw.type === "message_start") {
+      const startIdentity = messageIdentity(raw.message) ?? (raw.id !== undefined ? JSON.stringify(["record", raw.id]) : undefined);
+      if (startIdentity !== undefined && messageStates.get(startIdentity)?.finalized) messageStates.delete(startIdentity);
       activeState = newMessageState();
       if (raw.message?.role === "assistant") {
         assistantState = activeState;
@@ -485,8 +524,7 @@ function transformPiV3Entries(records, mapLegacyEvent = event => event) {
       );
     } else if (raw.type === "tool_execution_end") {
       if (raw.toolCallId !== undefined && completions.has(raw.toolCallId)) continue;
-      if (raw.toolCallId !== undefined) completions.add(raw.toolCallId);
-      emit(raw, "tool.execution_complete", {
+      const event = emit(raw, "tool.execution_complete", {
         toolCallId: raw.toolCallId,
         toolName: raw.toolName,
         parentToolCallId: raw.parentToolCallId,
@@ -496,6 +534,10 @@ function transformPiV3Entries(records, mapLegacyEvent = event => event) {
         success: raw.isError === true || raw.error != null || isPiResultError(raw.result) ? false : raw.isError === false ? true : undefined,
         durationMs: isMetric(raw.durationMs) ? raw.durationMs : undefined,
       });
+      if (raw.toolCallId !== undefined) {
+        completions.set(raw.toolCallId, event);
+        retainMessageTimestamp(event, completionMessages.get(raw.toolCallId));
+      }
     } else if (raw.type === "tool_execution_update")
       emit(raw, "tool.execution_update", { toolCallId: raw.toolCallId, toolName: raw.toolName, parentToolCallId: raw.parentToolCallId, input: raw.args, output: raw.partialResult, partial: true });
     else if (Object.hasOwn(PI_SESSION_EVENT_TYPES, raw.type)) {
@@ -503,16 +545,30 @@ function transformPiV3Entries(records, mapLegacyEvent = event => event) {
       emit(raw, PI_SESSION_EVENT_TYPES[type], data);
     } else if (raw.type === "agent_end") {
       const consumed = new Set();
+      const consumedStates = new Set();
+      const openAssistantState = assistantState;
       const messages = raw.messages ?? [];
       const lastAssistant = messages.findLastIndex(message => message?.role === "assistant");
       for (const [position, message] of messages.entries()) {
         const index = snapshots.findIndex((snapshot, i) => !consumed.has(i) && isDeepStrictEqual(snapshot.message, message));
-        if (index >= 0) consumed.add(index);
-        emitMessage(raw, message, index >= 0 ? snapshots[index].state : partialAssistant && position === lastAssistant ? assistantState : newMessageState());
+        if (index >= 0) {
+          consumed.add(index);
+          consumedStates.add(snapshots[index].state);
+          emitMessage(raw, message, snapshots[index].state);
+          continue;
+        }
+        // Prefer matching by message identity in turn order so modified snapshots from earlier
+        // turns reconcile against their own turn state even after assistantState advances;
+        // fall back to the open assistantState only for an unidentifiable trailing partial turn.
+        const messageID = messageIdentity(message);
+        const byIdentity = messageID !== undefined ? identityStates.get(messageID)?.find(candidate => !consumedStates.has(candidate)) : undefined;
+        const selectedState = byIdentity ?? (partialAssistant && position === lastAssistant && !consumedStates.has(openAssistantState) ? openAssistantState : newMessageState());
+        consumedStates.add(selectedState);
+        emitMessage(raw, message, selectedState);
       }
     } else if (raw.type === "error" || raw.type === "extension_error") emit(raw, "session.error", { error: raw.error ?? raw.message, ...(raw.type === "extension_error" ? { sourceType: raw.type } : {}) });
     else {
-      const flat = normalizeAgentSession(transformFlatSessionEntries([raw]), { sourceEngine: "pi" });
+      const flat = normalizeAgentSession(transformFlatSessionEntries([raw]), { sourceEngine });
       if (flat.length) events.push(...flat);
       else if (typeof raw.type === "string" && raw.type !== "") emit(raw, "session.info", { sourceType: raw.type, content: raw });
     }
@@ -537,9 +593,10 @@ function piUsage(usage) {
  * Count finalized assistant messages once, even in interrupted streams that lack
  * turn_end. agent_end.messages is a transcript snapshot, never extra usage.
  * @param {Array<any>} records
+ * @param {{sourceEngine?: string}} [options]
  * @returns {any}
  */
-function computePiV3Stats(records) {
+function computePiV3Stats(records, { sourceEngine = "pi" } = {}) {
   records = records.filter(record => record && typeof record === "object" && !Array.isArray(record));
   /** @type {Record<string, any>} */
   const usage = {};
@@ -568,20 +625,23 @@ function computePiV3Stats(records) {
     if (isMetric(value.cost?.total)) totalCostUsd = (totalCostUsd ?? 0) + value.cost.total;
     if (isTokenCount(value.input)) usage.input_tokens_include_cache = false;
   };
-  const addMessage = (raw, message) => {
+  const addMessage = (raw, message, existingReport = undefined) => {
     if (!message || message.role !== "assistant") return;
     const identity = messageIdentity(message) ?? (raw.id !== undefined && raw.type !== "agent_end" ? JSON.stringify(["record", raw.id]) : undefined);
     const sourceIdentity = raw.id !== undefined && raw.type !== "agent_end" ? JSON.stringify(["record", raw.id]) : undefined;
     const signature = { ...message, usage: undefined, errorMessage: undefined };
-    let report = (sourceIdentity !== undefined && seen.get(sourceIdentity)) || (identity !== undefined && seen.get(identity));
-    if (!report && ((raw.type === "turn_end" && lastWasMessageEnd) || (raw.type === "message_end" && lastWasMessageUpdate)) && isDeepStrictEqual(lastReport?.signature, signature)) report = lastReport;
+    let report = existingReport ?? (raw.type === "agent_end" ? undefined : (sourceIdentity !== undefined && seen.get(sourceIdentity)) || (identity !== undefined && seen.get(identity)));
+    if (!report && raw.type !== "agent_end" && ((raw.type === "turn_end" && lastWasMessageEnd) || (raw.type === "message_end" && lastWasMessageUpdate)) && isDeepStrictEqual(lastReport?.signature, signature)) report = lastReport;
     if (!report) {
-      report = { signature: structuredClone(signature), message: structuredClone(message), usage: {}, cost: undefined, error: undefined };
+      report = { identity, finalized: false, signature: structuredClone(signature), message: structuredClone(message), usage: {}, cost: undefined, error: undefined };
       reports.push(report);
       turns++;
     }
-    if (identity !== undefined) seen.set(identity, report);
-    if (sourceIdentity !== undefined) seen.set(sourceIdentity, report);
+    if (raw.type !== "agent_end") {
+      if (identity !== undefined) seen.set(identity, report);
+      if (sourceIdentity !== undefined) seen.set(sourceIdentity, report);
+    }
+    if (raw.type === "message_end" || raw.type === "turn_end") report.finalized = true;
     lastReport = report;
     lastWasMessageUpdate = raw.type === "message_update";
     lastWasMessageEnd = raw.type === "message_end" || lastWasMessageUpdate;
@@ -607,6 +667,13 @@ function computePiV3Stats(records) {
   };
   for (const raw of records) {
     if (raw.type === "turn_start") {
+      seen.clear();
+      lastReport = undefined;
+      lastWasMessageEnd = false;
+      lastWasMessageUpdate = false;
+    } else if (raw.type === "message_start" && raw.message?.role === "assistant") {
+      const identity = messageIdentity(raw.message);
+      if (identity !== undefined && seen.get(identity)?.finalized) seen.delete(identity);
       lastReport = undefined;
       lastWasMessageEnd = false;
       lastWasMessageUpdate = false;
@@ -628,9 +695,15 @@ function computePiV3Stats(records) {
     } else if (raw.type === "agent_end") {
       const remaining = [...reports];
       for (const message of raw.messages ?? []) {
+        if (message?.role !== "assistant") continue;
         const index = remaining.findIndex(report => isDeepStrictEqual(report.message, message));
         if (index >= 0) remaining.splice(index, 1);
-        else addMessage(raw, message);
+        else {
+          const identity = messageIdentity(message);
+          const idIndex = identity === undefined ? -1 : remaining.findIndex(report => report.identity === identity);
+          const existing = idIndex >= 0 ? remaining.splice(idIndex, 1)[0] : undefined;
+          addMessage(raw, message, existing);
+        }
       }
       const snapshot = raw.usage ?? raw.stats?.usage ?? raw.stats;
       if (snapshot && typeof snapshot === "object") {
@@ -652,7 +725,7 @@ function computePiV3Stats(records) {
         errors.push(...structuredClone(diagnostics));
       }
     } else if (raw.type === "result" || raw.type === "session.result") {
-      const result = normalizeAgentSession(transformFlatSessionEntries([raw]), { sourceEngine: "pi" }).find(event => event.type === "session.result")?.data;
+      const result = normalizeAgentSession(transformFlatSessionEntries([raw]), { sourceEngine }).find(event => event.type === "session.result")?.data;
       if (!result) continue;
       if (result.usage) {
         for (const [key, value] of Object.entries(result.usage)) {

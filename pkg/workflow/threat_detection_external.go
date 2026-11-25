@@ -46,7 +46,7 @@ func (c *Compiler) buildPrepareDetectionEngineConfigForExternalDetectorStep(data
 	// OpenAI (10000) or Copilot (10002) ingress can serve it.
 	codexAPIBase := NewCodexEngine().getOpenAIProxyProviderBaseURL(detectionData)
 	codexWSSBase := codexProxyWebsocketBaseURL(codexAPIBase)
-	codexConfig := buildExternalDetectorCodexConfig(codexAPIBase, codexWSSBase, isCodexAzureOIDC(detectionData))
+	codexConfig := buildExternalDetectorCodexConfig(codexAPIBase, codexWSSBase, isCodexAzureOIDC(detectionData) || isCodexOpenAIWIF(detectionData))
 	codexConfigDelimiter := GenerateHeredocDelimiterFromContent("CODEX_DETECTION_CONFIG", codexConfig)
 
 	return []string{
@@ -126,7 +126,6 @@ func buildThreatDetectionWorkflowData(data *WorkflowData, engineID string) *Work
 		Permissions:          data.Permissions,
 		ParsedFrontmatter:    data.ParsedFrontmatter,
 		CachedPermissions:    data.CachedPermissions,
-		ModelCosts:           data.ModelCosts,
 		IsDetectionRun:       true,
 		AdmissionEnabled:     admissionBudgetOutputsEnabled(data),
 		RunnerConfig:         data.RunnerConfig,
@@ -150,6 +149,10 @@ func buildThreatDetectionWorkflowData(data *WorkflowData, engineID string) *Work
 	if ResolveEngineID(data) == engineID {
 		detectionData.SandboxConfig.Agent.Targets = cloneAgentAPITargets(data)
 		detectionData.ModelMappings = data.ModelMappings
+		if usesConnectorInference(data) {
+			disabled := TemplatableBool("false")
+			detectionData.SandboxConfig.Agent.ModelFallback = &disabled
+		}
 	} else {
 		detectionData.ModelMappings = MergeImportedModelAliases(nil, nil)
 	}
@@ -171,6 +174,7 @@ func buildThreatDetectionWorkflowData(data *WorkflowData, engineID string) *Work
 	if len(detectionData.SandboxConfig.Agent.Images) == 0 {
 		detectionData.SandboxConfig.Agent.Images = buildThreatDetectionContainerImages(detectionData)
 	}
+	detectionData.ModelCosts, detectionData.ModelCostOverrides = data.ModelCosts, data.ModelCostOverrides
 	return detectionData
 }
 
@@ -274,9 +278,9 @@ func (c *Compiler) buildPullAWFContainersStep(data *WorkflowData) []string {
 	}
 
 	// Split the generated YAML into individual lines so each is a separate entry
-	lines := strings.Split(b.String(), "\n")
 	var steps []string
-	for _, line := range lines {
+	for line := range strings.Lines(b.String()) {
+		line = strings.TrimSuffix(line, "\n")
 		if line != "" {
 			steps = append(steps, line+"\n")
 		}
@@ -369,6 +373,7 @@ var declarableDetectionEngineIDs = []string{"copilot", "claude", "codex"}
 func (c *Compiler) resolveCustomEngineDetectionEngineID(engineID string) string {
 	if def := c.engineCatalog.Get(engineID); def != nil && def.DetectionEngine != "" {
 		if slices.Contains(declarableDetectionEngineIDs, def.DetectionEngine) {
+			threatLog.Printf("Engine definition %q declares detection-engine %q", engineID, def.DetectionEngine)
 			return def.DetectionEngine
 		}
 		threatLog.Printf("Engine definition %q declares an unsupported detection-engine %q; using %q instead", engineID, def.DetectionEngine, defaultThreatDetectionEngineID)
@@ -388,6 +393,17 @@ type externalDetectorPathSetup struct {
 	commandPrefix string
 }
 
+const threatDetectBinaryPathSetup = `detector="${THREAT_DETECT_BINARY:?Verified detector path must be supplied by the install step}"
+if [[ ! -f "$detector" || ! -x "$detector" || -L "$detector" ]]; then
+  echo "ERROR: Verified detector must be a regular executable file" >&2
+  exit 1
+fi
+mkdir -p "${RUNNER_TEMP}/gh-aw/bin"
+rm -f "${RUNNER_TEMP}/gh-aw/bin/threat-detect"
+cp "$detector" "${RUNNER_TEMP}/gh-aw/bin/threat-detect"
+chmod +x "${RUNNER_TEMP}/gh-aw/bin/threat-detect"
+`
+
 // buildExternalDetectorPathSetup returns the host-side shell commands that run
 // before AWF plus any command prefix needed inside the external detector container.
 // For the installed Copilot engine, threat-detect invokes the engine binary by
@@ -398,7 +414,14 @@ type externalDetectorPathSetup struct {
 // staged on the shared volume before AWF starts.
 func (c *Compiler) buildExternalDetectorPathSetup(data *WorkflowData, engineID string) externalDetectorPathSetup {
 	setup := externalDetectorPathSetup{}
+	threatLog.Printf("Building external detector path setup: engine=%s", engineID)
+	if useRootlessCLIInstallation(data) && !isArcDindTopology(data) {
+		// Mount the verified user-space binary without relying on the container's HOME.
+		setup.hostSetup = threatDetectBinaryPathSetup
+		setup.commandPrefix = `export PATH="${RUNNER_TEMP}/gh-aw/bin:$PATH" && `
+	}
 	if isArcDindTopology(data) {
+		threatLog.Print("ARC/DinD topology detected, staging threat detection inputs on shared volume")
 		setup.hostSetup = `bash "${RUNNER_TEMP}/gh-aw/actions/stage_threat_detection_arc_dind.sh" stage`
 		setup.commandPrefix = `export PATH="${RUNNER_TEMP}/gh-aw/bin:$PATH" && `
 		if engineID == "codex" {
@@ -420,7 +443,7 @@ func (c *Compiler) buildExternalDetectorPathSetup(data *WorkflowData, engineID s
 		return setup
 	}
 	setup.commandPrefix = `export PATH="${RUNNER_TEMP}/gh-aw/bin:$PATH" && `
-	setup.hostSetup = copilotBinaryPathSetup
+	setup.hostSetup += copilotBinaryPathSetup
 	return setup
 }
 
@@ -443,11 +466,25 @@ func (c *Compiler) buildInstallAWFForExternalDetectorStep(data *WorkflowData) []
 		return nil
 	}
 
-	lines := make([]string, 0, len(step))
-	for _, line := range step {
+	lines := make([]string, 0, len(step)+1)
+	for i, line := range step {
 		lines = append(lines, line+"\n")
+		if i == 0 {
+			// Expose the install outcome so execution is gated on a verified AWF and
+			// the conclude step can report a GitHub API quota stop explicitly.
+			lines = append(lines, "        id: "+detectionAWFInstallStepID+"\n")
+		}
 	}
 	return lines
+}
+
+// detectionAWFInstallStepID identifies the external detector's AWF installation step.
+const detectionAWFInstallStepID = "detection_awf_install"
+
+// hasExternalDetectorAWFInstallStep reports whether the external detector path emits
+// an AWF installation step whose outcome can gate execution and conclusion.
+func (c *Compiler) hasExternalDetectorAWFInstallStep(data *WorkflowData) bool {
+	return len(c.buildInstallAWFForExternalDetectorStep(data)) > 0
 }
 
 // buildInstallDetectionEngineForExternalDetectorStep installs the selected detection
@@ -607,8 +644,8 @@ func (c *Compiler) buildExternalDetectorExecutionStep(data *WorkflowData) []stri
 	// no longer writes any step-summary output (see
 	// github/gh-aw-threat-detection#792), so the flag is intentionally omitted here.
 	npmPathSetup := GetNpmBinPathSetup()
-	if engineID == "codex" && isCodexAzureOIDC(threatDetectionData) {
-		npmPathSetup += " && " + codexAzureOIDCReflectionGuard()
+	if engineID == "codex" && (isCodexAzureOIDC(threatDetectionData) || isCodexOpenAIWIF(threatDetectionData)) {
+		npmPathSetup += " && " + codexOIDCReflectionGuard(threatDetectionData.EngineConfig.Auth.Provider)
 	}
 	threatDetectCmd := buildThreatDetectCommand(npmPathSetup, engineID, data.SafeOutputs.ThreatDetection, isArcDindTopology(threatDetectionData))
 
@@ -656,6 +693,10 @@ func (c *Compiler) buildExternalDetectorExecutionStep(data *WorkflowData) []stri
 	}
 
 	executionCondition := detectionExecutionCondition + " && steps.threat_detect_install.outcome == 'success'"
+	if c.hasExternalDetectorAWFInstallStep(data) {
+		// Never run a missing or unverified AWF binary after a failed installation.
+		executionCondition += " && steps." + detectionAWFInstallStepID + ".outcome == 'success'"
+	}
 	if isArcDindTopology(threatDetectionData) {
 		executionCondition += " && steps.detection_staging_reset.outcome == 'success'"
 	}
@@ -680,7 +721,14 @@ func (c *Compiler) buildExternalDetectorExecutionStep(data *WorkflowData) []stri
 	// Pass context as environment variables: AWF's --env-all forwards them to
 	// threat-detect without interpolating user-controlled prompt text into a command.
 	steps = append(steps, c.buildThreatDetectionContextEnvVars(data, continueOnError, continueOnErrorExpr)...)
-	if isArcDindTopology(threatDetectionData) {
+	if engineID == "copilot" {
+		inputDir := constants.ThreatDetectionInputDir
+		if isArcDindTopology(threatDetectionData) {
+			inputDir = strings.ReplaceAll(rewriteArcDindPath(inputDir), "${RUNNER_TEMP}", "${{ runner.temp }}")
+		}
+		steps = append(steps, fmt.Sprintf("          GH_AW_DETECTION_INPUT_DIR: %q\n", inputDir))
+	}
+	if useRootlessCLIInstallation(threatDetectionData) {
 		steps = append(steps, "          THREAT_DETECT_BINARY: ${{ steps.threat_detect_install.outputs.binary-path }}\n")
 	}
 	steps = append(steps, "        run: |\n")
@@ -698,17 +746,19 @@ func (c *Compiler) buildExternalDetectorExecutionStep(data *WorkflowData) []stri
 	return append(c.buildTokenBrokerRequestStep(threatDetectionData, detectionExecutionCondition), steps...)
 }
 
-func codexAzureOIDCReflectionGuard() string {
-	script := `fetch("http://api-proxy:10000/reflect", { signal: AbortSignal.timeout(60000) }).then(async response => {
+func codexOIDCReflectionGuard(provider string) string {
+	authType := strconv.Quote("github-oidc/" + provider)
+	errorMessage := strconv.Quote("No configured OpenAI endpoint uses github-oidc/" + provider)
+	script := fmt.Sprintf(`fetch("http://api-proxy:10000/reflect", { signal: AbortSignal.timeout(60000) }).then(async response => {
   if (!response.ok) throw new Error("AWF /reflect request failed");
   const reflectData = await response.json();
   const endpoints = Array.isArray(reflectData?.endpoints) ? reflectData.endpoints.filter(endpoint => endpoint?.configured === true) : [];
   const endpoint = endpoints.find(candidate => String(candidate?.provider || "").trim().toLowerCase() === "openai");
-  if (!endpoint || endpoint.auth_type !== "github-oidc/azure") throw new Error("No configured OpenAI endpoint uses github-oidc/azure");
+  if (!endpoint || endpoint.auth_type !== %s) throw new Error(%s);
 }).catch(error => {
-  console.error("Azure OIDC threat detection requires fresh AWF reflection:", error);
+  console.error("OpenAI OIDC threat detection requires fresh AWF reflection:", error);
   process.exitCode = 1;
-})`
+})`, authType, errorMessage)
 	return "node -e " + shellEscapeArg(script)
 }
 
@@ -731,12 +781,12 @@ func buildThreatDetectCommand(npmPathSetup, engineID string, config *ThreatDetec
 	}
 
 	resultPath := shellEscapeArg(constants.ThreatDetectionResultPath)
-	inputPath := shellEscapeArg(constants.ThreatDetectionDir)
+	inputPath := shellEscapeArg(constants.ThreatDetectionInputDir)
 	if arcDind {
 		// These compiler-owned expressions must expand inside the sandbox, with
 		// quotes retained so runner temp paths containing spaces remain single args.
 		resultPath = strconv.Quote(rewriteArcDindPath(constants.ThreatDetectionResultPath))
-		inputPath = strconv.Quote(rewriteArcDindPath(constants.ThreatDetectionDir))
+		inputPath = strconv.Quote(rewriteArcDindPath(constants.ThreatDetectionInputDir))
 	}
 	args = append(args, "--output", resultPath, inputPath)
 
@@ -798,6 +848,7 @@ func (c *Compiler) buildUploadDetectionArtifactStep(data *WorkflowData) []string
 		"            " + detectionExecutionEvidencePath + "\n",
 		"            " + constants.TmpGhAwDir + "/threat-detection/detection_usage.json\n",
 		"            " + constants.TmpGhAwDir + "/threat-detection/detection_usage.jsonl\n",
+		"            " + constants.TmpGhAwDir + "/threat-detection/detection_harness_retry.json\n",
 	}
 	// Include the detection AWF run's own firewall proxy/audit logs (token usage, squid
 	// logs) so detection-phase usage surfaces in the usage artifact and counts toward the
@@ -814,15 +865,8 @@ func (c *Compiler) buildUploadDetectionArtifactStep(data *WorkflowData) []string
 	return steps
 }
 
-// buildExternalDetectorConcludeStep creates the conclude step for the external
-// threat-detect binary. It runs `threat-detect conclude --result-file ...` which reads
-// the structured detection_result.json and sets the detection_conclusion/detection_reason/
-// detection_success step outputs, preserving the same gate contract as the inline
-// parse_threat_detection_results.cjs path. Outputs (not env vars) are used exclusively;
-// downstream jobs consume these via needs.detection.outputs.* expressions.
-// The step ID (detection_conclusion) and env vars (RUN_DETECTION, DETECTION_AGENTIC_EXECUTION_OUTCOME,
-// GH_AW_DETECTION_CONTINUE_ON_ERROR) match the inline conclude step; THREAT_DETECT_INSTALL_OUTCOME is
-// additionally passed because only the external path installs a pinned binary.
+// buildExternalDetectorConcludeStep reads the external detector's recorded
+// verdict on the host. Downstream jobs consume its outputs via needs.detection.
 func (c *Compiler) buildExternalDetectorConcludeStep(data *WorkflowData) []string {
 	// Determine continue-on-error mode (same logic as buildDetectionConclusionStep).
 	continueOnError := true
@@ -838,12 +882,8 @@ func (c *Compiler) buildExternalDetectorConcludeStep(data *WorkflowData) []strin
 		"        if: " + detectionConclusionCondition + "\n",
 	}
 
-	if continueOnErrorExpr != nil {
-		steps = append(steps, fmt.Sprintf("        continue-on-error: %s\n", *continueOnErrorExpr))
-	} else if continueOnError {
-		steps = append(steps, "        continue-on-error: true\n")
-	}
-
+	// The reader applies warn mode itself; a step-level override would also
+	// swallow failures to record the conclusion.
 	var coeEnvLine string
 	if continueOnErrorExpr != nil {
 		coeEnvLine = fmt.Sprintf("          GH_AW_DETECTION_CONTINUE_ON_ERROR: %s\n", *continueOnErrorExpr)
@@ -855,12 +895,16 @@ func (c *Compiler) buildExternalDetectorConcludeStep(data *WorkflowData) []strin
 		"        env:\n",
 		"          RUN_DETECTION: ${{ steps.detection_guard.outputs.run_detection }}\n",
 		"          DETECTION_AGENTIC_EXECUTION_OUTCOME: ${{ steps.detection_agentic_execution.outcome }}\n",
-		// The conclude script must never invoke a detector that was not installed
-		// under compiler-pinned digest verification: on a failed install the binary on
-		// PATH is absent, unverified, or the install script's fail-closed placeholder.
-		// The placeholder cannot set conclusion outputs itself, so the script emits the
-		// agent_failure conclusion from this outcome instead.
+		// A failed verified install means no detector could run. The host reader
+		// reports this outcome rather than looking for a verdict.
 		"          THREAT_DETECT_INSTALL_OUTCOME: ${{ steps.threat_detect_install.outcome }}\n",
+	}...)
+	if c.hasExternalDetectorAWFInstallStep(data) {
+		// A failed AWF install (for example a GitHub API quota stop during attestation
+		// verification) is reported explicitly instead of as a missing verdict.
+		steps = append(steps, "          AWF_INSTALL_OUTCOME: ${{ steps."+detectionAWFInstallStepID+".outcome }}\n")
+	}
+	steps = append(steps, []string{
 		coeEnvLine,
 		"        run: |\n",
 		fmt.Sprintf("          bash \"${RUNNER_TEMP}/gh-aw/actions/conclude_threat_detection.sh\" %s\n", shellEscapeArg(constants.ThreatDetectionResultPath)),

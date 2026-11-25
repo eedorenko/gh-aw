@@ -1,7 +1,7 @@
 package workflow
 
 import (
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
@@ -10,7 +10,7 @@ import (
 )
 
 func workQueueMCPToolNames(data *WorkflowData) []string {
-	tools := []string{"work_queue_read", "work_queue_explain"}
+	tools := []string{"work_queue_read"}
 	if workQueueRuntimeRole(data) != "observer" {
 		tools = append(tools, "work_queue_submit", "work_queue_dispatch_next", "work_queue_claim_finish")
 	}
@@ -34,6 +34,10 @@ func collectMCPServersForManifest(data *WorkflowData) []GHAWManifestMCPServer {
 		}
 	}
 
+	if usesWebFetchMCP(data) {
+		add(webFetchMCPServer, []string{"web_fetch"})
+	}
+
 	// collectMCPTools intentionally excludes GitHub when gh-proxy is configured,
 	// because that mode exposes GitHub access through the gh CLI rather than MCP.
 	for _, toolName := range collectMCPTools(data) {
@@ -47,7 +51,7 @@ func collectMCPServersForManifest(data *WorkflowData) []GHAWManifestMCPServer {
 		case "agentic-workflows":
 			add(constants.AgenticWorkflowsMCPServerID.String(), []string{"*"})
 		case "safe-outputs":
-			add(constants.SafeOutputsMCPServerID.String(), collectSafeOutputsManifestTools(data.SafeOutputs))
+			add(constants.SafeOutputsMCPServerID.String(), collectSafeOutputsManifestTools(data))
 		case "ledger":
 			add("ledger", []string{"ledger_append", "ledger_get", "ledger_query", "ledger_status"})
 		case "work-queue":
@@ -67,9 +71,6 @@ func collectMCPServersForManifest(data *WorkflowData) []GHAWManifestMCPServer {
 		}
 	}
 
-	if len(serversByName) == 0 {
-		return []GHAWManifestMCPServer{}
-	}
 	names := sliceutil.SortedKeys(serversByName)
 	servers := make([]GHAWManifestMCPServer, 0, len(names))
 	for _, name := range names {
@@ -121,12 +122,30 @@ func collectGenericMCPManifestTools(toolConfig map[string]any) []string {
 	return stringsFromAnySlice(allowed)
 }
 
-func collectSafeOutputsManifestTools(safeOutputs *SafeOutputsConfig) []string {
+func collectLedgerSafeOutputToolNames(ledgerConfig *LedgerToolConfig) []string {
+	tools := computeEnabledToolNames(&WorkflowData{LedgerConfig: ledgerConfig})
+	if ledgerConfig.Enabled() {
+		for _, ledger := range ledgerConfig.Ledgers {
+			switch ledger.Type {
+			case "map":
+				tools["ledger_map_put"] = struct{}{}
+				tools["ledger_map_delete"] = struct{}{}
+			case "notes":
+				tools["ledger_note_add"] = struct{}{}
+				tools["ledger_note_vote"] = struct{}{}
+			}
+		}
+	}
+	return sliceutil.SortedKeys(tools)
+}
+
+func collectSafeOutputsManifestTools(data *WorkflowData) []string {
+	tools := collectLedgerSafeOutputToolNames(data.LedgerConfig)
+	safeOutputs := data.SafeOutputs
 	if safeOutputs == nil {
-		return nil
+		return tools
 	}
 
-	var tools []string
 	for fieldName, toolName := range safeOutputFieldMapping {
 		if hasSafeOutputFieldSet(safeOutputs, fieldName) {
 			tools = append(tools, toolName)
@@ -205,7 +224,7 @@ func normalizeManifestToolNames(tools []string) []string {
 		seen[tool] = struct{}{}
 		normalized = append(normalized, tool)
 	}
-	sort.Strings(normalized)
+	slices.Sort(normalized)
 	if len(normalized) == 0 {
 		return nil
 	}

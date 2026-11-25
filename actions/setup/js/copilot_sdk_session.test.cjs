@@ -5,13 +5,15 @@ import * as path from "path";
 import os from "node:os";
 
 const require = createRequire(import.meta.url);
-const { runWithCopilotSDK, resolveCopilotSDKWorkingDirectory } = require("./copilot_sdk_session.cjs");
+const { readDocumentMetadata, withCompilerFixtures } = require("../../../scripts/markdown_metadata_test_adapter.cjs");
+const { runWithCopilotSDK, resolveCopilotSDKWorkingDirectory } = withCompilerFixtures(require("./copilot_sdk_session.cjs"));
+const { WORKFLOW_TOOL_PERMISSION_DENIED_EXIT_CODE } = require("./permission_denied_helpers.cjs");
+const { COPILOT_MODEL_VERIFICATION_EXIT_CODE } = require("./copilot_model_selection.cjs");
 const { normalizeCopilotSession } = require("./copilot_session.cjs");
 const { resolveMultiProviderFromReflect } = require("./awf_reflect.cjs");
-const { extractInlineSubAgents } = require("./extract_inline_sub_agents.cjs");
-const { writeInlineSkills } = require("./extract_inline_skills.cjs");
+const { extractInlineSubAgents } = withCompilerFixtures(require("./extract_inline_sub_agents.cjs"));
+const { writeInlineSkills } = withCompilerFixtures(require("./extract_inline_skills.cjs"));
 const { extractFrontmatterAndBody } = require("./frontmatter_hash_pure.cjs");
-const { parseDocument } = require("./work_queue_yaml.cjs");
 const models = [
   { id: "gpt-5.4", provider: "openai" },
   { id: "claude-sonnet-4.6", provider: "anthropic" },
@@ -39,6 +41,28 @@ describe("copilot_sdk_session runtime configuration", () => {
     vi.unstubAllGlobals();
     fs.rmSync(base, { recursive: true, force: true });
     vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["http://127.0.0.1", "127.0.0.1", 80],
+    ["http://[::1]:80", "::1", 80],
+    ["tcp://[::1]:3002", "::1", 3002],
+  ])("passes the normalized SDK endpoint %s to the TCP connection", async (sdkUri, host, port) => {
+    const forTcp = vi.fn();
+    const stopBeforeNetwork = new Error("stop before connecting");
+    forTcp.mockImplementation(() => {
+      throw stopBeforeNetwork;
+    });
+    await expect(
+      runWithCopilotSDK({
+        sdkUri,
+        connectionToken: "test-token",
+        prompt: "test",
+        logger: () => {},
+        sdkModule: { CopilotClient: class {}, RuntimeConnection: { forTcp }, approveAll: () => "allow" },
+      })
+    ).rejects.toBe(stopBeforeNetwork);
+    expect(forTcp).toHaveBeenCalledExactlyOnceWith(host, port, { connectionToken: "test-token" });
   });
 
   // Sanitized final message from run 38513316902: the SDK resolved normally,
@@ -77,7 +101,7 @@ describe("copilot_sdk_session runtime configuration", () => {
       logger,
       workingDirectory: base,
       agentsBaseDir: base,
-      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forUri: () => ({}) }, approveAll: () => "allow" },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
     });
     expect(result).toMatchObject({ exitCode: 1, hasOutput: mode === "partial-output" });
     expect(result.output).not.toContain(filteredMessage.data.content);
@@ -101,6 +125,78 @@ describe("copilot_sdk_session runtime configuration", () => {
     expect(logger.mock.calls.flat().some(message => message.includes("treating as completed"))).toBe(false);
     expect(disconnect).toHaveBeenCalledTimes(1);
     expect(stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a dedicated exit code for SDK workflow tool permission denials", async () => {
+    let sessionConfig;
+    class FakeCopilotClient {
+      start = async () => {};
+      stop = async () => {};
+      createSession = async config => {
+        sessionConfig = config;
+        return {
+          sessionId: "workflow-tool-denial",
+          on: () => {},
+          sendAndWait: async () => {
+            await sessionConfig.permissions.onRequest({ kind: "shell", fullCommandText: "echo blocked" });
+            throw new Error("session failed after permission denial");
+          },
+          disconnect: async () => {},
+        };
+      };
+    }
+
+    const result = await runWithCopilotSDK({
+      sdkUri: "http://127.0.0.1:3002",
+      prompt: "test",
+      logger: () => {},
+      workingDirectory: base,
+      agentsBaseDir: base,
+      permissionConfig: { allowedTools: ["read"] },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
+    });
+
+    expect(result.exitCode).toBe(WORKFLOW_TOOL_PERMISSION_DENIED_EXIT_CODE);
+    expect(result.exitCode).not.toBe(COPILOT_MODEL_VERIFICATION_EXIT_CODE);
+  });
+
+  it.each([
+    "[sdk-driver] permission denied by workflow tool permissions: shell(ls)",
+    '{"source":"sdk-driver","event":"permission-denied-by-workflow-tool-permissions"}',
+    '{"component":"sdk-driver","type":"permission-denied-by-workflow-tool-permissions"}',
+    '{"type":"guard.tool_denials_exceeded","data":{"denialCount":5,"threshold":5}}',
+    "permission denied\npermission denied\npermission denied",
+    "permissions denied\npermissions denied\npermissions denied",
+    "EACCES\nEACCES\nEACCES",
+    "EPERM\nEPERM\nEPERM",
+    "permission denied\nEACCES: permission denied\nEPERM operation not permitted",
+  ])("does not set the trusted workflow denial exit code from assistant output: %s", content => {
+    let handler;
+    class FakeCopilotClient {
+      start = async () => {};
+      stop = async () => {};
+      createSession = async () => ({
+        sessionId: "spoofed-workflow-tool-denial",
+        on: callback => {
+          handler = callback;
+        },
+        sendAndWait: async () => {
+          handler({ type: "assistant.message", data: { content } });
+          throw new Error("session failed without permission denial");
+        },
+        disconnect: async () => {},
+      });
+    }
+
+    return runWithCopilotSDK({
+      sdkUri: "http://127.0.0.1:3002",
+      prompt: "test",
+      logger: () => {},
+      workingDirectory: base,
+      agentsBaseDir: base,
+      permissionConfig: { allowedTools: ["read"] },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
+    }).then(result => expect(result).toMatchObject({ exitCode: 1, hasOutput: true, output: content }));
   });
 
   it.each([{}, { rte: false }, { rte: true, parentToolCallId: "child" }])("does not fail ordinary quoted text or a nested filtered response %j", context => {
@@ -127,7 +223,7 @@ describe("copilot_sdk_session runtime configuration", () => {
       logger: () => {},
       workingDirectory: base,
       agentsBaseDir: base,
-      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forUri: () => ({}) }, approveAll: () => "allow" },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
     }).then(result => expect(result.exitCode).toBe(0));
   });
 
@@ -140,7 +236,10 @@ describe("copilot_sdk_session runtime configuration", () => {
 
     const app = path.join(base, "packages/app");
     fs.mkdirSync(path.join(app, ".github/agents"), { recursive: true });
-    fs.writeFileSync(path.join(app, ".github/agents/local.agent.md"), "---\nmodel: small\n---\nApp agent.");
+    fs.writeFileSync(path.join(app, ".github/agents/local.agent.md"), "Checkout version.");
+    const stagedAgents = path.join(base, "base/copilot-agents");
+    fs.mkdirSync(stagedAgents, { recursive: true });
+    fs.writeFileSync(path.join(stagedAgents, "local.agent.md"), "---\nmodel: small\n---\nApp agent.");
     // The harness resolved `small` before the driver started.
     vi.stubEnv("GH_AW_COPILOT_SDK_SUBAGENT_MODELS", JSON.stringify({ local: "claude-sonnet-4.6" }));
     vi.stubEnv("GITHUB_WORKSPACE", base);
@@ -161,13 +260,13 @@ describe("copilot_sdk_session runtime configuration", () => {
       prompt: "test",
       logger: () => {},
       agentsBaseDir: base,
-      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forUri: () => ({}) }, approveAll: () => "allow" },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
     });
     expect(result.exitCode).toBe(0);
     expect(createSession).toHaveBeenCalledWith(
       expect.objectContaining({
         workingDirectory: app,
-        customAgents: [{ name: "local", displayName: "local", prompt: "App agent.", model: "anthropic/claude-sonnet-4.6" }],
+        agents: { definitions: [{ name: "local", displayName: "local", prompt: "App agent.", model: "anthropic/claude-sonnet-4.6" }] },
       })
     );
   });
@@ -197,27 +296,31 @@ describe("copilot_sdk_session runtime configuration", () => {
       workingDirectory: base,
       agentsBaseDir: staging,
       bare,
-      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forUri: () => ({}) }, approveAll: () => "allow" },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
     });
     expect(result.exitCode).toBe(0);
     const config = createSession.mock.calls[0][0];
-    expect(config).toMatchObject({ skipCustomInstructions: bare, enableConfigDiscovery: false, enableSkills: true, skillDirectories: [path.join(staging, ".github/skills")] });
+    expect(config).toMatchObject({ instructions: { skipCustomInstructions: bare }, enableConfigDiscovery: false, skills: { enabled: true, directories: [path.join(staging, ".github/skills")] } });
     const names = ["opt-phase-performance", "opt-phase-pr-analysis", "opt-phase-recommendations", "opt-phase-issue-creation"];
-    expect(fs.readdirSync(config.skillDirectories[0]).sort()).toEqual([...names].sort());
+    expect(fs.readdirSync(config.skills.directories[0]).sort()).toEqual([...names].sort());
     for (const name of names) {
-      expect(fs.readFileSync(path.join(config.skillDirectories[0], name, "SKILL.md"), "utf8")).toContain("description:");
+      const content = fs.readFileSync(path.join(config.skills.directories[0], name, "SKILL.md"), "utf8");
+      expect(extractFrontmatterAndBody(content).frontmatterText).toBe("");
+      expect(content.trim()).not.toBe("");
       expect(prompt).toContain(`/tmp/gh-aw/.github/skills/${name}/SKILL.md`);
       expect(prompt).not.toContain(`Invoke skill \`${name}\``);
     }
     expect(prompt).toContain("Do not use `cd`, `cut`, or `sed`");
-    const document = parseDocument(extractFrontmatterAndBody(workflow).frontmatterText).toJS();
+    const document = readDocumentMetadata(extractFrontmatterAndBody(workflow).frontmatterText).value;
     expect(document["max-tool-denials"]).toBe(3);
     for (const command of ["cd *", "cut *", "sed *", "*"]) expect(document.tools.bash).not.toContain(command);
   });
 
-  it("does not discover repository skills when no workflow skills were staged", async () => {
+  it("does not discover checkout agents or skills when no activation files were staged", async () => {
     fs.mkdirSync(path.join(base, ".github/skills/ambient"), { recursive: true });
     fs.writeFileSync(path.join(base, ".github/skills/ambient/SKILL.md"), "---\ndescription: Ambient repository skill\n---\nNot staged.");
+    fs.mkdirSync(path.join(base, ".github/agents"), { recursive: true });
+    fs.writeFileSync(path.join(base, ".github/agents/ambient.agent.md"), "Not staged.");
     const createSession = vi.fn().mockResolvedValue({
       sessionId: "no-staged-skills",
       on: () => {},
@@ -235,11 +338,11 @@ describe("copilot_sdk_session runtime configuration", () => {
       logger: () => {},
       workingDirectory: base,
       agentsBaseDir: path.join(base, "staged"),
-      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forUri: () => ({}) }, approveAll: () => "allow" },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
     });
     expect(result.exitCode).toBe(0);
-    expect(createSession.mock.calls[0][0]).toMatchObject({ enableConfigDiscovery: false, skillDirectories: [] });
-    expect(createSession.mock.calls[0][0].enableSkills).toBeUndefined();
+    expect(createSession.mock.calls[0][0]).toMatchObject({ enableConfigDiscovery: false, agents: { definitions: [] }, skills: { directories: [] } });
+    expect(createSession.mock.calls[0][0].skills.enabled).toBeUndefined();
   });
 
   it.each(["file", "symlink", "dangling symlink"])("rejects a staged skills root that is a %s", async kind => {
@@ -261,7 +364,7 @@ describe("copilot_sdk_session runtime configuration", () => {
       logger,
       workingDirectory: base,
       agentsBaseDir: staging,
-      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forUri: () => ({}) }, approveAll: () => "allow" },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
     });
     expect(result.exitCode).toBe(1);
     expect(result.output).toContain("Staged Copilot skills must be a directory:");
@@ -288,10 +391,10 @@ describe("copilot_sdk_session runtime configuration", () => {
       prompt: "test",
       logger,
       agentsBaseDir: base,
-      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forUri: () => ({}) }, approveAll: () => "allow" },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
     }).then(result => {
       expect(result.exitCode).toBe(0);
-      expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ skipCustomInstructions: false }));
+      expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ instructions: { skipCustomInstructions: false } }));
       expect(logger).toHaveBeenCalledWith(expect.stringMatching(/warning: Invalid GH_AW_COPILOT_SDK_SERVER_ARGS.*using sidecar default args/));
     });
   });
@@ -318,10 +421,10 @@ describe("copilot_sdk_session runtime configuration", () => {
       model: "gpt-5.4",
       logger,
       agentsBaseDir: base,
-      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forUri: () => ({}) }, approveAll: () => "allow" },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
     });
     expect(result.exitCode).toBe(0);
-    expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ model: "gpt-5.4", customAgents: [{ name: "researcher", displayName: "researcher", prompt: "Research carefully.", model: "claude-sonnet-4.6" }] }));
+    expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ model: "gpt-5.4", agents: { definitions: [{ name: "researcher", displayName: "researcher", prompt: "Research carefully.", model: "claude-sonnet-4.6" }] } }));
     expect(logger.mock.calls.flat().some(message => message.includes("warning: custom agent"))).toBe(false);
   });
 
@@ -339,7 +442,7 @@ describe("copilot_sdk_session runtime configuration", () => {
       model: "unavailable-session-model",
       logger,
       agentsBaseDir: base,
-      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forUri: () => ({}) }, approveAll: () => "allow" },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
     });
     expect(result.exitCode).toBe(1);
     expect(result.output).toMatch(/Cannot qualify session model "unavailable-session-model"/);
@@ -351,12 +454,10 @@ describe("copilot_sdk_session runtime configuration", () => {
     const root = path.resolve(import.meta.dirname, "../../..");
     const workflow = fs.readFileSync(path.join(root, ".github/workflows/contribution-check.md"), "utf8");
     const { frontmatterText } = extractFrontmatterAndBody(workflow);
-    const document = parseDocument(frontmatterText);
-    expect(document.errors).toEqual([]);
-    expect(document.toJS().engine).toMatchObject({ id: "copilot", "copilot-sdk": true, agent: "contribution-checker" });
-    const lock = parseDocument(fs.readFileSync(path.join(root, ".github/workflows/contribution-check.lock.yml"), "utf8"));
-    expect(lock.errors).toEqual([]);
-    const executionEnv = lock.toJS().jobs.agent.steps.find(step => step.id === "agentic_execution").env;
+    const document = readDocumentMetadata(frontmatterText);
+    expect(document.value.engine).toMatchObject({ id: "copilot", "copilot-sdk": true, agent: "contribution-checker" });
+    const lock = readDocumentMetadata(fs.readFileSync(path.join(root, ".github/workflows/contribution-check.lock.yml"), "utf8"));
+    const executionEnv = lock.value.jobs.agent.steps.find(step => step.id === "agentic_execution").env;
     expect(String(executionEnv.GH_AW_COPILOT_SDK_DRIVER)).toBe("1");
     expect(executionEnv.COPILOT_PROVIDER_WIRE_API).toBeUndefined();
 
@@ -403,19 +504,19 @@ describe("copilot_sdk_session runtime configuration", () => {
       logger,
       workingDirectory: base,
       agentsBaseDir: base,
-      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forUri: () => ({}) }, approveAll: () => "allow" },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
     });
     expect(result.exitCode).toBe(0);
     const session = createSession.mock.calls[0][0];
     expect(session.model).toBe("copilot-completions/claude-sonnet-5.5");
-    expect(session.providers).toEqual([
+    expect(session.inference.providers).toEqual([
       { name: "copilot-responses", type: "openai", baseUrl: "http://api-proxy:10002", wireApi: "responses" },
       { name: "copilot-completions", type: "openai", baseUrl: "http://api-proxy:10002", wireApi: "completions" },
     ]);
-    expect(session.models).toContainEqual({ id: "claude-haiku-4.5", provider: "copilot-completions" });
-    expect(session.customAgents).toHaveLength(2);
+    expect(session.inference.models).toContainEqual({ id: "claude-haiku-4.5", provider: "copilot-completions" });
+    expect(session.agents.definitions).toHaveLength(2);
     for (const agent of agents) {
-      expect(session.customAgents).toContainEqual(
+      expect(session.agents.definitions).toContainEqual(
         expect.objectContaining({
           name: agent.name,
           model: "copilot-responses/gpt-6-luna",
@@ -453,7 +554,7 @@ describe("copilot_sdk_session runtime configuration", () => {
       prompt: "test",
       logger: () => {},
       agentsBaseDir: base,
-      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forUri: () => ({}) }, approveAll: () => "allow" },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
     });
     expect(result.exitCode).toBe(0);
     const captured = fs
@@ -503,7 +604,7 @@ describe("copilot_sdk_session runtime configuration", () => {
       prompt: "test",
       logger: () => {},
       agentsBaseDir: base,
-      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forUri: () => ({}) }, approveAll: () => "allow" },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
     });
     expect(result.exitCode).toBe(0);
     const captured = fs.readFileSync(path.join(base, "native-tools/events.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
@@ -556,7 +657,7 @@ describe("copilot_sdk_session runtime configuration", () => {
       prompt: "test",
       logger: () => {},
       agentsBaseDir: base,
-      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forUri: () => ({}) }, approveAll: () => "allow" },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
     });
     expect(result.exitCode).toBe(0);
     const captured = fs.readFileSync(path.join(base, "release-events/events.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
@@ -600,7 +701,7 @@ describe("copilot_sdk_session runtime configuration", () => {
       prompt: "test",
       logger: () => {},
       agentsBaseDir: base,
-      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forUri: () => ({}) }, approveAll: () => "allow" },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
     });
     expect(result.exitCode).toBe(0);
     const raw = fs.readFileSync(path.join(base, "split-credential/events.jsonl"), "utf8");
@@ -652,7 +753,7 @@ describe("copilot_sdk_session runtime configuration", () => {
       prompt: "test",
       logger,
       agentsBaseDir: base,
-      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forUri: () => ({}) }, approveAll: () => "allow" },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
     });
     await sending;
     for (const sequence of [0, 1]) {
@@ -695,7 +796,7 @@ describe("copilot_sdk_session runtime configuration", () => {
       prompt: "test",
       logger: () => {},
       agentsBaseDir: base,
-      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forUri: () => ({}) }, approveAll: () => "allow" },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
     });
     expect(result).toMatchObject({ exitCode: 0, output: "done" });
     expect(disconnect).toHaveBeenCalledTimes(1);
@@ -731,9 +832,11 @@ describe("copilot_sdk_session runtime configuration", () => {
       prompt: "test",
       logger: () => {},
       agentsBaseDir: base,
-      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forUri: () => ({}) }, approveAll: () => "allow" },
+      sdkModule: { CopilotClient: FakeCopilotClient, RuntimeConnection: { forTcp: () => ({}) }, approveAll: () => "allow" },
     });
     expect(result.exitCode).toBe(0);
-    expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ model: expected, providers, models, workingDirectory: base, skipCustomInstructions: true, customAgents: [] }));
+    expect(createSession).toHaveBeenCalledWith(
+      expect.objectContaining({ model: expected, inference: expect.objectContaining({ providers, models }), workingDirectory: base, instructions: { skipCustomInstructions: true }, agents: { definitions: [] } })
+    );
   });
 });

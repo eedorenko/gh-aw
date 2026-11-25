@@ -10,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goccy/go-yaml"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,27 +29,6 @@ func nativeRoutedWorkflowSource(engine, provider, allowedModels, engineExtra, fr
 	source.WriteString(frontmatter)
 	source.WriteString("---\nReport a finding.\n")
 	return source.String()
-}
-
-// agentExecutionEnv returns the env of the agent job's AWF execution step.
-func agentExecutionEnv(t *testing.T, lock string) map[string]string {
-	t.Helper()
-	var workflow struct {
-		Jobs map[string]struct {
-			Steps []struct {
-				Run string            `yaml:"run"`
-				Env map[string]string `yaml:"env"`
-			} `yaml:"steps"`
-		} `yaml:"jobs"`
-	}
-	require.NoError(t, yaml.Unmarshal([]byte(lock), &workflow))
-	for _, step := range workflow.Jobs["agent"].Steps {
-		if strings.Contains(step.Run, `awf --config "${RUNNER_TEMP}/gh-aw/awf-config.json"`) {
-			return step.Env
-		}
-	}
-	t.Fatal("agent job has no AWF execution step")
-	return nil
 }
 
 func TestModelRoutingClaudeNativeProviderCompile(t *testing.T) {
@@ -117,17 +95,17 @@ func TestModelRoutingNativeAllowedModelsAndAliases(t *testing.T) {
 		{name: "matching provider qualification is normalized", engine: "claude", models: "[anthropic/claude-sonnet-5]", want: []string{"claude-sonnet-5"}},
 		{name: "mismatched Copilot qualification is rejected", engine: "claude", models: "[github-copilot/claude-sonnet-5]", wantError: `provider "github-copilot" differs from the native "anthropic" provider`},
 		{name: "mismatched OpenAI qualification is rejected", engine: "claude", models: "[openai/gpt-5.4]", wantError: `provider "openai" differs from the native "anthropic" provider`},
-		{name: "exact native OpenAI id", engine: "codex", models: "[gpt-5.4]", want: []string{"gpt-5.4"}},
+		{name: "native OpenAI alias expands without local inventory", engine: "codex", models: "[gpt-5.4]", want: []string{"gpt-5.4*"}},
 		{name: "matching OpenAI qualification is normalized", engine: "codex", models: "[openai/gpt-5.4]", want: []string{"gpt-5.4"}},
 		{name: "Codex rejects Anthropic qualification", engine: "codex", models: "[anthropic/claude-sonnet-5]", wantError: `provider "anthropic" differs from the native "openai" provider`},
 		{name: "Codex small alias stays in the GPT family", engine: "codex", models: "[small]", want: []string{"gpt-5*mini*", "gpt-5*nano*"}},
-		{name: "OpenAI exact id wins over alias of the same name", engine: "codex", models: "[gpt-5-mini]", want: []string{"gpt-5-mini"}},
+		{name: "qualified OpenAI id wins over alias of the same name", engine: "codex", models: "[openai/gpt-5-mini]", want: []string{"gpt-5-mini"}},
 		{name: "Codex rejects Sonnet alias", engine: "codex", models: "[sonnet]", wantError: `alias "sonnet" has no models compatible with Codex's Responses API`},
 		{name: "Claude family validation applies to exact ids", engine: "claude", models: "[gpt-5.4]", wantError: "native Messages API"},
 		{name: "native allow policy narrows alias", engine: "claude", models: "[sonnet]", policy: "models:\n  allowed: [\"anthropic/claude-sonnet-5*\"]\n", want: []string{"claude-sonnet-5*"}},
 		{name: "bare allow policy narrows alias", engine: "claude", models: "[sonnet]", policy: "models:\n  allowed: [\"claude-sonnet-5*\"]\n", want: []string{"claude-sonnet-5*"}},
 		{name: "Copilot allow policy does not authorize Anthropic", engine: "claude", models: "[claude-sonnet-5]", policy: "models:\n  allowed: [\"github-copilot/claude-*\"]\n", wantError: "excluded by models.allowed or models.blocked"},
-		{name: "native block policy excludes exact id", engine: "codex", models: "[gpt-5.4, gpt-5.5]", policy: "models:\n  blocked: [\"openai/gpt-5.4\"]\n", want: []string{"gpt-5.5"}},
+		{name: "native block policy excludes exact id", engine: "codex", models: "[openai/gpt-5.4, openai/gpt-5.5]", policy: "models:\n  blocked: [\"openai/gpt-5.4\"]\n", want: []string{"gpt-5.5"}},
 		{name: "Anthropic prefix before an expression is normalized", engine: "claude", models: `["anthropic/${{ vars.ROUTING_MODEL }}"]`, want: []string{"${{ vars.ROUTING_MODEL }}"}},
 		{name: "OpenAI prefix before an expression is normalized", engine: "codex", models: `["openai/${{ vars.ROUTING_MODEL }}"]`, want: []string{"${{ vars.ROUTING_MODEL }}"}},
 		{name: "mismatched prefix before an expression is rejected", engine: "claude", models: `["openai/${{ vars.ROUTING_MODEL }}"]`, wantError: `provider "openai" differs from the native "anthropic" provider`},
@@ -150,16 +128,13 @@ func TestModelRoutingNativeAllowedModelsAndAliases(t *testing.T) {
 		patterns, err := expandModelRoutingAliasInNamespace("sonnet", BuiltinModelAliases(), "claude", "anthropic")
 		require.NoError(t, err)
 		require.Equal(t, []string{"anthropic/claude-*sonnet*"}, patterns)
-		require.True(t, bundledProviderModelMatches("anthropic", "claude-*sonnet*"))
-		require.True(t, isBundledProviderModelID("anthropic", "claude-sonnet-5-5"))
-		require.False(t, isBundledProviderModelID("anthropic", "claude-sonnet-5.5"), "native Anthropic ids are dash-form")
 	})
 
 	t.Run("exact native id wins over alias of the same name", func(t *testing.T) {
 		groups, err := resolveModelRoutingCandidateGroups(&WorkflowData{
 			EngineConfig: &EngineConfig{
 				ID:           "codex",
-				ModelRouting: &CopilotModelRoutingConfig{Goal: "cost", Mode: "economy", AllowedModels: []string{"gpt-5.4"}},
+				ModelRouting: &CopilotModelRoutingConfig{Goal: "cost", Mode: "economy", AllowedModels: []string{"openai/gpt-5.4"}},
 			},
 		}, "codex")
 		require.NoError(t, err)
@@ -186,7 +161,7 @@ func TestModelRoutingNativeLegacyAllowlistKeepsProviderPrefix(t *testing.T) {
 		want     []any
 	}{
 		{name: "claude", provider: LLMProviderAnthropic, models: []string{"anthropic/claude-sonnet-5", "claude-haiku-4-5"}, want: []any{"anthropic/claude-sonnet-5", "anthropic/claude-haiku-4-5"}},
-		{name: "codex", provider: LLMProviderOpenAI, models: []string{"openai/gpt-5.4", "gpt-5.5"}, want: []any{"openai/gpt-5.4", "openai/gpt-5.5"}},
+		{name: "codex", provider: LLMProviderOpenAI, models: []string{"openai/gpt-5.4", "openai/gpt-5.5"}, want: []any{"openai/gpt-5.4", "openai/gpt-5.5"}},
 	} {
 		for _, legacy := range []struct {
 			name  string
@@ -332,6 +307,21 @@ func TestModelRoutingCopilotLocksUnchanged(t *testing.T) {
 		}
 	}
 	require.NotZero(t, routed, "no compiled lock has apiProxy.routing")
+
+	for name, provider := range map[string]string{
+		"daily-cli-tools-tester.lock.yml":     "",
+		"schema-consistency-checker.lock.yml": "",
+		"daily-spending-forecast.lock.yml":    "",
+		"issue-triage-agent.lock.yml":         "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			content, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", name))
+			require.NoError(t, err)
+			match := routedLockRoutingPattern.FindStringSubmatch(string(content))
+			require.NotNil(t, match, "%s lost model routing", name)
+			require.Equal(t, provider, match[2], "%s routing provider", name)
+		})
+	}
 }
 
 // TestNativeRoutingSmokeEvidence checks that the native routed smokes compile to native
@@ -346,7 +336,7 @@ func TestNativeRoutingSmokeEvidence(t *testing.T) {
 		credential string
 	}{
 		{name: "smoke-claude-routed-anthropic", provider: "anthropic", candidates: []any{"claude-sonnet-5"}, endpoint: `mainEndpoint: "/v1/messages"`, credential: "ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}"},
-		{name: "smoke-codex-routed-openai", provider: "openai", candidates: []any{"gpt-5.4"}, endpoint: `mainEndpoint: "/responses"`, credential: "CODEX_API_KEY: ${{ secrets.CODEX_API_KEY || secrets.OPENAI_API_KEY }}"},
+		{name: "smoke-codex-routed-openai", provider: "openai", candidates: []any{"gpt-5.4*"}, endpoint: `mainEndpoint: "/responses"`, credential: "CODEX_API_KEY: ${{ secrets.CODEX_API_KEY || secrets.OPENAI_API_KEY }}"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := filepath.Join("..", "..", ".github", "workflows")

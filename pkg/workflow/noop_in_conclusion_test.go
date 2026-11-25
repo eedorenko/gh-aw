@@ -5,10 +5,13 @@ package workflow
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/github/gh-aw/pkg/testutil"
+	"github.com/goccy/go-yaml"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNoopCommentBodyOutputRequiresNoopStep(t *testing.T) {
@@ -20,6 +23,227 @@ func TestNoopCommentBodyOutputRequiresNoopStep(t *testing.T) {
 	}
 	if _, exists := buildConclusionJobOutputs(data)["noop_comment_body"]; exists {
 		t.Error("Work-queue participants have no noop step and must not export its categorized body")
+	}
+}
+
+func TestCompletionCommentFooterMetadata(t *testing.T) {
+	data := &WorkflowData{
+		Name:         "Test workflow",
+		WorkflowID:   "test-workflow",
+		EngineConfig: &EngineConfig{ID: "copilot"},
+		Model:        "gpt-5.6-luna",
+		SafeOutputs:  &SafeOutputsConfig{NoOp: &NoOpConfig{}, ThreatDetection: &ThreatDetectionConfig{}},
+		Evals:        &EvalsConfig{Questions: []EvalDefinition{{ID: "result", Question: "Done?"}}},
+	}
+	env := strings.Join(NewCompiler().buildConclusionScriptEnvVars(data, "agent", nil, ""), "")
+	for _, expected := range []string{
+		`GH_AW_ENGINE_ID: "copilot"`,
+		`GH_AW_ENGINE_MODEL: "gpt-5.6-luna"`,
+		`GH_AW_AIC: ${{ needs.agent.outputs.aic }}`,
+		`GH_AW_THREAT_DETECTION_AIC: ${{ needs.detection.outputs.aic }}`,
+		`GH_AW_DETECTION_ACCEPTED: ${{ needs.detection.result == 'success' && needs.detection.outputs.detection_success == 'true' }}`,
+		`GH_AW_EVALS_AIC: ${{ needs.evals.outputs.aic }}`,
+		`GH_AW_AMBIENT_CONTEXT: ${{ needs.agent.outputs.ambient_context }}`,
+		`GH_AW_WORKFLOW_ID: "test-workflow"`,
+	} {
+		if !strings.Contains(env, expected) {
+			t.Errorf("Completion comment footer is missing %s", expected)
+		}
+	}
+}
+
+func TestCompletionCommentWithoutDetectionJob(t *testing.T) {
+	data := &WorkflowData{
+		EngineConfig:  &EngineConfig{ID: "copilot"},
+		StatusComment: new(true),
+		SafeOutputs: &SafeOutputsConfig{
+			NoOp:            &NoOpConfig{},
+			ThreatDetection: &ThreatDetectionConfig{EngineDisabled: true},
+		},
+	}
+	job, err := NewCompiler().buildConclusionJob(data, "agent", nil)
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	require.NotContains(t, job.Needs, "detection")
+	steps := strings.Join(job.Steps, "")
+	require.Contains(t, steps, "Update reaction comment with completion status")
+	require.NotContains(t, steps, "needs.detection.")
+	require.Contains(t, steps, `GH_AW_DETECTION_ACCEPTED: "false"`)
+	require.Contains(t, steps, `GH_AW_DETECTION_CONCLUSION: ""`)
+}
+
+func TestCompletionCommentPerToolStagedInputs(t *testing.T) {
+	compiler := NewCompiler()
+	config := map[string]any{
+		"noop":                map[string]any{"staged": true},
+		"report-incomplete":   map[string]any{"staged": "${{ inputs.preview }}"},
+		"report-missing-data": map[string]any{"staged": false},
+		"report-missing-tool": map[string]any{"staged": true},
+	}
+	data := &WorkflowData{SafeOutputs: &SafeOutputsConfig{
+		NoOp:             compiler.parseNoOpConfig(config),
+		ReportIncomplete: compiler.parseReportIncompleteConfig(config),
+		MissingData:      compiler.parseMissingDataConfig(config),
+		MissingTool:      compiler.parseMissingToolConfig(config),
+	}}
+	env := strings.Join(compiler.buildConclusionScriptEnvVars(data, "agent", nil, ""), "")
+	require.Contains(t, env, `GH_AW_COMPLETION_STAGED_NOOP: "true"`)
+	require.Contains(t, env, `GH_AW_COMPLETION_STAGED_REPORT_INCOMPLETE: ${{ inputs.preview }}`)
+	require.Contains(t, env, `GH_AW_COMPLETION_STAGED_REPORT_MISSING_TOOL: "true"`)
+	require.NotContains(t, env, "GH_AW_COMPLETION_STAGED_REPORT_MISSING_DATA:")
+}
+
+func TestCompletionCommentPublicationInputs(t *testing.T) {
+	for _, addComment := range []bool{false, true} {
+		name := "without add_comment"
+		condition := "always()"
+		var jobs []string
+		if addComment {
+			name = "with add_comment"
+			condition += " && !(needs.add_comment.outputs.comment_id)"
+			jobs = []string{"add_comment"}
+		}
+		t.Run(name, func(t *testing.T) {
+			data := &WorkflowData{
+				EngineConfig:  &EngineConfig{ID: "copilot"},
+				StatusComment: new(true),
+				SafeOutputs: &SafeOutputsConfig{
+					ThreatDetection: &ThreatDetectionConfig{EngineDisabled: true},
+					Staged:          new(TemplatableBool("${{ inputs.staged }}")),
+					AllowedDomains:  []string{"api.example.com"},
+					URLs:            SafeOutputsURLsPolicyAllowedOrCodeRegion,
+					AuthorizationRequirements: map[string]*SafeOutputAuthorization{
+						"noop": {}, "report_incomplete": {}, "create_issue": {},
+					},
+					Env: map[string]string{
+						"GH_AW_DETECTION_ACCEPTED":              `"true"`,
+						"gh_aw_detection_conclusion":            `"success"`,
+						"GH_AW_SAFE_OUTPUTS_STAGED":             `"false"`,
+						"GH_AW_AUTHORIZATION_PROTECTED_REPORTS": `""`,
+						"GH_AW_ALLOWED_DOMAINS":                 `"ignored.example.com"`,
+						"CUSTOM_SETTING":                        `"preserved"`,
+					},
+				},
+			}
+			job, err := NewCompiler().buildConclusionJob(data, "agent", jobs)
+			require.NoError(t, err)
+			var compiled struct {
+				Steps []struct {
+					ID  string            `yaml:"id"`
+					If  string            `yaml:"if"`
+					Env map[string]string `yaml:"env"`
+				} `yaml:"steps"`
+			}
+			require.NoError(t, yaml.Unmarshal([]byte("steps:\n"+strings.Join(job.Steps, "")), &compiled))
+			for _, step := range compiled.Steps {
+				if step.ID != "conclusion" {
+					continue
+				}
+				require.Equal(t, condition, step.If)
+				require.Contains(t, step.Env["GH_AW_AGENT_CONCLUSION"], "steps.handle_agent_failure.outcome == 'failure'")
+				require.Equal(t, "false", step.Env["GH_AW_DETECTION_ACCEPTED"])
+				require.Empty(t, step.Env["GH_AW_DETECTION_CONCLUSION"])
+				require.NotContains(t, step.Env, "gh_aw_detection_conclusion")
+				require.Equal(t, "${{ inputs.staged }}", step.Env["GH_AW_SAFE_OUTPUTS_STAGED"])
+				require.Equal(t, "noop,report_incomplete", step.Env["GH_AW_AUTHORIZATION_PROTECTED_REPORTS"])
+				require.Contains(t, strings.Split(step.Env["GH_AW_ALLOWED_DOMAINS"], ","), "api.example.com")
+				require.Equal(t, "allowed-or-code-region", step.Env["GH_AW_SAFE_OUTPUTS_URLS"])
+				require.Equal(t, "${{ github.server_url }}", step.Env["GITHUB_SERVER_URL"])
+				require.Equal(t, "${{ github.api_url }}", step.Env["GITHUB_API_URL"])
+				require.Equal(t, "preserved", step.Env["CUSTOM_SETTING"])
+				return
+			}
+			t.Fatal("missing completion comment step")
+		})
+	}
+}
+
+func TestCompletionCommentFooterMetadataUsesMainJobName(t *testing.T) {
+	tests := []struct {
+		name         string
+		engineConfig *EngineConfig
+		model        string
+		expected     map[string]string
+	}{
+		{
+			name:         "explicit model",
+			engineConfig: &EngineConfig{ID: "copilot", Version: "1.0.0"},
+			model:        "gpt-5.6-luna",
+			expected: map[string]string{
+				"GH_AW_ENGINE_ID":      "copilot",
+				"GH_AW_ENGINE_VERSION": "1.0.0",
+				"GH_AW_ENGINE_MODEL":   "gpt-5.6-luna",
+			},
+		},
+		{
+			name:         "model routing",
+			engineConfig: &EngineConfig{ID: "copilot", ModelRouting: &CopilotModelRoutingConfig{}},
+			model:        "must-not-be-baked-in",
+			expected: map[string]string{
+				"GH_AW_ENGINE_ID":            "copilot",
+				"GH_AW_ENGINE_MODEL":         "${{ needs.custom-agent.outputs.model }}",
+				"GH_AW_ENGINE_MODEL_EFFORT":  "${{ needs.custom-agent.outputs.model_effort }}",
+				"GH_AW_MODEL_ROUTING_STATUS": "${{ needs.custom-agent.outputs.model_routing_status }}",
+			},
+		},
+		{
+			name:         "empty model",
+			engineConfig: &EngineConfig{ID: "copilot"},
+			expected: map[string]string{
+				"GH_AW_ENGINE_ID":    "copilot",
+				"GH_AW_ENGINE_MODEL": "${{ needs.custom-agent.outputs.model }}",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			statusComment := true
+			data := &WorkflowData{
+				EngineConfig:  tt.engineConfig,
+				Model:         tt.model,
+				StatusComment: &statusComment,
+				SafeOutputs: &SafeOutputsConfig{
+					NoOp:             &NoOpConfig{},
+					MissingTool:      &MissingToolConfig{},
+					ReportIncomplete: &ReportIncompleteConfig{},
+				},
+			}
+			job, err := NewCompiler().buildConclusionJob(data, "custom-agent", nil)
+			require.NoError(t, err)
+			require.NotNil(t, job)
+			require.Contains(t, job.Needs, "custom-agent")
+			require.NotContains(t, job.Needs, "agent")
+
+			steps := strings.Join(job.Steps, "")
+			for _, match := range regexp.MustCompile(`needs\.([a-zA-Z0-9_-]+)\.`).FindAllStringSubmatch(job.If+steps, -1) {
+				require.Contains(t, job.Needs, match[1], "Conclusion references an undeclared job")
+			}
+			var compiled struct {
+				Steps []struct {
+					ID  string            `yaml:"id"`
+					Env map[string]string `yaml:"env"`
+				} `yaml:"steps"`
+			}
+			require.NoError(t, yaml.Unmarshal([]byte("steps:\n"+steps), &compiled))
+			metadataSteps := map[string]bool{"conclusion": false, "noop": false, "missing_tool": false, "report_incomplete": false}
+			for _, step := range compiled.Steps {
+				if _, ok := metadataSteps[step.ID]; !ok {
+					continue
+				}
+				metadataSteps[step.ID] = true
+				metadata := make(map[string]string)
+				for key, value := range step.Env {
+					if strings.HasPrefix(key, "GH_AW_ENGINE_") || key == "GH_AW_MODEL_ROUTING_STATUS" {
+						metadata[key] = value
+					}
+				}
+				require.Equal(t, tt.expected, metadata, "Incorrect footer metadata in step %s", step.ID)
+			}
+			for id, found := range metadataSteps {
+				require.True(t, found, "Missing footer step %s", id)
+			}
+		})
 	}
 }
 

@@ -19,8 +19,200 @@ import { dynamicWorkflow } from "./fixtures/claude_dynamic_workflow.cjs";
 import { DYNAMIC_WORKFLOW_EVENT_TYPES } from "./dynamic_workflow_session.cjs";
 import { failure as claudeFailures } from "./fixtures/claude_ci_sessions.cjs";
 import { createSessionLookups } from "./grader_session.cjs";
+import { sessionTimestampNs } from "./unified_session_order.cjs";
+import { useModelOverrides } from "./fixtures/model_overrides.cjs";
 
 describe("essential unified session payloads", () => {
+  let restoreModels;
+  afterEach(() => {
+    restoreModels?.();
+    restoreModels = undefined;
+  });
+  it.each([false, { value: 0 }, "yesterday", "2026-02-30T00:00:00Z", Infinity, NaN])("falls back from an invalid native clock to a valid archived message clock %j", timestamp => {
+    for (const archivedTimestamp of [0, 1.25, "2026-11-09T00:27:23.729123456Z"]) {
+      const original = {
+        type: "tool.execution_complete",
+        message: { timestamp },
+        data: {
+          toolCallId: "call",
+          messageId: "message",
+          model: "served-model",
+          structuredContent: { nested: [false, 0, null] },
+          messageMetadata: { timestamp: archivedTimestamp, private: "OMITTED_NATIVE_CONTEXT" },
+        },
+      };
+      const snapshot = structuredClone(original);
+      const projected = normalizeUnifiedSessionEvent(original);
+      expect(projected.timestamp).toBe(archivedTimestamp);
+      expect(sessionTimestampNs(projected)).toBe(sessionTimestampNs({ timestamp: archivedTimestamp }));
+      expect(normalizeUnifiedSessionEvent(projected)).toEqual(projected);
+      const [unified] = mergeSessionSources([{ component: "agent", phase: "agent", path: "agent-session.jsonl", events: [original] }]);
+      const published = JSON.parse(serializeSessionArtifact([unified]).trim());
+      expect(published).toMatchObject({ timestamp: archivedTimestamp, data: { toolCallId: "call", messageId: "message", model: "served-model", structuredContent: original.data.structuredContent } });
+      expect(JSON.stringify(published)).not.toContain("OMITTED_NATIVE_CONTEXT");
+      expect(createSessionValidator("unified").event(published)).toBe(true);
+      expect(original).toEqual(snapshot);
+    }
+  });
+
+  it("preserves supplemental lifecycle adoption observations as distinct delivery and adoption facts", () => {
+    const event = {
+      ...normalizeUnifiedSessionEvent({
+        type: "lifecycle.adoption",
+        data: {
+          sourceRunId: "123",
+          sourceWorkflow: "workflow.yml",
+          repository: "owner/repo",
+          outputType: "create_issue",
+          deliveryState: "delivered",
+          deliverySignal: "effect_applied",
+          deliveryAt: "2026-05-12T00:00:00Z",
+          deliveryObservedAt: "2026-05-12T01:00:00Z",
+          deliverySource: "safe-output-execution",
+          adoptionState: "accepted",
+          adoptionSignal: "delivered",
+          adoptionAt: "2026-05-12T00:00:00Z",
+          adoptionObservedAt: "2026-05-12T01:00:00Z",
+          adoptionSource: "delivery-rule",
+          adoptionRuleVersion: "1",
+          acceptanceKind: "fallback_delivery",
+          humanVerified: false,
+          adoptionCoverage: "available",
+          survivalState: "unknown",
+          survivalCoverage: "unsupported",
+          targetUrl: "https://github.com/owner/repo/issues/42",
+        },
+      }),
+      provenance: { component: "lifecycle", phase: "adoption", path: "adoption-123.jsonl", index: 1 },
+    };
+    expect(event.data).toMatchObject({
+      deliveryState: "delivered",
+      adoptionState: "accepted",
+      acceptanceKind: "fallback_delivery",
+      humanVerified: false,
+    });
+    expect(event.data).not.toHaveProperty("targetUrl");
+    expect(createSessionValidator("unified").event(event)).toBe(true);
+  });
+
+  it.each(["yesterday", "2026-11-09T00:27:23.729", "2026-02-30T00:00:00Z", 8640000000000001, Infinity, { value: 0 }])("does not promote invalid native or archived message clocks %j", timestamp => {
+    for (const original of [
+      { type: "tool.execution_start", data: { toolCallId: "call", messageMetadata: { timestamp } } },
+      { type: "assistant.message", data: { content: "untimed" }, message: { role: "assistant", content: "untimed", timestamp } },
+    ]) {
+      const snapshot = structuredClone(original);
+      const projected = normalizeUnifiedSessionEvent(original);
+      expect(sessionTimestampNs(original)).toBeUndefined();
+      expect(projected).not.toHaveProperty("timestamp");
+      expect(sessionTimestampNs(projected)).toBeUndefined();
+      expect(normalizeUnifiedSessionEvent(projected)).toEqual(projected);
+      const [unified] = mergeSessionSources([{ component: "agent", phase: "agent", path: "agent-session.jsonl", events: [original] }]);
+      expect(unified).not.toHaveProperty("timestamp");
+      expect(unified.provenance).not.toHaveProperty("timestampMs");
+      expect(createSessionValidator("unified").event(unified)).toBe(true);
+      expect(original).toEqual(snapshot);
+    }
+  });
+
+  it.each(["tool.execution_start", "tool.execution_update", "tool.execution_complete"])("retains tool/message correlation without publishing native envelopes (%s)", type => {
+    const original = {
+      type,
+      data: {
+        toolCallId: "call",
+        message_id: "message",
+        model: "served-model",
+        messageMetadata: { timestamp: 0, api: "fixture-api", usage: { input: 10 }, private: "OMITTED_NATIVE_CONTEXT" },
+      },
+    };
+    const projected = normalizeUnifiedSessionEvent(original);
+    expect(projected).toEqual({ type, timestamp: 0, data: { toolCallId: "call", messageId: "message", model: "served-model" } });
+    expect(normalizeUnifiedSessionEvent(projected)).toEqual(projected);
+    const [unified] = mergeSessionSources([{ component: "agent", phase: "agent", path: "agent-session.jsonl", events: [original] }]);
+    expect(createSessionValidator("unified").event(unified)).toBe(true);
+    expect(JSON.stringify(unified)).not.toContain("OMITTED_NATIVE_CONTEXT");
+    expect(original.data.messageMetadata.usage).toEqual({ input: 10 });
+  });
+
+  it("retains structured content together with tool correlation and the archived Pi message clock", () => {
+    const structuredContent = { stdout: 'line\n"quoted"\\path \u2603', nested: [false, 0, null, ""] };
+    const original = {
+      type: "tool.execution_complete",
+      data: {
+        toolCallId: "call",
+        messageId: "response",
+        model: "served-model",
+        output: [],
+        structuredContent,
+        messageMetadata: { timestamp: 1794184043729, private: "OMITTED_NATIVE_CONTEXT" },
+      },
+    };
+    const snapshot = structuredClone(original);
+    const [unified] = mergeSessionSources([{ component: "agent", phase: "agent", path: "agent-session.jsonl", events: [original] }]);
+    const published = JSON.parse(serializeSessionArtifact([unified]).trim());
+    expect(published).toMatchObject({
+      timestamp: 1794184043729,
+      provenance: { timestampMs: 1794184043729 },
+      data: { toolCallId: "call", messageId: "response", model: "served-model", output: [], structuredContent },
+    });
+    expect(published.data).not.toHaveProperty("messageMetadata");
+    expect(normalizeUnifiedSessionEvent(unified)).toEqual(normalizeUnifiedSessionEvent(published));
+    expect(createSessionValidator("unified").event(published)).toBe(true);
+    expect(original).toEqual(snapshot);
+  });
+
+  it.each([null, false, 0, "", [], {}, { stdout: 'line\n"quoted"\\path \u2603', stderr: "", exit_code: 0, nested: [false, 0, null, ""] }])(
+    "retains explicitly supplied structured tool content %j without restoring provider envelopes",
+    structuredContent => {
+      const event = {
+        type: "tool.execution_complete",
+        id: "completion",
+        data: {
+          toolCallId: "shell",
+          success: false,
+          output: [],
+          structuredContent,
+          nativeEnvelope: { omitted: true },
+        },
+      };
+      const original = structuredClone(event);
+      const projected = normalizeUnifiedSessionEvent(event);
+      expect(projected).toEqual({ type: event.type, id: event.id, data: { toolCallId: "shell", success: false, output: [], structuredContent } });
+      expect(normalizeUnifiedSessionEvent(projected)).toEqual(projected);
+      expect(event).toEqual(original);
+      const [unified] = mergeSessionSources([{ component: "agent", phase: "agent", path: "agent-session.jsonl", events: [event] }]);
+      const published = JSON.parse(serializeSessionArtifact([unified]).trim());
+      expect(published.data.structuredContent).toEqual(structuredContent);
+      const validate = createSessionValidator("unified").event;
+      expect(validate(published), JSON.stringify(validate.errors)).toBe(true);
+    }
+  );
+
+  it("does not invent structured tool content or retain it in compact RPC observations", () => {
+    expect(normalizeUnifiedSessionEvent({ type: "tool.execution_complete", data: { output: [] } }).data).toEqual({ output: [] });
+    const rpc = normalizeUnifiedSessionEvent({
+      type: "mcp.rpc.response",
+      data: { id: 1, result: { structuredContent: { omitted: true }, content: [{ type: "text", text: "omitted" }] } },
+    });
+    expect(JSON.stringify(rpc)).not.toContain("structuredContent");
+    expect(JSON.stringify(rpc)).not.toContain("omitted");
+  });
+
+  it("redacts structured tool payload values and keys without rejecting them as structural metadata", () => {
+    const event = {
+      type: "tool.execution_complete",
+      data: {
+        toolCallId: "shell",
+        structuredContent: { stdout: "SANITIZED_MASK\n", stderr: "", exit_code: 0, nested: { SANITIZED_MASK: "SANITIZED_MASK" } },
+      },
+    };
+    for (const events of [[event], mergeSessionSources([{ component: "agent", phase: "agent", path: "agent-session.jsonl", events: [event] }])]) {
+      const serialized = serializeSessionArtifact(events, ["SANITIZED_MASK"], { rejectStructuralRedaction: true });
+      expect(serialized).not.toContain("SANITIZED_MASK");
+      expect(JSON.parse(serialized.trim()).data.structuredContent).toEqual({ stdout: "***\n", stderr: "", exit_code: 0, nested: { "***": "***" } });
+    }
+    expect(() => serializeSessionArtifact([{ ...event, id: "SANITIZED_MASK" }], ["SANITIZED_MASK"], { rejectStructuralRedaction: true })).toThrow("Session redaction changed structural fields");
+  });
+
   it("preserves observed Codex reconnect progress separately from harness attempts", () => {
     const native = parseEngineSession("Reconnecting... 2/5 (connection interrupted)\n", "codex").find(event => event.type === "session.result");
     expect(native).toMatchObject({ reconnectAttempt: 2, maxReconnects: 5 });
@@ -374,19 +566,22 @@ describe("essential unified session payloads", () => {
 
   it("preserves grader attribution and unavailable diagnostics without executable payloads", () => {
     const result = {
-      id: "coverage",
-      source: "builtin",
+      id: "operational-value",
+      source: "operational-value",
       status: "unavailable",
       value: null,
       passed: null,
       message: "No trajectory evidence available",
       severity: "warning",
       implementation: { id: "gh-aw/graders", version: 1, digest: "", script: "PRIVATE_SCRIPT" },
-      metrics: [{ id: "observed", value: 0, trace: "PRIVATE_TRACE" }],
+      metrics: [
+        { id: "primary", value: 0, trace: "PRIVATE_TRACE" },
+        { id: "diagnostic", value: null, trace: "PRIVATE_TRACE" },
+      ],
       diagnostics: { private: "PRIVATE_DIAGNOSTICS" },
       script: "PRIVATE_SCRIPT",
     };
-    const manifest = { version: 1, graders: [{ id: "coverage", source: "builtin", enabled: false, min: 0, max: 1, digest: "", script: "PRIVATE_SCRIPT" }] };
+    const manifest = { version: 1, graders: [{ id: "operational-value", source: "operational-value", enabled: false, min: 0, max: 1, digest: "", script: "PRIVATE_SCRIPT" }] };
     const run = { id: "123", attempt: 2, graderCount: 1, passed: 0, failed: 0, errors: 0 };
     const records = [
       { type: "grader.manifest", data: manifest },
@@ -396,17 +591,20 @@ describe("essential unified session payloads", () => {
     ];
     const original = structuredClone(records);
     const unified = mergeSessionSources([{ component: "grader", phase: "agent", path: "agent/graders/grader_results.json", events: records }]);
-    expect(unified[0].data).toEqual({ version: 1, graders: [{ id: "coverage", source: "builtin", enabled: false, min: 0, max: 1, digest: "" }] });
+    expect(unified[0].data).toEqual({ version: 1, graders: [{ id: "operational-value", source: "operational-value", enabled: false, min: 0, max: 1, digest: "" }] });
     const expected = {
-      id: "coverage",
-      source: "builtin",
+      id: "operational-value",
+      source: "operational-value",
       status: "unavailable",
       value: null,
       passed: null,
       message: result.message,
       severity: "warning",
       implementation: { id: "gh-aw/graders", version: 1, digest: "" },
-      metrics: [{ id: "observed", value: 0 }],
+      metrics: [
+        { id: "primary", value: 0 },
+        { id: "diagnostic", value: null },
+      ],
     };
     expect(unified[1].data).toEqual({ version: 1, run, results: [expected] });
     expect(unified[2].data).toEqual({ ...expected, implementation: null, metrics: [] });
@@ -736,12 +934,19 @@ describe("essential unified session payloads", () => {
     ["tool.execution_complete", { result: false, output: null, is_error: true, duration_ms: 0, exit_code: 1, metadata: "duplicate" }, { output: null, result: false, isError: true, durationMs: 0, exitCode: 1 }],
     ["tool.execution_complete", { toolCallId: "declined", status: "declined", exit_code: null }, { toolCallId: "declined", status: "declined", exitCode: null }],
     ["session.init", { sourceEngine: "copilot", model: "fixture", session_id: "session", tools: Array(100).fill("large descriptor") }, { sourceEngine: "copilot", model: "fixture", sessionId: "session" }],
+    ["session.init", { sourceEngine: "kiro", agent_version: "2.31.1", provider: "github", credentials: "omit" }, { sourceEngine: "kiro", agentVersion: "2.31.1", provider: "github" }],
+    ["session.start", { agentVersion: "2.31.1", provider: "github", model: "auto", headers: "omit" }, { agentVersion: "2.31.1", provider: "github", model: "auto" }],
     ["firewall.http_access", { domain: "example.com", http_status: 0, squid_request_status: "DENIED", credentials: "omit" }, { host: "example.com", status: 0, decision: "DENIED" }],
     ["firewall.steering", { eventName: "token_steering", message: "budget warning", reason: null, body: "omit" }, { event: "token_steering", message: "budget warning", reason: null }],
     [
       "firewall.steering",
       { event: "ai_credit_steering", request_id: "steered", provider: "copilot", threshold: 80, message: "[AWF AI CREDIT WARNING] budget" },
       { event: "ai_credit_steering", requestId: "steered", threshold: 80, message: "[AWF AI CREDIT WARNING] budget" },
+    ],
+    [
+      "firewall.steering",
+      { event: "timeout_steering", request_id: "late", threshold: null, trigger: "little_left", conversation: "0123456789ab", message: "[AWF TIME WARNING] time" },
+      { event: "timeout_steering", requestId: "late", threshold: null, trigger: "little_left", conversation: "0123456789ab", message: "[AWF TIME WARNING] time" },
     ],
     ["mcp.tool_call", { tool_call_id: "call", tool_name: "lookup", duration: 5, input_size: 0, output_size: 10, status: "error" }, { toolCallId: "call", toolName: "lookup", durationMs: 5, inputSize: 0, outputSize: 10, status: "error" }],
     ["execution.result", { exit_code: 0, duration_ms: 0, outcome: "success", extra: "omit" }, { exitCode: 0, durationMs: 0, outcome: "success" }],
@@ -762,6 +967,15 @@ describe("essential unified session payloads", () => {
     expect(compact).toEqual({ type, data: expected });
     expect(normalizeUnifiedSessionEvent(compact)).toEqual(compact);
     expect(data).toEqual(original);
+  });
+
+  it.each(["session.init", "session.start"])("omits non-string initialization version and provider fields for %s", type => {
+    expect(
+      normalizeUnifiedSessionEvent({
+        type,
+        data: { agentVersion: 2, agent_version: "ignored", provider: { name: "invalid" }, model: "fixture" },
+      })
+    ).toEqual({ type, data: { model: "fixture" } });
   });
 
   it("flattens RPC metadata but excludes arguments, response bodies, and error context", () => {
@@ -1028,6 +1242,32 @@ describe("essential unified session payloads", () => {
     expect(normalizeUnifiedSessionEvent({ type: "firewall.token_usage", data: { request_id: "plain" } }).data).not.toHaveProperty("steering");
   });
 
+  it("keeps every AWF steering delivery with its trigger and conversation on token usage events", () => {
+    const threshold = { type: "ai_credit", trigger: "threshold", threshold: 80, conversation: "0123456789ab", first: false, message: "omit" };
+    const delivered = normalizeUnifiedSessionEvent({ type: "firewall.token_usage", data: { request_id: "again", steering_delivery: threshold } });
+    expect(delivered.data).toEqual({ requestId: "again", steeringDelivery: { type: "ai_credit", trigger: "threshold", threshold: 80, conversation: "0123456789ab", first: false } });
+    expect(normalizeUnifiedSessionEvent(delivered)).toEqual(delivered);
+    const littleLeft = { type: "timeout", trigger: "little_left", threshold: null, conversation: null, first: true };
+    const report = normalizeUnifiedSessionEvent({ type: "usage.report", data: { request_id: "late", steering: { type: "timeout", threshold: 95 }, steeringDelivery: littleLeft } });
+    expect(report.data).toEqual({ requestId: "late", steering: { type: "timeout", threshold: 95 }, steeringDelivery: littleLeft });
+    for (const steeringDelivery of [
+      null,
+      [],
+      {},
+      { ...threshold, type: "token" },
+      { ...threshold, trigger: "unknown" },
+      { ...threshold, threshold: null },
+      { ...threshold, threshold: 50 },
+      { ...littleLeft, threshold: 80 },
+      { ...threshold, conversation: "PRIVATE-PROMPT" },
+      { ...threshold, conversation: undefined },
+      { ...threshold, first: "true" },
+    ]) {
+      expect(normalizeUnifiedSessionEvent({ type: "firewall.token_usage", data: { request_id: "plain", steering_delivery: steeringDelivery } }).data).not.toHaveProperty("steeringDelivery");
+    }
+    expect(normalizeUnifiedSessionEvent({ type: "firewall.token_usage", data: { request_id: "plain" } }).data).not.toHaveProperty("steeringDelivery");
+  });
+
   it("retains normalized subagent invocation and per-request usage fields", () => {
     const source = {
       type: "subagent.request",
@@ -1157,6 +1397,7 @@ describe("essential unified session payloads", () => {
   });
 
   it("preserves camelCase AIC checkpoints and resolves only valid priced token usage", () => {
+    restoreModels = useModelOverrides({ openai: { models: { "gpt-4o-mini": { cost: { input: "0.000002", cache_read: "0.0000002" } } } } });
     const checkpoint = normalizeUnifiedSessionEvent({ type: "usage.report", data: { provider: "openai", model: "gpt-4o-mini", aiCreditsTotal: 2.5, input_tokens: 100 } }, "evals");
     expect(checkpoint.data).toMatchObject({ totalAic: 2.5 });
     expect(checkpoint.data).not.toHaveProperty("aic");

@@ -1,13 +1,155 @@
 // @ts-check
 
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-const { detectNonRetryableHarnessGuard, buildSoftTimeoutGuard, isMaxRunsExceededError, isAuthenticationFailedError, parseAICreditsExceededProxyRejection, parseAPIProxyGuardRejection } = require("./harness_retry_guard.cjs");
-const { parseModelEndpointMismatch, MODEL_ENDPOINT_MISMATCH_PATTERN, shouldSuppressGuardCategory } = require("./harness_error_patterns.cjs");
+const {
+  detectNonRetryableHarnessGuard,
+  detectExhaustedAWFInvocationBudget,
+  observeInvocationBudget,
+  resolveRetryAfterDecision,
+  buildSoftTimeoutGuard,
+  isMaxRunsExceededError,
+  isAuthenticationFailedError,
+  parseAICreditsExceededProxyRejection,
+  parseAPIProxyGuardRejection,
+} = require("./harness_retry_guard.cjs");
+const { parseModelEndpointMismatch, MODEL_ENDPOINT_MISMATCH_PATTERN, shouldSuppressGuardCategory, isHTMLResponseError } = require("./harness_error_patterns.cjs");
 
 describe("harness_retry_guard.cjs", () => {
+  describe("shared operational decisions", () => {
+    beforeEach(() => vi.stubEnv("GH_AW_SAFE_OUTPUTS", ""));
+    afterEach(() => vi.unstubAllEnvs());
+    it("adds fresh invocation evidence once without replacing other failure classes", async () => {
+      const guard = { maxRunsExceeded: false };
+      const result = { exitCode: 1, output: "", hasOutput: true, failureClasses: ["authentication_failed"] };
+      const fetchReflect = vi.fn(async () => ({ ok: true, reflectData: { runs: { enabled: true, max_runs: 2, invocation_count: 2, remaining_runs: 0 } } }));
+      const log = vi.fn();
+      const options = { guard, result, attempt: 1, nativeTerminalRateLimitError: true, env: { AWF_REFLECT_ENABLED: "1" }, fetchReflect, log };
+      await observeInvocationBudget(options);
+      await observeInvocationBudget(options);
+      expect(guard.maxRunsExceeded).toBe(true);
+      expect(result.failureClasses).toEqual(["authentication_failed", "invocation_cap_exceeded"]);
+      expect(fetchReflect).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledTimes(1);
+    });
+
+    it("leaves engine classification untouched without confirmed exhaustion", async () => {
+      const guard = { maxRunsExceeded: false };
+      const result = { exitCode: 1, output: "", hasOutput: false, failureClasses: ["no_output"] };
+      await observeInvocationBudget({ guard, result, attempt: 0, nativeTerminalRateLimitError: false, log: vi.fn() });
+      expect(guard.maxRunsExceeded).toBe(false);
+      expect(result.failureClasses).toEqual(["no_output"]);
+    });
+
+    it.each([0, 100, 257000, 2147483647])("accepts bounded timer waits beyond the backoff cap: %s", retryAfterMs => {
+      const log = vi.fn();
+      const result = { exitCode: 1, output: "", hasOutput: true, retryAfterMs };
+      expect(resolveRetryAfterDecision({ result, attempt: 0, softTimeoutGuard: { softDeadlineMs: Date.now() + 2147493647 }, harnessName: "Test", log })).toEqual({ action: "retry", nextDelayMs: retryAfterMs });
+      expect(result.failureClasses).toEqual(["rate_limit_error"]);
+      expect(log).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not report a retry or alter failure classes on an exhausted attempt", () => {
+      const log = vi.fn();
+      const result = { exitCode: 1, output: "", hasOutput: true, retryAfterMs: 100, failureClasses: ["partial_execution"] };
+      expect(resolveRetryAfterDecision({ result, attempt: 3, softTimeoutGuard: null, harnessName: "Test", log, terminal: true })).toBeNull();
+      expect(result.failureClasses).toEqual(["partial_execution"]);
+      expect(log).not.toHaveBeenCalled();
+    });
+
+    it("still rejects excessive waits on an exhausted attempt", () => {
+      const result = { exitCode: 1, output: "", hasOutput: true, retryAfterMs: 2147483648 };
+      expect(resolveRetryAfterDecision({ result, attempt: 3, softTimeoutGuard: null, harnessName: "Test", log: vi.fn(), terminal: true })).toEqual({ action: "stop" });
+      expect(result.failureClasses).toEqual(["rate_limit_wait_exceeded"]);
+    });
+
+    it.each([-1, NaN, Infinity, 0.5, 2147483648])("rejects invalid or overflowing waits: %s", retryAfterMs => {
+      const result = { exitCode: 1, output: "", hasOutput: true, retryAfterMs };
+      expect(resolveRetryAfterDecision({ result, attempt: 0, softTimeoutGuard: null, harnessName: "Test", log: () => {} })).toEqual({ action: "stop" });
+      expect(result.failureClasses).toEqual(["rate_limit_wait_exceeded"]);
+    });
+
+    it("rejects a wait exactly reaching the soft deadline", () => {
+      const now = vi.spyOn(Date, "now").mockReturnValue(100);
+      try {
+        const result = { exitCode: 1, output: "", hasOutput: true, retryAfterMs: 10 };
+        const log = vi.fn();
+        expect(resolveRetryAfterDecision({ result, attempt: 0, softTimeoutGuard: { softDeadlineMs: 110 }, harnessName: "Test", log })).toEqual({ action: "stop" });
+        expect(log.mock.calls.flat().join("\n")).toContain("rate limited, retry after 0.01 s");
+      } finally {
+        now.mockRestore();
+      }
+    });
+
+    it.each([undefined, "", "invalid", "0"])("bounds waits when timeout is unset or invalid: %s", timeout => {
+      const softTimeoutGuard = buildSoftTimeoutGuard(Date.now(), { GH_AW_TIMEOUT_MINUTES: timeout });
+      expect(softTimeoutGuard).toBeNull();
+      const log = vi.fn();
+      const result = { exitCode: 1, output: "", hasOutput: true, retryAfterMs: 60001 };
+      expect(resolveRetryAfterDecision({ result, attempt: 0, softTimeoutGuard, harnessName: "Test", log })).toEqual({ action: "stop" });
+      expect(result.failureClasses).toEqual(["rate_limit_wait_exceeded"]);
+      expect(log.mock.calls.flat().join("\n")).toContain("no-timeout fallback limit (60000ms)");
+      expect(log.mock.calls.flat().join("\n")).toContain("retry after 60.001 s");
+    });
+
+    it("allows a wait at the no-timeout fallback limit", () => {
+      const result = { exitCode: 1, output: "", hasOutput: true, retryAfterMs: 60000 };
+      expect(resolveRetryAfterDecision({ result, attempt: 0, softTimeoutGuard: null, harnessName: "Test", log: vi.fn() })).toEqual({ action: "retry", nextDelayMs: 60000 });
+    });
+
+    it("emits a structured fallback diagnostic even on the last attempt", () => {
+      vi.stubEnv("GH_AW_SAFE_OUTPUTS", "/tmp/safeoutputs.jsonl");
+      const exec = vi.spyOn(require("node:child_process"), "execFileSync").mockReturnValue("");
+      try {
+        const result = { exitCode: 1, output: "", hasOutput: true, retryAfterMs: 257000 };
+        expect(resolveRetryAfterDecision({ result, attempt: 3, softTimeoutGuard: null, harnessName: "Test", log: vi.fn(), terminal: true })).toEqual({ action: "stop" });
+        expect(exec).toHaveBeenCalledWith(expect.any(String), expect.arrayContaining(["report_incomplete", "--reason", "infrastructure_error", "--details", expect.stringContaining("retry after 257 s")]), expect.any(Object));
+      } finally {
+        exec.mockRestore();
+      }
+    });
+  });
+  describe("detectExhaustedAWFInvocationBudget", () => {
+    const options = { nativeTerminalRateLimitError: true, env: { AWF_REFLECT_ENABLED: "1" } };
+    const exhaustedReflect = {
+      ok: true,
+      reflectData: { runs: { enabled: true, max_runs: 60, invocation_count: 60, remaining_runs: 0 } },
+    };
+
+    it("confirms exhaustion only from a fresh, complete reflection", async () => {
+      const fetchReflect = async () => exhaustedReflect;
+      await expect(detectExhaustedAWFInvocationBudget({ ...options, fetchReflect })).resolves.toEqual({ invocationCount: 60, maxRuns: 60 });
+    });
+
+    it.each([
+      { ok: false, reflectData: exhaustedReflect.reflectData },
+      { ok: true, reflectData: { runs: { enabled: false, max_runs: 60, invocation_count: 60, remaining_runs: 0 } } },
+      { ok: true, reflectData: { runs: { enabled: true, max_runs: 60, invocation_count: 59, remaining_runs: 1 } } },
+      { ok: true, reflectData: { runs: { enabled: true, max_runs: 60, invocation_count: 60 } } },
+      { ok: true, reflectData: { runs: { enabled: true, max_runs: "60", invocation_count: 60, remaining_runs: 0 } } },
+    ])("preserves fallback behavior when reflection is incomplete or does not show exhaustion", async reflection => {
+      const fetchReflect = async () => reflection;
+      await expect(detectExhaustedAWFInvocationBudget({ ...options, fetchReflect })).resolves.toBeNull();
+    });
+
+    it("does not fetch reflection without a native terminal 429 or enabled AWF reflection", async () => {
+      const fetchReflect = async () => {
+        throw new Error("must not fetch");
+      };
+      await expect(detectExhaustedAWFInvocationBudget({ ...options, nativeTerminalRateLimitError: false, fetchReflect })).resolves.toBeNull();
+      await expect(detectExhaustedAWFInvocationBudget({ ...options, env: { AWF_REFLECT_ENABLED: "0" }, fetchReflect })).resolves.toBeNull();
+    });
+
+    it("preserves fallback behavior when fresh reflection throws", async () => {
+      const fetchReflect = async () => {
+        throw new Error("reflection unavailable");
+      };
+      await expect(detectExhaustedAWFInvocationBudget({ ...options, fetchReflect })).resolves.toBeNull();
+    });
+  });
+
   it.each([
     "400 Cannot translate Copilot request feature: tool_search",
     "400 Unsupported Responses custom tool: web_search",
@@ -414,9 +556,142 @@ describe("harness_retry_guard.cjs", () => {
     expect(isAuthenticationFailedError("Authentication failed")).toBe(true);
   });
 
-  it('isAuthenticationFailedError returns true for Claude Code stream-JSON "error":"authentication_failed" field', () => {
-    const jsonLine = JSON.stringify({ type: "result", error: "authentication_failed" });
+  it.each([
+    "Authentication failed\n<!DOCTYPE html>",
+    "Authentication failed\n<!doctype html><html><title>Login</title></html>",
+    "Authentication failed (Request ID: abc)\nJust a moment...",
+    "Authentication failed: HTTP 403\nunrelated transcript\n<!DOCTYPE html>",
+    "Authentication failed: HTTP 403\n" + "\n".repeat(17) + "<!DOCTYPE html>",
+    "Authentication failed: HTTP 403\nX-Long-Header: " + "x".repeat(8192) + "\n<!DOCTYPE html>",
+  ])("does not associate unrelated or unbounded HTML with a credential diagnostic: %s", output => {
+    expect(isAuthenticationFailedError(output)).toBe(true);
+    expect(isHTMLResponseError(output)).toBe(false);
+  });
+
+  it.each(["<!DOCTYPE html>", "<html>Forbidden</html>", "Just a moment...", "cf-chl-token", "/cdn-cgi/challenge-platform"])("associates %s with an explicit HTTP error through headers and blank lines", body => {
+    const output = `Authentication failed: HTTP 403\nContent-Type: text/html\nServer: cloudflare\n\n${body}`;
+    expect(isAuthenticationFailedError(output)).toBe(false);
+    expect(isHTMLResponseError(output)).toBe(true);
+    expect(isAuthenticationFailedError(output + "\nAuthentication failed (Request ID: abc)")).toBe(true);
+  });
+
+  it.each([
+    { type: "item.completed", item: { type: "error", message: "Authentication failed: <html>Forbidden</html>" } },
+    { type: "item.updated", item: { type: "error", message: "Just a moment..." } },
+    { event: "result", result: { status: "ERROR", error: "Authentication failed: <html>Forbidden</html>" } },
+    { type: "session.error", data: { message: "Authentication failed\n<!DOCTYPE html><html>Forbidden</html>" } },
+  ])("recognizes supported native item and Agy error envelopes: %j", record => {
+    const output = JSON.stringify(record);
+    expect(isHTMLResponseError(output)).toBe(true);
+    expect(isAuthenticationFailedError(output)).toBe(false);
+  });
+
+  it.each([
+    { error: "Just a moment..." },
+    { error: "<html>Forbidden</html>" },
+    { error: { metadata: { quoted: "Just a moment..." } } },
+    { error: "Just a moment...", message: null },
+    { error: "Just a moment...", message: 42 },
+    { error: "Just a moment...", errors: "quoted diagnostic" },
+  ])("does not attribute typeless error objects without native diagnostic structure: %j", record => {
+    expect(isHTMLResponseError(JSON.stringify(record))).toBe(false);
+  });
+
+  it("does not decode an unstructured typeless error string into an authentication diagnostic", () => {
+    const output = JSON.stringify({ error: '{"message":"Authentication\\u0020failed"}' });
+    expect(isAuthenticationFailedError(output)).toBe(false);
+  });
+
+  it("retains nested provider authentication diagnostics", () => {
+    const output = JSON.stringify({ error: { type: "authentication_error", message: '{"message":"Authentication\\u0020failed"}' } });
+    expect(isAuthenticationFailedError(output)).toBe(true);
+  });
+
+  it.each([
+    { error: "api_error", message: "Just a moment..." },
+    { error: "api_error", errorMessage: "<html>Forbidden</html>" },
+    { error: { status: 403, message: "<html>Forbidden</html>" } },
+    { error: { type: "api_error", message: '{"error":{"message":"Just a moment..."}}' } },
+    { error: "api_error", is_api_error_message: true, message: { role: "assistant", content: [{ type: "text", text: "Just a moment..." }] } },
+    { error: "api_error", is_error: true, result: "Just a moment..." },
+    { error: "api_error", is_error: true, errors: ["Just a moment..."] },
+  ])("retains recognizable typeless native and nested provider diagnostics: %j", record => {
+    expect(isHTMLResponseError(JSON.stringify(record))).toBe(true);
+    expect(isAuthenticationFailedError(JSON.stringify(record))).toBe(false);
+  });
+
+  it.each([
+    { type: "item.completed", item: { type: "agent_message", text: "API Error: <html>Forbidden</html>" } },
+    { type: "item.completed", item: { type: "command_execution", aggregated_output: "API Error: Just a moment..." } },
+    { event: "result", result: { status: "DONE", error: "API Error: <html>Forbidden</html>" } },
+    { type: "error", message: "connection reset", metadata: { quoted: "API Error: <html>Forbidden</html>" } },
+  ])("does not classify challenge text outside native error diagnostics: %j", record => {
+    expect(isHTMLResponseError(JSON.stringify(record))).toBe(false);
+  });
+
+  it.each([
+    { type: "result", is_error: true, errors: ["API Error: Just a moment...", "Authentication failed (Request ID: abc)"] },
+    { type: "result", is_error: true, result: "API Error: Just a moment...", errors: ["Authentication failed (Request ID: abc)"] },
+    { type: "session.error", data: { message: "API Error: Just a moment...\nAuthentication failed (Request ID: abc)" } },
+    { type: "session.error", data: { message: "Authentication failed (Request ID: abc)\nAPI Error: Just a moment..." } },
+    { event: "result", result: { status: "ERROR", error: "API Error: Just a moment...\nAuthentication failed (Request ID: abc)" } },
+    { type: "session.error", data: { message: "API Error: <html>\nNot logged in\n</html>" } },
+    { type: "turn.failed", error: { message: JSON.stringify({ message: "API Error: Just a moment...", error: { message: "Authentication failed (Request ID: abc)" } }) } },
+  ])("retains independent credential diagnostics inside a single native record: %j", record => {
+    const output = JSON.stringify(record);
+    expect(isHTMLResponseError(output)).toBe(true);
+    expect(isAuthenticationFailedError(output)).toBe(true);
+  });
+
+  it('isAuthenticationFailedError returns true for Claude Code failed result "error":"authentication_failed" field', () => {
+    const jsonLine = JSON.stringify({ type: "result", is_error: true, error: "authentication_failed" });
     expect(isAuthenticationFailedError(jsonLine)).toBe(true);
+  });
+
+  it.each(
+    [
+      { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: 'Authentication failed (Request ID: abc); "is_api_error_message":true' }] } },
+      { type: "assistant", is_api_error_message: false, message: { content: [{ type: "text", text: 'Not logged in; "error":"authentication_failed"' }] } },
+      { type: "user", message: { content: [{ type: "tool_result", is_error: true, content: "Authentication failed (Request ID: abc)" }] } },
+      { type: "tool", error: "authentication_failed", message: "Not logged in" },
+      { type: "result", is_error: false, error: "authentication_failed", result: "Authentication failed (Request ID: abc)" },
+      { type: "result", error: "authentication_failed" },
+      { type: "result", result: 'Authentication failed; "is_error":true' },
+      { type: "item.completed", item: { type: "agent_message", text: 'Authentication failed; {"type":"turn.failed"}' } },
+      { type: "item.completed", item: { type: "command_execution", exit_code: 1, aggregated_output: 'Not logged in; {"type":"session.error"}' } },
+      { event: "result", result: { status: "DONE", error: "Authentication failed" } },
+      { type: "error", message: "connection reset", metadata: { quoted: "Authentication failed" } },
+      { type: "turn.failed", error: { message: "connection reset" }, message: { role: "assistant", content: [{ type: "text", text: "Authentication failed" }] } },
+      { error: "Authentication failed" },
+      { error: { metadata: { quoted: "Authentication failed" } } },
+      { error: "authentication_failed", message: null },
+      ["Authentication failed", { type: "error", message: "Not logged in" }],
+      "Authentication failed",
+    ].map(record => [record])
+  )("ignores authentication text outside native error diagnostics: %j", record => {
+    expect(isAuthenticationFailedError(JSON.stringify(record))).toBe(false);
+  });
+
+  it.each([
+    { type: "assistant", is_api_error_message: true, message: { role: "assistant", content: [{ type: "text", text: "Authentication failed (Request ID: abc)" }] } },
+    { type: "assistant", error: "authentication_failed" },
+    { type: "error", message: "Authentication failed (Request ID: abc)" },
+    { type: "error", error: "authentication_failed" },
+    { type: "session.error", data: { message: "Not logged in" } },
+    { type: "turn.failed", error: { message: "Authentication failed (Request ID: abc)" } },
+    { type: "result", is_error: true, result: "Not logged in" },
+    { type: "item.completed", item: { type: "error", text: "Authentication failed (Request ID: abc)" } },
+    { event: "result", result: { status: "ERROR", error: "Authentication failed" } },
+    { error: "authentication_failed", message: "Invalid credential" },
+  ])("retains authentication failures in supported native error envelopes: %j", record => {
+    expect(isAuthenticationFailedError(JSON.stringify(record))).toBe(true);
+  });
+
+  it("retains independent plain CLI credentials alongside a quoted auth failure and an HTML challenge", () => {
+    const quoted = JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "Authentication failed (Request ID: quoted)" }] } });
+    const challenge = JSON.stringify({ type: "error", message: "Authentication failed: HTTP 403: Just a moment..." });
+    expect(isAuthenticationFailedError(`${quoted}\n${challenge}`)).toBe(false);
+    expect(isAuthenticationFailedError(`${quoted}\n${challenge}\nAuthentication failed (Request ID: real)`)).toBe(true);
   });
 
   it('isAuthenticationFailedError returns true for Claude Code "not logged in" message (case-insensitive)', () => {

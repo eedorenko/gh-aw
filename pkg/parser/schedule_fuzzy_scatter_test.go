@@ -85,6 +85,29 @@ func TestScatterScheduleDeterministic(t *testing.T) {
 	}
 }
 
+func TestFinalizeScatteredMinutes(t *testing.T) {
+	tests := []struct {
+		name            string
+		scatteredMinute int
+		wantHour        int
+		wantMinute      int
+	}{
+		{name: "unchanged minute", scatteredMinute: 12*60 + 22, wantHour: 12, wantMinute: 22},
+		{name: "hour boundary", scatteredMinute: 7*60 + 2, wantHour: 7, wantMinute: 7},
+		{name: "EU peak minute", scatteredMinute: 7*60 + 30, wantHour: 7, wantMinute: 34},
+		{name: "US peak minute", scatteredMinute: 15*60 + 15, wantHour: 15, wantMinute: 19},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotHour, gotMinute := finalizeScatteredMinutes(tt.scatteredMinute)
+			if gotHour != tt.wantHour || gotMinute != tt.wantMinute {
+				t.Errorf("finalizeScatteredMinutes(%d) = (%d, %d), want (%d, %d)", tt.scatteredMinute, gotHour, gotMinute, tt.wantHour, tt.wantMinute)
+			}
+		})
+	}
+}
+
 func TestScatterScheduleHourly(t *testing.T) {
 	tests := []struct {
 		name               string
@@ -533,6 +556,93 @@ func TestScatterScheduleTriWeekly(t *testing.T) {
 			// Check that result is a valid cron expression
 			if !IsCronExpression(result) {
 				t.Errorf("ScatterSchedule returned invalid cron: %s", result)
+			}
+		})
+	}
+}
+
+func TestScatterScheduleSingleIntervals(t *testing.T) {
+	const identifier = "smoke-copilot"
+	hour, minute := weightedDailyTimeSlot(identifier)
+	for _, tt := range []struct {
+		input string
+		want  string
+	}{
+		{"every 1w", fmt.Sprintf("%d %d * * %d", minute, hour, stableHash(identifier, 7))},
+		{"every 1mo", fmt.Sprintf("%d %d %d * *", minute, hour, stableHash(identifier+":day-of-month", 28)+1)},
+	} {
+		t.Run(tt.input, func(t *testing.T) {
+			fuzzy, _, err := ParseSchedule(tt.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := ScatterSchedule(fuzzy, identifier)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Errorf("expected %q, got %q", tt.want, got)
+			}
+		})
+	}
+}
+
+func TestScatterScheduleDailyInterval(t *testing.T) {
+	// Must not be swallowed by the FUZZY:DAILY handler and must keep the */N day field.
+	result, err := ScatterSchedule("FUZZY:DAILY_INTERVAL/2 * * *", "smoke-copilot")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	fields := strings.Fields(result)
+	if len(fields) != 5 || fields[2] != "*/2" || fields[3] != "*" || fields[4] != "*" {
+		t.Fatalf("expected 'M H */2 * *', got %q", result)
+	}
+	hour, minute := weightedDailyTimeSlot("smoke-copilot")
+	if want := fmt.Sprintf("%d %d */2 * *", minute, hour); result != want {
+		t.Errorf("expected %q, got %q", want, result)
+	}
+
+	// Distinct workflows sharing "every 2 days" spread across many distinct times.
+	distinct := map[string]bool{}
+	for i := range 60 {
+		r, err := ScatterSchedule("FUZZY:DAILY_INTERVAL/2 * * *", fmt.Sprintf("github/gh-aw/.github/workflows/smoke-%d.md", i))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		distinct[r] = true
+	}
+	if len(distinct) < 50 {
+		t.Errorf("expected at least 50 distinct crons for 60 workflows, got %d", len(distinct))
+	}
+
+	if _, err := ScatterSchedule("FUZZY:DAILY_INTERVAL/0 * * *", "wf"); err == nil {
+		t.Error("expected error for zero interval")
+	}
+}
+
+func TestScatterScheduleMonthlyInterval(t *testing.T) {
+	tests := []struct {
+		fuzzyCron     string
+		expectedMonth string
+	}{
+		{"FUZZY:MONTHLY_INTERVAL/1 * * *", "*"},
+		{"FUZZY:MONTHLY_INTERVAL/3 * * *", "*/3"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.fuzzyCron, func(t *testing.T) {
+			for i := range 100 {
+				result, err := ScatterSchedule(tt.fuzzyCron, fmt.Sprintf("workflow-%d", i))
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				fields := strings.Fields(result)
+				if len(fields) != 5 || fields[3] != tt.expectedMonth || fields[4] != "*" {
+					t.Fatalf("unexpected cron %q", result)
+				}
+				var day int
+				if _, err := fmt.Sscanf(fields[2], "%d", &day); err != nil || day < 1 || day > 28 {
+					t.Fatalf("day of month must be in [1, 28], got %q", result)
+				}
 			}
 		})
 	}

@@ -130,7 +130,7 @@ func (e *GeminiEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHub
 	}
 
 	npmSteps := BuildStandardNpmEngineInstallSteps(
-		"@google/gemini-cli",
+		geminiNpmPackageName,
 		string(constants.DefaultGeminiVersion),
 		"Install Gemini CLI",
 		"gemini",
@@ -252,6 +252,7 @@ func (e *GeminiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 				workflowData.Runtimes,
 			)
 		}
+		allowedDomains = mergeAPITargetDomains(allowedDomains, extractAPITargetHost(workflowData, "GEMINI_API_BASE_URL"))
 		// Add GHES/custom API target domains to the firewall allow-list when engine.api-target is set
 		if workflowData.EngineConfig != nil && workflowData.EngineConfig.APITarget != "" {
 			allowedDomains = mergeAPITargetDomains(allowedDomains, workflowData.EngineConfig.APITarget)
@@ -375,6 +376,7 @@ touch %s
 	// This allows users to override the default engine token expression (e.g.
 	// GEMINI_API_KEY: ${{ secrets.MY_ORG_GEMINI_KEY }}) via engine.env.
 	applyEngineCwdEnv(env, workflowData)
+	applyHarnessRetryPolicyEnv(env, workflowData)
 	if workflowData.EngineConfig != nil && len(workflowData.EngineConfig.Env) > 0 {
 		maps.Copy(env, workflowData.EngineConfig.Env)
 	}
@@ -399,6 +401,8 @@ touch %s
 		}
 		env["GOOGLE_CLOUD_LOCATION"] = location
 	}
+
+	applyDurableExecutionEnv(env, workflowData)
 
 	// Generate the execution step
 	stepLines := []string{

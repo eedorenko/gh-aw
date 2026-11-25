@@ -10,7 +10,7 @@ Use the smallest trigger that matches the request.
 
 | User intent | Trigger | Typical read tools | Typical safe output |
 |---|---|---|---|
-| Review PR changes, comment on quality, suggest fixes | `pull_request` | `github` (`gh-proxy`), optional `playwright` for UI diffs | `add-comment` |
+| Review PR changes, comment on quality, suggest fixes | `pull_request` with `types: [ready_for_review]` (see [pr-reviewer.md](pr-reviewer.md)) | `github` (`gh-proxy`), optional `playwright` for UI diffs | `add-comment` or PR review outputs |
 | Investigate failed CI/Actions runs and summarize incident | `workflow_run` | `github` (`gh-proxy`) with `actions: read` | `create-issue` |
 | Monitor external service deployment failures (Heroku, Vercel, Fly.io) | `deployment_status` | `github` (`gh-proxy`) with `deployments: read` | `create-issue` |
 | Run visual regression checks on PR UI changes | `pull_request` | `playwright` + `cache-memory` | `add-comment` |
@@ -28,6 +28,22 @@ Use the smallest trigger that matches the request.
 
 The matrix above gives trigger, tools, and output. These add the `paths:` scoping and definitions the matrix cannot express.
 
+### Reviewer Workflows: Prefer `ready_for_review`
+
+For reviewer workflows, trigger on `pull_request` with `types: [ready_for_review]` so review starts when a draft becomes reviewable instead of on every push. Add `opened`, `synchronize`, and `reopened` only when the workflow is a required check or must review every new commit. Pair with a `slash_command` for manual re-review. See [pr-reviewer.md](pr-reviewer.md).
+
+```yaml
+on:
+  pull_request:
+    types: [ready_for_review]
+```
+
+### Pull Request Path Filters and Diffs
+
+- Treat `pull_request.paths` as an activation filter, not as the complete changed-file inventory. GitHub evaluates PR path filters against a three-dot diff and documents a 300-file limit; a matching change outside the files considered by that filter may not start the workflow. See [GitHub's path-filter and diff behavior](https://docs.github.com/actions/reference/workflow-syntax-for-github-actions).
+- For renames, inspect the PR's changed-file list and consider both `filename` and `previous_filename` when a file has status `renamed`. GitHub's path-filter guidance does not promise that the old path independently matches, so include patterns for both old and new locations when either should activate the workflow, or avoid a narrow filter when missing a move is unacceptable. See the [pull-request changed-files API](https://docs.github.com/rest/pulls/pulls#list-pull-requests-files).
+- For a local base-to-head Git diff, the default agent checkout is shallow (`fetch-depth: 1`). Configure checkout with `fetch-depth: 0` and ensure both base and head refs/SHA are available so Git can find the comparison range. If no local Git operations are needed, use the pull-request changed-files API instead. See [GitHub Repository Checkout](https://github.github.com/gh-aw/reference/checkout/) for checkout behavior.
+
 Engineering-focused:
 
 - **Schema/API review on PRs**: `paths:` scoped to backend contract files (`db/migrate/**`, `migrations/**`, `schema/**`, `openapi/**`, `api/**`); `noop` when contracts are unchanged.
@@ -44,7 +60,7 @@ Non-engineering personas:
 
 ### Pattern-specific `noop` examples
 
-- **PR reviewer (`pull_request`)**: `noop` when only docs/metadata changed outside scoped `paths:`.
+- **PR reviewer (`pull_request` `ready_for_review`)**: `noop` when only docs/metadata changed outside scoped `paths:`.
 - **Failure triage (`workflow_run`)**: `noop` when rerun succeeds, signal is flake-only, or an open incident already exists for the same failure key.
 - **Scheduled digest (`schedule`)**: `noop` when the exact reporting window (for example `since previous successful run`) has zero qualifying updates.
 - **Deployment monitor (`deployment_status`)**: `noop` when non-terminal statuses (`queued`, `in_progress`) arrive without a terminal failure.
@@ -65,6 +81,19 @@ on:
   schedule:
     - cron: "0 9 * * 1"  # Monday 9AM UTC
   workflow_dispatch:    # Manual trigger
+```
+
+### Issue Template Routing
+
+The `issues` event cannot filter by issue template. A workflow triggered by `issues` receives matching issue events regardless of which template created the issue.
+
+To activate only for a particular template, configure that issue form to apply a dedicated label and use a `label_command` trigger restricted to `issues`. Otherwise, use an `issues` trigger and instruct the agent to check a template-specific marker or required fields before acting: `noop` for a known different template, and explicitly choose whether missing or ambiguous template evidence should `noop` or use a generic fallback.
+
+```yaml
+on:
+  label_command:
+    name: bug-report
+    events: [issues]
 ```
 
 ### `workflow_run` Failure-Triage Pattern
@@ -115,6 +144,8 @@ on:
   schedule: every 6 hours                # Every 6 hours, all days
 ```
 
+Day, week, and month intervals are also supported: `every 2 days`, `every 2w`, and `every 2mo`. Recompiling workflows that use these intervals changes their scattered cron once, including the weekday for `every 1w` and day of month for `every 1mo`; see the [schedule syntax reference](https://github.github.com/gh-aw/reference/schedule-syntax/) for migration details.
+
 The compiler converts fuzzy schedules to deterministic cron (e.g., `daily on weekdays` → `43 5 * * 1-5`), scatters execution to avoid load spikes, and adds `workflow_dispatch:` for manual runs.
 
 **Recommended Pattern:**
@@ -152,7 +183,15 @@ on:
     forks: ["trusted-org/*", "trusted-user/repo"]
 ```
 
-`pull_request_target` supports the same `forks:` field and defaults to same-repository PRs only (omitting `forks:` is equivalent to `forks: []`). List exact `owner/repo` or `owner/*` entries to admit specific forks; `"*"` anywhere in the list allows all forks and triggers a strict-mode warning recommending a narrower pattern. `acknowledge-risk: true` and disabled/trusted checkout do not suppress this warning — prefer `pull_request` and avoid `pull_request_target` fork admission unless base-repository context is required.
+`pull_request_target` supports the same `forks:` field and defaults to same-repository PRs only (omitting `forks:` is equivalent to `forks: []`). List exact `owner/repo` or `owner/*` entries to admit specific forks. Strict mode rejects `"*"` unless the main workflow's top-level `features.dangerously-allow-pull-request-target-forks-all: true` is set; an imported feature does not count as this opt-in. Non-strict mode allows `"*"` with a warning, and the warning remains when strict mode is opted in. `acknowledge-risk: true` and disabled/trusted checkout do not suppress this warning — prefer `pull_request` and avoid `pull_request_target` fork admission unless base-repository context is required.
+
+#### Policy Checks on Fork PRs
+
+The default `pull_request` policy-check trigger skips fork PRs. If a check must review fork contributions directly, explicitly allow the required forks with `forks:` (prefer a narrow allowlist) and keep the workflow read-only; treat PR content as untrusted input.
+
+For PR checks against policy files (for example alt-text rules, allowlists or owners), read the policy from the default branch or a CODEOWNERS-protected path, never the PR head; otherwise the PR author can change the policy to satisfy the check.
+
+Use `workflow_run` instead when the check depends on another workflow's completed result or artifact and must wait for that workflow, rather than racing it on `pull_request`. Scope it to the named workflow and completion type, gate on its conclusion, and read the result through GitHub APIs or artifacts. Do not use `workflow_run` to check out or execute the PR's head code or as a way to bypass fork safeguards.
 
 ### Command Triggers (/mentions)
 

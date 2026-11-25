@@ -35,7 +35,7 @@ Local runtime imports have the same author expression capabilities as the main w
 
 ### Prompt Execution and Credentials
 
-Activation-job prompt creation, interpolation, and substitution use pinned `actions/github-script` actions. Their default GitHub token is replaced with the non-secret `no-authentication` placeholder because the action requires a nonempty token. Before loading prompt modules, the compiler-owned script removes environment variables outside its explicit bindings and non-secret runner/context allowlist, including inherited tokens and Node startup options. Prompt modules receive `core` and `context`, not an authenticated API client. Existing shell validation and printing steps remain shell steps.
+Activation-job prompt creation, interpolation, and substitution use pinned `actions/github-script` actions. Their default GitHub token is replaced with the non-secret `no-authentication` placeholder because the action requires a nonempty token. Before loading prompt modules, the shared `setup_prompt_globals.cjs` helper removes environment variables outside its explicit bindings and non-secret runner/context allowlist, including inherited tokens and Node startup options. The compiler passes selected binding names through `GH_AW_PROMPT_ENV`, keeping environment filtering and global setup out of generated lock-file scripts. Prompt modules receive `core` and `context`, not an authenticated API client. Existing shell validation and printing steps remain shell steps.
 
 Environment cleanup occurs after the action starts, not before Node startup. It is not process-startup, filesystem, or runner isolation; authors must not place credentials in prompt files, inputs, or custom job outputs.
 
@@ -63,6 +63,8 @@ Content to include if expression is truthy
 ```
 
 The compiler automatically wraps expressions with `${{ }}` for GitHub Actions evaluation. For example, `{{#if github.event.issue.number}}` becomes `{{#if ${{ github.event.issue.number }} }}`.
+
+Comparisons require an operator, for example `{{#if experiments.reasoning_depth == 'iterative'}}`. Invalid expressions or active conditions in the main workflow or local runtime imports fail compilation; they do not disable substitution of other prompt expressions. Syntactically invalid implicit conditions inside code regions are treated as literal examples; valid conditions and explicit GitHub Actions expressions still receive bindings.
 
 **Falsy values:** `false`, `0`, `null`, `undefined`, `""` (empty string)
 **Truthy values:** Everything else
@@ -110,7 +112,7 @@ These labels describe source capabilities, not the safety of every interpolated 
 
 ### Macro Syntax
 
-Use `{{#runtime-import filepath}}` to include file content at runtime. Use `{{#runtime-import? filepath}}` when the file is optional. All file paths resolve within `.github`, with or without the `.github/` prefix:
+Use `{{#runtime-import filepath}}` to include file content at runtime. Use `{{#runtime-import? filepath}}` when the file is optional. Unprefixed paths are relative to `.github/workflows`. Paths starting with `.github/` or `.agents/` are relative to the repository root.
 
 ```aw wrap
 ---
@@ -124,7 +126,7 @@ engine: copilot
 Follow these coding guidelines:
 
 {{#runtime-import coding-standards.md}}
-<!-- Same as: {{#runtime-import .github/coding-standards.md}} -->
+<!-- Same as: {{#runtime-import .github/workflows/coding-standards.md}} -->
 
 Review the code changes and provide feedback.
 ```
@@ -136,7 +138,7 @@ Review the code changes and provide feedback.
 
 The original buggy code was (from .github/docs/auth.go):
 
-{{#runtime-import docs/auth.go:45-52}}
+{{#runtime-import .github/docs/auth.go:45-52}}
 
 Verify the fix addresses the issue.
 ```

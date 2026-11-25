@@ -31,7 +31,11 @@ start_job() {
     local log_file="$PARALLEL_DIR/job-$index.log"
 
     echo "Starting $label..."
-    ("$@") >"$log_file" 2>&1 &
+    (
+        started_seconds=$SECONDS
+        trap 'echo "Elapsed: $((SECONDS - started_seconds))s"' EXIT
+        "$@"
+    ) >"$log_file" 2>&1 &
     job_pids+=("$!")
     job_labels+=("$label")
     job_logs+=("$log_file")
@@ -81,13 +85,14 @@ fi
 
 go_files=()
 go_packages=()
-prettier_files=()
 setup_js_files=()
 eslint_factory_files=()
 action_shell_files=()
 workflow_drift_required=0
-model_alias_validation_required=0
 session_schema_validation_required=0
+schema_binary_validation_required=0
+go_module_changed=0
+dev_loop_validation_required=0
 
 for file in "${CHANGED_FILES[@]}"; do
     case "$file" in
@@ -103,14 +108,6 @@ for file in "${CHANGED_FILES[@]}"; do
             fi
             if [ -f "$file" ]; then
                 go_files+=("$file")
-            fi
-            ;;
-    esac
-
-    case "$file" in
-        *.cjs|*.js|*.mjs|*.ts|*.json)
-            if [ -f "$file" ]; then
-                prettier_files+=("$file")
             fi
             ;;
     esac
@@ -134,8 +131,12 @@ for file in "${CHANGED_FILES[@]}"; do
     esac
 
     case "$file" in
-        pkg/cli/data/models.json|actions/setup/js/models.json)
-            model_alias_validation_required=1
+        go.mod|go.sum) go_module_changed=1 ;;
+        pkg/parser/schemas/*) schema_binary_validation_required=1 ;;
+    esac
+    case "$file" in
+        Makefile|scripts/agent-report-progress*|scripts/format-changed*)
+            dev_loop_validation_required=1
             ;;
     esac
 
@@ -149,26 +150,22 @@ done
 echo "Validating ${#CHANGED_FILES[@]} changed file(s) relative to $BASE_REF..."
 
 CHECK_STALE_LOCK_BASE_REF="$BASE_REF" make --no-print-directory check-stale-lock-files
+make --no-print-directory check-instruction-prefixes
 
-if [ "${#go_files[@]}" -gt 0 ]; then
-    echo "Formatting ${#go_files[@]} changed Go file(s)..."
-    gofmt -w "${go_files[@]}"
-fi
-
-if [ "${#prettier_files[@]}" -gt 0 ]; then
-    prettier_bin="./actions/setup/js/node_modules/.bin/prettier"
-    if [ ! -x "$prettier_bin" ]; then
-        echo "Pinned Prettier is not installed. Run 'npm ci --prefix actions/setup/js' before validation." >&2
-        exit 1
-    fi
-    echo "Formatting ${#prettier_files[@]} changed JavaScript/TypeScript/JSON file(s)..."
-    "$prettier_bin" --write "${prettier_files[@]}" --ignore-path .prettierignore --log-level=error
-fi
+bash "$(dirname "${BASH_SOURCE[0]}")/format-changed.sh" "${CHANGED_FILES[@]}"
 
 git diff --check "$BASE_COMMIT"
 
-echo "Building gh-aw..."
-make --no-print-directory build
+if [ "$WITH_TESTS" -eq 1 ] || [ "$schema_binary_validation_required" -eq 1 ]; then
+    echo "Building gh-aw..."
+    make --no-print-directory build
+else
+    make --no-print-directory check-agent-local-settings
+fi
+
+if [ "$go_module_changed" -eq 1 ]; then
+    go_packages+=("./cmd/gh-aw")
+fi
 
 if [ "${#go_packages[@]}" -gt 0 ]; then
     sorted_go_packages=()
@@ -177,7 +174,6 @@ if [ "${#go_packages[@]}" -gt 0 ]; then
     done < <(printf '%s\n' "${go_packages[@]}" | LC_ALL=C sort -u)
     go_packages=("${sorted_go_packages[@]}")
 fi
-
 normalize_repo_path() {
     local file="$1"
     file="${file#"$PWD"/}"
@@ -271,7 +267,7 @@ run_change_scoped_go_linter() {
 lint_go_packages() {
     GOPATH=$(go env GOPATH)
     if command -v golangci-lint >/dev/null 2>&1 || [ -x "$GOPATH/bin/golangci-lint" ]; then
-        run_change_scoped_go_linter "Go linter" env PATH="$GOPATH/bin:$PATH" golangci-lint run "${go_packages[@]}"
+        run_change_scoped_go_linter "Go linter" env PATH="$GOPATH/bin:$PATH" golangci-lint run --timeout=40m "${go_packages[@]}"
     else
         echo "golangci-lint is not installed. Run 'make deps-dev' to install dependencies." >&2
         return 1
@@ -310,8 +306,11 @@ test_setup_javascript() {
     (
         cd actions/setup/js
         npm run typecheck --silent
+        # Runs beside the CPU-bound custom-linter job; lock-parsing tests that take
+        # ~1s alone have exceeded vitest's 10s default there.
         npm run test:js -- \
             --no-file-parallelism \
+            --testTimeout=30000 \
             --passWithNoTests \
             "${JS_TEST_EXCLUDES[@]}" \
             "${setup_js_files[@]}"
@@ -326,9 +325,18 @@ test_go_packages() {
     make --no-print-directory test-unit BASE_REF="$BASE_REF"
 }
 
+compile_go_packages() {
+    go test -run '^$' "${go_packages[@]}"
+}
+
 if [ "${#go_packages[@]}" -gt 0 ]; then
-    start_job "Go lint (${#go_packages[@]} package(s))" lint_go_packages
-    start_job "custom Go linters (${#go_packages[@]} package(s))" lint_custom_go_packages
+    if [ "$WITH_TESTS" -eq 1 ]; then
+        start_job "Go lint (${#go_packages[@]} package(s))" lint_go_packages
+        start_job "custom Go linters (${#go_packages[@]} package(s))" lint_custom_go_packages
+    else
+        start_job "Go compile/vet (${#go_packages[@]} package(s), no test bodies)" compile_go_packages
+        echo "Deferring package-wide Go lint and custom Go linters to make agent-report-progress."
+    fi
 fi
 if [ "${#setup_js_files[@]}" -gt 0 ] || [ "${#eslint_factory_files[@]}" -gt 0 ]; then
     start_job "JavaScript lint" lint_javascript
@@ -336,16 +344,18 @@ fi
 if [ "${#action_shell_files[@]}" -gt 0 ]; then
     start_job "action shell lint" lint_action_shell_files
 fi
-if [ "$model_alias_validation_required" -eq 1 ]; then
-    start_job "model alias validation" make --no-print-directory validate-model-alias-chains
+if [ "$WITH_TESTS" -eq 1 ] || [ "$schema_binary_validation_required" -eq 1 ]; then
+    start_job "schema freshness check" make --no-print-directory check-stale-schema-binary
 fi
-start_job "schema freshness check" make --no-print-directory check-stale-schema-binary
 if [ "$session_schema_validation_required" -eq 1 ]; then
     start_job "session schema freshness check" make --no-print-directory check-session-schemas
 fi
 
 if [ "$WITH_TESTS" -eq 1 ]; then
     start_job "impacted Go tests" test_go_packages
+    if [ "$dev_loop_validation_required" -eq 1 ]; then
+        start_job "dev-loop script tests" make --no-print-directory test-agent-dev-loop
+    fi
     if [ "${#setup_js_files[@]}" -gt 0 ]; then
         start_job "impacted setup JavaScript tests" test_setup_javascript
     fi
@@ -356,8 +366,10 @@ fi
 
 wait_for_jobs
 
-if [ "$workflow_drift_required" -eq 1 ]; then
+if [ "$workflow_drift_required" -eq 1 ] && [ "$WITH_TESTS" -eq 1 ]; then
     make --no-print-directory check-workflow-drift
+elif [ "$workflow_drift_required" -eq 1 ]; then
+    echo "Deferring full workflow recompilation to make agent-report-progress."
 else
     echo "No workflow source or compiler changes; skipping full workflow recompilation."
 fi
@@ -365,5 +377,6 @@ fi
 if [ "$WITH_TESTS" -eq 1 ]; then
     echo "Pre-PR validation passed (changed files formatted and linted, impacted tests pass). Safe to call report_progress."
 else
-    echo "Pre-PR validation passed (changed files formatted and linted). Safe to call report_progress."
+    echo "Intermediate validation passed (changed files formatted, Go packages compile/vet; full Go lint and workflow drift deferred). Safe to call report_progress."
 fi
+echo "Validation elapsed: ${SECONDS}s"

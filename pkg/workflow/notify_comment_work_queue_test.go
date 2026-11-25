@@ -68,7 +68,7 @@ func TestConclusionWorkQueueTerminationUsesOnlyQueuePermissions(t *testing.T) {
 func TestConclusionWorkerTerminationIsInlineAndAlwaysRuns(t *testing.T) {
 	for _, required := range []bool{true, false} {
 		data := &WorkflowData{
-			Tools:       map[string]any{"work-queue": map[string]any{"worker": required}},
+			Tools:       map[string]any{"work-queue": map[string]any{"worker": required, "issues": true}},
 			SafeOutputs: &SafeOutputsConfig{},
 		}
 		compiler := NewCompiler()
@@ -84,7 +84,9 @@ func TestConclusionWorkerTerminationIsInlineAndAlwaysRuns(t *testing.T) {
 		require.Contains(t, steps, "id: worker_termination\n        if: always()")
 		require.NotContains(t, steps, "worker_termination\n        if: always()\n        continue-on-error")
 		require.Contains(t, steps, "reconcile_work_queue_run.cjs")
+		require.NotContains(t, steps, "work_queue_issues.cjs")
 		require.Less(t, strings.Index(steps, "reconcile_work_queue_run.cjs"), strings.Index(steps, "work_queue_summary.cjs"))
+		require.Contains(t, job.Permissions, "issues: write")
 	}
 }
 
@@ -103,6 +105,8 @@ func TestConclusionWorkQueueReferencesOnlyGeneratedSteps(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			data := &WorkflowData{
 				AdmissionEnabled: true,
+				FrontmatterHash:  strings.Repeat("a", 64),
+				BodyHash:         strings.Repeat("b", 64),
 				Tools:            map[string]any{"work-queue": tc.queue},
 				SafeOutputs: &SafeOutputsConfig{
 					NoOp:             &NoOpConfig{},
@@ -125,9 +129,10 @@ func TestConclusionWorkQueueReferencesOnlyGeneratedSteps(t *testing.T) {
 				require.Equal(t, !tc.participant, exists, key)
 			}
 			require.Equal(t, !tc.participant, strings.Contains(steps, "steps.report_failed_jobs.outputs.job_durations"))
-			require.Contains(t, job.Outputs, "admission_compact_session")
-			require.Contains(t, job.Outputs, "usage_artifact_id")
-			require.Contains(t, job.Outputs, "usage_artifact_retry_id")
+			require.NotContains(t, job.Outputs, "admission_compact_session")
+			require.NotContains(t, job.Outputs, "usage_artifact_id")
+			require.NotContains(t, job.Outputs, "usage_artifact_retry_id")
+			require.Contains(t, steps, "conclusion_admission.cjs")
 		})
 	}
 }

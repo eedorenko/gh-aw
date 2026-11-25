@@ -28,6 +28,12 @@ func TestCollectSecretReferences(t *testing.T) {
 			expected: []string{"GITHUB_TOKEN"},
 		},
 		{
+			name: "Static bracket secret reference",
+			yaml: `env:
+  TOKEN: ${{ secrets['MY_TOKEN'] }}`,
+			expected: []string{"MY_TOKEN"},
+		},
+		{
 			name: "Multiple secret references",
 			yaml: `env:
   GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
@@ -123,6 +129,26 @@ func TestCollectActionReferences(t *testing.T) {
         - uses: ./.github/workflows/worker.lock.yml
         - uses: actions/checkout@abc123 # v4`,
 			expected: []string{"actions/checkout@abc123 # v4"},
+		},
+		{
+			name: "Self-repository references are excluded",
+			yaml: `
+      steps:
+        - uses: $/actions/setup
+        - uses: $/actions/report # self-repository
+        - uses: actions/checkout@abc123 # v4
+      call:
+        uses: $/.github/workflows/worker.yml`,
+			expected: []string{"actions/checkout@abc123 # v4"},
+		},
+		{
+			name: "Only self-repository references",
+			yaml: `
+      steps:
+        - uses: $/actions/setup
+      call:
+        uses: $/.github/workflows/worker.yml`,
+			expected: []string{},
 		},
 		{
 			name: "Action without inline tag",
@@ -347,7 +373,7 @@ func TestSecretRedactionRunsWithoutWorkflowSecrets(t *testing.T) {
 	var builder strings.Builder
 	compiler := NewCompiler()
 
-	compiler.generateSecretRedactionStep(&builder, "", &WorkflowData{})
+	compiler.generateSecretRedactionStep(&builder, "", &WorkflowData{}, false)
 
 	output := builder.String()
 	if !strings.Contains(output, "const { main } = require('${{ runner.temp }}/gh-aw/actions/redact_secrets.cjs');") {
@@ -372,7 +398,7 @@ func TestSecretRedactionEmitsEnvMappingWithWorkflowSecrets(t *testing.T) {
 	var builder strings.Builder
 	compiler := NewCompiler()
 
-	compiler.generateSecretRedactionStep(&builder, "${{ secrets.MY_TOKEN }}", &WorkflowData{})
+	compiler.generateSecretRedactionStep(&builder, "${{ secrets.MY_TOKEN }} and ${{ secrets[vars.SECRET_NAME] }}", &WorkflowData{}, false)
 
 	steps := parseGeneratedSteps(t, builder.String())
 	if len(steps) != 1 {
@@ -387,6 +413,9 @@ func TestSecretRedactionEmitsEnvMappingWithWorkflowSecrets(t *testing.T) {
 	}
 	if _, ok := env["SECRET_MY_TOKEN"]; !ok {
 		t.Errorf("Expected the secret value to be passed as SECRET_MY_TOKEN, got %#v", env)
+	}
+	if env["GH_AW_DYNAMIC_SECRET_VALUE_0"] != "${{ secrets[vars.SECRET_NAME] }}" {
+		t.Errorf("Expected the computed secret value to be passed for redaction, got %#v", env["GH_AW_DYNAMIC_SECRET_VALUE_0"])
 	}
 }
 
@@ -408,7 +437,7 @@ func TestSecretRedactionPreparesFilesOnlyForCustomMasking(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var builder strings.Builder
 			compiler := NewCompiler()
-			compiler.generateSecretRedactionStep(&builder, "", &WorkflowData{SecretMasking: tt.masking})
+			compiler.generateSecretRedactionStep(&builder, "", &WorkflowData{SecretMasking: tt.masking}, false)
 			steps := parseGeneratedSteps(t, builder.String())
 			with := steps[0]["with"].(map[string]any)
 			script := with["script"].(string)

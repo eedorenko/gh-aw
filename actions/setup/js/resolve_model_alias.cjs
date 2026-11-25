@@ -8,6 +8,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { loadModelsJson } = require("./model_costs.cjs");
 
 /** Runner-written record of configured and resolved models, relative to /tmp/gh-aw. */
 const MODEL_RESOLUTION_RECORD_PATH = "agent/model-resolution.json";
@@ -100,9 +101,9 @@ function marshalParams(params) {
  * @returns {boolean}
  */
 function globMatch(pattern, entry) {
-  const patternParts = pattern.split("/", 2);
-  const entryParts = entry.split("/", 2);
-  if (patternParts.length === 1) {
+  const patternParts = [pattern.slice(0, pattern.indexOf("/")), pattern.slice(pattern.indexOf("/") + 1)];
+  const entryParts = [entry.slice(0, entry.indexOf("/")), entry.slice(entry.indexOf("/") + 1)];
+  if (!pattern.includes("/")) {
     if (!pattern.includes("*")) {
       return pattern.toLowerCase() === entry.toLowerCase();
     }
@@ -110,7 +111,7 @@ function globMatch(pattern, entry) {
     const regex = new RegExp(`^${escapedPattern}$`, "i");
     return regex.test(entry);
   }
-  if (entryParts.length === 1) {
+  if (!entry.includes("/")) {
     return false;
   }
   if (patternParts[0].toLowerCase() !== entryParts[0].toLowerCase()) {
@@ -175,8 +176,10 @@ function selectLatestGlobMatch(pattern, catalog) {
     return null;
   }
   matches.sort((left, right) => {
-    const leftToken = left.includes("/") ? left.split("/", 2)[1] : left;
-    const rightToken = right.includes("/") ? right.split("/", 2)[1] : right;
+    const leftSlash = left.indexOf("/");
+    const rightSlash = right.indexOf("/");
+    const leftToken = leftSlash >= 0 ? left.slice(leftSlash + 1) : left;
+    const rightToken = rightSlash >= 0 ? right.slice(rightSlash + 1) : right;
     return compareVersionTuples(extractVersionTuple(rightToken), extractVersionTuple(leftToken));
   });
   return matches[0];
@@ -218,15 +221,42 @@ function buildCatalogFromReflect(reflectData) {
 }
 
 /**
+ * AWF /reflect data without the models AWF says may not be chosen automatically, that is
+ * those an endpoint's `routing_models` mark `automatic_selection_eligible: false` (a
+ * Decisions-only evaluation model, or one disabled in the Copilot model picker). AWF owns
+ * the rule (AWF config spec §12.8). Models without the field stay, so an AWF release that
+ * does not publish it changes nothing. Returns `reflectData` itself when nothing is removed.
+ * @param {any} reflectData
+ * @returns {any}
+ */
+function filterAutomaticallySelectable(reflectData) {
+  if (!Array.isArray(reflectData?.endpoints)) return reflectData;
+  const key = (/** @type {unknown} */ id) => (typeof id === "string" ? id.trim().toLowerCase() : "");
+  let changed = false;
+  const endpoints = reflectData.endpoints.map((/** @type {any} */ endpoint) => {
+    if (!Array.isArray(endpoint?.models) || !Array.isArray(endpoint.routing_models)) return endpoint;
+    const blocked = new Set(endpoint.routing_models.filter((/** @type {any} */ model) => model?.automatic_selection_eligible === false && typeof model.model_id === "string").map((/** @type {any} */ model) => key(model.model_id)));
+    const models = endpoint.models.filter((/** @type {unknown} */ model) => !blocked.has(key(model)));
+    if (models.length === endpoint.models.length) return endpoint;
+    changed = true;
+    return { ...endpoint, models };
+  });
+  return changed ? { ...reflectData, endpoints } : reflectData;
+}
+
+/**
+ * `wildcardCatalog` is the catalogue `*` entries match against (default `catalog`); exact
+ * entries and the configured name always use `catalog`.
  * @param {string} target
  * @param {Record<string, string[]>} aliasMap
  * @param {string[]} catalog
- * @param {{ visited?: Set<string>, logger?: (msg: string) => void }} [options]
+ * @param {{ visited?: Set<string>, logger?: (msg: string) => void, wildcardCatalog?: string[] }} [options]
  * @returns {string|null}
  */
 function resolveModelAlias(target, aliasMap, catalog, options = {}) {
   const visited = options.visited ?? new Set();
   const logger = options.logger ?? (() => {});
+  const wildcardCatalog = options.wildcardCatalog ?? catalog;
   const { base, params } = splitModelIdentifier(target);
   if (!base) {
     return null;
@@ -243,7 +273,7 @@ function resolveModelAlias(target, aliasMap, catalog, options = {}) {
       return null;
     }
     for (const entry of entries) {
-      const resolved = resolveAliasEntry(String(entry), params, aliasMap, catalog, new Set(visited), logger);
+      const resolved = resolveAliasEntry(String(entry), params, aliasMap, catalog, new Set(visited), logger, wildcardCatalog);
       if (resolved) {
         return resolved;
       }
@@ -268,19 +298,27 @@ function resolveModelAlias(target, aliasMap, catalog, options = {}) {
  * @param {string[]} catalog
  * @param {Set<string>} visited
  * @param {(msg: string) => void} logger
+ * @param {string[]} [wildcardCatalog]
  * @returns {string|null}
  */
-function resolveAliasEntry(entry, inheritedParams, aliasMap, catalog, visited, logger) {
+function resolveAliasEntry(entry, inheritedParams, aliasMap, catalog, visited, logger, wildcardCatalog = catalog) {
   const { base: eBase, params: eParams } = splitModelIdentifier(entry);
   const mergedParams = mergeParams(inheritedParams, eParams);
   const suffix = marshalParams(mergedParams);
 
   if (Object.prototype.hasOwnProperty.call(aliasMap, eBase)) {
-    return resolveModelAlias(eBase + suffix, aliasMap, catalog, { visited, logger });
+    return resolveModelAlias(eBase + suffix, aliasMap, catalog, { visited, logger, wildcardCatalog });
   }
 
   if (eBase.includes("*")) {
-    const match = selectLatestGlobMatch(eBase, catalog);
+    if (wildcardCatalog !== catalog) {
+      const selectable = new Set(wildcardCatalog);
+      const skipped = catalog.filter(item => !selectable.has(item) && globMatch(eBase, item));
+      if (skipped.length > 0) {
+        logger(`model alias resolution: '${eBase}' skipped ${skipped.join(", ")}: AWF marks them as not automatically selectable`);
+      }
+    }
+    const match = selectLatestGlobMatch(eBase, wildcardCatalog);
     if (match) {
       return match + suffix;
     }
@@ -410,32 +448,16 @@ function isLiveModelId(modelId, catalog) {
   });
 }
 
-/** @type {Set<string>|null} */
-let bundledModelIds = null;
-
 /**
  * Whether `modelId` (no provider prefix, no parameters) is listed, under any provider, in
- * the bundled model catalogue (`models.json`, shipped with the setup action). This is the
- * "plausible model id" test used when no `/reflect` catalogue can exist: a name such as
- * `gpt-5-mini` is a model id there, while a pure alias such as `small`, `opus` or `auto`
- * is not.
+ * the explicit GH_AW_MODELS_JSON_PATH overlay when no `/reflect` catalogue can exist.
  * @param {string} modelId
  * @returns {boolean}
  */
-function isBundledModelId(modelId) {
+function isExplicitModelId(modelId) {
   if (!modelId) return false;
-  if (!bundledModelIds) {
-    bundledModelIds = new Set();
-    try {
-      const providers = JSON.parse(fs.readFileSync(path.join(__dirname, "models.json"), "utf8"))?.providers || {};
-      for (const section of Object.values(providers)) {
-        for (const id of Object.keys(section?.models || {})) bundledModelIds.add(id.toLowerCase());
-      }
-    } catch {
-      // No bundled catalogue: nothing counts as a plausible model id.
-    }
-  }
-  return bundledModelIds.has(modelId.toLowerCase());
+  const providers = loadModelsJson()?.providers || {};
+  return Object.values(providers).some(section => Object.keys(section?.models || {}).some(id => id.toLowerCase() === modelId.toLowerCase()));
 }
 
 /**
@@ -453,6 +475,8 @@ function isBundledModelId(modelId) {
  * Resolve a configured model with the rules shared by every engine:
  * - a gh-aw alias (built-in or workflow-defined), optionally behind a `provider/` prefix,
  *   resolves to the newest live match in the `/reflect` catalogue;
+ * - `*` alias entries skip models AWF marks as not automatically selectable
+ *   (`filterAutomaticallySelectable`); exact alias entries such as `evals` do not;
  * - a provider prefix (or the engine's `provider`) limits the lookup to that provider;
  * - exact ids are never rewritten: a value whose id (after removing the provider prefix)
  *   exactly matches a live id in that provider's catalogue is returned unchanged even when
@@ -460,9 +484,8 @@ function isBundledModelId(modelId) {
  *   there is no exact live match;
  * - `?effort=` and other parameters carry through.
  * - when no `/reflect` catalogue can exist on this run (`noCatalog`, set when AWF is
- *   disabled), a value whose id is listed in the bundled model catalogue
- *   (`isBundledModelId`) is exact and passes through even when an alias has the same
- *   name; any other alias fails with catalog_unavailable.
+ *   disabled), an explicit overlay id or a version-shaped built-in alias matching
+ *   its provider pattern passes through as exact; other aliases fail with catalog_unavailable.
  *
  * `resolvedModel` keeps the configured form: a provider-prefixed alias resolves to a
  * provider-prefixed id, a provider-scoped bare alias resolves to a bare id, and an
@@ -500,9 +523,21 @@ function resolveConfiguredModel(options) {
   if (options.preserveAuto && aliasKey.toLowerCase() === "auto") {
     return exact;
   }
-  if (options.noCatalog && isBundledModelId(aliasKey)) {
-    // No live catalogue can exist (AWF disabled): a bundled model id stays exact.
-    logger(`${logPrefix}: no live catalogue on this run; '${configuredModel}' is a bundled model id${scope ? ` (provider=${scope})` : ""}; passing it through as exact`);
+  const builtinPatterns = loadBuiltinModelAliases()?.[aliasKey];
+  const isNativeModelId =
+    /-\d/.test(aliasKey) &&
+    Array.isArray(builtinPatterns) &&
+    aliasMap[aliasKey].length === builtinPatterns.length &&
+    aliasMap[aliasKey].every((entry, index) => entry === builtinPatterns[index]) &&
+    builtinPatterns.some(entry => {
+      const pattern = splitModelIdentifier(String(entry)).base;
+      const slash = pattern.indexOf("/");
+      if (slash < 0 || !pattern.includes("*")) return false;
+      if (scope && canonicalModelProvider(pattern.slice(0, slash)) !== scope) return false;
+      return globMatch(pattern.slice(slash + 1), aliasKey);
+    });
+  if (options.noCatalog && (isExplicitModelId(aliasKey) || isNativeModelId)) {
+    logger(`${logPrefix}: no live catalogue on this run; '${configuredModel}' is an explicit model id${scope ? ` (provider=${scope})` : ""}; passing it through as exact`);
     return exact;
   }
 
@@ -521,7 +556,20 @@ function resolveConfiguredModel(options) {
     throw new ModelAliasResolutionError(configuredModel, "catalog_unavailable", { provider: scope });
   }
 
-  const resolved = resolveModelAlias(aliasKey + marshalParams(params), aliasMap, catalog, { logger });
+  const selectableReflectData = filterAutomaticallySelectable(options.reflectData);
+  let wildcardCatalog = catalog;
+  if (selectableReflectData !== options.reflectData) {
+    // Entries /reflect marks ineligible, removed from whichever catalogue is in use (built or caller-supplied).
+    const fromReflect = (/** @type {any} */ reflectData) => (scope ? buildProviderCatalog({ reflectData, provider: scope }) : buildCatalogFromReflect(reflectData));
+    const selectable = new Set(fromReflect(selectableReflectData).map(entry => entry.toLowerCase()));
+    const blocked = new Set(
+      fromReflect(options.reflectData)
+        .map(entry => entry.toLowerCase())
+        .filter(entry => !selectable.has(entry))
+    );
+    wildcardCatalog = catalog.filter(entry => !blocked.has(entry.toLowerCase()));
+  }
+  const resolved = resolveModelAlias(aliasKey + marshalParams(params), aliasMap, catalog, { logger, wildcardCatalog });
   if (!resolved) {
     if (!scope && !Array.isArray(options.catalog) && hasIncompleteCandidateCatalog(aliasKey, aliasMap, options.reflectData)) {
       logger(`${logPrefix}: candidate provider catalog unavailable from awf-reflect for known alias '${configuredModel}'`);
@@ -594,6 +642,43 @@ async function resolveConfiguredModelWithRefresh(options) {
  * workflow defines and imports no aliases.
  */
 const MODEL_ALIASES_ENV_VAR = "GH_AW_MODEL_ALIASES";
+
+/**
+ * Environment variable the compiler sets to "false" on engine steps when the workflow sets
+ * `engine.model-catalog: false`: configured models are passed to the engine verbatim,
+ * without alias resolution or a live model-catalogue lookup.
+ */
+const MODEL_CATALOG_ENV_VAR = "GH_AW_MODEL_CATALOG";
+
+/**
+ * Whether the workflow disabled live model-catalogue resolution (`engine.model-catalog: false`).
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {boolean}
+ */
+function isModelCatalogDisabled(env = process.env) {
+  return String(env[MODEL_CATALOG_ENV_VAR] || "").trim() === "false";
+}
+
+/**
+ * The workflow-defined alias (from `GH_AW_MODEL_ALIASES`) that the configured model names,
+ * or "" when it names none. Built-in aliases are not consulted.
+ * @param {string} configuredModel
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {string}
+ */
+function workflowAliasNamedBy(configuredModel, env) {
+  let aliases;
+  try {
+    aliases = JSON.parse(String(env[MODEL_ALIASES_ENV_VAR] || ""));
+  } catch {
+    return "";
+  }
+  if (!aliases || typeof aliases !== "object" || Array.isArray(aliases)) return "";
+  const { base } = splitModelIdentifier(configuredModel);
+  const slash = base.indexOf("/");
+  const aliasKey = slash > 0 ? base.slice(slash + 1) : base;
+  return aliasKey && Object.prototype.hasOwnProperty.call(aliases, aliasKey) ? aliasKey : "";
+}
 
 /** @type {Record<string, string[]>|null|undefined} */
 let builtinModelAliases;
@@ -709,6 +794,9 @@ function recordModelResolution(record, env = process.env) {
  * `noCatalog` defaults to true when AWF is disabled (`AWF_REFLECT_ENABLED` is not "1")
  * and neither `/reflect` data nor a catalogue is supplied.
  *
+ * When the workflow sets `engine.model-catalog: false` (`GH_AW_MODEL_CATALOG=false`), the
+ * configured model is used verbatim: no alias is resolved and no catalogue is required.
+ *
  * @param {Omit<Parameters<typeof resolveConfiguredModel>[0], "aliasMap"> & {
  *   aliasMap?: Record<string, string[]>|null,
  *   engine: string,
@@ -725,7 +813,17 @@ async function resolveEngineModel(options) {
   const env = options.env || process.env;
   const role = options.role || "main";
   const configuredModel = String(options.configuredModel || "").trim();
-  const aliasMap = options.aliasMap !== undefined ? options.aliasMap : loadModelAliasMap({ reflectData: options.reflectData, env });
+  const catalogDisabled = isModelCatalogDisabled(env);
+  if (catalogDisabled) {
+    logger(`model resolution: engine=${options.engine} role=${role} engine.model-catalog is false; using '${configuredModel}' verbatim`);
+    const workflowAlias = workflowAliasNamedBy(configuredModel, env);
+    if (workflowAlias) {
+      logger(
+        `model resolution: warning: '${configuredModel}' names the workflow-defined alias '${workflowAlias}' from models:, but engine.model-catalog is false, so aliases are not resolved; it is passed to the engine as a literal model id (set the model to a concrete id instead)`
+      );
+    }
+  }
+  const aliasMap = catalogDisabled ? null : options.aliasMap !== undefined ? options.aliasMap : loadModelAliasMap({ reflectData: options.reflectData, env });
   // Without AWF no /reflect catalogue can exist; an explicit catalogue or /reflect data overrides.
   const noCatalog = options.noCatalog ?? (env.AWF_REFLECT_ENABLED !== "1" && !options.reflectData && !Array.isArray(options.catalog));
   const record = (/** @type {any} */ fields) => {
@@ -751,13 +849,16 @@ module.exports = {
   buildCatalogFromReflect,
   buildProviderCatalog,
   canonicalModelProvider,
+  filterAutomaticallySelectable,
   globMatch,
-  isBundledModelId,
+  isExplicitModelId,
   isLiveModelId,
   loadBuiltinModelAliases,
   loadModelAliasMap,
   mergeParams,
   MODEL_ALIASES_ENV_VAR,
+  MODEL_CATALOG_ENV_VAR,
+  isModelCatalogDisabled,
   MODEL_RESOLUTION_RECORD_PATH,
   ModelAliasResolutionError,
   normalizeForCopilotCLI,

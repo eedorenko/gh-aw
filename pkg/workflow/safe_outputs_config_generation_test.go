@@ -6,11 +6,35 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v3"
 )
+
+func TestConnectorSafeScriptThreatWarningPolicy(t *testing.T) {
+	config := map[string]any{}
+	addSafeScriptsConfig(config, map[string]*SafeScriptConfig{
+		"custom-alias-mutate": {connectorInputSchema: map[string]any{}},
+		"ordinary-script":     {},
+	})
+	require.Equal(t, "abort", config["custom_alias_mutate"].(map[string]any)["threat_warning_policy"])
+	require.NotContains(t, config["ordinary_script"], "threat_warning_policy")
+	compiler := NewCompiler()
+	var steps []string
+	compiler.addHandlerManagerConfigEnvVar(&steps, &WorkflowData{SafeOutputs: &SafeOutputsConfig{Scripts: map[string]*SafeScriptConfig{
+		"custom-alias-mutate": {connectorInputSchema: map[string]any{}},
+		"ordinary-script":     {},
+	}}})
+	var env map[string]string
+	require.NoError(t, yaml.Unmarshal([]byte(strings.Join(steps, "")), &env))
+	var runtimeConfig map[string]any
+	require.NoError(t, json.Unmarshal([]byte(env["GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG"]), &runtimeConfig))
+	require.Equal(t, "abort", runtimeConfig["custom_alias_mutate"].(map[string]any)["threat_warning_policy"])
+	require.NotContains(t, runtimeConfig, "ordinary_script")
+}
 
 func TestBuildSafeOutputInputsConfigIncludesMaxLength(t *testing.T) {
 	maxLength := 40000
@@ -26,6 +50,75 @@ func TestBuildSafeOutputInputsConfigIncludesMaxLength(t *testing.T) {
 
 	require.Equal(t, maxLength, result["payload"].(map[string]any)["maxLength"])
 	assert.NotContains(t, result["legacy"].(map[string]any), "maxLength")
+}
+
+func TestGenerateSafeOutputsConfigSafeJobsAndScripts(t *testing.T) {
+	maxLength := 120
+	inputs := map[string]*InputDefinition{
+		"message": {
+			Type:        "string",
+			Description: "Finding message",
+			Required:    true,
+			Default:     "example",
+			MaxLength:   &maxLength,
+		},
+	}
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			Jobs: map[string]*SafeJobConfig{
+				"publish-report": {
+					Description: "Publish a report",
+					Output:      "report",
+					Max:         3,
+					Inputs:      inputs,
+				},
+			},
+			Scripts: map[string]*SafeScriptConfig{
+				"custom-script": {
+					Description: "Run a custom script",
+					Max:         4,
+					Inputs:      inputs,
+				},
+			},
+		},
+	}
+
+	result, err := generateSafeOutputsConfig(data)
+	require.NoError(t, err)
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(result), &parsed))
+	require.Equal(t, map[string]any{
+		"description":           "Publish a report",
+		"max":                   float64(3),
+		"output":                "report",
+		"supports_dependencies": false,
+		"inputs": map[string]any{
+			"message": map[string]any{
+				"type":        "string",
+				"description": "Finding message",
+				"required":    true,
+				"default":     "example",
+				"maxLength":   float64(120),
+			},
+		},
+	}, parsed["publish-report"])
+
+	require.Equal(t, map[string]any{
+		"description": "Run a custom script",
+		"max":         float64(4),
+		"inputs": map[string]any{
+			"message": map[string]any{
+				"type":        "string",
+				"description": "Finding message",
+				"required":    true,
+				"default":     "example",
+				"maxLength":   float64(120),
+			},
+		},
+	}, parsed["custom_script"])
+	assert.NotContains(t, parsed["custom_script"].(map[string]any), "supports_dependencies")
+	assert.NotContains(t, parsed["custom_script"].(map[string]any), "output")
 }
 
 // TestGenerateSafeOutputsConfigDispatchWorkflow tests that generateSafeOutputsConfig correctly
@@ -859,9 +952,11 @@ func TestGenerateSafeOutputsConfigSafeJobMax(t *testing.T) {
 	findingCfg, ok := parsed["emit-finding"].(map[string]any)
 	require.True(t, ok, "emit-finding should be present in config")
 	assert.InDelta(t, float64(25), findingCfg["max"], 0.0001, "max should be 25")
+	assert.Equal(t, false, findingCfg["supports_dependencies"], "separate safe jobs must reject runtime dependencies")
 
 	singleCfg, ok := parsed["single-output"].(map[string]any)
 	require.True(t, ok, "single-output should be present in config")
+	assert.Equal(t, false, singleCfg["supports_dependencies"])
 	_, hasMax := singleCfg["max"]
 	assert.False(t, hasMax, "max should be absent when not configured (lets runtime default to 1)")
 }

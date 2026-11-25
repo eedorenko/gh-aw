@@ -2,6 +2,7 @@
 /// <reference types="@actions/github-script" />
 
 const { createReportIssue } = require("./issue_report.cjs");
+const { getIssueLabel, getIssueLabelQuery } = require("./issue_label.cjs");
 
 const fs = require("fs");
 const { getErrorMessage } = require("./error_helpers.cjs");
@@ -9,6 +10,7 @@ const { ERR_API, ERR_SYSTEM } = require("./error_codes.cjs");
 const { parseReportMarkdown } = require("./report_markdown.cjs");
 const { renderSizedReport } = require("./report_size.cjs");
 const { getPromptPath } = require("./messages_core.cjs");
+const { getDetectionReasonText } = require("./threat_detection_warning.cjs");
 
 /**
  * Classify the warning/failure reasons emitted by parse_threat_detection_results.
@@ -22,7 +24,7 @@ function classifyDetectionOutcome(reason) {
       return {
         category: "threat_finding",
         reason,
-        description: "The detector reported a potential security threat. This is a finding, not a detector execution failure.",
+        description: `${getDetectionReasonText(reason)} This is a finding, not a detector execution failure.`,
       };
     case "agent_failure":
       return {
@@ -35,6 +37,12 @@ function classifyDetectionOutcome(reason) {
         category: "detector_result_invalid",
         reason,
         description: "The detector did not produce a valid result. Security assessment is incomplete; this is not evidence of a threat or a clean result.",
+      };
+    case "github_api_quota_exhausted":
+      return {
+        category: "detection_deferred",
+        reason,
+        description: `${getDetectionReasonText(reason)} Safe outputs were not published; completed agent artifacts are retained for a later run.`,
       };
     default:
       return {
@@ -51,12 +59,12 @@ function classifyDetectionOutcome(reason) {
 async function ensureDetectionRunsIssue() {
   const { owner, repo } = context.repo;
   const parentTitle = "[aw] Detection Runs";
-  const parentLabel = "agentic-workflows";
+  const parentLabel = getIssueLabel();
 
   core.info(`Searching for detection runs issue: "${parentTitle}"`);
 
   // Search for existing detection runs issue
-  const searchQuery = `repo:${owner}/${repo} is:issue is:open label:${parentLabel} in:title "${parentTitle}"`;
+  const searchQuery = `repo:${owner}/${repo} is:issue is:open ${getIssueLabelQuery()} in:title "${parentTitle}"`;
 
   try {
     const { data } = await github.rest.search.issuesAndPullRequests({

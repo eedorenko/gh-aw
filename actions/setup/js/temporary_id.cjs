@@ -27,8 +27,9 @@ const crypto = require("crypto");
 /**
  * Regex pattern for matching temporary ID references in text
  * Format: #aw_XXX to #aw_XXXXXXXXXXXX (aw_ prefix + 3 to 12 alphanumeric or underscore characters)
+ * Markdown rendering may escape the hash and underscores; consume those escapes too.
  */
-const TEMPORARY_ID_PATTERN = /#(aw_[A-Za-z0-9_]{3,12})\b/gi;
+const TEMPORARY_ID_PATTERN = /\\?#(aw\\?_(?:[A-Za-z0-9]|\\?_){3,12})(?![A-Za-z0-9_-]|\\_)/gi;
 
 /**
  * Regex pattern for detecting candidate #aw_ references (any alphanumeric, underscore, or hyphen content)
@@ -36,13 +37,13 @@ const TEMPORARY_ID_PATTERN = /#(aw_[A-Za-z0-9_]{3,12})\b/gi;
  * Uses a broader character set (including hyphens) than the valid pattern to capture the full token
  * and warn about references like #aw_test-id where the hyphen makes the whole token invalid.
  */
-const TEMPORARY_ID_CANDIDATE_PATTERN = /#aw_([A-Za-z0-9_-]+)/gi;
+const TEMPORARY_ID_CANDIDATE_PATTERN = /\\?#aw\\?_((?:[A-Za-z0-9-]|\\?_)+)/gi;
 
 /**
  * Regex pattern for quick candidate detection of temporary ID references.
  * Non-global on purpose so repeated `.test()` calls are state-free.
  */
-const TEMPORARY_ID_CANDIDATE_REFERENCE_PATTERN = /#aw_/i;
+const TEMPORARY_ID_CANDIDATE_REFERENCE_PATTERN = /\\?#aw\\?_/i;
 
 /**
  * @typedef {Object} RepoIssuePair
@@ -81,12 +82,12 @@ function isTemporaryId(value) {
 
 /**
  * Normalize a temporary ID to a bare lowercase map key for consistent lookups.
- * Strips the leading '#' if present, then lowercases.
+ * Removes Markdown escapes and the leading '#' if present, then lowercases.
  * @param {string} tempId - The temporary ID to normalize (with or without leading '#')
  * @returns {string} Bare lowercase temporary ID (e.g. 'aw_abc123')
  */
 function normalizeTemporaryId(tempId) {
-  const s = String(tempId);
+  const s = String(tempId).replace(/\\([#_])/g, "$1");
   return (s.startsWith("#") ? s.substring(1) : s).toLowerCase();
 }
 
@@ -103,14 +104,15 @@ function replaceTemporaryIdReferences(text, tempIdMap, currentRepo) {
   let candidate;
   TEMPORARY_ID_CANDIDATE_PATTERN.lastIndex = 0;
   while ((candidate = TEMPORARY_ID_CANDIDATE_PATTERN.exec(text)) !== null) {
-    const tempId = `aw_${candidate[1]}`;
+    const tempId = normalizeTemporaryId(`aw_${candidate[1]}`);
     if (!isTemporaryId(tempId)) {
       core.warning(`Malformed temporary ID reference '${candidate[0]}' found in body text. Temporary IDs must be in format '#aw_' followed by 3 to 12 alphanumeric or underscore characters (A-Za-z0-9_). Example: '#aw_abc' or '#aw_pr_fix'`);
     }
   }
 
   return text.replace(TEMPORARY_ID_PATTERN, (match, tempId) => {
-    const resolved = tempIdMap.get(normalizeTemporaryId(tempId));
+    const normalizedId = normalizeTemporaryId(tempId);
+    const resolved = tempIdMap.get(normalizedId);
     if (resolved !== undefined) {
       // If we have a currentRepo and the issue is in the same repo, use short format
       if (currentRepo && resolved.repo === currentRepo) {
@@ -138,7 +140,7 @@ function replaceTemporaryIdReferences(text, tempIdMap, currentRepo) {
 function replaceTemporaryIdReferencesInPatch(text, tempIdMap, currentRepo) {
   // First pass: URL-context replacement — /<path>/#aw_XXX → /<path>/NUMBER
   // This must run before the standard replacement to avoid leaving a '#' in URLs
-  const urlContextPattern = /\/(#aw_[A-Za-z0-9_]{3,12})\b/gi;
+  const urlContextPattern = /\/(\\?#aw\\?_(?:[A-Za-z0-9]|\\?_){3,12})(?![A-Za-z0-9_-]|\\_)/gi;
   let result = text.replace(urlContextPattern, (match, tempIdWithHash) => {
     const resolved = tempIdMap.get(normalizeTemporaryId(tempIdWithHash));
     if (resolved !== undefined) {
@@ -571,7 +573,7 @@ function replaceArtifactUrlReferences(text, artifactUrlMap) {
   let candidate;
   TEMPORARY_ID_CANDIDATE_PATTERN.lastIndex = 0;
   while ((candidate = TEMPORARY_ID_CANDIDATE_PATTERN.exec(text)) !== null) {
-    const tempId = `aw_${candidate[1]}`;
+    const tempId = normalizeTemporaryId(`aw_${candidate[1]}`);
     if (!isTemporaryId(tempId)) {
       core.warning(
         `Malformed temporary ID reference '${candidate[0]}' found in body text. This reference will not be replaced with an artifact URL. Temporary IDs must be in format '#aw_' followed by 3 to 12 alphanumeric or underscore characters (A-Za-z0-9_). Example: '#aw_chart1' or '#aw_img_out'`
@@ -579,7 +581,8 @@ function replaceArtifactUrlReferences(text, artifactUrlMap) {
     }
   }
   return text.replace(TEMPORARY_ID_PATTERN, (match, tempId) => {
-    const url = artifactUrlMap.get(normalizeTemporaryId(tempId));
+    const normalizedId = normalizeTemporaryId(tempId);
+    const url = artifactUrlMap.get(normalizedId);
     if (url !== undefined) {
       // Replace #aw_XXXX with the URL directly (no '#' prefix)
       return url;
@@ -676,7 +679,7 @@ function extractTemporaryIdReferences(message) {
   }
 
   // Check direct ID reference fields
-  const idFields = ["parent_issue_number", "sub_issue_number", "issue_number", "item_number", "discussion_number", "pull_request_number", "content_number", "id", "work_item_id", "source_id", "target_id"];
+  const idFields = ["parent_issue_number", "sub_issue_number", "issue_number", "item_number", "discussion_number", "pull_request_number", "content_number", "id"];
 
   for (const field of idFields) {
     const value = message[field];
@@ -746,6 +749,8 @@ function getCreatedTemporaryId(message) {
     return null;
   }
 
+  // Inline-review IDs are URLs scoped to a single review, not shared producers.
+  if (message.type === "create_pull_request_review_comment") return null;
   const tempId = message.temporary_id;
   if (tempId && isTemporaryId(String(tempId))) {
     return normalizeTemporaryId(String(tempId));

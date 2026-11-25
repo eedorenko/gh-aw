@@ -118,13 +118,13 @@ func FuzzSanitizeRunStepExpressions(f *testing.F) {
 		}
 
 		// Quoted bodies remain literal; expanding bodies must be sanitized.
-		sanitizedScan := executableShellContent(sanitizedRun)
+		sanitizedScan := shellExpansionContent(sanitizedRun)
 		if strings.Contains(sanitizedScan, "${{") {
 			if len(ExpressionPattern.FindAllString(sanitizedScan, -1)) > 0 {
 				t.Errorf("executable portion of sanitized run field still contains a complete expression: %q", sanitizedRun)
 			}
 			// An incomplete wrapper cannot be extracted, but must fail validation.
-			if err := validateNoGitHubExpressionsInRunScriptsFromParsed(map[string]any{"steps": []any{result}}); err == nil {
+			if err := validateRunScriptExpressions(map[string]any{"steps": []any{result}}, true); err == nil {
 				t.Errorf("remaining malformed expression bypassed validation: %q", sanitizedRun)
 			}
 		}

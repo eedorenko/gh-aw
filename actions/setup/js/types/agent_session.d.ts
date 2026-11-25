@@ -36,6 +36,8 @@ export interface EventMetadata {
 
 export interface SessionInitData {
   sourceEngine?: string;
+  agentVersion?: string;
+  provider?: string;
   model?: string;
   reasoningEffort?: string;
   sessionId?: string | null;
@@ -84,6 +86,9 @@ export interface ToolExecutionCompleteData {
   workflowRunId?: string;
   success?: boolean;
   output?: JsonValue;
+  /** Native output truncation, not a collector completeness guarantee. */
+  outputTruncated?: boolean;
+  structuredContent?: JsonValue;
   result?: JsonValue;
   error?: JsonValue;
   fileEdits?: JsonValue;

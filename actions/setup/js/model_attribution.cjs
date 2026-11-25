@@ -2,13 +2,15 @@
 
 const { iterateJsonl, readJsonlFile } = require("./jsonl_helpers.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { computeInferenceAIC } = require("./model_costs.cjs");
+const { ERR_SYSTEM } = require("./error_codes.cjs");
 
 const ROUTING_STATUSES = new Set(["selected", "pending", "failed", "rejected", "unavailable"]);
 const ROUTING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "off"]);
 const ROUTING_TASK_TYPES = new Set(["explain", "plan", "fix", "refactor", "chore", "implement", "unknown"]);
 const ROUTING_SCOPES = new Set(["local", "multi_file", "subsystem", "cross_system", "unknown"]);
 const ROUTING_COMPLEXITIES = new Set(["trivial", "easy", "medium", "hard", "expert", "unknown"]);
+// Same candidates as ai_credits_context.cjs; these files ship in the agent artifact.
+const TOKEN_USAGE_LOG_PATHS = ["sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl", "sandbox/firewall-audit-logs/api-proxy-logs/token-usage.jsonl", "sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl"];
 const MODEL_ROUTING_LOG_PATHS = ["sandbox/firewall/logs/api-proxy-logs/model-routing.jsonl", "sandbox/firewall/audit/api-proxy-logs/model-routing.jsonl", "sandbox/firewall-audit-logs/api-proxy-logs/model-routing.jsonl"];
 
 /** @typedef {{ status: string, mode: string, router_version: string, failure_code?: string, objective: string, task_type: string, scope: string, complexity: string, degraded?: boolean, classifier_aic?: number, deviated_requests?: number }} ModelRoutingSummary */
@@ -43,7 +45,7 @@ function readFallbackMetadata(filePath) {
   try {
     return JSON.parse(require("fs").readFileSync(filePath, "utf8"));
   } catch (error) {
-    throw new Error(`Cannot read model fallback metadata '${filePath}': ${getErrorMessage(error)}`, { cause: error });
+    throw new Error(`${ERR_SYSTEM}: Cannot read model fallback metadata '${filePath}': ${getErrorMessage(error)}`, { cause: error });
   }
 }
 
@@ -65,7 +67,7 @@ function recordFallbackModel(model, env, infoPath) {
     fs.mkdirSync(require("path").dirname(infoPath), { recursive: true });
     fs.writeFileSync(infoPath, JSON.stringify(info, null, 2));
   } catch (error) {
-    throw new Error(`Cannot record model fallback metadata '${infoPath}': ${getErrorMessage(error)}`, { cause: error });
+    throw new Error(`${ERR_SYSTEM}: Cannot record model fallback metadata '${infoPath}': ${getErrorMessage(error)}`, { cause: error });
   }
 }
 
@@ -122,7 +124,7 @@ function recordModelRouting(routing, env = process.env, infoPath = `${env.GH_AW_
     fs.mkdirSync(require("path").dirname(infoPath), { recursive: true });
     fs.writeFileSync(infoPath, JSON.stringify(info, null, 2));
   } catch (error) {
-    throw new Error(`Cannot record model routing metadata '${infoPath}': ${getErrorMessage(error)}`, { cause: error });
+    throw new Error(`${ERR_SYSTEM}: Cannot record model routing metadata '${infoPath}': ${getErrorMessage(error)}`, { cause: error });
   }
   return modelRouting;
 }
@@ -160,6 +162,32 @@ function readModelRoutingSession(sessionPath) {
   return events;
 }
 
+/**
+ * Reads models from successful agent requests in the AWF token-usage log.
+ * Returns null when no log exists so callers can fall back to the unified session.
+ * @param {string} ghAwDir
+ * @returns {string[] | null}
+ */
+function readAgentTokenUsageModels(ghAwDir) {
+  const fs = require("fs");
+  const path = require("path");
+  const logPath = TOKEN_USAGE_LOG_PATHS.map(relativePath => path.join(ghAwDir, relativePath)).find(candidate => fs.existsSync(candidate));
+  if (!logPath) return null;
+  const models = [];
+  try {
+    for (const record of readJsonlFile(logPath)) {
+      if (typeof record?._schema !== "string" || !record._schema.startsWith("token-usage/")) continue;
+      if (record.purpose && record.purpose !== "agent") continue;
+      const status = Number(record.status);
+      if (!(status >= 200 && status < 300)) continue;
+      models.push(record.model);
+    }
+  } catch {
+    return null;
+  }
+  return models;
+}
+
 function readModelRoutingProxyRecords(ghAwDir) {
   for (const relativePath of MODEL_ROUTING_LOG_PATHS) {
     const records = [];
@@ -195,25 +223,13 @@ function classifierAIC(sessionEvents) {
   const classifierUsage = sessionEvents.filter(event => event.type === "firewall.token_usage" && event.data?.purpose === "routing_classification");
   if (classifierUsage.length === 0) return undefined;
 
-  return classifierUsage.reduce((total, event) => {
-    const data = event.data;
-    const reportedAIC = data.aic;
-    if (typeof reportedAIC === "number" && Number.isFinite(reportedAIC) && reportedAIC >= 0) return total + reportedAIC;
-
-    const usage = data.usage ?? {};
-    const tokenCount = value => (typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0);
-    const estimatedAIC = computeInferenceAIC({
-      provider: typeof data.provider === "string" ? data.provider : "",
-      model: typeof data.model === "string" ? data.model : "",
-      inputTokens: tokenCount(usage.inputTokens),
-      outputTokens: tokenCount(usage.outputTokens),
-      cacheReadTokens: tokenCount(usage.cacheReadInputTokens),
-      cacheWriteTokens: tokenCount(usage.cacheCreationInputTokens),
-      reasoningTokens: tokenCount(usage.reasoningOutputTokens),
-      ...(typeof usage.inputTokensIncludeCache === "boolean" ? { inputTokensIncludeCache: usage.inputTokensIncludeCache } : {}),
-    });
-    return total + (Number.isFinite(estimatedAIC) && estimatedAIC >= 0 ? estimatedAIC : 0);
-  }, 0);
+  let total = 0;
+  for (const event of classifierUsage) {
+    const reportedAIC = event.data.aic;
+    if (typeof reportedAIC !== "number" || !Number.isFinite(reportedAIC) || reportedAIC < 0) return undefined;
+    total += reportedAIC;
+  }
+  return total;
 }
 
 function firstValidated(...values) {
@@ -309,6 +325,7 @@ function resolveEffectiveModel(infoPath = `${process.env.GH_AW_TMP_DIR || "/tmp/
     model,
     fallbackModel,
     routing,
+    selection,
     requestedModel: requestedModelIdentifier(observed ? info.requested_model || selection.configured_model : routing?.requested_model || (routing ? env.GH_AW_INFO_MODEL || env.GH_AW_ENGINE_MODEL : "")),
     effort: routing?.status === "selected" ? routing.applied_effort || routing.effort : "",
   };
@@ -318,7 +335,40 @@ function getEffectiveModelLabel(infoPath = `${process.env.GH_AW_TMP_DIR || "/tmp
   const attribution = resolveEffectiveModel(infoPath, phase, env);
   const { reduceModelNameToIdentifier } = require("./model_aliases.cjs");
   const shortModel = reduceModelNameToIdentifier(attribution.model);
-  if (!attribution.routing) return shortModel;
+  if (!attribution.routing) {
+    const requested = attribution.requestedModel || requestedModelIdentifier(env.GH_AW_INFO_MODEL || env.GH_AW_ENGINE_MODEL);
+    if (requested.toLowerCase() !== "auto") return shortModel;
+    const models = new Set();
+    if (phase === "agent") {
+      // Footers render in safe_outputs and before the conclusion job builds aw_session.jsonl,
+      // so prefer the token-usage log shipped in the agent artifact.
+      const ghAwDir = require("path").dirname(infoPath);
+      let requestModels = readAgentTokenUsageModels(ghAwDir);
+      if (requestModels === null) {
+        requestModels = [];
+        for (const event of readModelRoutingSession(require("path").join(ghAwDir, "usage/aw_session.jsonl"))) {
+          if (event.type !== "firewall.token_usage" || (event.data?.purpose && event.data.purpose !== "agent") || Number(event.data?.status) >= 400) continue;
+          requestModels.push(event.data?.model);
+        }
+      }
+      for (const value of requestModels) {
+        const model = validateModelIdentifier(value);
+        if (model && model.toLowerCase() !== "auto") models.add(model);
+      }
+      const observedModels = attribution.selection?.status === "observed" ? attribution.selection.observed_models : null;
+      // Native observations name the model Copilot requested, not a proxy fallback replacement.
+      if (!models.size && !attribution.fallbackModel && Array.isArray(observedModels)) {
+        for (const value of observedModels) {
+          const model = validateModelIdentifier(value);
+          if (model && model.toLowerCase() !== "auto") models.add(model);
+        }
+      }
+    }
+    if (!models.size && !attribution.fallbackModel && attribution.model && attribution.model.toLowerCase() !== "auto") models.add(attribution.model);
+    const names = [...new Set([...models].map(formatAttributionModelName).filter(Boolean))];
+    if (names.length) return `auto (${names.join(", ")})`;
+    return attribution.fallbackModel && shortModel ? shortModel : "auto";
+  }
   if (attribution.routing.status === "selected") {
     const routedModel = reduceModelNameToIdentifier(attribution.routing.wire_model);
     const routed = `routed: ${routedModel}${attribution.effort ? ` ${attribution.effort}` : ""}`;
@@ -327,6 +377,15 @@ function getEffectiveModelLabel(infoPath = `${process.env.GH_AW_TMP_DIR || "/tmp
   }
   const failureCode = validateModelIdentifier(attribution.routing.failure_code);
   return `routing ${attribution.routing.status}${failureCode ? ` (${failureCode})` : ""}`;
+}
+
+// Keep the full model version and tier readable rather than compressing them into an alias.
+function formatAttributionModelName(model) {
+  return model
+    .replace(/^.*\//, "")
+    .split(/[-_]/)
+    .map(part => (/^(gpt|o\d+)$/i.test(part) ? part.toUpperCase() : /^\d/.test(part) ? part : part.charAt(0).toUpperCase() + part.slice(1)))
+    .join(" ");
 }
 
 function recordFallbackModelFromUsage(content, env = process.env, infoPath = `${env.GH_AW_TMP_DIR || "/tmp/gh-aw"}/aw_info.json`, logger = console.warn) {

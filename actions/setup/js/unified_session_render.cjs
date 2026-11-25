@@ -7,6 +7,7 @@ const { collapseStreamedMessages, boundSummaryLines, escapeSummaryText, redactSe
 const { collectArtifactSecretValues, redactManifestValue } = require("./safe_output_manifest.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { normalizeUnifiedSessionEvent } = require("./unified_session_payload.cjs");
+const { normalizeHarnessDecisionData } = require("./harness_retry_record.cjs");
 const { COPILOT_WORKFLOW_EVENT_FIELDS, COPILOT_WORKFLOW_EVENT_TYPES } = require("./copilot_workflow_events.cjs");
 const { ERR_SYSTEM, ERR_VALIDATION } = require("./error_codes.cjs");
 const { validateAgentExecution } = require("./agent_execution.cjs");
@@ -33,11 +34,14 @@ const RUNTIME_TYPES = new Set([
   "model_routing.outcome",
   "model_endpoint.mismatch",
   "model.resolution",
+  "durable.restore",
+  "durable.session",
   "firewall.steering",
   "firewall.event",
   "safe_output.request",
   "safe_output.result",
-  "safe_output.outcome",
+  "safe_output.execution",
+  "lifecycle.adoption",
   "safe_output.error",
   "experiment.state",
   "experiment.assignment",
@@ -46,6 +50,7 @@ const RUNTIME_TYPES = new Set([
   "eval.result",
   "usage.report",
   "execution.result",
+  "harness.decision",
   "detection.result",
   "workflow.info",
   "workflow.job_result",
@@ -97,6 +102,9 @@ function scalarFields(value, keys) {
 function eventDetail(event) {
   /** @type {Record<string, any>} */
   const data = normalizeUnifiedSessionEvent({ ...event, data: event.data ?? {} }).data;
+  if (event.type === "harness.decision") {
+    return fields(data, ["proposedAttempt", "outcome", "latencyMs", "avoidedInvocation", "error"]) + ` questions=[${data.questions.map(question => fields(question, ["question", "outcome", "error"])).join("; ")}]`;
+  }
   if (COPILOT_WORKFLOW_EVENT_TYPES.has(event.type)) {
     return fields({ ...data, agentId: event.agentId }, ["agentId", ...Object.keys(COPILOT_WORKFLOW_EVENT_FIELDS[event.type])]);
   }
@@ -125,7 +133,7 @@ function eventDetail(event) {
     case "session.info":
       return scalarFields(data, ["status", "model", "message", "sourceType", "kind", "isAuthenticating", "rateLimitInfo"]);
     case "session.shutdown":
-      return fields(data, ["shutdownType", "errorReason", "currentModel", "premiumRequests", "totalApiDurationMs", "totalNanoAiu"]);
+      return fields(data, ["shutdownType", "errorReason", "currentModel", "premiumRequests", "totalApiDurationMs", "totalNanoAiu", "aiCreditsStatus"]);
     case "session.task_complete":
       return fields(data, ["success"]);
     case "session.mode_changed":
@@ -197,7 +205,7 @@ function eventDetail(event) {
     case "firewall.http_access":
       return fields(data, ["host", "method", "status", "decision"]);
     case "firewall.steering":
-      return fields(data, ["event", "threshold", "message", "reason"]);
+      return fields(data, ["event", "trigger", "threshold", "conversation", "message", "reason"]);
     case "firewall.token_usage":
     case "usage.report":
       return (
@@ -209,12 +217,17 @@ function eventDetail(event) {
       return fields(data, ["stage", "routed", "outcome", "selectedModel", "selectedEffort", "router"]);
     case "model_routing.outcome":
       return fields(data, ["status", "wireModel", "effectiveEndpoint", "selectedEndpoint", "effort", "appliedEffort", "failureCode"]);
+    case "routing.observation":
+      return fields(data, ["outcome", "reason"]);
     case "model.inventory":
       return fields(data, ["endpoints", "modelsFetchComplete"]);
     case "model_endpoint.mismatch":
       return `${fields(data, ["category", "phase", "configured_model", "resolved_model", "wire_api", "wire_api_source", "supported_endpoints", "model", "endpoint"])} cause=${inline(data.detail)} fix=${inline(data.fix)}`;
     case "model.resolution":
       return fields(data, ["engine", "role", "configured_model", "resolved_model", "provider", "status", "cause"]);
+    case "durable.restore":
+    case "durable.session":
+      return fields(data, ["engine", "storage", "status", "runId", "runAttempt", "parentRunId", "artifactId", "sessionId"]);
     case "mcp.event":
       return fields(data, ["event", "serverName", "level", "status", "message", "reason"]);
     case "firewall.event":
@@ -234,8 +247,10 @@ function eventDetail(event) {
       return `${fields(data, ["type", "repo", "number"])} [requested, not executed]`;
     case "safe_output.result":
       return `${fields(data, ["type", "status", "repo", "number", "provider", "identifier", "url"])} [execution recorded]`;
-    case "safe_output.outcome":
-      return fields(data, ["type", "messageIndex", "status", "staged", "url"]);
+    case "safe_output.execution":
+      return fields(data, ["type", "messageIndex", "status", "staged", "operation_outcome", "url"]);
+    case "lifecycle.adoption":
+      return fields(data, ["sourceRunId", "sourceWorkflow", "repository", "outputType", "deliveryState", "adoptionState", "adoptionSignal", "acceptanceKind", "humanVerified", "adoptionCoverage", "survivalState", "survivalCoverage"]);
     case "safe_output.error":
       return `${fields(data, ["type", "status", "errorCode", "message", "error"])}${Array.isArray(data.errors) ? ` errors=${data.errors.length} [${data.errors.map(error => fields(error, ["type", "errorCode"])).join("; ")}]` : ""}`;
     case "experiment.assignment":
@@ -446,6 +461,8 @@ function renderUnifiedSession(events, { markdown, maxBytes, maxLineBytes, agentS
   const preamble = markdown ? "<details><summary>Unified session</summary>\n\n" : "";
   const tail = markdown ? "\n\n</details>" : "";
   if (!markdown) return boundSummaryLines(lines, maxBytes, maxLineBytes).join("\n").replace(/::/g, ": :");
+  const decisions = decisionSummarySection(redacted);
+  /** @type {Array<{title: string, collapsed: boolean, lines: string[], markdown?: boolean}>} */
   const sections = [
     { title: "Session overview", collapsed: true, lines: overview },
     {
@@ -458,6 +475,7 @@ function renderUnifiedSession(events, { markdown, maxBytes, maxLineBytes, agentS
     },
     { title: "Full timeline", collapsed: true, lines: traceLines },
   ];
+  if (decisions) sections.push({ ...decisions, collapsed: true, markdown: true });
   const bounded = sections.map(section => ({
     ...section,
     lines: boundSummaryLines(section.lines.length ? section.lines : ["No agent conversation recorded."], Number.MAX_SAFE_INTEGER, maxLineBytes),
@@ -467,9 +485,9 @@ function renderUnifiedSession(events, { markdown, maxBytes, maxLineBytes, agentS
   // Fenced code treats HTML as literal text; escaping here would print entities.
   for (const section of bounded) for (const line of section.lines) for (const run of line.match(/`+/g) ?? []) longest = Math.max(longest, run.length);
   const fence = "`".repeat(longest + 1);
-  /** @param {{title: string, collapsed: boolean}} section @param {string[]} content */
+  /** @param {{title: string, collapsed: boolean, markdown?: boolean}} section @param {string[]} content */
   const block = (section, content) => {
-    const transcript = `${fence}text\n${content.join("\n")}\n${fence}\n\n`;
+    const transcript = section.markdown ? `${content.join("\n")}\n\n` : `${fence}text\n${content.join("\n")}\n${fence}\n\n`;
     return section.collapsed ? `<details><summary>${section.title}</summary>\n\n${transcript}</details>\n\n` : `### ${section.title}\n\n${transcript}`;
   };
   const shellBytes = Buffer.byteLength(preamble + tail + bounded.map(section => block(section, [])).join(""), "utf8");
@@ -477,7 +495,7 @@ function renderUnifiedSession(events, { markdown, maxBytes, maxLineBytes, agentS
   const fallback = "Unified session summary omitted: remaining step-summary byte limit reached.\n";
   if (remaining < 512) return Buffer.byteLength(fallback, "utf8") <= maxBytes ? fallback : "";
   const contentBySection = new Map();
-  const priority = [bounded[1], bounded[0], bounded[2]];
+  const priority = [...(decisions ? [bounded[3]] : []), bounded[1], bounded[0], bounded[2]];
   for (const [index, section] of priority.entries()) {
     // Reserve an explicit omission notice for every later priority section.
     const reserved = priority.slice(index + 1).reduce((bytes, next) => bytes + Buffer.byteLength(next.notice, "utf8") + 1, 0);
@@ -488,7 +506,37 @@ function renderUnifiedSession(events, { markdown, maxBytes, maxLineBytes, agentS
     contentBySection.set(section, content);
   }
   const blocks = bounded.map(section => block(section, contentBySection.get(section)));
-  return preamble + blocks.join("") + tail;
+  return (decisions ? blocks[3] : "") + preamble + blocks.slice(0, 3).join("") + tail;
+}
+
+/** @param {Array<any>} events */
+function decisionSummarySection(events) {
+  const decisions = events
+    .filter(event => event.type === "harness.decision")
+    .map(event => {
+      const decision = normalizeHarnessDecisionData(event.data);
+      if (!decision) throw new Error(`${ERR_VALIDATION}: Harness decision evidence must contain bounded outcomes and latency metadata`);
+      return decision;
+    });
+  if (!decisions.length) return undefined;
+  const skipped = decisions.filter(decision => decision.avoidedInvocation).length;
+  const status = skipped ? `${skipped} invocation${skipped === 1 ? "" : "s"} skipped` : "No invocations skipped";
+  const lines = [
+    "### Invocation skip decisions",
+    "",
+    `**${status}.** ${decisions.length} decision check${decisions.length === 1 ? "" : "s"} evaluated before eligible agent invocations.`,
+    "",
+    "| Proposed attempt | Outcome | Effect | Questions (allow / deny / unknown) | Latency | Errors |",
+    "| --- | --- | --- | --- | --- | --- |",
+  ];
+  for (const decision of decisions) {
+    const counts = ["allow", "deny", "unknown"].map(outcome => decision.questions.filter(question => question.outcome === outcome).length);
+    const errors = [...(decision.error ? [`Batch: \`${decision.error}\``] : []), ...decision.questions.filter(question => question.error).map(question => `Q${question.question}: \`${question.error}\``)];
+    const attempt = `${decision.startupAttemptId ? `${decision.startupAttemptId} / ` : ""}${decision.proposedAttempt}`;
+    lines.push(`| ${attempt} | \`${decision.outcome}\` | ${decision.avoidedInvocation ? "Skipped" : "No skip recommended"} | ${counts.join(" / ")} | ${decision.latencyMs} ms | ${errors.join("<br>") || "None"} |`);
+  }
+  lines.push("", "Unknown answers preserve the harness-selected execution path. Decision requests may consume credits; a skip is not independent proof of task completion.");
+  return { title: `skip-if-decision: ${status.toLowerCase()}`, lines };
 }
 
 /** @param {string} filePath @returns {Promise<void>} */

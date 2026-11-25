@@ -56,7 +56,6 @@ tools:
   edit:
 
 safe-outputs:
-  steer: true
   create-pull-request:
     expires: 1d
     title-prefix: "[community] "
@@ -77,9 +76,11 @@ experiments:
   prompt_style: [concise, verbose]
 
 imports:
+  - shared/pr-safe-output-defaults.md
   - shared/community-attribution.md
   - shared/otlp.md
   - shared/issue-dedup.md
+  - shared/reporting.md
 
 steps:
   - name: Re-fetch full community issue history with pagination
@@ -369,6 +370,8 @@ evals:
 ---
 
 # Daily Community Attribution Updater
+
+Use only commands listed under `tools.bash`, one standalone command per call. Do not combine commands with shell operators unless the complete command is explicitly allowlisted. If a required operation is blocked, stop and report it instead of probing command variants.
 
 Maintain an up-to-date **🌍 Community Contributions** section in `README.md`
 and an all-time **Community Contributors** wiki page by attributing all

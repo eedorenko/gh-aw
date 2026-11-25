@@ -11,6 +11,8 @@ import (
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/semverutil"
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/goccy/go-yaml"
 )
 
@@ -28,14 +30,16 @@ func (c *Compiler) validateExpressions(workflowData *WorkflowData, markdownPath 
 	// to provide a specific, actionable error/warning message.
 	// In strict mode this returns an error that stops further validation.
 	// In non-strict mode it emits a warning and continues.
-	if err := c.validateSecretsSerializationExpressions(workflowData); err != nil {
+	expressionData := *workflowData
+	expressionData.MarkdownContent += "\n" + workflowData.PromptMarkdown
+	if err := c.validateSecretsSerializationExpressions(&expressionData); err != nil {
 		return formatCompilerError(markdownPath, "error", err.Error(), err)
 	}
 
 	// Validate expression safety - check that all GitHub Actions expressions are in the allowed list.
 	// In non-strict mode, ${{ toJSON(secrets) }} occurrences were already warned about above;
 	// neutralize them so the allowlist does not re-surface them as errors.
-	markdownForAllowlist := removeXMLComments(workflowData.MarkdownContent)
+	markdownForAllowlist := removeXMLComments(expressionData.MarkdownContent)
 	if !c.effectiveStrictMode(workflowData.RawFrontmatter) {
 		markdownForAllowlist = neutralizeSecretsSerializationExpressions(markdownForAllowlist)
 	}
@@ -61,7 +65,7 @@ func (c *Compiler) validateExpressions(workflowData *WorkflowData, markdownPath 
 		}
 	}
 
-	if err := validatePromptSecretBindings(workflowData, c.collectRuntimeImportMarkdownForCompilerAnalysis(workflowData)); err != nil {
+	if err := validatePromptSecretBindings(workflowData, c.collectRuntimeImportMarkdownForPromptExpressions(workflowData)); err != nil {
 		return formatCompilerError(markdownPath, "error", err.Error(), err)
 	}
 	// Warn when the prompt explicitly references /tmp/ or /tmp/gh-aw/ directly instead
@@ -85,6 +89,10 @@ func runtimeImportValidationMarkdown(workflowData *WorkflowData) string {
 
 	var seed strings.Builder
 	seed.WriteString(workflowData.MarkdownContent)
+	if workflowData.PromptMarkdown != "" {
+		seed.WriteByte('\n')
+		seed.WriteString(workflowData.PromptMarkdown)
+	}
 	if workflowData.MainWorkflowMarkdown != "" {
 		seed.WriteByte('\n')
 		seed.WriteString(workflowData.MainWorkflowMarkdown)
@@ -184,18 +192,20 @@ func (c *Compiler) validateFeatureConfig(workflowData *WorkflowData, markdownPat
 // permission requirement, and dispatch/call-workflow configurations.
 // workflowPermissions is the *Permissions value returned by validatePermissions.
 func (c *Compiler) validateToolConfiguration(workflowData *WorkflowData, markdownPath string, workflowPermissions *Permissions) error {
-	strict := c.effectiveStrictMode(workflowData.RawFrontmatter)
-	if err := validateEngineCooldown(workflowData.EngineConfig, strict); err != nil {
+	if err := validateEngineCooldown(workflowData.EngineConfig); err != nil {
 		return formatCompilerError(markdownPath, "error", err.Error(), err)
 	}
 	c.warnLegacyBehaviorInstallationCooldown(workflowData, markdownPath)
 	if workflowData.SafeOutputs != nil && workflowData.SafeOutputs.ThreatDetection != nil {
-		if err := validateEngineCooldown(workflowData.SafeOutputs.ThreatDetection.EngineConfig, strict); err != nil {
+		if err := validateEngineCooldown(workflowData.SafeOutputs.ThreatDetection.EngineConfig); err != nil {
 			return formatCompilerError(markdownPath, "error", "safe-outputs.threat-detection: "+err.Error(), err)
 		}
 	}
 	workflowLog.Printf("Validating release checksum pins")
 	if err := c.validateReleaseIntegrityPins(workflowData); err != nil {
+		return formatCompilerError(markdownPath, "error", err.Error(), err)
+	}
+	if err := c.validateEngineReleaseCooldowns(workflowData, markdownPath); err != nil {
 		return formatCompilerError(markdownPath, "error", err.Error(), err)
 	}
 	if err := validateExperimentalSubagentModels(workflowData); err != nil {
@@ -251,13 +261,14 @@ func (c *Compiler) warnLegacyBehaviorInstallationCooldown(workflowData *Workflow
 	}
 
 	message := fmt.Sprintf(
-		"engine definition %q uses deprecated behaviors.installation.cooldown, which is ignored; set workflow engine.cooldown instead (0 disables cooldown only outside strict mode; strict mode rejects zero)",
+		"engine definition %q uses deprecated behaviors.installation.cooldown, which is ignored; set workflow engine.cooldown instead (0 disables cooldown, including in strict mode)",
 		definition.ID,
 	)
 	fmt.Fprintln(os.Stderr, formatCompilerMessage(markdownPath, "warning", message))
 	c.IncrementWarningCount()
 }
 
+//nolint:largefunc // Keep the ordered core validation table and its dispatch together.
 func (c *Compiler) validateCoreToolConfiguration(workflowData *WorkflowData, markdownPath string) error {
 	validations := []struct {
 		logMessage string
@@ -267,6 +278,7 @@ func (c *Compiler) validateCoreToolConfiguration(workflowData *WorkflowData, mar
 		{logMessage: "Validating GitHub CLI proxy version", validateFn: func() error { return validateGitHubCLIProxyVersion(workflowData) }},
 		{logMessage: "Validating safe-outputs target fields", validateFn: func() error { return validateSafeOutputsTarget(workflowData.SafeOutputs) }},
 		{logMessage: "Validating safe-outputs max fields", validateFn: func() error { return validateSafeOutputsMax(workflowData.SafeOutputs) }},
+		{logMessage: "Validating request-continuation authorization", validateFn: func() error { return validateRequestContinuationAuthorization(workflowData.SafeOutputs) }},
 		{logMessage: "Validating steering issue configuration", validateFn: func() error { return validateSteeringIssue(workflowData) }},
 		{logMessage: "Validating safe-outputs data schema", validateFn: func() error { return validateSafeOutputsDataSchema(workflowData.SafeOutputs) }},
 		{logMessage: "Validating safe-outputs samples entries against MCP tool schemas", validateFn: func() error { return validateSafeOutputsSamples(workflowData.SafeOutputs) }},
@@ -285,13 +297,15 @@ func (c *Compiler) validateCoreToolConfiguration(workflowData *WorkflowData, mar
 		{logMessage: "Validating network firewall configuration", validateFn: func() error { return validateNetworkFirewallConfig(workflowData.NetworkPermissions) }},
 		{logMessage: "Validating safe-outputs allow-workflows", validateFn: func() error { return validateSafeOutputsAllowWorkflows(workflowData.SafeOutputs) }},
 		{logMessage: "Validating safe-outputs approve-workflow-run authentication", validateFn: func() error { return validateSafeOutputsApproveWorkflowRun(workflowData.SafeOutputs) }},
+		{logMessage: "Validating safe-outputs create-security-advisory authentication", validateFn: func() error { return validateSafeOutputsCreateSecurityAdvisory(workflowData.SafeOutputs) }},
+		{logMessage: "Validating safe-outputs add-security-advisory-comment authentication", validateFn: func() error { return validateSafeOutputsAddSecurityAdvisoryComment(workflowData.SafeOutputs) }},
 		{logMessage: "Validating OTLP resource attributes", validateFn: func() error { return validateOTLPResourceAttributes(workflowData) }},
 		{logMessage: "Validating labels", validateFn: func() error { return validateLabels(workflowData) }},
 		{logMessage: "Validating workflow_dispatch input requirements for command triggers", validateFn: func() error { return validateCommandWorkflowDispatchInputs(workflowData) }},
 		{logMessage: "Validating max-daily-ai-credits frontmatter", validateFn: func() error { return validateMaxDailyAICFrontmatter(workflowData) }},
 		{logMessage: "Validating private-to-public-flows string value", validateFn: func() error { return validatePrivateToPublicFlowsStringValue(workflowData) }},
 		{logMessage: "Validating private-to-public-flows server IDs", validateFn: func() error { return validatePrivateToPublicFlowsServerIDs(workflowData) }},
-		{logMessage: "Validating Azure and GCP WIF engine auth required fields", validateFn: func() error { return validateWIFEngineAuth(workflowData) }},
+		{logMessage: "Validating WIF engine auth required fields", validateFn: func() error { return c.validateWIFEngineAuth(workflowData) }},
 		{logMessage: "Validating OTLP workload identity configuration", validateFn: func() error { return validateOTLPWorkloadIdentity(workflowData) }},
 		{logMessage: "Validating default AI credits pricing values", validateFn: func() error { return validateDefaultAiCreditsPricing(workflowData) }},
 		{logMessage: "Validating enclaves configuration", validateFn: func() error { return validateEnclavesConfig(workflowData) }},
@@ -307,10 +321,16 @@ func (c *Compiler) validateCoreToolConfiguration(workflowData *WorkflowData, mar
 		fmt.Fprintln(os.Stderr, formatCompilerMessage(markdownPath, "warning", err.Error()))
 		c.IncrementWarningCount()
 	}
+	workflowLog.Printf("Validating BYOK provider host firewall coverage")
+	if err := c.validateBYOKProviderHostAllowlist(workflowData, markdownPath); err != nil {
+		return err
+	}
 	workflowLog.Printf("Validating cross-repo checkout paths")
 	c.deriveAndWarnCrossRepoCheckoutPaths(workflowData.CheckoutConfigs, markdownPath)
+	c.warnCheckoutRefWithSteps(workflowData, markdownPath)
 	workflowLog.Printf("Validating push-to-pull-request-branch configuration")
 	c.validatePushToPullRequestBranchWarnings(workflowData.SafeOutputs, workflowData.CheckoutConfigs)
+	c.warnNestedPublicationAlerts(workflowData.SafeOutputs, markdownPath)
 	for _, validation := range validations {
 		workflowLog.Printf("%s", validation.logMessage)
 		if err := validation.validateFn(); err != nil {
@@ -571,37 +591,85 @@ func (c *Compiler) emitExperimentalFeatureWarnings(workflowData *WorkflowData) {
 	c.emitExperimentalFeatureWarningsTo(workflowData, os.Stderr)
 }
 
+// experimentalFeatureChecks maps experimental feature IDs from data/experimental_features.json
+// to the condition that makes a workflow use them.
+var experimentalFeatureChecks = []struct {
+	id      string
+	enabled func(*WorkflowData) bool
+}{
+	{"copilot-dynamic-workflows", func(w *WorkflowData) bool {
+		return ResolveEngineID(w) == string(constants.CopilotEngine) && w.EngineConfig.DynamicWorkflowsEnabled()
+	}},
+	{"rate-limit", func(w *WorkflowData) bool { return w.RateLimit != nil }},
+	{"skip-if-decision", isSkipIfDecisionEnabled},
+	{"token-broker", func(w *WorkflowData) bool { return w.TokenBrokerEnabled }},
+	{"engine-durable", func(w *WorkflowData) bool { return w.EngineConfig != nil && w.EngineConfig.Durable != nil }},
+	{"gateway-dispatch", func(w *WorkflowData) bool { return len(w.WebhookSubscriptions) > 0 }},
+	{"gateway-dispatch-projects-items", func(w *WorkflowData) bool { return hasWebhookSubscriptionEvent(w, "projects_v2_item") }},
+	{"gateway-dispatch-code-scanning-alert", func(w *WorkflowData) bool { return hasWebhookSubscriptionEvent(w, "code_scanning_alert") }},
+	{"gateway-dispatch-dependabot-alerts", func(w *WorkflowData) bool { return hasWebhookSubscriptionEvent(w, "dependabot_alert") }},
+	{"graders", func(w *WorkflowData) bool {
+		return w.RawFrontmatter["graders"] != nil && w.Graders != nil && w.Graders.HasGraders()
+	}},
+	{"merge-pull-request", func(w *WorkflowData) bool { return w.SafeOutputs != nil && w.SafeOutputs.MergePullRequest != nil }},
+	{"security-advisory-safe-outputs", func(w *WorkflowData) bool {
+		return w.SafeOutputs != nil && (w.SafeOutputs.CreateSecurityAdvisory != nil || w.SafeOutputs.AddSecurityAdvisoryComment != nil)
+	}},
+	{"lsp", func(w *WorkflowData) bool { return len(w.LSP) > 0 }},
+	{"enclaves", hasCloudHypervisorEnclaves},
+	{"plugins", func(w *WorkflowData) bool { return len(w.Plugins) > 0 }},
+	{"drive-memory", func(w *WorkflowData) bool { return w.DriveMemoryConfig != nil && len(w.DriveMemoryConfig.Drives) > 0 }},
+	{"continual-experiments", func(w *WorkflowData) bool { return hasContinualExperiment(w.ExperimentConfigs) }},
+	{"safe-outputs-steer", func(w *WorkflowData) bool { return w.SafeOutputs != nil && w.SafeOutputs.Steer }},
+	{"issue-intent", hasIssueIntentEnabled},
+}
+
+// hasIssueIntentEnabled reports whether any intent-capable safe output opts in with issue-intent: true.
+func hasIssueIntentEnabled(w *WorkflowData) bool {
+	so := w.SafeOutputs
+	if so == nil {
+		return false
+	}
+	var toggles []*bool
+	if so.CloseIssues != nil {
+		toggles = append(toggles, so.CloseIssues.IssueIntent)
+	}
+	if so.AddLabels != nil {
+		toggles = append(toggles, so.AddLabels.IssueIntent)
+	}
+	if so.AssignToAgent != nil {
+		toggles = append(toggles, so.AssignToAgent.IssueIntent)
+	}
+	if so.AssignToUser != nil {
+		toggles = append(toggles, so.AssignToUser.IssueIntent)
+	}
+	if so.SetIssueType != nil {
+		toggles = append(toggles, so.SetIssueType.IssueIntent)
+	}
+	if so.SetIssueField != nil {
+		toggles = append(toggles, so.SetIssueField.IssueIntent)
+	}
+	return slices.ContainsFunc(toggles, issueIntentRequired)
+}
+
+func hasWebhookSubscriptionEvent(workflowData *WorkflowData, event string) bool {
+	return slices.ContainsFunc(workflowData.WebhookSubscriptions, func(subscription WebhookSubscription) bool { return subscription.Event == event })
+}
+
 func (c *Compiler) emitExperimentalFeatureWarningsTo(workflowData *WorkflowData, writer io.Writer) {
-	warnings := []struct {
+	type experimentalWarning struct {
 		enabled bool
 		message string
-	}{
-		{enabled: ResolveEngineID(workflowData) == string(constants.CopilotEngine) && workflowData.EngineConfig.DynamicWorkflowsEnabled(), message: "Using experimental feature: copilot.dynamic-workflows"},
-		{enabled: workflowData.RateLimit != nil, message: "Using experimental feature: rate limiting"},
-		{enabled: workflowData.TokenBrokerEnabled, message: "Using experimental feature: token-broker"},
-		{enabled: len(workflowData.WebhookSubscriptions) > 0, message: "Using experimental feature: on.gateway-dispatch (approved webhook bridge required)"},
-		{enabled: slices.ContainsFunc(workflowData.WebhookSubscriptions, func(subscription WebhookSubscription) bool { return subscription.Event == "projects_v2_item" }), message: "Using experimental feature: on.gateway-dispatch.projects-items (hosted CAO triggers)"},
-		{enabled: slices.ContainsFunc(workflowData.WebhookSubscriptions, func(subscription WebhookSubscription) bool { return subscription.Event == "code_scanning_alert" }), message: "Using experimental feature: on.gateway-dispatch.code-scanning-alert (hosted CAO triggers)"},
-		{enabled: slices.ContainsFunc(workflowData.WebhookSubscriptions, func(subscription WebhookSubscription) bool { return subscription.Event == "dependabot_alert" }), message: "Using experimental feature: on.gateway-dispatch.dependabot-alerts (hosted CAO triggers)"},
-		{enabled: slices.ContainsFunc(workflowData.WebhookSubscriptions, func(subscription WebhookSubscription) bool { return subscription.Event == "jira_issue" }), message: "Using experimental feature: on.gateway-dispatch.jira-issue (approved webhook bridge required)"},
-		{enabled: slices.ContainsFunc(workflowData.WebhookSubscriptions, func(subscription WebhookSubscription) bool { return subscription.Event == "linear_issue" }), message: "Using experimental feature: on.gateway-dispatch.linear-issue (approved webhook bridge required)"},
-		{enabled: slices.ContainsFunc(workflowData.WebhookSubscriptions, func(subscription WebhookSubscription) bool { return subscription.Event == "azure_devops_issue" }), message: "Using experimental feature: on.gateway-dispatch.azure-devops-issue (approved webhook bridge required)"},
-		{enabled: workflowData.RawFrontmatter["graders"] != nil && workflowData.Graders != nil && workflowData.Graders.HasGraders(), message: "Using experimental feature: graders"},
-		{enabled: workflowData.SafeOutputs != nil && workflowData.SafeOutputs.MergePullRequest != nil, message: "Using experimental feature: merge-pull-request"},
-		{enabled: workflowData.SafeOutputs != nil && workflowData.SafeOutputs.CreateWorkItems != nil, message: "Using experimental feature: ado-create-work-item"},
-		{enabled: workflowData.SafeOutputs != nil && workflowData.SafeOutputs.UpdateWorkItems != nil, message: "Using experimental feature: ado-update-work-item"},
-		{enabled: workflowData.SafeOutputs != nil && workflowData.SafeOutputs.CommentOnWorkItems != nil, message: "Using experimental feature: ado-comment-on-work-item"},
-		{enabled: workflowData.SafeOutputs != nil && workflowData.SafeOutputs.AssignWorkItems != nil, message: "Using experimental feature: ado-assign-work-item"},
-		{enabled: workflowData.SafeOutputs != nil && workflowData.SafeOutputs.LinkWorkItems != nil, message: "Using experimental feature: ado-link-work-items"},
-		{enabled: workflowData.SafeOutputs != nil && workflowData.SafeOutputs.UploadWorkItemAttachments != nil, message: "Using experimental feature: ado-upload-workitem-attachment"},
-		{enabled: hasLinearSafeOutputs(workflowData.SafeOutputs), message: "Using experimental feature: Linear safe outputs"},
-		{enabled: len(workflowData.LSP) > 0, message: "Using experimental feature: lsp"},
-		{enabled: hasCloudHypervisorEnclaves(workflowData), message: "Using experimental feature: enclaves cloud-hypervisor runtime"},
-		{enabled: len(workflowData.Plugins) > 0, message: "Using experimental feature: plugins"},
-		{enabled: workflowData.DriveMemoryConfig != nil && len(workflowData.DriveMemoryConfig.Drives) > 0, message: "Using experimental feature: drive-memory"},
-		{enabled: workflowData.RepoMemoryConfig != nil && slices.ContainsFunc(workflowData.RepoMemoryConfig.Memories, func(memory RepoMemoryEntry) bool { return memory.Ledger != nil }), message: "Using experimental feature: repo-memory ledger"},
-		{enabled: hasContinualExperiment(workflowData.ExperimentConfigs), message: "Using experimental feature: continual experiments"},
-		{enabled: workflowData.SafeOutputs != nil && workflowData.SafeOutputs.Steer, message: "Using experimental feature: safe-outputs steer"},
+	}
+	warnings := make([]experimentalWarning, 0, len(experimentalFeatureChecks))
+	for _, check := range experimentalFeatureChecks {
+		warnings = append(warnings, experimentalWarning{enabled: check.enabled(workflowData), message: experimentalFeatureWarning(check.id)})
+	}
+	for _, alias := range sliceutil.SortedKeys(workflowData.Connectors) {
+		warnings = append(warnings, experimentalWarning{
+			enabled: workflowData.Connectors[alias].Experimental,
+			message: experimentalFeatureWarning("connectors") + "." + alias,
+		})
 	}
 	for _, warning := range warnings {
 		if warning.enabled {
@@ -754,11 +822,126 @@ func validateGCPWIFEngineAuth(workflowData *WorkflowData) error {
 	return nil
 }
 
-func validateWIFEngineAuth(workflowData *WorkflowData) error {
+func (c *Compiler) validateWIFEngineAuth(workflowData *WorkflowData) error {
 	if err := validateAzureWIFEngineAuth(workflowData); err != nil {
 		return err
 	}
-	return validateGCPWIFEngineAuth(workflowData)
+	if err := validateGCPWIFEngineAuth(workflowData); err != nil {
+		return err
+	}
+	if err := validateOpenAIWIFEngineAuthAtPath(workflowData, "engine"); err != nil {
+		return err
+	}
+	return c.validateThreatDetectionOpenAIWIFEngineAuth(workflowData)
+}
+
+func (c *Compiler) validateThreatDetectionOpenAIWIFEngineAuth(workflowData *WorkflowData) error {
+	if workflowData == nil || workflowData.SafeOutputs == nil || workflowData.SafeOutputs.ThreatDetection == nil ||
+		workflowData.SafeOutputs.ThreatDetection.EngineDisabled {
+		return nil
+	}
+	engineID := c.getThreatDetectionEngineID(workflowData)
+	detectionData := buildExternalDetectorWorkflowData(workflowData, engineID)
+	detectionData.Model = inheritedDetectionModel(workflowData, engineID)
+	if workflowData.SafeOutputs.ThreatDetection.Model != "" {
+		detectionData.Model = workflowData.SafeOutputs.ThreatDetection.Model
+	}
+	if err := validateOpenAIWIFEngineAuthAtPath(detectionData, "safe-outputs.threat-detection.engine"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateOpenAIWIFEngineAuthAtPath(workflowData *WorkflowData, engineConfigPath string) error {
+	if workflowData == nil || workflowData.EngineConfig == nil {
+		return nil
+	}
+	auth := resolveOpenAIWIFAuth(workflowData.EngineConfig)
+	if auth == nil {
+		return nil
+	}
+
+	var missing []string
+	if auth.OpenAIIdentityProviderID == "" {
+		missing = append(missing, "identity-provider-id")
+	}
+	if auth.ServiceAccountID == "" {
+		missing = append(missing, "service-account-id")
+	}
+	if auth.Audience == "" {
+		missing = append(missing, "audience")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%s.auth with provider=openai requires the following fields: %s", engineConfigPath, strings.Join(missing, ", "))
+	}
+	if workflowData.EngineConfig.ID != "codex" {
+		return fmt.Errorf("%s.id: auth.provider=openai requires codex", engineConfigPath)
+	}
+	if !isFirewallEnabled(workflowData) {
+		return fmt.Errorf("%s.auth with provider=openai requires the firewall to be enabled", engineConfigPath)
+	}
+	if NewCodexEngine().ResolveLLMProvider(workflowData) != LLMProviderOpenAI {
+		return fmt.Errorf("%s.auth with provider=openai requires the OpenAI inference provider", engineConfigPath)
+	}
+	if err := validateOpenAIWIFVersionSupport(workflowData, engineConfigPath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateOpenAIWIFVersionSupport(workflowData *WorkflowData, engineConfigPath string) error {
+	firewallConfig := getFirewallConfig(workflowData)
+	configuredVersion := ""
+	if firewallConfig != nil {
+		configuredVersion = firewallConfig.Version
+	}
+	effectiveVersion := configuredVersion
+	if effectiveVersion == "" {
+		effectiveVersion = string(constants.DefaultFirewallVersion)
+	}
+	minVersion := string(constants.AWFOpenAIWIFMinVersion)
+	if !isFullSemanticVersion(effectiveVersion) || semverutil.Compare(effectiveVersion, minVersion) < 0 {
+		return NewValidationError(
+			engineConfigPath+".auth",
+			effectiveVersion,
+			fmt.Sprintf("OpenAI WIF requires AWF %s or newer", minVersion),
+			fmt.Sprintf("The effective AWF version is %s. Set sandbox.agent.version or network.firewall.version to %s or newer.", effectiveVersion, minVersion),
+		)
+	}
+
+	if agentConfig := getAgentConfig(workflowData); agentConfig != nil {
+		if image, ok := agentConfig.Images[awfImageRoleAPIProxy]; ok {
+			imageTag, found := imageReferenceTag(image)
+			if !found || !isFullSemanticVersion(imageTag) || semverutil.Compare(imageTag, minVersion) < 0 {
+				return NewValidationError(
+					"sandbox.agent.images.api-proxy",
+					image,
+					fmt.Sprintf("OpenAI WIF requires an API proxy image tagged %s or newer", minVersion),
+					fmt.Sprintf("The API proxy image tag %q does not establish support for OpenAI WIF. Use a digest-pinned image with a semantic version tag of %s or newer.", imageTag, minVersion),
+				)
+			}
+		}
+	}
+	return nil
+}
+
+func isFullSemanticVersion(version string) bool {
+	version = strings.TrimPrefix(version, "v")
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		for _, digit := range part {
+			if digit < '0' || digit > '9' {
+				return false
+			}
+		}
+	}
+	return semverutil.IsValid(version)
 }
 
 func validateAzureWIFEngineAuth(workflowData *WorkflowData) error {

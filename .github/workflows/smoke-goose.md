@@ -39,7 +39,7 @@ network:
     - go
 runtimes:
   go:
-    version: "1.27.3"
+    version: "1.27.4"
 tools:
   cache-memory: true
   github:
@@ -143,7 +143,7 @@ safe-outputs:
     expires: 2h
     close-older-issues: true
     close-older-key: "smoke-goose"
-    labels: [automation, testing]
+    labels: [automation, testing, "backlog:smoke-tests"]
   add-labels:
     allowed: [smoke-goose]
   messages:

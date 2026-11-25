@@ -77,13 +77,21 @@ credential-free placeholders; neither step-level staging overrides nor
 available, but their outputs are empty and dependent jobs may be skipped.
 Reusable output bindings and self-hosted runner policy remain valid without
 retaining original executable targets or matrix-dependent runner expressions.
-Host steps (`steps`, `pre-steps`, `pre-agent-steps`, `post-steps`, `on.steps`,
+Authored `steps` and `post-steps` are accepted but their code and credentials
+are omitted from dry-run locks before job construction and token wiring.
+Separate dispatch cannot execute them; review the reduced coverage from missing
+setup and cleanup. The agent and compiler-owned steps still execute on an
+authorized live test.
+Other host steps (`pre-steps`, `pre-agent-steps`, `on.steps`,
 safe-output/threat-detection/secret-masking steps, and unsafe built-in job
 overrides), custom MCP servers, `mcp-scripts`, custom safe-output scripts/actions,
-enabled Bash graders, and authored OIDC permissions (including safe-output
+and authored OIDC permissions (including safe-output
 permissions) are rejected, including declarations from imports. Compiler-owned
 pull-request stack gates remain enabled. Remove those declarations
 from a separate diagnostic workflow; there is no unsafe dry-run override.
+Compiler-generated connector safe-output handlers are accepted with forced staging
+and no connector write credentials, even when an operation sets `staged: false`.
+This does not permit authored safe-output scripts or custom MCP servers.
 Diagnostics, summaries, and run artifacts remain available;
 `OTEL_*`, `GH_AW_OTLP_*`, `GITHUB_AW_OTEL_*`, `TRACEPARENT`, `TRACESTATE`,
 `BAGGAGE`, and `CLAUDE_CODE_ENABLE_TELEMETRY` environment variables and automatic telemetry
@@ -100,6 +108,11 @@ is narrowed to maintainer/admin roles without bot exemptions.
 Use `DEBUG=workflow:compiler_development,cli:compile_development` for mutation logs;
 they report changed fields/keys and forced flags without configuration values.
 Compile text output reports excluded effects and scanner invocation coverage.
+Report the emitted artifact, outcome, checks run, and material missing coverage;
+say when no lock was emitted and never imply compilation executed the workflow.
+
+<!-- instruction-prefix-end -->
+
 `--json` adds a batch `workflow: "dry-run"` summary: `dry_run.gate` includes
 workflow and batch failures; scanner statuses distinguish `passed`, `failed`
 and `not_run`; each scanner's `differential` reports baseline, existing, added,

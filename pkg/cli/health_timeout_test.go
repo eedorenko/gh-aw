@@ -24,7 +24,7 @@ func TestHealthTimeoutFlag(t *testing.T) {
 	timeout, err = cmd.Flags().GetDuration("timeout")
 	require.NoError(t, err)
 	assert.Zero(t, timeout)
-	require.ErrorContains(t, RunHealth(HealthConfig{Timeout: -time.Second}), "--timeout must not be negative")
+	require.ErrorContains(t, runHealth(context.Background(), HealthConfig{Timeout: -time.Second}), "--timeout must not be negative")
 }
 
 func TestHealthTimeBudgetCancelsInFlightRequests(t *testing.T) {
@@ -86,12 +86,15 @@ func TestHealthTimeBudgetReturnsPartialJSON(t *testing.T) {
 				currentStage := "sampling"
 				response := `{"workflow_runs":[]}`
 				switch {
+				case endpoint == "repos/org/repo":
+					currentStage = "repository"
+					response = `{"default_branch":"main"}`
 				case strings.Contains(endpoint, "/actions/workflows?"):
 					currentStage = "registry"
 					response = `{"workflows":[{"id":1,"name":"Example","path":".github/workflows/example.lock.yml","state":"active"}]}`
 				case strings.Contains(endpoint, "status=failure"):
 					currentStage = "failure_listing"
-					response = `{"workflow_runs":[{"id":42,"name":"Example","path":".github/workflows/example.lock.yml","status":"completed","conclusion":"failure","event":"pull_request","run_attempt":1}]}`
+					response = `{"workflow_runs":[{"id":42,"name":"Example","path":".github/workflows/example.lock.yml","status":"completed","conclusion":"failure","event":"push","head_branch":"main","run_attempt":1}]}`
 				case strings.Contains(endpoint, "/jobs?per_page=1"):
 					currentStage = "job_presence"
 					if strings.Contains(endpoint, "per_page=100") {
@@ -107,28 +110,25 @@ func TestHealthTimeBudgetReturnsPartialJSON(t *testing.T) {
 			}
 			start := time.Now()
 			output := captureAuditGroupStdout(t, func() {
-				require.NoError(t, RunHealth(HealthConfig{
-					Days: 7, Threshold: 80, RepoOverride: "org/repo",
+				require.NoError(t, runHealth(context.Background(), HealthConfig{
+					WorkflowName: "example", Days: 7, Threshold: 80, RepoOverride: "org/repo",
 					JSONOutput: true, LogsDir: t.TempDir(), Timeout: 30 * time.Millisecond,
 				}))
 			})
 			assert.Less(t, time.Since(start), time.Second)
-			var report struct {
-				Collection HealthCollection `json:"collection"`
-				Workflows  []WorkflowHealth `json:"workflows"`
-			}
+			var report WorkflowHealth
 			require.NoError(t, json.Unmarshal([]byte(output), &report))
 			assert.True(t, report.Collection.Partial)
 			assert.Equal(t, "time_budget", report.Collection.Reason)
 			assert.Contains(t, report.Collection.Warning, "time budget exhausted")
 			assert.InDelta(t, 0.03, report.Collection.TimeoutSeconds, 0.001)
 			assert.GreaterOrEqual(t, report.Collection.ElapsedSeconds, 0.03)
-			assert.Equal(t, stage == "sampling", report.Collection.FailurePassComplete)
+			assert.False(t, report.Collection.FailurePassComplete, "the later branch pass has not completed")
+			assert.False(t, report.Collection.DefaultBranchPassComplete)
 			if stage == "representative_jobs" || stage == "sampling" {
 				assert.Equal(t, 1, report.Collection.FailureCandidates)
 				assert.Len(t, report.Collection.PotentialIssues, 1)
-				require.Len(t, report.Workflows, 1)
-				assert.Equal(t, 1, report.Workflows[0].TotalRuns, "collected runs must survive deadline expiry")
+				assert.Equal(t, 1, report.TotalRuns, "collected runs must survive deadline expiry")
 			}
 		})
 	}
@@ -137,9 +137,9 @@ func TestHealthTimeBudgetReturnsPartialJSON(t *testing.T) {
 func TestHealthTimeBudgetPropagatesToWorkQueueAndGit(t *testing.T) {
 	original := healthReadWorkQueue
 	t.Cleanup(func() { healthReadWorkQueue = original })
-	healthReadWorkQueue = func(ctx context.Context, _ workqueue.Branch) ([]workqueue.QueueCommit, error) {
+	healthReadWorkQueue = func(ctx context.Context, _ workqueue.Branch) (workqueue.Snapshot, error) {
 		<-ctx.Done()
-		return nil, ctx.Err()
+		return workqueue.Snapshot{}, ctx.Err()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()

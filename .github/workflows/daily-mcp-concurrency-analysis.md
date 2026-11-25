@@ -156,6 +156,8 @@ When issues are identified, create detailed issues with specific recommendations
 ### Step 1: Load Round-Robin State from Cache
 
 Use native `glob` to discover existing state files under `/tmp/gh-aw/cache-memory/`, then `view` to read the concurrency audit state. Reuse the existing state file and its format; if none exists, initialize `/tmp/gh-aw/cache-memory/concurrency-state.json` with the structure in Step 8. Do not inspect unrelated cache contents.
+Report `Cache hit` only after successfully reading reusable state, or `Cache miss`
+if the state file is missing. Keep the same state path across runs.
 
 Check your cache for:
 - `last_analyzed_tool`: The most recently analyzed tool
@@ -551,6 +553,14 @@ Your output MUST include:
    - Detailed issue report if problems found (create issue + optional agent session)
    - Clean tool confirmation if no problems found
 3. **Cache Update Confirmation**: Confirm cache was updated with results
+
+Use `###` or lower headings in the report. Start with a concise overview and
+tool-selection rationale, then summarize key results and actionable issues;
+collapse long analysis and supporting evidence in
+`<details><summary><b>...</b></summary>...</details>`, and finish with next
+actions or limitations. Keep the selected tool, result, and any required action
+visible. Format applicable run references as
+`[§12345](https://github.com/${{ github.repository }}/actions/runs/12345)`.
 
 ## Completion Requirement
 

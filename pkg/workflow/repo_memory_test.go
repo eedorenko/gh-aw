@@ -226,7 +226,7 @@ func TestRepoMemoryStepsGeneration(t *testing.T) {
 	}
 
 	var builder strings.Builder
-	generateRepoMemorySteps(&builder, data)
+	NewCompiler().generateRepoMemorySteps(&builder, data, "agent")
 
 	output := builder.String()
 
@@ -1283,7 +1283,7 @@ func TestRepoMemoryWikiStepsGeneration(t *testing.T) {
 	}
 
 	var builder strings.Builder
-	generateRepoMemorySteps(&builder, data)
+	NewCompiler().generateRepoMemorySteps(&builder, data, "agent")
 
 	output := builder.String()
 	assert.Contains(t, output, "TARGET_REPO: ${{ github.repository }}.wiki",
@@ -1310,7 +1310,7 @@ func TestRepoMemoryWikiStepsWithTargetRepo(t *testing.T) {
 	}
 
 	var builder strings.Builder
-	generateRepoMemorySteps(&builder, data)
+	NewCompiler().generateRepoMemorySteps(&builder, data, "agent")
 
 	output := builder.String()
 	assert.Contains(t, output, "TARGET_REPO: myorg/myrepo.wiki",
@@ -1447,6 +1447,34 @@ func TestRepoMemoryNonWikiPushNoAllowedRepos(t *testing.T) {
 	pushJobOutput := strings.Join(pushJob.Steps, "\n")
 	assert.NotContains(t, pushJobOutput, "REPO_MEMORY_ALLOWED_REPOS",
 		"Non-wiki push step should not set REPO_MEMORY_ALLOWED_REPOS")
+}
+
+// TestRepoMemoryPushReceivesAgentStartingCommit verifies that the agent job records the
+// commit each memory clone started from and passes it to the matching push step, so the
+// push can replay only this run's changes onto rows other runs saved in the meantime.
+func TestRepoMemoryPushReceivesAgentStartingCommit(t *testing.T) {
+	data := &WorkflowData{
+		RepoMemoryConfig: &RepoMemoryConfig{
+			Memories: []RepoMemoryEntry{
+				{ID: "default", BranchName: "memory/my-workflow"},
+				{ID: "notes", BranchName: "memory/notes"},
+			},
+		},
+	}
+	compiler := NewCompiler()
+
+	var agentSteps, preActivationSteps strings.Builder
+	compiler.generateRepoMemorySteps(&agentSteps, data, "agent")
+	compiler.generateRepoMemorySteps(&preActivationSteps, data, "pre_activation")
+	outputs := compiler.buildMainJobOutputs(data)
+
+	for _, memory := range data.RepoMemoryConfig.Memories {
+		assert.Contains(t, agentSteps.String(), "        id: clone_repo_memory_"+memory.ID+"\n", "Agent clone step should be addressable")
+		assert.Equal(t, "${{ steps.clone_repo_memory_"+memory.ID+".outputs.head }}", outputs["repo_memory_base_commit_"+memory.ID], "Agent job should expose the cloned commit")
+		step := compiler.buildSinglePushRepoMemoryStep(data, memory, true, false)
+		assert.Contains(t, step, "REPO_MEMORY_BASE_COMMIT: ${{ needs.agent.outputs.repo_memory_base_commit_"+memory.ID+" }}", "Push step should receive the cloned commit")
+	}
+	assert.NotContains(t, preActivationSteps.String(), "id: clone_repo_memory_", "Only the agent job's clone records the starting commit")
 }
 
 func TestRepoMemoryDailyAICWriterFilterExemption(t *testing.T) {
@@ -1717,7 +1745,7 @@ func TestRepoMemoryValidationConfigAndGeneratedSteps(t *testing.T) {
 
 	data := &WorkflowData{RepoMemoryConfig: config}
 	var restore strings.Builder
-	generateRepoMemorySteps(&restore, data)
+	NewCompiler().generateRepoMemorySteps(&restore, data, "agent")
 	assert.NotContains(t, restore.String(), "Validate repo-memory baseline (default)")
 	generateRepoMemoryBaselineValidationSteps(&restore, data)
 	restoreYAML := restore.String()
@@ -1743,6 +1771,7 @@ func TestRepoMemoryValidationConfigAndGeneratedSteps(t *testing.T) {
 	require.NotNil(t, pushJob)
 	pushYAML := strings.Join(pushJob.Steps, "\n")
 	assert.Contains(t, pushYAML, "VALIDATION_SCRIPT_B64:")
+	assert.Contains(t, pushYAML, "GH_AW_MEMORY_SOURCE_JOB_RESULT: ${{ needs.agent.result }}")
 	assert.Contains(t, pushYAML, "MEMORY_JSON_SCHEMAS_REQUIRED: 'true'")
 	assert.Contains(t, pushYAML, "VALIDATION_TIMEOUT_SECONDS: 60")
 }

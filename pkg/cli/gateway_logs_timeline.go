@@ -291,12 +291,15 @@ func auditEntryToTimelineEvent(entry AuditLogEntry) (UnifiedTimelineEvent, bool)
 func findGatewayJSONLPath(logDir string) string {
 	// Root-level gateway.jsonl (pre-mcp-logs-subdirectory artifact layout)
 	if p := filepath.Join(logDir, "gateway.jsonl"); fileutil.FileExists(p) {
+		gatewayLogsLog.Printf("Using root-level gateway.jsonl: %s", p)
 		return p
 	}
 	// mcp-logs/ subdirectory (standard layout after artifact download)
 	if p := filepath.Join(logDir, "mcp-logs", "gateway.jsonl"); fileutil.FileExists(p) {
+		gatewayLogsLog.Printf("Using mcp-logs gateway.jsonl: %s", p)
 		return p
 	}
+	gatewayLogsLog.Printf("No gateway.jsonl in %s, falling back to rpc-messages.jsonl", logDir)
 	// Fallback: rpc-messages.jsonl
 	return findRPCMessagesPath(logDir)
 }
@@ -529,7 +532,8 @@ func collectAgentTimelineEvents(logDir string, verbose bool) ([]UnifiedTimelineE
 //
 // The Status field is set to "token" for token_steering events, "time" for
 // timeout_steering events and "credit" for ai_credit_steering events, followed
-// by the budget threshold (for example "credit 90%") when AWF recorded one.
+// by the budget threshold (for example "credit 90%") when AWF recorded one, or
+// "little left" (for example "credit little left") for a little_left notice.
 // The Reason field carries the full message text.
 // The Time field is set from the Timestamp field when present; zero otherwise.
 func steeringEntryToTimelineEvent(entry proxyEventsEntry) (UnifiedTimelineEvent, bool) {
@@ -548,7 +552,9 @@ func steeringEntryToTimelineEvent(entry proxyEventsEntry) (UnifiedTimelineEvent,
 	case aiCreditSteeringEventName:
 		status = "credit"
 	}
-	if entry.Threshold > 0 {
+	if steeringEventTrigger(entry) == steeringTriggerLittleLeft {
+		status += " little left"
+	} else if entry.Threshold > 0 {
 		status = fmt.Sprintf("%s %d%%", status, entry.Threshold)
 	}
 

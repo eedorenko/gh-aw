@@ -9,10 +9,11 @@ const { validateContextVariables } = require("./validate_context_variables.cjs")
 const validateLockdownRequirements = require("./validate_lockdown_requirements.cjs");
 const { writeMergedModelsJSON } = require("./merge_frontmatter_models.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { genAiServerAddress } = require("./genai_endpoint.cjs");
 const { ERR_CONFIG, ERR_SYSTEM } = require("./error_codes.cjs");
 const { buildWorkflowCallId, normalizeLegacyWorkQueueContext, normalizeWorkQueueContext, resolveWorkQueueRuntime, readInboundAwContext } = require("./aw_context.cjs");
-const { normalizeWebhookContext, redactWebhookPayloads } = require("./webhook_context.cjs");
-const { normalizeEngineHarness, parseCompiledModelConfig } = require("./routing_analytics.cjs");
+const { normalizeWebhookContext } = require("./webhook_context.cjs");
+const { isRouterModelValue, normalizeEngineHarness, parseCompiledModelConfig, ROUTER_MODEL_VALUES } = require("./routing_analytics.cjs");
 
 /**
  * Generate aw_info.json with workflow run metadata.
@@ -59,6 +60,12 @@ async function main(core, ctx, githubClient) {
   // Build awInfo from env vars (compile-time) + context (runtime)
   const model = process.env.GH_AW_INFO_MODEL || "";
   const workflowId = process.env.GH_AW_INFO_WORKFLOW_ID || "";
+  if (!/^[^/]+\/[^/]+\/.+\.lock\.yml@.+$/.test(workflowId)) throw new Error("Run info requires the executing workflow identity");
+  const { loadMarkdownMetadata, metadataManifestFields } = require("./markdown_metadata.cjs");
+  const markdownMetadata = loadMarkdownMetadata(process.env.GITHUB_WORKSPACE || "", {
+    embeddedMetadata: process.env.GH_AW_INFO_MARKDOWN_METADATA,
+    embeddedMetadataFile: process.env.GH_AW_INFO_MARKDOWN_METADATA_FILE,
+  });
 
   // Reject model names that contain an unresolved GitHub Actions expression.
   // This can happen when a vars.* expression was used for the model in the
@@ -66,6 +73,27 @@ async function main(core, ctx, githubClient) {
   // causing GitHub Actions to pass the literal expression string at runtime.
   if (/\$\{\{/.test(model)) {
     const message = `${ERR_CONFIG}: GH_AW_INFO_MODEL contains an unresolved GitHub Actions expression: ${JSON.stringify(model)}`;
+    core.setFailed(message);
+    throw new Error(message);
+  }
+
+  const modelConfig = parseCompiledModelConfig(process.env.GH_AW_INFO_MODEL_CONFIG, process.env.GH_AW_INFO_MAX_AI_CREDITS, message => core.warning(message));
+
+  // A router value (router, router/economy, ...) chooses model routing; it is not a
+  // model name. Router values are accepted when written in the workflow, where the
+  // compiler turns them into routing, and from a whole-model expression on a workflow
+  // compiled for routing chosen at run time, where the activation job enables routing
+  // first. When the main agent's model is not routed for this run and a variable or
+  // expression resolves to a router value, stop before the agent starts instead of
+  // passing it to the engine as a model. When the model expression resolves empty,
+  // the harness uses the model-variable fallback (GH_AW_INFO_MODEL_FALLBACK mirrors
+  // GH_AW_MODEL_FALLBACK), so check that value.
+  const effectiveModel = model.trim() || (process.env.GH_AW_INFO_MODEL_FALLBACK || "").trim();
+  if (isRouterModelValue(effectiveModel) && modelConfig?.routing?.enabled !== true) {
+    const message =
+      `${ERR_CONFIG}: the main agent's model resolved to the router value ${JSON.stringify(effectiveModel)} at run time. ` +
+      `Router values (${[...ROUTER_MODEL_VALUES].join(", ")}) are routed only when written in the workflow's model or engine.model, or when that model is a single expression on a workflow that supports routing; they are not accepted from variables such as vars.GH_AW_MODEL_AGENT_<ENGINE> or vars.GH_AW_DEFAULT_MODEL_<ENGINE>. ` +
+      "Set a model name in the variable or expression, or write the router value in the workflow and recompile. See https://github.github.com/gh-aw/reference/model-routing/";
     core.setFailed(message);
     throw new Error(message);
   }
@@ -79,6 +107,7 @@ async function main(core, ctx, githubClient) {
     agent_version: process.env.GH_AW_INFO_AGENT_VERSION || "",
     workflow_name: process.env.GH_AW_INFO_WORKFLOW_NAME || "",
     workflow_id: workflowId,
+    ...metadataManifestFields(markdownMetadata),
     workflow_call_id: buildWorkflowCallId(ctx.runId, process.env.GITHUB_RUN_ATTEMPT, workflowId),
     // GITHUB_WORKFLOW_REF identifies the top-level caller for reusable workflows.
     caller_workflow_ref: process.env.GITHUB_WORKFLOW_REF || "",
@@ -125,6 +154,14 @@ async function main(core, ctx, githubClient) {
       core.warning(`Unable to load workflow-run creation time: ${getErrorMessage(err)}`);
       core.setOutput("run_created_at", "");
     }
+  }
+
+  // Compiler-resolved BYOK GenAI provider (e.g. azure.ai.openai); absent for GitHub-hosted inference.
+  const genAiProvider = (process.env.GH_AW_INFO_GENAI_PROVIDER || "").trim();
+  if (genAiProvider) {
+    awInfo.genai_provider = genAiProvider;
+    const serverAddress = genAiServerAddress(process.env.GH_AW_INFO_GENAI_ENDPOINT);
+    if (serverAddress) awInfo.genai_server_address = serverAddress;
   }
 
   const frontmatterSource = process.env.GH_AW_INFO_FRONTMATTER_SOURCE || "";
@@ -196,7 +233,6 @@ async function main(core, ctx, githubClient) {
     awInfo.server_url = serverUrl;
   }
   // Configured routing, model policy and budget, published even when routing is disabled or later fails.
-  const modelConfig = parseCompiledModelConfig(process.env.GH_AW_INFO_MODEL_CONFIG, process.env.GH_AW_INFO_MAX_AI_CREDITS, message => core.warning(message));
   if (modelConfig) {
     awInfo.model_config = modelConfig;
   }
@@ -343,7 +379,6 @@ async function main(core, ctx, githubClient) {
   }
 
   core.info("Generated aw_info.json at: " + tmpPath);
-  core.info(JSON.stringify({ ...awInfo, ...(awInfo.context ? { context: redactWebhookPayloads(awInfo.context) } : {}) }, null, 2));
 
   // Set model and engine_id as outputs for reuse in other steps/jobs
   core.setOutput("model", awInfo.model);

@@ -1,13 +1,13 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
-const { iterateJsonl } = require("./jsonl_helpers.cjs");
+const { iterateJsonl, iterateJsonlEvents } = require("./jsonl_helpers.cjs");
 const fs = require("fs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { displayDirectories } = require("./display_file_helpers.cjs");
 const { ERR_PARSE, ERR_SYSTEM } = require("./error_codes.cjs");
 const { formatModelEmojiAlias } = require("./model_aliases.cjs");
-const { computeInferenceAIC, findModelPricing, formatAIC } = require("./model_costs.cjs");
+const { computeInclusiveInputTokens, computeInferenceAIC, findModelPricing, formatAIC } = require("./model_costs.cjs");
 const { parseUnknownModelAICreditsFromAuditLog } = require("./ai_credits_context.cjs");
 const { getMcpRateLimitHint, getRpcRateLimitHint } = require("./mcp_rate_limit.cjs");
 const { MAX_STEP_SUMMARY_SIZE } = require("./log_parser_shared.cjs");
@@ -53,7 +53,7 @@ const AI_CREDITS_RATE_LIMIT_PATTERNS = [
   /\b429\b.{0,80}(?:rate[\s-]*limit|too many requests|ai[\s_-]*credits?)/i,
 ];
 // Detects the AWF API proxy HTTP 400 error emitted when maxAiCredits is active and
-// the requested model is not in the built-in pricing table.
+// AWF has no pricing for the requested model.
 const UNKNOWN_MODEL_AI_CREDITS_PATTERNS = [/\bunknown_model_ai_credits\b/i];
 
 /**
@@ -116,7 +116,7 @@ function formatAICForTable(value, source) {
  * aborts, retries, authentication, and safe outputs use separate paths.
  *
  * @param {string} jsonlContent - The token-usage.jsonl file content
- * @returns {{totalInputTokens: number, totalOutputTokens: number, totalCacheReadTokens: number, totalCacheWriteTokens: number, totalRequests: number, totalDurationMs: number, totalAIC: number, aiCreditsAvailable: boolean, aiCreditsSource: "awf_reported"|"recomputed", aiCreditsWarnings: string[], ambientContextTokens: number|undefined, byModel: Record<string, any>, entries: Array} | null}
+ * @returns {{totalInputTokens: number, totalOutputTokens: number, totalCacheReadTokens: number, totalCacheWriteTokens: number, tokenUsage: Partial<Record<"input_tokens"|"output_tokens"|"cache_read_tokens"|"cache_write_tokens"|"input_tokens_inclusive", number>>, totalRequests: number, totalDurationMs: number, totalAIC: number, aiCreditsAvailable: boolean, aiCreditsSource: "awf_reported"|"recomputed", aiCreditsWarnings: string[], ambientContextTokens: number|undefined, byModel: Record<string, any>, entries: Array} | null}
  * ambientContextTokens records first-request context size as:
  * input_tokens + ((cache_read_tokens + cache_write_tokens) / 10).
  */
@@ -128,6 +128,8 @@ function parseTokenUsageJsonl(jsonlContent) {
     totalOutputTokens: 0,
     totalCacheReadTokens: 0,
     totalCacheWriteTokens: 0,
+    /** @type {Partial<Record<"input_tokens"|"output_tokens"|"cache_read_tokens"|"cache_write_tokens"|"input_tokens_inclusive", number>>} */
+    tokenUsage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, input_tokens_inclusive: 0 },
     totalRequests: 0,
     totalDurationMs: 0,
     totalAIC: 0,
@@ -144,7 +146,12 @@ function parseTokenUsageJsonl(jsonlContent) {
     entries: [],
   };
 
-  for (const entry of iterateJsonl(jsonlContent)) {
+  for (const event of iterateJsonlEvents(jsonlContent)) {
+    if (event.type !== "json") {
+      if (event.reason !== "blank") summary.tokenUsage = {};
+      continue;
+    }
+    const entry = event.value;
     try {
       if (!entry || typeof entry !== "object") continue;
       const requestId = typeof entry.request_id === "string" ? entry.request_id.trim() : "";
@@ -156,10 +163,35 @@ function parseTokenUsageJsonl(jsonlContent) {
       }
       if (dedupeKey) seenRequestIds.add(dedupeKey);
 
-      const inputTokens = entry.input_tokens || 0;
-      const outputTokens = entry.output_tokens || 0;
-      const cacheReadTokens = entry.cache_read_tokens || 0;
-      const cacheWriteTokens = entry.cache_write_tokens || 0;
+      const parsedInputTokens = parseNonNegativeFiniteNumber(entry.input_tokens);
+      const parsedCacheReadTokens = parseNonNegativeFiniteNumber(entry.cache_read_tokens);
+      const parsedCacheWriteTokens = parseNonNegativeFiniteNumber(entry.cache_write_tokens);
+      const inputTokens = parsedInputTokens ?? 0;
+      const outputTokens = parseNonNegativeFiniteNumber(entry.output_tokens) ?? 0;
+      const cacheReadTokens = parsedCacheReadTokens ?? 0;
+      const cacheWriteTokens = parsedCacheWriteTokens ?? 0;
+      const inclusiveInputTokens =
+        parsedInputTokens !== null && (entry.input_tokens_include_cache === true || (parsedCacheReadTokens !== null && parsedCacheWriteTokens !== null))
+          ? computeInclusiveInputTokens({
+              provider: typeof entry.provider === "string" ? entry.provider : "",
+              inputTokens,
+              cacheReadTokens,
+              cacheWriteTokens,
+              inputTokensIncludeCache: typeof entry.input_tokens_include_cache === "boolean" ? entry.input_tokens_include_cache : undefined,
+            })
+          : undefined;
+
+      // Public counters require complete evidence across requests. Keep the
+      // historical display/pricing totals separate from unavailable counters.
+      for (const key of /** @type {Array<keyof typeof summary.tokenUsage>} */ Object.keys(summary.tokenUsage)) {
+        const value = key === "input_tokens_inclusive" ? (inclusiveInputTokens ?? null) : parseNonNegativeFiniteNumber(entry[key]);
+        const total = summary.tokenUsage[key] + (value ?? 0);
+        if (value === null || !Number.isFinite(total)) {
+          delete summary.tokenUsage[key];
+        } else {
+          summary.tokenUsage[key] = total;
+        }
+      }
       const reasoningTokens = entry.reasoning_tokens || 0;
       const durationMs = entry.duration_ms || 0;
       const parsedTimestamp = typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : Number.NaN;

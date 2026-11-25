@@ -2,6 +2,7 @@
 mcp-scripts:
   github-issue-query:
     description: "Query GitHub issues with jq filtering support. Without --jq, returns schema and data size info. Use --jq '.' to get all data, or specific jq expressions to filter."
+    timeout: 600
     inputs:
       repo:
         type: string
@@ -17,7 +18,11 @@ mcp-scripts:
         required: false
       since:
         type: string
-        description: "ISO 8601 date or timestamp. When set, paginate by updatedAt until this boundary instead of applying limit."
+        description: "ISO 8601 date or timestamp. Paginate back to this boundary, or use as the lower bound with until."
+        required: false
+      until:
+        type: string
+        description: "ISO 8601 date or timestamp. When used with since, query only items updated within that date range."
         required: false
       jq:
         type: string
@@ -34,6 +39,7 @@ mcp-scripts:
       STATE="${INPUT_STATE:-open}"
       LIMIT="${INPUT_LIMIT:-30}"
       SINCE="${INPUT_SINCE:-}"
+      UNTIL="${INPUT_UNTIL:-}"
       JQ_FILTER="${INPUT_JQ:-}"
       
       # JSON fields to fetch
@@ -48,9 +54,103 @@ mcp-scripts:
       }
       trap cleanup EXIT
 
-      # Fetch all items updated in a date window. REST results are ordered by
-      # updated time, so stop only after reaching the requested boundary.
-      if [[ -n "$SINCE" ]]; then
+      run_gh_json_with_retry() {
+        local output_file="$1"
+        shift
+        local attempt status
+        for attempt in 1 2 3; do
+          if gh "$@" > "$output_file"; then
+            if jq -e 'type == "array"' "$output_file" >/dev/null 2>&1; then
+              return 0
+            fi
+            status=1
+          else
+            status=$?
+          fi
+          if [[ "$attempt" -eq 3 ]]; then
+            echo "Error: GitHub query failed or returned invalid JSON after three attempts" >&2
+            return "$status"
+          fi
+          sleep "$attempt"
+        done
+      }
+
+      collect_bounded_range() {
+        local range_start="$1"
+        local range_end="$2"
+        local item_count start_epoch end_epoch midpoint_epoch midpoint_date next_date
+        local gh_args
+        PAGE_OUTPUT_FILE=$(mktemp)
+        gh_args=("$QUERY_COMMAND" list --state "$STATE" --search "updated:${range_start}..${range_end}" --limit "$RANGE_LIMIT" --json "$JSON_FIELDS")
+        [[ -n "$REPO" ]] && gh_args+=(--repo "$REPO")
+        if ! run_gh_json_with_retry "$PAGE_OUTPUT_FILE" "${gh_args[@]}"; then
+          if ! rm -f "$PAGE_OUTPUT_FILE"; then
+            return 1
+          fi
+          PAGE_OUTPUT_FILE=""
+          return 1
+        fi
+        item_count=$(jq 'length' < "$PAGE_OUTPUT_FILE")
+        if [[ "$item_count" -ge "$RANGE_LIMIT" ]]; then
+          if ! rm -f "$PAGE_OUTPUT_FILE"; then
+            return 1
+          fi
+          PAGE_OUTPUT_FILE=""
+          start_epoch=$(date -u -d "$range_start" +%s)
+          end_epoch=$(date -u -d "$range_end" +%s)
+          if (( start_epoch >= end_epoch )); then
+            echo "Error: bounded query reached its $RANGE_LIMIT item limit for single-day range $range_start" >&2
+            return 1
+          fi
+          midpoint_epoch=$(((start_epoch + end_epoch) / 2))
+          midpoint_date=$(date -u -d "@$midpoint_epoch" '+%Y-%m-%d')
+          next_date=$(date -u -d "@$((midpoint_epoch + 86400))" '+%Y-%m-%d')
+          collect_bounded_range "$range_start" "$midpoint_date" || return $?
+          collect_bounded_range "$next_date" "$range_end" || return $?
+          return 0
+        fi
+        FILTERED_OUTPUT_FILE=$(mktemp)
+        if ! jq -s '.[0] + .[1]' "$MERGED_OUTPUT_FILE" "$PAGE_OUTPUT_FILE" > "$FILTERED_OUTPUT_FILE"; then
+          return 1
+        fi
+        if ! mv "$FILTERED_OUTPUT_FILE" "$MERGED_OUTPUT_FILE"; then
+          return 1
+        fi
+        FILTERED_OUTPUT_FILE=""
+        if ! rm -f "$PAGE_OUTPUT_FILE"; then
+          return 1
+        fi
+        PAGE_OUTPUT_FILE=""
+      }
+
+      if [[ -n "$UNTIL" && -z "$SINCE" ]]; then
+        echo "Error: until requires since" >&2
+        exit 1
+      fi
+
+      if [[ -n "$SINCE" && -n "$UNTIL" ]]; then
+        if ! date -d "$SINCE" --iso-8601=seconds >/dev/null 2>&1 || ! date -d "$UNTIL" --iso-8601=seconds >/dev/null 2>&1; then
+          echo "Error: since and until must be ISO 8601 dates or timestamps" >&2
+          exit 1
+        fi
+        SINCE=$(date -u -d "$SINCE" '+%Y-%m-%dT%H:%M:%SZ')
+        UNTIL=$(date -u -d "$UNTIL" '+%Y-%m-%dT%H:%M:%SZ')
+        if [[ "$SINCE" > "$UNTIL" ]]; then
+          echo "Error: since must be earlier than or equal to until" >&2
+          exit 1
+        fi
+        SEARCH_START=$(date -u -d "$SINCE" '+%Y-%m-%d')
+        SEARCH_END=$(date -u -d "$UNTIL" '+%Y-%m-%d')
+        RANGE_LIMIT="${INPUT_LIMIT:-1000}"
+        QUERY_COMMAND=issue
+        MERGED_OUTPUT_FILE=$(mktemp)
+        echo '[]' > "$MERGED_OUTPUT_FILE"
+        collect_bounded_range "$SEARCH_START" "$SEARCH_END"
+        FILTERED_OUTPUT_FILE=$(mktemp)
+        jq --arg since "$SINCE" --arg until "$UNTIL" '[.[] | select(.updatedAt >= $since and .updatedAt <= $until)] | unique_by(.number)' "$MERGED_OUTPUT_FILE" > "$FILTERED_OUTPUT_FILE"
+        mv "$FILTERED_OUTPUT_FILE" "$OUTPUT_FILE"
+        FILTERED_OUTPUT_FILE=""
+      elif [[ -n "$SINCE" ]]; then
         if ! date -d "$SINCE" --iso-8601=seconds >/dev/null 2>&1; then
           echo "Error: since must be an ISO 8601 date or timestamp" >&2
           exit 1
@@ -65,7 +165,7 @@ mcp-scripts:
         echo '[]' > "$OUTPUT_FILE"
         while :; do
           PAGE_OUTPUT_FILE=$(mktemp)
-          gh api "${API_PATH}?state=${STATE}&sort=updated&direction=desc&per_page=100&page=${PAGE}" > "$PAGE_OUTPUT_FILE"
+          run_gh_json_with_retry "$PAGE_OUTPUT_FILE" api "${API_PATH}?state=${STATE}&sort=updated&direction=desc&per_page=100&page=${PAGE}"
           [[ "$(jq 'length' < "$PAGE_OUTPUT_FILE")" -eq 0 ]] && { rm -f "$PAGE_OUTPUT_FILE"; PAGE_OUTPUT_FILE=""; break; }
           MERGED_OUTPUT_FILE=$(mktemp)
           jq -s '.[0] + .[1]' "$OUTPUT_FILE" "$PAGE_OUTPUT_FILE" > "$MERGED_OUTPUT_FILE"
@@ -85,9 +185,9 @@ mcp-scripts:
         mv "$FILTERED_OUTPUT_FILE" "$OUTPUT_FILE"
         FILTERED_OUTPUT_FILE=""
       elif [[ -n "$REPO" ]]; then
-        gh issue list --state "$STATE" --limit "$LIMIT" --json "$JSON_FIELDS" --repo "$REPO" > "$OUTPUT_FILE"
+        run_gh_json_with_retry "$OUTPUT_FILE" issue list --state "$STATE" --limit "$LIMIT" --json "$JSON_FIELDS" --repo "$REPO"
       else
-        gh issue list --state "$STATE" --limit "$LIMIT" --json "$JSON_FIELDS" > "$OUTPUT_FILE"
+        run_gh_json_with_retry "$OUTPUT_FILE" issue list --state "$STATE" --limit "$LIMIT" --json "$JSON_FIELDS"
       fi
       
       # Apply jq filter if specified
@@ -148,6 +248,7 @@ mcp-scripts:
 
   github-pr-query:
     description: "Query GitHub pull requests with jq filtering support. Without --jq, returns schema and data size info. Use --jq '.' to get all data, or specific jq expressions to filter."
+    timeout: 600
     inputs:
       repo:
         type: string
@@ -163,7 +264,11 @@ mcp-scripts:
         required: false
       since:
         type: string
-        description: "ISO 8601 date or timestamp. When set, paginate by updatedAt until this boundary instead of applying limit."
+        description: "ISO 8601 date or timestamp. Paginate back to this boundary, or use as the lower bound with until."
+        required: false
+      until:
+        type: string
+        description: "ISO 8601 date or timestamp. When used with since, query only items updated within that date range."
         required: false
       jq:
         type: string
@@ -180,6 +285,7 @@ mcp-scripts:
       STATE="${INPUT_STATE:-open}"
       LIMIT="${INPUT_LIMIT:-30}"
       SINCE="${INPUT_SINCE:-}"
+      UNTIL="${INPUT_UNTIL:-}"
       JQ_FILTER="${INPUT_JQ:-}"
       
       # JSON fields to fetch
@@ -194,9 +300,103 @@ mcp-scripts:
       }
       trap cleanup EXIT
 
-      # Fetch all items updated in a date window. REST results are ordered by
-      # updated time, so stop only after reaching the requested boundary.
-      if [[ -n "$SINCE" ]]; then
+      run_gh_json_with_retry() {
+        local output_file="$1"
+        shift
+        local attempt status
+        for attempt in 1 2 3; do
+          if gh "$@" > "$output_file"; then
+            if jq -e 'type == "array"' "$output_file" >/dev/null 2>&1; then
+              return 0
+            fi
+            status=1
+          else
+            status=$?
+          fi
+          if [[ "$attempt" -eq 3 ]]; then
+            echo "Error: GitHub query failed or returned invalid JSON after three attempts" >&2
+            return "$status"
+          fi
+          sleep "$attempt"
+        done
+      }
+
+      collect_bounded_range() {
+        local range_start="$1"
+        local range_end="$2"
+        local item_count start_epoch end_epoch midpoint_epoch midpoint_date next_date
+        local gh_args
+        PAGE_OUTPUT_FILE=$(mktemp)
+        gh_args=("$QUERY_COMMAND" list --state "$STATE" --search "updated:${range_start}..${range_end}" --limit "$RANGE_LIMIT" --json "$JSON_FIELDS")
+        [[ -n "$REPO" ]] && gh_args+=(--repo "$REPO")
+        if ! run_gh_json_with_retry "$PAGE_OUTPUT_FILE" "${gh_args[@]}"; then
+          if ! rm -f "$PAGE_OUTPUT_FILE"; then
+            return 1
+          fi
+          PAGE_OUTPUT_FILE=""
+          return 1
+        fi
+        item_count=$(jq 'length' < "$PAGE_OUTPUT_FILE")
+        if [[ "$item_count" -ge "$RANGE_LIMIT" ]]; then
+          if ! rm -f "$PAGE_OUTPUT_FILE"; then
+            return 1
+          fi
+          PAGE_OUTPUT_FILE=""
+          start_epoch=$(date -u -d "$range_start" +%s)
+          end_epoch=$(date -u -d "$range_end" +%s)
+          if (( start_epoch >= end_epoch )); then
+            echo "Error: bounded query reached its $RANGE_LIMIT item limit for single-day range $range_start" >&2
+            return 1
+          fi
+          midpoint_epoch=$(((start_epoch + end_epoch) / 2))
+          midpoint_date=$(date -u -d "@$midpoint_epoch" '+%Y-%m-%d')
+          next_date=$(date -u -d "@$((midpoint_epoch + 86400))" '+%Y-%m-%d')
+          collect_bounded_range "$range_start" "$midpoint_date" || return $?
+          collect_bounded_range "$next_date" "$range_end" || return $?
+          return 0
+        fi
+        FILTERED_OUTPUT_FILE=$(mktemp)
+        if ! jq -s '.[0] + .[1]' "$MERGED_OUTPUT_FILE" "$PAGE_OUTPUT_FILE" > "$FILTERED_OUTPUT_FILE"; then
+          return 1
+        fi
+        if ! mv "$FILTERED_OUTPUT_FILE" "$MERGED_OUTPUT_FILE"; then
+          return 1
+        fi
+        FILTERED_OUTPUT_FILE=""
+        if ! rm -f "$PAGE_OUTPUT_FILE"; then
+          return 1
+        fi
+        PAGE_OUTPUT_FILE=""
+      }
+
+      if [[ -n "$UNTIL" && -z "$SINCE" ]]; then
+        echo "Error: until requires since" >&2
+        exit 1
+      fi
+
+      if [[ -n "$SINCE" && -n "$UNTIL" ]]; then
+        if ! date -d "$SINCE" --iso-8601=seconds >/dev/null 2>&1 || ! date -d "$UNTIL" --iso-8601=seconds >/dev/null 2>&1; then
+          echo "Error: since and until must be ISO 8601 dates or timestamps" >&2
+          exit 1
+        fi
+        SINCE=$(date -u -d "$SINCE" '+%Y-%m-%dT%H:%M:%SZ')
+        UNTIL=$(date -u -d "$UNTIL" '+%Y-%m-%dT%H:%M:%SZ')
+        if [[ "$SINCE" > "$UNTIL" ]]; then
+          echo "Error: since must be earlier than or equal to until" >&2
+          exit 1
+        fi
+        SEARCH_START=$(date -u -d "$SINCE" '+%Y-%m-%d')
+        SEARCH_END=$(date -u -d "$UNTIL" '+%Y-%m-%d')
+        RANGE_LIMIT="${INPUT_LIMIT:-1000}"
+        QUERY_COMMAND=pr
+        MERGED_OUTPUT_FILE=$(mktemp)
+        echo '[]' > "$MERGED_OUTPUT_FILE"
+        collect_bounded_range "$SEARCH_START" "$SEARCH_END"
+        FILTERED_OUTPUT_FILE=$(mktemp)
+        jq --arg since "$SINCE" --arg until "$UNTIL" '[.[] | select(.updatedAt >= $since and .updatedAt <= $until)] | unique_by(.number)' "$MERGED_OUTPUT_FILE" > "$FILTERED_OUTPUT_FILE"
+        mv "$FILTERED_OUTPUT_FILE" "$OUTPUT_FILE"
+        FILTERED_OUTPUT_FILE=""
+      elif [[ -n "$SINCE" ]]; then
         if ! date -d "$SINCE" --iso-8601=seconds >/dev/null 2>&1; then
           echo "Error: since must be an ISO 8601 date or timestamp" >&2
           exit 1
@@ -213,7 +413,7 @@ mcp-scripts:
         echo '[]' > "$OUTPUT_FILE"
         while :; do
           PAGE_OUTPUT_FILE=$(mktemp)
-          gh api "${API_PATH}?state=${REST_STATE}&sort=updated&direction=desc&per_page=100&page=${PAGE}" > "$PAGE_OUTPUT_FILE"
+          run_gh_json_with_retry "$PAGE_OUTPUT_FILE" api "${API_PATH}?state=${REST_STATE}&sort=updated&direction=desc&per_page=100&page=${PAGE}"
           [[ "$(jq 'length' < "$PAGE_OUTPUT_FILE")" -eq 0 ]] && { rm -f "$PAGE_OUTPUT_FILE"; PAGE_OUTPUT_FILE=""; break; }
           MERGED_OUTPUT_FILE=$(mktemp)
           jq -s '.[0] + .[1]' "$OUTPUT_FILE" "$PAGE_OUTPUT_FILE" > "$MERGED_OUTPUT_FILE"
@@ -234,9 +434,9 @@ mcp-scripts:
         mv "$FILTERED_OUTPUT_FILE" "$OUTPUT_FILE"
         FILTERED_OUTPUT_FILE=""
       elif [[ -n "$REPO" ]]; then
-        gh pr list --state "$STATE" --limit "$LIMIT" --json "$JSON_FIELDS" --repo "$REPO" > "$OUTPUT_FILE"
+        run_gh_json_with_retry "$OUTPUT_FILE" pr list --state "$STATE" --limit "$LIMIT" --json "$JSON_FIELDS" --repo "$REPO"
       else
-        gh pr list --state "$STATE" --limit "$LIMIT" --json "$JSON_FIELDS" > "$OUTPUT_FILE"
+        run_gh_json_with_retry "$OUTPUT_FILE" pr list --state "$STATE" --limit "$LIMIT" --json "$JSON_FIELDS"
       fi
       
       # Apply jq filter if specified

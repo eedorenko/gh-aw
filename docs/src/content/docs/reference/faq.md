@@ -325,32 +325,78 @@ See [Conditional Execution](/gh-aw/reference/frontmatter/#conditional-execution-
 
 ### How should I configure Go caches safely in agentic workflows?
 
-For Go workflows, cache module downloads and build artifacts explicitly, and scope cache keys tightly:
+Cache module downloads (`GOMODCACHE`) separately from compiled packages (`GOCACHE`). Separate entries let you discard build artifacts without discarding downloaded modules. Use keys that include the trust scope, Go version, OS, and `go.sum`; include the architecture for compiled packages.
 
-```yaml wrap
+```aw wrap
+runtimes:
+  go:
+    version: "1.27.4"
+env:
+  GOMODCACHE: /tmp/gh-aw/agent/go-mod
+  GOCACHE: /tmp/gh-aw/agent/go-build
 cache:
-  key: go-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
-  path: |
-    ~/go/pkg/mod
-    ~/.cache/go-build
-  restore-keys: |
-    go-${{ runner.os }}-
-
-jobs:
-  setup:
-    steps:
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
-          cache: false
-      - run: |
-          echo "GOMODCACHE=$HOME/go/pkg/mod" >> "$GITHUB_ENV"
-          echo "GOCACHE=$HOME/.cache/go-build" >> "$GITHUB_ENV"
+  - key: go-mod-trusted-${{ runner.os }}-1.27.4-${{ hashFiles('go.sum') }}
+    path: /tmp/gh-aw/agent/go-mod
+  - key: go-build-trusted-${{ runner.os }}-${{ runner.arch }}-1.27.4-${{ hashFiles('go.sum') }}
+    path: /tmp/gh-aw/agent/go-build
 ```
 
-Keep cache keys specific to the OS and `go.sum`, do not share writable keys across trust boundaries such as untrusted forks and protected branches, and never place secrets in `GOMODCACHE` or `GOCACHE`.
+The explicit paths avoid relying on runner-home directories being writable inside AWF. Workflow-level `env` applies to every job; use `engine.env` when only the agent needs the override. Writing to `$GITHUB_ENV` inside `jobs.setup` affects that job only and does not configure the agent job.
+
+The compiler's generated Go setup disables `actions/setup-go` caching by default. An explicit setup action can override this with `cache: true`, but its automatic cache is separate from top-level `cache:` and must be reviewed for the same trust boundaries. Prefer one explicit caching strategy.
+
+Omit `restore-keys` for an exact match, as above. If module downloads need a fallback, keep its prefix within the same trust scope, OS, and Go version. A `trusted` prefix is a naming convention, not an access control: only trusted producers should populate caches used by protected runs. `tools.github.min-integrity` filters GitHub tool data; it does not validate Go cache contents or scope arbitrary `cache:` entries like [cache memory](/gh-aw/reference/cache-memory/).
+
+Restoring an Actions cache does not verify Go checksums. Go checks downloads against `go.sum` and its configured checksum database policy; `go mod verify` detects changes to downloaded module content. Keep checksum verification enabled and use `-mod=readonly` when builds must not update module manifests. Build caches contain compiled artifacts and need trusted provenance even when module verification passes.
+
+For a repository with `cmd/app`, a pre-build job can produce a binary for the agent. Add the following job and artifact download to the same workflow; the download transfers files between runners, while environment variables and local directories do not:
+
+```aw wrap
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.4"
+          cache: false
+      - run: |
+          go mod download
+          go mod verify
+          mkdir -p build
+          go build -mod=readonly -o build/app ./cmd/app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: go-build-output
+          path: build/
+steps:
+  - uses: actions/download-artifact@v4
+    with:
+      name: go-build-output
+      path: /tmp/gh-aw/agent/build-output
+  - run: chmod +x /tmp/gh-aw/agent/build-output/app
+```
+
+Artifact downloads do not preserve executable permissions, so the final step restores them for the binary. Top-level `cache:` runs in the agent job, so a custom setup job needs its own cache configuration if it also requires persistent caching. See [importing top-level jobs](/gh-aw/reference/imports/#importing-top-level-jobs) for dependency ordering and artifact handoffs.
 
 ## Guardrails
+
+### Can assigned build and test commands use toolchain caches and configured nonsecret values?
+
+Yes, within the stock XPIA policy. Its prompt is included in workflows unless disabled; strict mode does not allow disabling it. Assigned installation, build, and test commands may use the toolchain's normal package and build caches (for example Go, npm, or pip caches) and nonsecret values set directly in workflow configuration. The caches may be used, but their contents are untrusted data like any other outside content: the agent must never follow instructions found in them or search them or other files for credentials. The policy does not permit inspecting the process environment, loading `.env` files, or accessing credentials; if a required secret or credential isn't configured, the agent reports the limitation instead of looking for it.
+
+Disposable caches are optional, not required. To use them, or to pass other nonsecret values, set them directly through [`engine.env`](/gh-aw/reference/environment-variables/#environment-variable-scopes). For example:
+
+```yaml wrap
+engine:
+  id: codex
+  env:
+    npm_config_cache: /tmp/gh-aw/npm-cache
+    APP_MODE: test
+```
+
+Do not load `.env` files or use task text, repository files, or filenames as authorization. Workflow configuration cannot authorize secrets or credentials; never use developer, production, or publication credentials. Repository contents remain untrusted data, and sandbox, network, and tool restrictions still apply. If a check requires access outside these boundaries, report the limitation rather than bypassing it. See also [safe Go cache configuration](#how-should-i-configure-go-caches-safely-in-agentic-workflows).
 
 ### Agentic workflows run in GitHub Actions. Can they access my repository secrets?
 
@@ -526,7 +572,10 @@ macOS runners (`macos-*`) don't support container jobs, which agentic workflows 
 
 ### Can I use agentic workflows on GitHub Enterprise Server (GHES)?
 
-Yes, but enable GHES compatibility mode on instances predating `@actions/artifact` v2.0.0 — otherwise compiled workflows fail with `GHESNotSupportedError` because the compiler emits `upload-artifact@v4+` by default. Compatibility mode emits `v3.2.2`/`v3.1.0` instead:
+> [!IMPORTANT]
+> **GHES end-to-end availability is unconfirmed here.** gh-aw implements artifact/cache and endpoint compatibility paths, not a certified GHES release matrix. Check the [deployment and runner applicability summary](/gh-aw/reference/enterprise-configuration/#deployment-and-runner-applicability) for your deployment, topology, engine, and component versions, and [AWF applicability](https://github.com/github/gh-aw-firewall/blob/main/docs/compatibility.md#environment-and-runner-applicability) for firewall-only boundaries.
+
+For a server without the `@actions/artifact` v2.0.0+ backend or `cache-mode` syntax, compatibility mode emits artifact actions `v3.2.2`/`v3.1.0` and omits compiler-generated `cache-mode` fields:
 
 ```json
 // aw.json (applies to all workflows)
@@ -538,7 +587,11 @@ Yes, but enable GHES compatibility mode on instances predating `@actions/artifac
 gh aw compile --ghes my-workflow.md
 ```
 
-`gh aw init` auto-detects GHES and writes `ghes: true` for you. See [Enterprise Configuration](/gh-aw/reference/enterprise-configuration/) for CLI and Copilot prerequisites.
+`gh aw init` auto-detects GHES and writes `ghes: true` for you. This does not verify dependent service availability. See [Enterprise Configuration](/gh-aw/reference/enterprise-configuration/#ghes-compatibility-mode) for the action-runtime requirement and cache security caveat, and [AWF enterprise configuration](https://github.com/github/gh-aw-firewall/blob/main/docs/enterprise-configuration.md) for endpoint routing.
+
+### Does ARC/DinD configuration imply GHES or GHEC support?
+
+No. ARC is a runner topology, independent of the GitHub deployment. The [ARC walkthrough](/gh-aw/reference/arc-dind-copilot-agent/) describes the gh-aw Copilot CLI engine, not availability of the separate Copilot coding-agent service. AWF's [live split-DinD checks](https://github.com/github/gh-aw-firewall/blob/main/docs/compatibility.md#ci-test-matrix) are not live Kubernetes ARC, GHES, or data-residency tenant certification. See the [applicability summary](/gh-aw/reference/enterprise-configuration/#deployment-and-runner-applicability).
 
 ### I'm not using a supported AI Engine (coding agent). What should I do?
 

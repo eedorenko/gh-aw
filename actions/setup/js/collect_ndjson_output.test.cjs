@@ -119,6 +119,7 @@ describe("collect_ndjson_output.cjs", () => {
               body: { required: !0, type: "string", sanitize: !0, maxLength: 65e3 },
               start_line: { optionalPositiveInteger: !0 },
               side: { type: "string", enum: ["LEFT", "RIGHT"] },
+              temporary_id: { type: "string", pattern: "^#?aw_[A-Za-z0-9_]{3,12}$" },
             },
           },
           link_sub_issue: { defaultMax: 5, customValidation: "parentAndSubDifferent", fields: { parent_issue_number: { required: !0, issueNumberOrTemporaryId: !0 }, sub_issue_number: { required: !0, issueNumberOrTemporaryId: !0 } } },
@@ -195,6 +196,19 @@ describe("collect_ndjson_output.cjs", () => {
       delete process.env.GH_AW_VALIDATION_CONFIG_PATH;
       delete process.env.GH_AW_SAFE_OUTPUTS_CONFIG_PATH;
     }),
+    it.each([true, false])("publishes comment data using handler collapse_data=%s", async collapseData => {
+      const outputFile = "/tmp/gh-aw/test-ndjson-output.txt";
+      const data = { state: "a".repeat(64) };
+      process.env.GH_AW_SAFE_OUTPUTS = outputFile;
+      fs.writeFileSync(outputFile, JSON.stringify({ type: "add_comment", body: "Copilot is working through the prep list.", data }));
+      fs.writeFileSync(process.env.GH_AW_SAFE_OUTPUTS_CONFIG_PATH, JSON.stringify({ add_comment: { max: 1, data_enabled: true, collapse_data: collapseData } }));
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+      const output = JSON.parse(mockCore.setOutput.mock.calls.find(call => call[0] === "output")[1]);
+      expect(output.errors).toEqual([]);
+      expect(output.items[0].data).toEqual(data);
+      expect(output.items[0].body.includes("<details>")).toBe(collapseData);
+      expect(output.items[0].body.includes("Structured data:")).toBe(!collapseData);
+    }),
     it("should handle missing GH_AW_SAFE_OUTPUTS environment variable", async () => {
       (delete process.env.GH_AW_SAFE_OUTPUTS,
         await eval(`(async () => { ${collectScript}; await main(); })()`),
@@ -212,6 +226,50 @@ describe("collect_ndjson_output.cjs", () => {
         expect(mockCore.setOutput).toHaveBeenCalledWith("has_patch", "false"),
         expect(mockCore.info).toHaveBeenCalledWith(`Output file does not exist: ${missingFile}`),
         expect(mockCore.exportVariable).toHaveBeenCalledWith("GH_AW_AGENT_OUTPUT", path.join(TMP_GH_AW_PATH, AGENT_OUTPUT_FILENAME)));
+    }),
+    it("stamps continuation requests before upload without treating them as terminal output", async () => {
+      const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+      fs.writeFileSync(testFile, JSON.stringify({ type: "request_continuation", message: "Follow-up work remains", timestamp: "agent-supplied" }));
+      process.env.GH_AW_SAFE_OUTPUTS = testFile;
+      fs.writeFileSync(process.env.GH_AW_SAFE_OUTPUTS_CONFIG_PATH, JSON.stringify({ request_continuation: { max: 1 } }));
+      fs.writeFileSync(process.env.GH_AW_VALIDATION_CONFIG_PATH, JSON.stringify({ request_continuation: { defaultMax: 1, fields: { message: { required: true, type: "string", sanitize: true, maxLength: 1024 } } } }));
+
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+
+      const output = JSON.parse(fs.readFileSync(path.join(TMP_GH_AW_PATH, AGENT_OUTPUT_FILENAME), "utf8"));
+      const request = output.items.find(item => item.type === "request_continuation");
+      expect(request.timestamp).not.toBe("agent-supplied");
+      expect(Number.isNaN(Date.parse(request.timestamp))).toBe(false);
+      expect(output.collectorFailureCause).toBe("missing_terminal_safe_output");
+      expect(output.items.some(item => item.type === "report_incomplete")).toBe(true);
+    }),
+    it("rejects oversized or field-carrying routed requests before truncation and keeps advisory limits", async () => {
+      const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+      const oversized = "😀".repeat(4097);
+      const lines = [
+        { type: "request_continuation", message: oversized },
+        { type: "request_continuation", message: "Continue", route: "dispatch", remaining: 15 },
+        { type: "request_continuation", message: "   " },
+        { type: "request_continuation", message: "Summarize page 2" },
+      ];
+      fs.writeFileSync(testFile, lines.map(line => JSON.stringify(line)).join("\n"));
+      process.env.GH_AW_SAFE_OUTPUTS = testFile;
+      fs.writeFileSync(process.env.GH_AW_VALIDATION_CONFIG_PATH, JSON.stringify({ request_continuation: { defaultMax: 4, fields: { message: { required: true, type: "string", sanitize: true, maxLength: 65536 } } } }));
+      fs.writeFileSync(process.env.GH_AW_SAFE_OUTPUTS_CONFIG_PATH, JSON.stringify({ request_continuation: { max: 4, route: "dispatch" } }));
+
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+
+      let output = JSON.parse(fs.readFileSync(path.join(TMP_GH_AW_PATH, AGENT_OUTPUT_FILENAME), "utf8"));
+      expect(output.items.filter(item => item.type === "request_continuation").map(item => item.message)).toEqual(["Summarize page 2"]);
+      expect(output.errors).toEqual([expect.stringMatching(/^Line 1: .*exceeds 16384 UTF-8 bytes/), expect.stringMatching(/^Line 2: .*agent-supplied field\(s\): remaining, route/), expect.stringMatching(/^Line 3: /)]);
+
+      // The advisory form keeps its existing validation for the same input.
+      fs.writeFileSync(testFile, JSON.stringify({ type: "request_continuation", message: oversized }));
+      fs.writeFileSync(process.env.GH_AW_SAFE_OUTPUTS_CONFIG_PATH, JSON.stringify({ request_continuation: { max: 1 } }));
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+      output = JSON.parse(fs.readFileSync(path.join(TMP_GH_AW_PATH, AGENT_OUTPUT_FILENAME), "utf8"));
+      expect(output.items.some(item => item.type === "request_continuation")).toBe(true);
+      expect(output.errors).toEqual([]);
     }),
     it("should fail with infra error when safeoutputs gateway-empty flag exists and outputs file is missing", async () => {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "collect-gateway-empty-"));
@@ -232,6 +290,7 @@ describe("collect_ndjson_output.cjs", () => {
         const output = JSON.parse(mockCore.setOutput.mock.calls.find(call => call[0] === "output")[1]);
         expect(output.items[0].type).toBe("report_incomplete");
         expect(output.items[0].details).toContain("Safe-output tools: unavailable (gateway registered zero tools)");
+        expect(output.collectorInfrastructureCause).toBe("safeoutputs_gateway_empty");
         expect(fs.existsSync(path.join(TMP_GH_AW_PATH, AGENT_OUTPUT_FILENAME))).toBe(true);
       } finally {
         if (originalRunnerTemp === undefined) {
@@ -266,15 +325,19 @@ describe("collect_ndjson_output.cjs", () => {
         expect(mockCore.setOutput).toHaveBeenCalledWith("output", incompleteOutput),
         expect(mockCore.info).toHaveBeenCalledWith("Output file is empty"));
     }),
-    it("adds a terminal incompletion signal when the agent emitted only diagnostics", async () => {
+    it.each([undefined, 0])("adds one terminal incompletion signal for diagnostic-only output after driver exit %s", async driverExitCode => {
       const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
       fs.writeFileSync(testFile, '{"type":"report_missing_tool","tool":"read","reason":"Unavailable","alternatives":"Check permissions"}');
+      if (driverExitCode !== undefined) fs.writeFileSync(path.join(diagnosticRoot, "agent_execution_exit_code.txt"), String(driverExitCode));
       process.env.GH_AW_SAFE_OUTPUTS = testFile;
       fs.writeFileSync(process.env.GH_AW_SAFE_OUTPUTS_CONFIG_PATH, JSON.stringify({ report_missing_tool: {}, report_incomplete: {} }));
       await eval(`(async () => { ${collectScript}; await main(); })()`);
       const output = JSON.parse(mockCore.setOutput.mock.calls.find(call => call[0] === "output")[1]);
       expect(output.items.map(item => item.type)).toEqual(["report_missing_tool", "report_incomplete"]);
       expect(output.items[1].reason).toBe("missing_terminal_safe_output");
+      expect(output.collectorFailureCause).toBe("missing_terminal_safe_output");
+      expect(output.collectorDriverExitCode).toBe(driverExitCode);
+      expect(output.errors).toEqual([]);
     }),
     it.each(["missing_tool", "missing_data"])("normalizes legacy %s records and shares their canonical output budget", async legacy => {
       const canonical = `report_${legacy}`;
@@ -494,6 +557,38 @@ describe("collect_ndjson_output.cjs", () => {
         expect(parsedOutput.items[0].inputs).toEqual({ sentinel: "hello-sentinel" }),
         expect(parsedOutput.errors).toHaveLength(0));
     }),
+    it.each(["depends-on", "depends_on"])("preserves %s metadata for inline custom outputs", async key => {
+      const outputId = "so_AAAAAAAAAAAA";
+      const prerequisite = "so_BBBBBBBBBBBB";
+      const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+      fs.writeFileSync(testFile, JSON.stringify({ type: "publish_report", text: "Report", output_id: outputId, [key]: prerequisite }));
+      process.env.GH_AW_SAFE_OUTPUTS = testFile;
+      fs.writeFileSync("/tmp/gh-aw/safeoutputs/config.json", JSON.stringify({ publish_report: { inputs: { text: { type: "string" } } } }));
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+      const output = JSON.parse(fs.readFileSync("/tmp/gh-aw/agent_output.json", "utf8"));
+      expect(output.errors).toHaveLength(0);
+      expect(output.items).toEqual([{ type: "publish_report", text: "Report", output_id: outputId, "depends-on": prerequisite }]);
+    }),
+    it.each([null, "aw_issue1", "so_BBBBBBBBBBBB"])("rejects malformed or unsupported custom job dependencies: %j", async dependency => {
+      const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+      fs.writeFileSync(testFile, JSON.stringify({ type: "deploy", "depends-on": dependency }));
+      process.env.GH_AW_SAFE_OUTPUTS = testFile;
+      fs.writeFileSync("/tmp/gh-aw/safeoutputs/config.json", JSON.stringify({ deploy: { supports_dependencies: false } }));
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+      const output = JSON.parse(fs.readFileSync("/tmp/gh-aw/agent_output.json", "utf8"));
+      expect(output.items.some(item => item.type === "deploy")).toBe(false);
+      expect(output.errors.join("\n")).toContain("depends-on");
+    }),
+    it.each(["report_incomplete", "report_missing_tool", "report_missing_data"])("rejects dependencies for out-of-band %s during ingestion", async type => {
+      const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+      fs.writeFileSync(testFile, JSON.stringify({ type, "depends-on": "so_BBBBBBBBBBBB" }));
+      process.env.GH_AW_SAFE_OUTPUTS = testFile;
+      fs.writeFileSync("/tmp/gh-aw/safeoutputs/config.json", JSON.stringify({ [type]: { max: 1 } }));
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+      const output = JSON.parse(fs.readFileSync("/tmp/gh-aw/agent_output.json", "utf8"));
+      expect(output.items.some(item => item["depends-on"] === "so_BBBBBBBBBBBB")).toBe(false);
+      expect(output.errors.join("\n")).toContain("depends-on is not supported");
+    }),
     it("should preserve Slack mrkdwn links in custom safe-job string inputs", async () => {
       const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
       const slackText = "Tracking issue: <https://github.com/octo-org/octo-repo/issues/123|Build failure — Build github/gh-aw#456>";
@@ -702,7 +797,7 @@ describe("collect_ndjson_output.cjs", () => {
     it("should validate optional fields for create-pull-request-review-comment type", async () => {
       const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
         ndjsonContent =
-          '{"type": "create_pull_request_review_comment", "path": "src/file.js", "line": 20, "start_line": 15, "side": "LEFT", "body": "Multi-line comment"}\n{"type": "create_pull_request_review_comment", "path": "src/file.js", "line": 25, "side": "INVALID", "body": "Invalid side"}';
+          '{"type": "create_pull_request_review_comment", "path": "src/file.js", "line": 20, "start_line": 15, "side": "LEFT", "body": "Multi-line comment", "temporary_id": "aw_find1"}\n{"type": "create_pull_request_review_comment", "path": "src/file.js", "line": 25, "side": "INVALID", "body": "Invalid side"}';
       (fs.writeFileSync(testFile, ndjsonContent), (process.env.GH_AW_SAFE_OUTPUTS = testFile));
       const __config = '{"create_pull_request_review_comment": {"max": 10}}',
         configPath = "/tmp/gh-aw/safeoutputs/config.json";
@@ -714,6 +809,7 @@ describe("collect_ndjson_output.cjs", () => {
       (expect(parsedOutput.items).toHaveLength(1),
         expect(parsedOutput.items[0].side).toBe("LEFT"),
         expect(parsedOutput.items[0].start_line).toBe(15),
+        expect(parsedOutput.items[0].temporary_id).toBe("aw_find1"),
         expect(parsedOutput.errors).toHaveLength(1),
         expect(parsedOutput.errors[0]).toContain("side' must be 'LEFT' or 'RIGHT'"));
     }),

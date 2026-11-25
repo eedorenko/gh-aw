@@ -51,21 +51,20 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 
 	if output, exists := frontmatter["safe-outputs"]; exists {
 		if outputMap, ok := output.(map[string]any); ok {
+			authorizationAliasError := validateSafeOutputAuthorizationAliases(outputMap)
 			outputMap = normalizeMissingReportKeys(outputMap)
 			safeOutputsConfigLog.Printf("Processing safe-outputs configuration with %d top-level keys", len(outputMap))
 			config = &SafeOutputsConfig{}
+			config.Authorization, config.authorizationParseError = parseSafeOutputAuthorization(outputMap["authorization"])
+			if err := validateRawSafeOutputAuthorizations(outputMap); err != nil {
+				config.authorizationParseError = err
+			}
+			if authorizationAliasError != nil {
+				config.authorizationParseError = authorizationAliasError
+			}
 			if adapters, supplied := outputMap["claim-adapters"]; supplied {
 				config.ClaimAdapters, config.claimAdaptersParseError = parseWorkQueueClaimAdapters(adapters)
 			}
-			config.CreateWorkItems = c.parseCreateWorkItemConfig(outputMap)
-			config.UpdateWorkItems = c.parseUpdateWorkItemConfig(outputMap)
-			config.CommentOnWorkItems = c.parseCommentOnWorkItemConfig(outputMap)
-			config.AssignWorkItems = c.parseAssignWorkItemConfig(outputMap)
-			config.LinkWorkItems = c.parseLinkWorkItemsConfig(outputMap)
-			config.UploadWorkItemAttachments = c.parseUploadWorkItemAttachmentConfig(outputMap)
-			config.LinearCreateIssue = c.parseLinearCreateIssueConfig(outputMap)
-			config.LinearAddComment = c.parseLinearAddCommentConfig(outputMap)
-			config.LinearUpdateIssue = c.parseLinearUpdateIssueConfig(outputMap)
 
 			// Handle create-issue
 			if enabled, ok := outputMap["create-issue"].(bool); ok {
@@ -76,8 +75,6 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 				safeOutputsConfigLog.Print("Configured create-issue output handler")
 				config.CreateIssues = issuesConfig
 			}
-
-			c.extractJiraSafeOutputConfigs(outputMap, config)
 
 			// Handle create-agent-session
 			agentSessionConfig := c.parseAgentSessionConfig(outputMap)
@@ -132,6 +129,9 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 			if markPRReadyConfig != nil {
 				config.MarkPullRequestAsReadyForReview = markPRReadyConfig
 			}
+
+			config.CreateSecurityAdvisory = c.parseCreateSecurityAdvisoryConfig(outputMap)
+			config.AddSecurityAdvisoryComment = c.parseAddSecurityAdvisoryCommentConfig(outputMap)
 
 			// Handle approve-workflow-run
 			approveWorkflowRunConfig := c.parseApproveWorkflowRunConfig(outputMap)
@@ -395,6 +395,10 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 				}
 			}
 
+			c.extractGlobalConfigFields(outputMap, config)
+
+			config.RequestContinuation = c.parseRequestContinuationConfig(outputMap)
+
 			// Handle report-incomplete (parse configuration if present, or enable by default)
 			reportIncompleteConfig := c.parseReportIncompleteConfig(outputMap)
 			if reportIncompleteConfig != nil {
@@ -413,7 +417,6 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 				}
 			}
 
-			c.extractGlobalConfigFields(outputMap, config)
 		}
 	}
 

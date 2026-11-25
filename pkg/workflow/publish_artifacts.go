@@ -2,9 +2,11 @@ package workflow
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/typeutil"
 )
 
@@ -181,14 +183,31 @@ func generateSafeOutputsArtifactStagingUpload(builder *strings.Builder, data *Wo
 	builder.WriteString("      # Upload safe-outputs upload-artifact staging for the upload_artifact job\n")
 	builder.WriteString("      - name: Upload upload-artifact staging\n")
 	builder.WriteString("        if: always() && " + secretRedactionSuccessCondition(data) + "\n")
-	fmt.Fprintf(builder, "        uses: %s\n", pinAction("actions/upload-artifact"))
+	fmt.Fprintf(builder, "        uses: %s\n", pinAction("actions/upload-artifact")) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	builder.WriteString("        with:\n")
-	fmt.Fprintf(builder, "          name: %s%s\n", prefix, SafeOutputsUploadArtifactStagingArtifactName)
-	fmt.Fprintf(builder, "          path: %s\n", artifactStagingDirExpr)
+	fmt.Fprintf(builder, "          name: %s%s\n", prefix, SafeOutputsUploadArtifactStagingArtifactName) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	fmt.Fprintf(builder, "          path: %s\n", artifactStagingDirExpr)                                 //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	builder.WriteString("          retention-days: 1\n")
 	builder.WriteString("          if-no-files-found: ignore\n")
 }
 
 func usesSafeOutputsArtifactStaging(config *SafeOutputsConfig) bool {
-	return config != nil && (config.UploadArtifact != nil || config.UploadWorkItemAttachments != nil)
+	return len(safeOutputsArtifactStagingTypes(config)) != 0
+}
+
+func safeOutputsArtifactStagingTypes(config *SafeOutputsConfig) []string {
+	if config == nil {
+		return nil
+	}
+	var types []string
+	if config.UploadArtifact != nil {
+		types = append(types, "upload_artifact")
+	}
+	for name, script := range config.Scripts {
+		if script != nil && len(connectorStagedFilePolicies(script.connectorInputSchema)) != 0 {
+			types = append(types, stringutil.NormalizeSafeOutputIdentifier(name))
+		}
+	}
+	slices.Sort(types)
+	return slices.Compact(types)
 }

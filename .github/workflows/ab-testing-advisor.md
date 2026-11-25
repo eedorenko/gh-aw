@@ -16,6 +16,7 @@ permissions:
 network:
   allowed:
   - defaults
+  - go
 imports:
 - shared/lock-safe-pull-request.md
 - shared/otlp.md
@@ -33,10 +34,16 @@ safe-outputs:
     title-prefix: "[ab-advisor] "
 description: Daily A/B testing advisor that selects a workflow without experiments and implements a validated experiment campaign pull request
 emoji: 🧪
-model: openai/gpt-6.1-sol
+model: router/balanced
 engine:
   id: codex
-  model-provider: openai
+  env:
+    GOCACHE: /tmp/gh-aw/agent/go-build-cache
+    GOMODCACHE: /tmp/gh-aw/agent/go-mod-cache
+  model-provider: github
+steps:
+  - name: Provision disposable Go validation caches
+    run: mkdir -p /tmp/gh-aw/agent/go-build-cache /tmp/gh-aw/agent/go-mod-cache
 strict: true
 timeout-minutes: 30
 tools:
@@ -73,6 +80,14 @@ You are an **ultimate expert in A/B testing for software systems** with extensiv
 - Instrumentation, observability, and audit trail requirements for reproducible experiments
 
 Your mission today has two parts: **Primary quest** and **Side quest**.
+
+## Prepare the Compiler
+
+Use the disposable Go build and module caches provisioned by this workflow through `GOCACHE` and `GOMODCACHE`; do not read pre-existing caches or inspect the process environment.
+
+Before discovery, run `make build` in the workspace to build the checked-out compiler, then run `./gh-aw version`. Use `./gh-aw compile` for workflow validation rather than assuming a `gh aw` extension is installed. The provisioned caches are also available for the required `make recompile` and final `make agent-report-progress` validation gates.
+
+If the build or validation fails, call `report_incomplete` with the concrete failure; do not install an alternative compiler, bypass validation, or publish an unvalidated campaign.
 
 ## Primary Quest: Design an Experiment Campaign
 
@@ -373,7 +388,6 @@ Propose how experiments should integrate with `gh aw audit` and OTEL observabili
 ## agent: `workflow-characterizer`
 ---
 description: Read a selected workflow file and return a concise structured characterization for experiment design
-model: small
 ---
 You receive a single file path to a `.github/workflows/<name>.md` workflow file.
 
@@ -404,7 +418,6 @@ Requirements:
 ## agent: `field-presence-checker`
 ---
 description: Check whether named experiment fields are genuinely implemented in the compiler and picker code
-model: small
 ---
 You receive two file paths:
 - `pkg/workflow/compiler_experiments.go`

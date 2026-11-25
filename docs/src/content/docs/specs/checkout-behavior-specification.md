@@ -1,5 +1,6 @@
 ---
 title: Checkout Behavior Specification
+spec: true
 description: Formal specification of checkout behavior across activation, agent, and safe_outputs jobs in gh-aw workflows
 sidebar:
   order: 1365
@@ -188,13 +189,13 @@ silently turn a single entry into a repository list:
 
 ### 3.3 Job-specific Checkout Generation
 
-- **Activation job** MUST use sparse checkout for `.github` and `.agents`, with `persist-credentials: false`.
+- **Activation job** MUST use a full, shallow checkout when saving a trusted base configuration snapshot, so symlink targets elsewhere in the repository are available. Otherwise it MUST use sparse checkout for `.github` and `.agents`. Both use `persist-credentials: false`.
 - **Agent job** MUST generate default checkout plus additional checkouts from `CheckoutManager`, with `persist-credentials: false` by default.
 - **safe_outputs job** MUST reuse the same checkout generators but set keep-credentials mode for push/fetch use and inject a `Configure Git credentials` step.
 
 For activation checkouts, the compiler MUST select `github.event.pull_request.base.sha` when the active event is `pull_request`, `pull_request_review`, or `pull_request_review_comment`, provided the pull-request payload exists. The expression MUST guard access to the pull-request payload by event name and nullability. Trigger detection MUST match exact names: `pull_request_target` alone MUST NOT enable this pin. On other events, including non-PR events in a mixed-trigger workflow, checkout MUST retain its existing ref (`github.sha` for the standard activation checkout or the resolved callee checkout SHA for `workflow_call`). This checkout occurs before runtime imports and skills are loaded; restoring agent configuration after the PR checkout is not a substitute for pinning activation.
 
-For cross-repository `workflow_call`, activation MUST retain the same-repository checkout condition whenever its token can resolve to the repository-scoped `GITHUB_TOKEN`, including the `on.github-app.ignore-if-missing` fallback. A missing optional App credential MUST NOT cause a cross-repository sparse checkout attempt with `GITHUB_TOKEN`.
+For cross-repository `workflow_call`, activation MUST retain the same-repository checkout condition whenever its token can resolve to the repository-scoped `GITHUB_TOKEN`, including the `on.github-app.ignore-if-missing` fallback. A missing optional App credential MUST NOT cause a cross-repository checkout attempt with `GITHUB_TOKEN`.
 
 ### 3.4 Checkout Manifest
 
@@ -302,7 +303,7 @@ This avoids blobless partial-clone behavior that would require later authenticat
 
 ### 5.3 Activation Symlink Handling
 
-Activation sparse checkout path expansion MUST detect symlinks for known `.github` subpaths and include resolved in-repo targets.  
+Activation sparse checkout path expansion MUST detect tracked or non-ignored symlinks under sparse checkout paths in the compile-time tree and include in-repo targets. The runtime ref can differ from the compile-time tree.
 Resolved targets escaping repository root MUST be rejected.
 
 ### 5.4 Submodules and Credential Cleanup
@@ -448,6 +449,8 @@ The following MUST-level norms govern credential and token safety during checkou
 
 ### Informative References
 
+- [Runtime repository-list checkout model](https://github.com/github/gh-aw/blob/main/specs/workflow-security/RuntimeRepositoryCheckout.tla) — bounded preflight, job-local finalization, manifest ordering, and credential-source selection.
+- [Compiled workflow model](https://github.com/github/gh-aw/blob/main/specs/workflow-security/CompiledWorkflow.tla) — bounded checkout and credential-cleanup lifecycle across trusted setup, agent execution, and privileged safe outputs.
 - `/gh-aw/reference/checkout/`
 - `/gh-aw/reference/safe-outputs-pull-requests/`
 - `/gh-aw/docs/sparseness.md`

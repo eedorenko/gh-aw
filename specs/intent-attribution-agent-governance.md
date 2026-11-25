@@ -4,7 +4,7 @@ title: Intent Attribution & Agent Governance Specification
 version: 2.0.0
 status: Partially Implemented
 date: 2026-06-09
-last_updated: 2026-06-12
+last_updated: 2026-11-03
 replaces: objective-mapping-portfolio-reporting.md
 ---
 
@@ -63,7 +63,7 @@ An ambiguous attribution MUST NOT be treated as equivalent to a mapped attributi
 
 #### Fail-Closed Behavior
 
-An implementation MUST apply the safest available execution policy when the intent is `unlinked`, `ambiguous`, or otherwise indeterminate.
+An implementation MUST apply the safest available execution policy unless attribution status is authoritatively `mapped`. This includes `unlinked`, `ambiguous`, `unmapped`, `suggested`, empty, and unknown statuses.
 
 The safest available policy MUST be: autonomy `propose_only`, write scope `none`, `human_approval_required: true`, `auto_merge_allowed: false`, `max_attempts: 1`.
 
@@ -76,33 +76,22 @@ A policy decision MUST be deterministic: given identical attribution inputs, the
 The minimum conformance fixture set for these RFC 2119 norms is tracked in
 `specs/intent-attribution-compliance/`:
 
+The directory contains six YAML fixtures and this README.
+
 - `specs/intent-attribution-compliance/explicit-intent-wins.yaml`
 - `specs/intent-attribution-compliance/ambiguous-root-closing-issues.yaml`
 - `specs/intent-attribution-compliance/unlinked-pr-fail-closed.yaml`
-
+- `specs/intent-attribution-compliance/multi-root-policy.yaml`
+- `specs/intent-attribution-compliance/suggested-attribution-fail-closed.yaml`
+- `specs/intent-attribution-compliance/unmapped-labels-fail-closed.yaml`
 
 ## Current implementation
 
-The existing implementation provides the initial attribution and reporting foundation:
-
-1. A shared GitHub utility loads `.github/objective-mapping.json`
-2. Labels are mapped to numeric weights through `ObjectiveMapping`
-3. CLI outcome reports include:
-
-   * `objective_value`
-   * `objective_labels`
-   * `traced_root_url`
-4. Pull request outcomes trace to closing issues before labels are evaluated
-5. Direct issue labels are used as a fallback
-6. Outcome summaries aggregate attempted and accepted weights
-7. Per-label breakdowns aggregate accepted, rejected, and pending outcomes
-8. `PolicyCompiler` output shape is defined by `pkg/intent/policy.go` (`ExecutionPolicy`, `PolicyRule`, `PolicyCompiler`) and runtime gate wiring by `pkg/intent/governance.go`
-
-These capabilities remain supported.
-
-In this specification, they are treated as an early implementation of **intent attribution**, not as proof of business impact.
+Implementation status, operational sync guidance, and the runtime enforcement map are maintained in the [implementation companion](intent-attribution-agent-governance-implementation.md#current-implementation). This heading remains as a stable reference anchor; normative safeguards remain below.
 
 ### Safeguards
+
+In this repository, `.github/intent-policy.json` is an illustrative future migration path; the checked-in attribution source is `.github/objective-mapping.json`.
 
 When governance policy resolution fails because `.github/objective-mapping.json`,
 `.github/intent-policy.json`, or equivalent policy inputs are missing, malformed,
@@ -115,42 +104,11 @@ fallback to safe policy decision SHOULD be recorded in execution provenance.
 
 ### Sync Notes
 
-Until repositories migrate fully to `.github/intent-policy.json`, `.github/objective-mapping.json`
-remains the authoritative label-to-intent source for attribution fallback and drift detection.
-This specification defines the precedence and sync expectations for that migration, but does
-not assign a mandatory repository-by-repository completion deadline.
-For this document, "fully migrate" means all active intent keys and governance rules are
-defined in `.github/intent-policy.json`, and runtime authorization no longer depends on
-reading `.github/objective-mapping.json` except for explicit backward-compatibility paths.
-
-Implementations SHOULD detect drift by comparing the active repository governance inputs —
-the compiled rule set from `.github/intent-policy.json` when present, otherwise the effective
-label-to-intent selectors derived from `.github/objective-mapping.json` — during validation
-or CI. Keys present in one source but not the other SHOULD surface as a sync warning or
-compliance failure so attribution and authorization stay aligned.
-
-**Escalation norm**: A sync warning that persists across **3 or more consecutive CI runs**
-without a corresponding corrective PR or explicit waiver **MUST** be escalated to a compliance
-failure. When a sync warning escalates, the CI check responsible for drift detection **MUST**
-fail with a non-zero exit code and open (or update) a tracking issue recording the affected
-keys, the first-detected date, and the on-call maintainer as the default assignee. This norm
-ensures that aspirational migration language does not mask persistent, unaddressed
-configuration drift.
+See the [implementation companion's sync notes](intent-attribution-agent-governance-implementation.md#sync-notes). This heading remains as a stable reference anchor.
 
 ### Non-normative maintenance split proposal
 
-To reduce review risk in this file, future edits SHOULD split content into linked
-documents while preserving RFC 2119 norms here:
-
-1. Keep normative requirements in this file (Core model, RFC 2119 norms, conformance).
-2. Move implementation-status details (Current implementation + runtime enforcement map)
-   to a companion file, for example
-   `specs/intent-attribution-agent-governance-implementation.md`.
-3. Keep operational sync guidance (migration/drift/escalation) in a short companion
-   ops-focused section or companion note linked from this file.
-
-Section boundaries for the split should use existing heading anchors so references from
-`specs/intent-attribution-compliance/` remain stable.
+This split was executed on 2026-11-09. Normative requirements remain in this specification; the companion document contains implementation and operational details, and the existing heading anchors are retained here.
 
 ## Product boundary
 
@@ -655,6 +613,14 @@ Future supported policies may include:
 
 The active policy must be recorded in decision provenance.
 
+### Multiple-Root Open Questions and Proposed Resolutions
+
+These proposals are non-normative until accepted by the governance policy owner.
+
+1. **How are duplicate root references distinguished from multiple roots?** Proposed resolution: deduplicate by stable GitHub node ID when available; if identity is missing, keep the candidates distinct and fail closed as `ambiguous`.
+2. **Can explicit intent metadata resolve multiple closing issues?** Proposed resolution: a schema-valid explicit intent may resolve them only when it names one canonical root and its provenance is retained; otherwise return `ambiguous`.
+3. **Are the listed future policies active alternatives?** Proposed resolution: no. Explicit-primary, highest-priority, all-root, and fractional policies remain unsupported until separately specified with deterministic provenance and conformance fixtures.
+
 ## Risk classification
 
 Risk should be explicit where possible.
@@ -752,6 +718,14 @@ organization constraints
 ```
 
 A lower-precedence rule may not weaken a higher-precedence constraint.
+
+### Policy Precedence Open Questions and Proposed Resolutions
+
+These proposals are non-normative until accepted by the governance policy owner.
+
+4. **Are organization and repository policies constraints or replaceable defaults?** Proposed resolution: treat them as hard constraints; lower-precedence layers may narrow authority but cannot relax them.
+5. **How are conflicting rules at the same precedence handled?** Proposed resolution: merge deterministically using the more restrictive value for authority-bearing fields; choose the lower autonomy and narrowest write scope, union required checks and denied tools, intersect allowed tools, require approval if any rule requires it, permit auto-merge only if all rules permit it, and use the lower attempt limit.
+6. **What resolves ties between same-level rules?** Proposed resolution: reject conflicting policy compilation as ambiguous and apply the safest default rather than relying on declaration order or agent choice.
 
 Example:
 
@@ -953,23 +927,7 @@ The agent must not be able to modify or expand its own policy.
 
 ### `Authorizer.AuthorizeTool` Implementation Audit
 
-`Authorizer.AuthorizeTool` and `ResolveRisk` are implemented in `pkg/intent` (see `pkg/intent/governance.go`), but neither is yet called by the Go orchestrator. The following table documents which fields of `ExecutionPolicy` are wired to runtime enforcement and which remain unused.
-
-| `ExecutionPolicy` field | Wired to enforcement? | Notes |
-|---|---|---|
-| `AllowedTools` | **Implemented, not wired into orchestrator** | `pkg/intent` implements `PolicyCompiler.Compile()`, `mergePolicy()`, and `Authorizer.AuthorizeTool()` for this field, but no orchestrator calls `AuthorizeTool` at tool-call time yet. |
-| `DeniedTools` | **Implemented, not wired into orchestrator** | Same as `AllowedTools` — `Authorizer.AuthorizeTool()` checks this field, but it is not yet invoked from the execution path. |
-| `Autonomy` | **Not wired** | The autonomy level is compiled into the policy but not checked against actual workflow capabilities at execution time. |
-| `WriteScope` | **Not wired** | Defined in the policy model; no runtime enforcement in the Go orchestrator. |
-| `HumanApprovalRequired` | **Not wired** | Defined in policy model; human approval gates are not currently tied to `ExecutionPolicy`. |
-| `AutoMergeAllowed` | **Not wired** | Not enforced by the orchestrator. |
-| `RequiredChecks` | **Not wired** | Not checked before workflow execution. |
-| `MaxAttempts` | **Not wired** | Not enforced at the orchestrator level. |
-| `RuleIDs` | **Provenance only** | Recorded in the policy for auditing; not used to gate execution. |
-
-**Risk**: Policy constraints defined in `.github/intent-policy.json` (or the equivalent `rules` array) have no runtime effect until the orchestrator calls `Authorizer.AuthorizeTool` and enforces `WriteScope`, `HumanApprovalRequired`, and `RequiredChecks`. Any policy compiled by `PolicyCompiler.Compile()` today is purely advisory.
-
-**Required follow-up**: Wire the now-implemented `Authorizer.AuthorizeTool` (in `pkg/intent`) into the execution path. Gate enforcement behind a feature flag until the policy model is validated in production.
+See the [implementation companion's runtime enforcement map](intent-attribution-agent-governance-implementation.md#authorizerauthorizetool-implementation-audit). This heading remains as a stable reference anchor.
 
 
 Initial observable rules:
@@ -1443,3 +1401,19 @@ This system is not a business-impact calculator.
 It is a deterministic control layer for agentic GitHub work.
 
 > **Intent determines authority. Execution produces evidence.**
+
+## Change Log
+
+### 2026-11-15
+
+- Listed all six YAML conformance fixtures currently present in `specs/intent-attribution-compliance/`.
+- Assigned the unverified three-consecutive-CI-run drift escalation norm to Intent Attribution maintainers, with a planned CI enforcement path recorded in the implementation companion.
+
+### 2026-11-09
+
+- Executed the implementation-document split and retained the legacy implementation and audit anchors.
+- The three-consecutive-CI-run drift escalation norm remains in force; enforcement by a CI check and tracking issue was not verified in this pass.
+
+### 2026-11-03
+
+- Added numbered multiple-root and policy-precedence questions with non-normative proposed resolutions.

@@ -14,6 +14,7 @@ import (
 	"github.com/github/gh-aw/pkg/linters/appendbytestring"
 	"github.com/github/gh-aw/pkg/linters/appendoneelement"
 	"github.com/github/gh-aw/pkg/linters/blankassigncomma"
+	"github.com/github/gh-aw/pkg/linters/blankassignedcleanuperror"
 	"github.com/github/gh-aw/pkg/linters/bufferresetbeforereuse"
 	"github.com/github/gh-aw/pkg/linters/bufioscannererunchecked"
 	"github.com/github/gh-aw/pkg/linters/bytesbufferstring"
@@ -26,11 +27,14 @@ import (
 	deferrerrorunchecked "github.com/github/gh-aw/pkg/linters/deferred-error-unchecked"
 	"github.com/github/gh-aw/pkg/linters/errorfwrapv"
 	"github.com/github/gh-aw/pkg/linters/errormessage"
+	"github.com/github/gh-aw/pkg/linters/errorsnewerrorstring"
 	"github.com/github/gh-aw/pkg/linters/errortypeassertion"
 	"github.com/github/gh-aw/pkg/linters/errstringmatch"
 	"github.com/github/gh-aw/pkg/linters/excessivefuncparams"
+	"github.com/github/gh-aw/pkg/linters/execcommandoutputerrdiscard"
 	"github.com/github/gh-aw/pkg/linters/execcommandwithoutcontext"
 	"github.com/github/gh-aw/pkg/linters/fileclosenotdeferred"
+	"github.com/github/gh-aw/pkg/linters/filepathwalkpreferwalkdir"
 	"github.com/github/gh-aw/pkg/linters/fmterrorfnoverbs"
 	"github.com/github/gh-aw/pkg/linters/formatintitoa"
 	"github.com/github/gh-aw/pkg/linters/fprintferrorunchecked"
@@ -40,11 +44,16 @@ import (
 	"github.com/github/gh-aw/pkg/linters/goroutinemissingrecover"
 	"github.com/github/gh-aw/pkg/linters/goroutineresourceleak"
 	"github.com/github/gh-aw/pkg/linters/hardcodedfilepath"
+	"github.com/github/gh-aw/pkg/linters/hasprefixdotdotpathescape"
+	"github.com/github/gh-aw/pkg/linters/httpclientnotimeout"
 	"github.com/github/gh-aw/pkg/linters/httpnoctx"
 	"github.com/github/gh-aw/pkg/linters/httprespbodyclose"
 	"github.com/github/gh-aw/pkg/linters/httpstatuscode"
+	"github.com/github/gh-aw/pkg/linters/ignoredlocalerror"
 	"github.com/github/gh-aw/pkg/linters/ioutildeprecated"
+	"github.com/github/gh-aw/pkg/linters/jsondecodertrailingdataunchecked"
 	"github.com/github/gh-aw/pkg/linters/jsonmarshalignoredeerror"
+	"github.com/github/gh-aw/pkg/linters/jsonunmarshalbytesconversion"
 	"github.com/github/gh-aw/pkg/linters/largefunc"
 	"github.com/github/gh-aw/pkg/linters/lenstringsplit"
 	"github.com/github/gh-aw/pkg/linters/lenstringzero"
@@ -54,13 +63,16 @@ import (
 	"github.com/github/gh-aw/pkg/linters/mapclearloop"
 	"github.com/github/gh-aw/pkg/linters/mapdeletecheck"
 	"github.com/github/gh-aw/pkg/linters/nilctxpassed"
+	osstatignoredeerrorderef "github.com/github/gh-aw/pkg/linters/os-stat-ignored-error-deref"
 	"github.com/github/gh-aw/pkg/linters/osexitinlibrary"
 	"github.com/github/gh-aw/pkg/linters/osgetenvlibrary"
 	"github.com/github/gh-aw/pkg/linters/osisnotexist"
 	"github.com/github/gh-aw/pkg/linters/osopenreadallpreferreadfile"
+	"github.com/github/gh-aw/pkg/linters/osremoveuncheckedcleanup"
 	"github.com/github/gh-aw/pkg/linters/ossetenvlibrary"
 	"github.com/github/gh-aw/pkg/linters/packagelevelmutableslicemap"
 	panicinlibrarycode "github.com/github/gh-aw/pkg/linters/panic-in-library-code"
+	"github.com/github/gh-aw/pkg/linters/prefercutprefix"
 	"github.com/github/gh-aw/pkg/linters/rawloginlib"
 	"github.com/github/gh-aw/pkg/linters/readerstringconv"
 	reflectdeepequalusage "github.com/github/gh-aw/pkg/linters/reflect-deepequal-usage"
@@ -68,7 +80,10 @@ import (
 	"github.com/github/gh-aw/pkg/linters/regexpdynamicpattern"
 	"github.com/github/gh-aw/pkg/linters/seenmapbool"
 	"github.com/github/gh-aw/pkg/linters/slicemakezerolength"
+	"github.com/github/gh-aw/pkg/linters/sortbasicslices"
 	"github.com/github/gh-aw/pkg/linters/sortslice"
+	"github.com/github/gh-aw/pkg/linters/splitindexzero"
+	splitlinesonnewline "github.com/github/gh-aw/pkg/linters/splitlines-on-newline"
 	"github.com/github/gh-aw/pkg/linters/sprintfbool"
 	"github.com/github/gh-aw/pkg/linters/sprintferrdot"
 	"github.com/github/gh-aw/pkg/linters/sprintferrorsnew"
@@ -82,6 +97,7 @@ import (
 	"github.com/github/gh-aw/pkg/linters/stringsindexcontains"
 	"github.com/github/gh-aw/pkg/linters/stringsindexhasprefix"
 	"github.com/github/gh-aw/pkg/linters/stringsjoinone"
+	"github.com/github/gh-aw/pkg/linters/stringssplitfirst"
 	"github.com/github/gh-aw/pkg/linters/timeafterleak"
 	"github.com/github/gh-aw/pkg/linters/timenowsub"
 	"github.com/github/gh-aw/pkg/linters/timesleepnocontext"
@@ -97,6 +113,7 @@ import (
 	"github.com/github/gh-aw/pkg/linters/walkfuncerrshadow"
 	"github.com/github/gh-aw/pkg/linters/wgdonenotdeferred"
 	"github.com/github/gh-aw/pkg/linters/writebytestring"
+	"github.com/github/gh-aw/pkg/linters/writefilepublicpermsensitive"
 )
 
 // TestSpec tests derive from pkg/linters/README.md. They enforce the documented
@@ -112,24 +129,26 @@ type docAnalyzer struct {
 }
 
 // documentedAnalyzers returns the analyzer subpackages documented in the README
-// "Public API > Subpackages" table. The README documents 86 analyzer
+// "Public API > Subpackages" table. The README documents 103 analyzer
 // subpackages (the non-analyzer `internal` helper subpackage is excluded because
 // it exposes no Analyzer).
 //
 // Spec (README "Public API > Subpackages"):
 //
-//	appendbytestring, appendoneelement, blankassigncomma, bufferresetbeforereuse, bufioscannererunchecked, bytesbufferstring, bytescomparestring, closeerrorunchecked, contextcancelnotdeferred, ctxbackground, deferinloop, deferrerrorunchecked, errorfwrapv, excessivefuncparams, errormessage,
-//	errortypeassertion, errstringmatch, execcommandwithoutcontext, fileclosenotdeferred, fmterrorfnoverbs, formatintitoa, fprintferrorunchecked, fprintlnsprintf,
-//	generatedyamlheredoc, globwalkignorederror, goroutinemissingrecover, goroutineresourceleak, hardcodedfilepath, httpnoctx, httprespbodyclose, httpstatuscode, ioutildeprecated, jsonmarshalignoredeerror, largefunc, lenstringsplit, lenstringzero,
-//	logfatallibrary, manualmutexunlock, manualpathconcat, mapclearloop, mapdeletecheck, nilctxpassed, osexitinlibrary, osgetenvlibrary, osisnotexist, osopenreadallpreferreadfile, ossetenvlibrary, packagelevelmutableslicemap, panic-in-library-code, rawloginlib,
-//	readerstringconv, reflectdeepequalusage, regexpcompileinfunction, regexpdynamicpattern, seenmapbool, slicemakezerolength, sortslice, sprintferrdot, sprintferrorsnew, sprintfbool, sprintfint, ssljson,
-//	strconvparseignorederror, stringbytesroundtrip, stringreplaceminusone, stringsconcatloop, stringscountcontains, stringsindexcontains, stringsindexhasprefix, stringsjoinone, timeafterleak, timesleepnocontext, timenowsub,
-//	tolowerequalfold, trimleftright, typeassertionnil, typeassertionokdiscarded, unchecked_deferredclose, uncheckedflushreturn, uncheckedsliceindex, uncheckedtypeassertion, walkdirignoredeerror, walkfuncerrshadow, wgdonenotdeferred, writebytestring
+//	appendbytestring, appendoneelement, blankassigncomma, blankassignedcleanuperror, bufferresetbeforereuse, bufioscannererunchecked, bytesbufferstring, bytescomparestring, closeerrorunchecked, contextcancelnotdeferred, ctxbackground, deferinloop, deferrerrorunchecked, errorfwrapv, excessivefuncparams, errormessage, errorsnewerrorstring,
+//	errortypeassertion, errstringmatch, execcommandoutputerrdiscard, execcommandwithoutcontext, fileclosenotdeferred, filepathwalkpreferwalkdir, fmterrorfnoverbs, formatintitoa, fprintferrorunchecked, fprintlnsprintf,
+//	generatedyamlheredoc, globwalkignorederror, goroutinemissingrecover, goroutineresourceleak, hardcodedfilepath, hasprefixdotdotpathescape, httpclientnotimeout, httpnoctx, httprespbodyclose, httpstatuscode, ignoredlocalerror, ioutildeprecated, jsondecodertrailingdataunchecked, jsonmarshalignoredeerror, jsonunmarshalbytesconversion, largefunc, lenstringsplit, lenstringzero,
+//	logfatallibrary, manualmutexunlock, manualpathconcat, mapclearloop, mapdeletecheck, nilctxpassed, osexitinlibrary, osgetenvlibrary, osisnotexist, osopenreadallpreferreadfile, osremoveuncheckedcleanup, osstatignoredeerrorderef, ossetenvlibrary, packagelevelmutableslicemap, panic-in-library-code, prefercutprefix, rawloginlib,
+//	readerstringconv, reflectdeepequalusage, regexpcompileinfunction, regexpdynamicpattern, seenmapbool, slicemakezerolength, sortbasicslices, sortslice, splitindexzero, splitlines-on-newline, sprintferrdot, sprintferrorsnew, sprintfbool, sprintfint, ssljson,
+//	strconvparseignorederror, stringbytesroundtrip, stringreplaceminusone, stringsconcatloop, stringscountcontains, stringsindexcontains, stringsindexhasprefix, stringsjoinone, stringssplitfirst,
+//	timeafterleak, timesleepnocontext, timenowsub,
+//	tolowerequalfold, trimleftright, typeassertionnil, typeassertionokdiscarded, unchecked_deferredclose, uncheckedflushreturn, uncheckedsliceindex, uncheckedtypeassertion, walkdirignoredeerror, walkfuncerrshadow, wgdonenotdeferred, writebytestring, writefilepublicpermsensitive
 func documentedAnalyzers() []docAnalyzer {
 	return []docAnalyzer{
 		{"appendbytestring", appendbytestring.Analyzer},
 		{"appendoneelement", appendoneelement.Analyzer},
 		{"blankassigncomma", blankassigncomma.Analyzer},
+		{"blankassignedcleanuperror", blankassignedcleanuperror.Analyzer},
 		{"bufferresetbeforereuse", bufferresetbeforereuse.Analyzer},
 		{"bufioscannererunchecked", bufioscannererunchecked.Analyzer},
 		{"bytesbufferstring", bytesbufferstring.Analyzer},
@@ -143,10 +162,13 @@ func documentedAnalyzers() []docAnalyzer {
 		{"errorfwrapv", errorfwrapv.Analyzer},
 		{"excessivefuncparams", excessivefuncparams.Analyzer},
 		{"errormessage", errormessage.Analyzer},
+		{"errorsnewerrorstring", errorsnewerrorstring.Analyzer},
 		{"errortypeassertion", errortypeassertion.Analyzer},
 		{"errstringmatch", errstringmatch.Analyzer},
+		{"execcommandoutputerrdiscard", execcommandoutputerrdiscard.Analyzer},
 		{"execcommandwithoutcontext", execcommandwithoutcontext.Analyzer},
 		{"fileclosenotdeferred", fileclosenotdeferred.Analyzer},
+		{"filepathwalkpreferwalkdir", filepathwalkpreferwalkdir.Analyzer},
 		{"fmterrorfnoverbs", fmterrorfnoverbs.Analyzer},
 		{"formatintitoa", formatintitoa.Analyzer},
 		{"fprintferrorunchecked", fprintferrorunchecked.Analyzer},
@@ -156,11 +178,16 @@ func documentedAnalyzers() []docAnalyzer {
 		{"goroutinemissingrecover", goroutinemissingrecover.Analyzer},
 		{"goroutineresourceleak", goroutineresourceleak.Analyzer},
 		{"hardcodedfilepath", hardcodedfilepath.Analyzer},
+		{"hasprefixdotdotpathescape", hasprefixdotdotpathescape.Analyzer},
+		{"httpclientnotimeout", httpclientnotimeout.Analyzer},
 		{"httpnoctx", httpnoctx.Analyzer},
 		{"httprespbodyclose", httprespbodyclose.Analyzer},
 		{"httpstatuscode", httpstatuscode.Analyzer},
+		{"ignoredlocalerror", ignoredlocalerror.Analyzer},
 		{"ioutildeprecated", ioutildeprecated.Analyzer},
+		{"jsondecodertrailingdataunchecked", jsondecodertrailingdataunchecked.Analyzer},
 		{"jsonmarshalignoredeerror", jsonmarshalignoredeerror.Analyzer},
+		{"jsonunmarshalbytesconversion", jsonunmarshalbytesconversion.Analyzer},
 		{"largefunc", largefunc.Analyzer},
 		{"lenstringsplit", lenstringsplit.Analyzer},
 		{"lenstringzero", lenstringzero.Analyzer},
@@ -174,9 +201,12 @@ func documentedAnalyzers() []docAnalyzer {
 		{"osgetenvlibrary", osgetenvlibrary.Analyzer},
 		{"osisnotexist", osisnotexist.Analyzer},
 		{"osopenreadallpreferreadfile", osopenreadallpreferreadfile.Analyzer},
+		{"osremoveuncheckedcleanup", osremoveuncheckedcleanup.Analyzer},
+		{"osstatignoredeerrorderef", osstatignoredeerrorderef.Analyzer},
 		{"ossetenvlibrary", ossetenvlibrary.Analyzer},
 		{"packagelevelmutableslicemap", packagelevelmutableslicemap.Analyzer},
 		{"panic-in-library-code", panicinlibrarycode.Analyzer},
+		{"prefercutprefix", prefercutprefix.Analyzer},
 		{"rawloginlib", rawloginlib.Analyzer},
 		{"readerstringconv", readerstringconv.Analyzer},
 		{"reflectdeepequalusage", reflectdeepequalusage.Analyzer},
@@ -184,7 +214,10 @@ func documentedAnalyzers() []docAnalyzer {
 		{"regexpdynamicpattern", regexpdynamicpattern.Analyzer},
 		{"seenmapbool", seenmapbool.Analyzer},
 		{"slicemakezerolength", slicemakezerolength.Analyzer},
+		{"sortbasicslices", sortbasicslices.Analyzer},
 		{"sortslice", sortslice.Analyzer},
+		{"splitindexzero", splitindexzero.Analyzer},
+		{"splitlines-on-newline", splitlinesonnewline.Analyzer},
 		{"sprintferrdot", sprintferrdot.Analyzer},
 		{"sprintferrorsnew", sprintferrorsnew.Analyzer},
 		{"sprintfbool", sprintfbool.Analyzer},
@@ -198,6 +231,7 @@ func documentedAnalyzers() []docAnalyzer {
 		{"stringsindexcontains", stringsindexcontains.Analyzer},
 		{"stringsindexhasprefix", stringsindexhasprefix.Analyzer},
 		{"stringsjoinone", stringsjoinone.Analyzer},
+		{"stringssplitfirst", stringssplitfirst.Analyzer},
 		{"timeafterleak", timeafterleak.Analyzer},
 		{"timesleepnocontext", timesleepnocontext.Analyzer},
 		{"timenowsub", timenowsub.Analyzer},
@@ -213,6 +247,7 @@ func documentedAnalyzers() []docAnalyzer {
 		{"walkfuncerrshadow", walkfuncerrshadow.Analyzer},
 		{"wgdonenotdeferred", wgdonenotdeferred.Analyzer},
 		{"writebytestring", writebytestring.Analyzer},
+		{"writefilepublicpermsensitive", writefilepublicpermsensitive.Analyzer},
 	}
 }
 

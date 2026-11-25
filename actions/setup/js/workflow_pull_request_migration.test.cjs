@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import fs from "node:fs";
-import { parseDocument } from "./work_queue_yaml.cjs";
+import { readDocumentMetadata } from "../../../scripts/markdown_metadata_test_adapter.cjs";
 
 // Latest 100 merged PRs: these workflows produced closing issues with gh-aw provenance.
 const migrated = [
@@ -21,9 +21,8 @@ const retained = ["semantic-function-refactor", "go-fan"];
 function readWorkflow(id) {
   const source = fs.readFileSync(new URL(`../../../.github/workflows/${id}.md`, import.meta.url), "utf8");
   const frontmatter = source.match(/^---\n([\s\S]*?)\n---/)[1];
-  const document = parseDocument(frontmatter, { version: "1.2", uniqueKeys: true });
-  expect(document.errors).toEqual([]);
-  return { source, config: document.toJS() };
+  const document = readDocumentMetadata(frontmatter, { version: "1.2", uniqueKeys: true });
+  return { source, config: document.value };
 }
 
 describe("code-producing issue workflow migration", () => {
@@ -42,9 +41,12 @@ describe("code-producing issue workflow migration", () => {
     expect(lock).toContain('\\"exclude_lock_yml\\":true');
   });
 
-  it.each(["daily-formal-spec-verifier", "sergo"])("%s explicitly allows Go formatting and focused tests", id => {
+  it.each([
+    ["daily-formal-spec-verifier", ["gofmt -w:*", "go test:*"]],
+    ["sergo", ["gofmt -w *", "go test *"]],
+  ])("%s explicitly allows Go formatting and focused tests", (id, commands) => {
     const { config } = readWorkflow(id);
-    expect(config.tools.bash).toEqual(expect.arrayContaining(["gofmt -w *", "go test *"]));
+    expect(config.tools.bash).toEqual(expect.arrayContaining(commands));
     expect(config.tools.bash).not.toContain("*");
   });
 

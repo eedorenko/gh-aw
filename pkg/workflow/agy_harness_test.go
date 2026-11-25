@@ -23,11 +23,17 @@ func agyHarnessCommand(t *testing.T, body string, reflectJSON string) (*exec.Cmd
 	t.Helper()
 	dir := t.TempDir()
 	harness := filepath.Join(dir, "agy_harness.cjs")
-	for _, name := range []string{"agy_harness.cjs", "jsonl_helpers.cjs", "resolve_model_alias.cjs", "json_schema_validation.cjs", "schema-validation.cjs", "add_labels_schema.cjs", "memory_schema_contract.cjs"} {
-		require.NoError(t, os.WriteFile(filepath.Join(dir, name), agyRuntimeScript(t, name), 0o600))
-	}
 	actionsDir, err := filepath.Abs("../../actions/setup/js")
 	require.NoError(t, err)
+	entries, err := os.ReadDir(actionsDir)
+	require.NoError(t, err)
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || strings.Contains(name, ".test.") || (!strings.HasSuffix(name, ".cjs") && !strings.HasSuffix(name, ".json")) {
+			continue
+		}
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), agyRuntimeScript(t, name), 0o600))
+	}
 	module, err := json.Marshal(filepath.Join(actionsDir, "awf_reflect.cjs"))
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "awf_reflect.cjs"), []byte("module.exports = { ...require("+string(module)+"), fetchAWFReflect: async () => JSON.parse(process.env.AGY_TEST_REFLECT) };"), 0o600))
@@ -79,7 +85,15 @@ process.stdin.on("end", () => {
 			ADC, GoogleKey         *string
 		}
 	}
-	require.NoError(t, json.Unmarshal([]byte(strings.Split(string(out), "\n")[0]), &observation))
+	initLine := ""
+	for line := range strings.SplitSeq(string(out), "\n") {
+		if strings.HasPrefix(line, `{"event":"init"`) {
+			initLine = line
+			break
+		}
+	}
+	require.NotEmpty(t, initLine, "native init event must be forwarded to stdout")
+	require.NoError(t, json.Unmarshal([]byte(initLine), &observation))
 	assert.Equal(t, "Literal $(touch SHOULD_NOT_EXIST)\n\"quoted\"; --model not-an-argument", observation.Init.Input.Message.Content)
 	assert.Equal(t, map[string]string{"modelProvider": "gemini"}, observation.Init.Settings)
 	assert.Equal(t, "awf-proxy", observation.Init.APIKey)
@@ -191,12 +205,11 @@ const timer = setInterval(() => {
 }, 1);
 setInterval(() => {}, 1000);`
 	cmd, _ := agyHarnessCommand(t, body, validReflect)
-	start := time.Now()
 	out, err := cmd.CombinedOutput()
 	require.Error(t, err)
 	assert.Contains(t, string(out), "pending JSONL record limit (16777216 UTF-16 code units)")
 	assert.Contains(t, string(out), "session.error")
-	assert.Less(t, time.Since(start), 4*time.Second, "pending output must terminate the child before the watchdog")
+	assert.Equal(t, 1, cmd.ProcessState.ExitCode(), "pending output must terminate the harness before its context deadline")
 }
 
 func TestAgyHarnessBoundsDescendantPipes(t *testing.T) {

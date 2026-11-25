@@ -32,11 +32,11 @@ func TestGenerateInterpolationAndTemplateStep_DeduplicatesEnvVars(t *testing.T) 
 	result := yaml.String()
 
 	// MY_VAR should appear exactly once
-	count := strings.Count(result, "GH_AW_VARS_MY_VAR: ${{ vars.MY_VAR }}")
+	count := strings.Count(result, `GH_AW_VARS_MY_VAR: "${{ vars.MY_VAR }}"`)
 	assert.Equal(t, 1, count, "duplicate env var GH_AW_VARS_MY_VAR should appear exactly once")
 
 	// OTHER_VAR should be present
-	assert.Contains(t, result, "GH_AW_VARS_OTHER_VAR: ${{ vars.OTHER_VAR }}", "OTHER_VAR should be present")
+	assert.Contains(t, result, `GH_AW_VARS_OTHER_VAR: "${{ vars.OTHER_VAR }}"`, "OTHER_VAR should be present")
 }
 
 // TestGenerateInterpolationAndTemplateStep_SkipPath tests that the step is not generated
@@ -91,6 +91,22 @@ func TestGenerateInterpolationAndTemplateStep_WithInlineSubAgent(t *testing.T) {
 	result := yaml.String()
 	assert.Contains(t, result, "Interpolate variables and render templates", "step should be present when inline sub-agents are defined")
 	assert.Contains(t, result, "interpolate_prompt.cjs", "interpolate_prompt script should run to extract inline sub-agents")
+}
+
+func TestGenerateInterpolationAndTemplateStep_WithPreservedDefinitions(t *testing.T) {
+	for _, kind := range []string{"agent", "skill"} {
+		t.Run(kind, func(t *testing.T) {
+			compiler := &Compiler{}
+			data := &WorkflowData{
+				MarkdownContent: "Main prompt",
+				PromptMarkdown:  "Main prompt\n\n## " + kind + ": `helper`\nHelp.",
+				ParsedTools:     NewTools(map[string]any{}),
+			}
+			var yaml strings.Builder
+			compiler.generateInterpolationAndTemplateStep(&yaml, nil, data, false)
+			assert.Contains(t, yaml.String(), "interpolate_prompt.cjs", "a preserved definition alone must trigger extraction")
+		})
+	}
 }
 
 // TestGenerateInterpolationAndTemplateStep_WithRuntimeImport ensures the interpolation step

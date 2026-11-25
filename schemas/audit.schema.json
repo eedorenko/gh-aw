@@ -1334,6 +1334,12 @@
             "noop_count": {
               "type": "integer"
             },
+            "continuation_request_count": {
+              "type": [
+                "null",
+                "integer"
+              ]
+            },
             "agent_active_ratio": {
               "type": "number"
             },
@@ -1342,7 +1348,8 @@
             }
           },
           "required": [
-            "timeout_detected"
+            "timeout_detected",
+            "continuation_request_count"
           ],
           "additionalProperties": false
         },
@@ -1733,6 +1740,77 @@
             "additionalProperties": false
           }
         },
+        "incomplete": {
+          "type": [
+            "null",
+            "array"
+          ],
+          "items": {
+            "type": "object",
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "details": {
+                "type": "string"
+              },
+              "timestamp": {
+                "type": "string"
+              },
+              "workflow_name": {
+                "type": "string"
+              },
+              "run_id": {
+                "type": "integer"
+              },
+              "experiment_name": {
+                "type": "string"
+              },
+              "variant": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "reason",
+              "timestamp"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "continuation_requests": {
+          "type": [
+            "null",
+            "array"
+          ],
+          "items": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "timestamp": {
+                "type": "string"
+              },
+              "workflow_name": {
+                "type": "string"
+              },
+              "run_id": {
+                "type": "integer"
+              },
+              "experiment_name": {
+                "type": "string"
+              },
+              "variant": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "message",
+              "timestamp"
+            ],
+            "additionalProperties": false
+          }
+        },
         "mcp_failures": {
           "type": [
             "null",
@@ -1840,6 +1918,12 @@
               },
               "request_id": {
                 "type": "string"
+              },
+              "trigger": {
+                "type": "string"
+              },
+              "conversation": {
+                "type": "string"
               }
             },
             "required": [
@@ -1875,6 +1959,93 @@
               "threshold"
             ],
             "additionalProperties": false
+          }
+        },
+        "steering_deliveries": {
+          "type": [
+            "null",
+            "array"
+          ],
+          "items": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "ai_credit",
+                  "timeout"
+                ]
+              },
+              "trigger": {
+                "type": "string"
+              },
+              "threshold": {
+                "type": [
+                  "null",
+                  "integer"
+                ]
+              },
+              "conversation": {
+                "type": [
+                  "null",
+                  "string"
+                ],
+                "pattern": "^[0-9a-f]{12}$"
+              },
+              "first": {
+                "type": "boolean"
+              },
+              "request_id": {
+                "type": "string"
+              },
+              "phase": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "trigger",
+              "threshold",
+              "conversation",
+              "first"
+            ],
+            "additionalProperties": false,
+            "oneOf": [
+              {
+                "properties": {
+                  "threshold": {
+                    "type": "integer",
+                    "enum": [
+                      80,
+                      90,
+                      95,
+                      99
+                    ]
+                  },
+                  "trigger": {
+                    "const": "threshold"
+                  }
+                },
+                "required": [
+                  "trigger",
+                  "threshold"
+                ]
+              },
+              {
+                "properties": {
+                  "threshold": {
+                    "type": "null"
+                  },
+                  "trigger": {
+                    "const": "little_left"
+                  }
+                },
+                "required": [
+                  "trigger",
+                  "threshold"
+                ]
+              }
+            ]
           }
         },
         "steering_notices_unavailable": {
@@ -1921,6 +2092,9 @@
             },
             "total_aic": {
               "type": "number"
+            },
+            "aic_found": {
+              "type": "boolean"
             },
             "ambient_context": {
               "type": [
@@ -2360,6 +2534,93 @@
                 "additionalProperties": false
               }
             },
+            "steering_deliveries": {
+              "type": [
+                "null",
+                "array"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "ai_credit",
+                      "timeout"
+                    ]
+                  },
+                  "trigger": {
+                    "type": "string"
+                  },
+                  "threshold": {
+                    "type": [
+                      "null",
+                      "integer"
+                    ]
+                  },
+                  "conversation": {
+                    "type": [
+                      "null",
+                      "string"
+                    ],
+                    "pattern": "^[0-9a-f]{12}$"
+                  },
+                  "first": {
+                    "type": "boolean"
+                  },
+                  "request_id": {
+                    "type": "string"
+                  },
+                  "phase": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "trigger",
+                  "threshold",
+                  "conversation",
+                  "first"
+                ],
+                "additionalProperties": false,
+                "oneOf": [
+                  {
+                    "properties": {
+                      "threshold": {
+                        "type": "integer",
+                        "enum": [
+                          80,
+                          90,
+                          95,
+                          99
+                        ]
+                      },
+                      "trigger": {
+                        "const": "threshold"
+                      }
+                    },
+                    "required": [
+                      "trigger",
+                      "threshold"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "threshold": {
+                        "type": "null"
+                      },
+                      "trigger": {
+                        "const": "little_left"
+                      }
+                    },
+                    "required": [
+                      "trigger",
+                      "threshold"
+                    ]
+                  }
+                ]
+              }
+            },
             "steering_notices_unavailable": {
               "type": "boolean"
             },
@@ -2789,6 +3050,24 @@
                 ],
                 "additionalProperties": false
               }
+            },
+            "observation": {
+              "type": [
+                "null",
+                "object"
+              ],
+              "properties": {
+                "outcome": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "outcome"
+              ],
+              "additionalProperties": false
             },
             "endpoint_only_deviation_normalized": {
               "type": "boolean"
@@ -3677,6 +3956,9 @@
           "items": {
             "type": "object",
             "properties": {
+              "status": {
+                "type": "string"
+              },
               "type": {
                 "type": "string"
               },
@@ -3782,7 +4064,125 @@
             "additionalProperties": false
           }
         },
-        "outcomes": {
+        "delivery": {
+          "type": [
+            "null",
+            "object"
+          ],
+          "properties": {
+            "run_id": {
+              "type": "integer"
+            },
+            "workflow": {
+              "type": "string"
+            },
+            "items": {
+              "type": [
+                "null",
+                "array"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "host": {
+                    "type": "string"
+                  },
+                  "repository": {
+                    "type": "string"
+                  },
+                  "workflow": {
+                    "type": "string"
+                  },
+                  "run_id": {
+                    "type": "integer"
+                  },
+                  "run_attempt": {
+                    "type": "integer"
+                  },
+                  "invocation_id": {
+                    "type": "string"
+                  },
+                  "evidence_id": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string"
+                  },
+                  "target_url": {
+                    "type": "string"
+                  },
+                  "target_repository": {
+                    "type": "string"
+                  },
+                  "delivery": {
+                    "type": "object",
+                    "properties": {
+                      "state": {
+                        "type": "string"
+                      },
+                      "signal": {
+                        "type": "string"
+                      },
+                      "at": {
+                        "type": "string"
+                      },
+                      "observed_at": {
+                        "type": "string"
+                      },
+                      "source": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "state",
+                      "signal",
+                      "at",
+                      "observed_at",
+                      "source"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "id",
+                  "host",
+                  "repository",
+                  "run_id",
+                  "run_attempt",
+                  "invocation_id",
+                  "evidence_id",
+                  "type",
+                  "delivery"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "delivered": {
+              "type": "integer"
+            },
+            "coverage": {
+              "type": "string"
+            },
+            "error": {
+              "type": "string"
+            },
+            "retention_days": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "run_id",
+            "items",
+            "delivered",
+            "coverage",
+            "retention_days"
+          ],
+          "additionalProperties": false
+        },
+        "adoption": {
           "type": [
             "null",
             "array"
@@ -3790,13 +4190,110 @@
           "items": {
             "type": "object",
             "properties": {
-              "outcome_status": {
+              "adoption_status": {
                 "type": "string"
               },
               "evidence_strength": {
                 "type": "string"
               },
               "signal": {
+                "type": "string"
+              },
+              "adoption": {
+                "type": [
+                  "null",
+                  "object"
+                ],
+                "properties": {
+                  "state": {
+                    "type": "string"
+                  },
+                  "signal": {
+                    "type": "string"
+                  },
+                  "at": {
+                    "type": "string"
+                  },
+                  "observed_at": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "type": "string"
+                  },
+                  "rule_version": {
+                    "type": "string"
+                  },
+                  "acceptance_kind": {
+                    "type": "string"
+                  },
+                  "actor": {
+                    "type": "object",
+                    "properties": {
+                      "login": {
+                        "type": "string"
+                      },
+                      "type": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "login"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "human_verified": {
+                    "type": "boolean"
+                  },
+                  "coverage": {
+                    "type": "string"
+                  },
+                  "error": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "state",
+                  "signal",
+                  "observed_at",
+                  "source",
+                  "rule_version",
+                  "human_verified",
+                  "coverage"
+                ],
+                "additionalProperties": false
+              },
+              "survival": {
+                "type": [
+                  "null",
+                  "object"
+                ],
+                "properties": {
+                  "state": {
+                    "type": "string"
+                  },
+                  "signal": {
+                    "type": "string"
+                  },
+                  "observed_at": {
+                    "type": "string"
+                  },
+                  "coverage": {
+                    "type": "string"
+                  },
+                  "error": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "state",
+                  "coverage"
+                ],
+                "additionalProperties": false
+              },
+              "reversal_signal": {
+                "type": "string"
+              },
+              "reversed_at": {
                 "type": "string"
               },
               "item_id": {
@@ -3826,7 +4323,7 @@
               "detail": {
                 "type": "string"
               },
-              "time_to_outcome_hours": {
+              "time_to_adoption_hours": {
                 "type": "number"
               },
               "human_comments": {
@@ -3839,6 +4336,9 @@
                 "type": "integer"
               },
               "zero_touch": {
+                "type": "boolean"
+              },
+              "zero_touch_evidence_complete": {
                 "type": "boolean"
               },
               "objective_value": {
@@ -3864,7 +4364,7 @@
               }
             },
             "required": [
-              "outcome_status",
+              "adoption_status",
               "evidence_strength",
               "type",
               "created_at",
@@ -3873,7 +4373,7 @@
             "additionalProperties": false
           }
         },
-        "outcome_summary": {
+        "adoption_summary": {
           "type": [
             "null",
             "object"
@@ -3885,10 +4385,19 @@
             "accepted": {
               "type": "integer"
             },
+            "accepted_human": {
+              "type": "integer"
+            },
+            "accepted_automation": {
+              "type": "integer"
+            },
+            "accepted_delivery_fallback": {
+              "type": "integer"
+            },
             "rejected": {
               "type": "integer"
             },
-            "ignored": {
+            "not_applicable": {
               "type": "integer"
             },
             "pending": {
@@ -3927,10 +4436,10 @@
             "zero_touch_rate": {
               "type": "number"
             },
-            "median_time_to_outcome_hours": {
+            "median_time_to_adoption_hours": {
               "type": "number"
             },
-            "cost_per_accepted_outcome": {
+            "cost_per_adopted_output": {
               "type": "number"
             },
             "total_objective_value": {
@@ -3994,8 +4503,11 @@
           "required": [
             "total",
             "accepted",
+            "accepted_human",
+            "accepted_automation",
+            "accepted_delivery_fallback",
             "rejected",
-            "ignored",
+            "not_applicable",
             "pending",
             "unknown",
             "lifecycle",
@@ -4232,71 +4744,6 @@
                     "string"
                   ]
                 },
-                "worker": {
-                  "type": [
-                    "null",
-                    "object"
-                  ],
-                  "properties": {
-                    "work_id": {
-                      "type": "string"
-                    },
-                    "claim_id": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "work_id",
-                    "claim_id"
-                  ],
-                  "additionalProperties": false
-                },
-                "transactions": {
-                  "type": [
-                    "null",
-                    "array"
-                  ],
-                  "items": {
-                    "type": "object",
-                    "properties": {
-                      "version": {
-                        "type": "integer"
-                      },
-                      "kind": {
-                        "type": "string"
-                      },
-                      "work": {
-                        "type": "string"
-                      },
-                      "claim": {
-                        "type": [
-                          "null",
-                          "string"
-                        ]
-                      },
-                      "attempt": {
-                        "type": [
-                          "null",
-                          "string"
-                        ]
-                      },
-                      "enqueued": {
-                        "type": [
-                          "null",
-                          "integer"
-                        ]
-                      }
-                    },
-                    "required": [
-                      "version",
-                      "kind",
-                      "work",
-                      "claim",
-                      "attempt"
-                    ],
-                    "additionalProperties": false
-                  }
-                },
                 "current": {
                   "type": [
                     "null",
@@ -4306,26 +4753,11 @@
                     "role": {
                       "type": "string"
                     },
-                    "policy_installed": {
-                      "type": "boolean"
-                    },
                     "tip": {
                       "type": "string"
                     },
-                    "policy_epoch": {
-                      "type": "string"
-                    },
-                    "captured_at": {
-                      "type": "integer"
-                    },
                     "commit_count": {
                       "type": "integer"
-                    },
-                    "admission_paused": {
-                      "type": "boolean"
-                    },
-                    "grants_paused": {
-                      "type": "boolean"
                     },
                     "assignment": {
                       "type": [
@@ -4336,17 +4768,27 @@
                         "dispatch_id": {
                           "type": "string"
                         },
-                        "request_id": {
-                          "type": "string"
-                        },
-                        "commit_id": {
-                          "type": "string"
-                        },
                         "state": {
                           "type": "string"
                         },
-                        "released": {
-                          "type": "boolean"
+                        "run": {
+                          "type": [
+                            "null",
+                            "object"
+                          ],
+                          "properties": {
+                            "run_id": {
+                              "type": "string"
+                            },
+                            "run_attempt": {
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "run_id",
+                            "run_attempt"
+                          ],
+                          "additionalProperties": false
                         },
                         "claims": {
                           "type": [
@@ -4367,17 +4809,13 @@
                               },
                               "state": {
                                 "type": "string"
-                              },
-                              "delivery_barrier": {
-                                "type": "string"
                               }
                             },
                             "required": [
                               "claim_handle",
                               "claim_id",
                               "work_id",
-                              "state",
-                              "delivery_barrier"
+                              "state"
                             ],
                             "additionalProperties": false
                           }
@@ -4385,10 +4823,8 @@
                       },
                       "required": [
                         "dispatch_id",
-                        "request_id",
-                        "commit_id",
                         "state",
-                        "released",
+                        "run",
                         "claims"
                       ],
                       "additionalProperties": false
@@ -4426,31 +4862,16 @@
                         "nodes": {
                           "type": "integer"
                         },
-                        "evaluated_at": {
-                          "type": "integer"
-                        },
                         "status": {
                           "type": "string"
                         },
                         "tip": {
                           "type": "string"
                         },
-                        "policy_epoch": {
-                          "type": "string"
-                        },
                         "repository": {
                           "type": "string"
                         },
                         "branch": {
-                          "type": "string"
-                        },
-                        "admission_paused": {
-                          "type": "boolean"
-                        },
-                        "grants_paused": {
-                          "type": "boolean"
-                        },
-                        "policy_mode": {
                           "type": "string"
                         },
                         "claims_by_state": {
@@ -4465,31 +4886,13 @@
                             "type": "integer"
                           }
                         },
-                        "delivery_by_state": {
+                        "work_cancellation_reasons": {
                           "type": "object",
                           "additionalProperties": {
                             "type": "integer"
                           }
-                        },
-                        "delivery_failure_reasons": {
-                          "type": "object",
-                          "additionalProperties": {
-                            "type": "integer"
-                          }
-                        },
-                        "native_reservations": {
-                          "type": "integer"
-                        },
-                        "dispatches_total": {
-                          "type": "integer"
                         },
                         "dispatches_by_state": {
-                          "type": "object",
-                          "additionalProperties": {
-                            "type": "integer"
-                          }
-                        },
-                        "reservations_by_state": {
                           "type": "object",
                           "additionalProperties": {
                             "type": "integer"
@@ -4506,9 +4909,6 @@
                               "pool": {
                                 "type": "string"
                               },
-                              "policy_installed": {
-                                "type": "boolean"
-                              },
                               "work_by_state": {
                                 "type": "object",
                                 "additionalProperties": {
@@ -4521,156 +4921,39 @@
                                   "type": "integer"
                                 }
                               },
-                              "delivery_by_state": {
+                              "open_dispatches": {
+                                "type": "integer"
+                              },
+                              "eligible": {
+                                "type": "integer"
+                              },
+                              "blocked": {
                                 "type": "object",
                                 "additionalProperties": {
                                   "type": "integer"
                                 }
                               },
-                              "native_reservations": {
-                                "type": "integer"
-                              },
-                              "logical_limit": {
-                                "type": "integer"
-                              },
-                              "native_limit": {
-                                "type": "integer"
-                              },
-                              "max_attempts": {
-                                "type": "integer"
-                              },
-                              "scheduling_eligible": {
-                                "type": "integer"
-                              },
-                              "ineligible_reasons": {
-                                "type": "object",
-                                "additionalProperties": {
-                                  "type": "integer"
-                                }
-                              },
-                              "oldest_available": {
+                              "next_eligible": {
                                 "type": [
                                   "null",
-                                  "object"
+                                  "array"
                                 ],
-                                "properties": {
-                                  "work_id": {
-                                    "type": "string"
-                                  },
-                                  "admitted_at": {
-                                    "type": "integer"
-                                  },
-                                  "age_ms": {
-                                    "type": "integer"
-                                  }
-                                },
-                                "required": [
-                                  "work_id",
-                                  "admitted_at",
-                                  "age_ms"
-                                ],
-                                "additionalProperties": false
-                              },
-                              "available_age_unknown": {
-                                "type": "integer"
-                              },
-                              "prediction": {
-                                "type": "object",
-                                "properties": {
-                                  "reason": {
-                                    "type": "string"
-                                  },
-                                  "assignments": {
-                                    "type": [
-                                      "null",
-                                      "array"
-                                    ],
-                                    "items": {
-                                      "type": "object",
-                                      "properties": {
-                                        "worker_profile": {
-                                          "type": "string"
-                                        },
-                                        "work_ids": {
-                                          "type": [
-                                            "null",
-                                            "array"
-                                          ],
-                                          "items": {
-                                            "type": "string"
-                                          }
-                                        }
-                                      },
-                                      "required": [
-                                        "worker_profile",
-                                        "work_ids"
-                                      ],
-                                      "additionalProperties": false
-                                    }
-                                  }
-                                },
-                                "required": [
-                                  "reason",
-                                  "assignments"
-                                ],
-                                "additionalProperties": false
+                                "items": {
+                                  "type": "string"
+                                }
                               }
                             },
                             "required": [
                               "pool",
-                              "policy_installed",
                               "work_by_state",
                               "claims_by_state",
-                              "delivery_by_state",
-                              "native_reservations",
-                              "logical_limit",
-                              "native_limit",
-                              "max_attempts",
-                              "scheduling_eligible",
-                              "ineligible_reasons",
-                              "oldest_available",
-                              "available_age_unknown",
-                              "prediction"
+                              "open_dispatches",
+                              "eligible",
+                              "blocked",
+                              "next_eligible"
                             ],
                             "additionalProperties": false
                           }
-                        },
-                        "activity": {
-                          "type": "object",
-                          "properties": {
-                            "since": {
-                              "type": "integer"
-                            },
-                            "until": {
-                              "type": "integer"
-                            },
-                            "transactions": {
-                              "type": "integer"
-                            },
-                            "operations": {
-                              "type": "object",
-                              "additionalProperties": {
-                                "type": "integer"
-                              }
-                            },
-                            "last_commit_id": {
-                              "type": "string"
-                            },
-                            "last_at": {
-                              "type": [
-                                "null",
-                                "integer"
-                              ]
-                            }
-                          },
-                          "required": [
-                            "since",
-                            "until",
-                            "transactions",
-                            "operations",
-                            "last_at"
-                          ],
-                          "additionalProperties": false
                         },
                         "assigned_claims": {
                           "type": [
@@ -4704,9 +4987,6 @@
                                   "priority": {
                                     "type": "integer"
                                   },
-                                  "admitted_priority": {
-                                    "type": "integer"
-                                  },
                                   "fairness_key": {
                                     "type": "string"
                                   },
@@ -4726,43 +5006,30 @@
                                     ],
                                     "additionalProperties": false
                                   },
-                                  "enqueued_at": {
-                                    "type": "integer"
-                                  },
-                                  "admitted_at": {
-                                    "type": [
-                                      "null",
-                                      "integer"
-                                    ]
-                                  },
                                   "attempts": {
-                                    "type": "integer"
-                                  },
-                                  "max_attempts": {
-                                    "type": [
-                                      "null",
-                                      "integer"
-                                    ]
-                                  },
-                                  "retry_not_before": {
                                     "type": "integer"
                                   },
                                   "claim_id": {
                                     "type": "string"
                                   },
-                                  "delivery": {
-                                    "type": "string"
-                                  },
                                   "completion_id": {
                                     "type": "string"
                                   },
-                                  "result_commit_id": {
-                                    "type": "string"
-                                  },
-                                  "disposition": {
-                                    "type": "string"
+                                  "effects": {
+                                    "type": [
+                                      "null",
+                                      "array"
+                                    ],
+                                    "items": {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 255
+                                    }
                                   },
                                   "cancellation_reason": {
+                                    "type": "string"
+                                  },
+                                  "cancellation_commit_id": {
                                     "type": "string"
                                   },
                                   "depends_on": {
@@ -4824,7 +5091,7 @@
                                       "additionalProperties": false
                                     }
                                   },
-                                  "issue": {
+                                  "subject": {
                                     "type": [
                                       "null",
                                       "object"
@@ -4858,6 +5125,50 @@
                                       "number"
                                     ],
                                     "additionalProperties": false
+                                  },
+                                  "backing_issue": {
+                                    "type": [
+                                      "null",
+                                      "object"
+                                    ],
+                                    "properties": {
+                                      "kind": {
+                                        "type": "string"
+                                      },
+                                      "host": {
+                                        "type": "string"
+                                      },
+                                      "repository": {
+                                        "type": "string"
+                                      },
+                                      "repository_id": {
+                                        "type": "string"
+                                      },
+                                      "resource_id": {
+                                        "type": "string"
+                                      },
+                                      "number": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "kind",
+                                      "host",
+                                      "repository",
+                                      "repository_id",
+                                      "resource_id",
+                                      "number"
+                                    ],
+                                    "additionalProperties": false
+                                  },
+                                  "issue_comment": {
+                                    "type": "string"
+                                  },
+                                  "ready": {
+                                    "type": "boolean"
+                                  },
+                                  "reason": {
+                                    "type": "string"
                                   }
                                 },
                                 "required": [
@@ -4868,16 +5179,12 @@
                                   "worker_profile",
                                   "state",
                                   "priority",
-                                  "admitted_priority",
                                   "fairness_key",
                                   "position",
-                                  "enqueued_at",
-                                  "admitted_at",
                                   "attempts",
-                                  "max_attempts",
-                                  "retry_not_before",
-                                  "delivery",
-                                  "depends_on"
+                                  "depends_on",
+                                  "ready",
+                                  "reason"
                                 ],
                                 "additionalProperties": false
                               },
@@ -4911,35 +5218,19 @@
                                   "terminal_commit_id": {
                                     "type": "string"
                                   },
-                                  "granted_at": {
-                                    "type": [
-                                      "null",
-                                      "integer"
-                                    ]
-                                  },
-                                  "terminal_at": {
-                                    "type": [
-                                      "null",
-                                      "integer"
-                                    ]
-                                  },
                                   "cancellation_reason": {
                                     "type": "string"
                                   },
-                                  "retry_not_before": {
-                                    "type": "integer"
-                                  },
-                                  "keep_open": {
-                                    "type": "boolean"
-                                  },
-                                  "delivery": {
-                                    "type": "string"
-                                  },
-                                  "delivery_failure_reason": {
-                                    "type": "string"
-                                  },
-                                  "disposition": {
-                                    "type": "string"
+                                  "effects": {
+                                    "type": [
+                                      "null",
+                                      "array"
+                                    ],
+                                    "items": {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 255
+                                    }
                                   }
                                 },
                                 "required": [
@@ -4950,12 +5241,7 @@
                                   "state",
                                   "current",
                                   "request_id",
-                                  "commit_id",
-                                  "granted_at",
-                                  "terminal_at",
-                                  "retry_not_before",
-                                  "keep_open",
-                                  "delivery"
+                                  "commit_id"
                                 ],
                                 "additionalProperties": false
                               }
@@ -4978,52 +5264,32 @@
                         "dispatches",
                         "transactions",
                         "nodes",
-                        "evaluated_at",
                         "status",
                         "tip",
-                        "policy_epoch",
                         "repository",
                         "branch",
-                        "admission_paused",
-                        "grants_paused",
-                        "policy_mode",
                         "claims_by_state",
                         "claim_cancellation_reasons",
-                        "delivery_by_state",
-                        "delivery_failure_reasons",
-                        "native_reservations",
-                        "dispatches_total",
+                        "work_cancellation_reasons",
                         "dispatches_by_state",
-                        "reservations_by_state",
-                        "pools",
-                        "activity"
+                        "pools"
                       ],
                       "additionalProperties": false
                     }
                   },
                   "required": [
                     "role",
-                    "policy_installed",
                     "tip",
-                    "policy_epoch",
-                    "captured_at",
-                    "commit_count",
-                    "admission_paused",
-                    "grants_paused"
+                    "commit_count"
                   ],
                   "additionalProperties": false
                 }
               },
               "required": [
                 "version",
-                "sha",
-                "worker",
-                "transactions"
+                "sha"
               ],
               "additionalProperties": false
-            },
-            "finish_intent": {
-              "type": "string"
             },
             "finish_intents": {
               "type": [
@@ -5033,21 +5299,14 @@
               "items": {
                 "type": "object",
                 "properties": {
-                  "intent_id": {
-                    "type": "string"
-                  },
                   "claim_handle": {
                     "type": "string"
                   },
                   "outcome": {
                     "type": "string"
-                  },
-                  "keep_open": {
-                    "type": "boolean"
                   }
                 },
                 "required": [
-                  "intent_id",
                   "claim_handle",
                   "outcome"
                 ],
@@ -6144,6 +6403,89 @@
                 ],
                 "additionalProperties": false
               }
+            },
+            "decisions": {
+              "type": [
+                "null",
+                "array"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "proposedAttempt": {
+                    "type": "integer"
+                  },
+                  "startupAttemptId": {
+                    "type": "string"
+                  },
+                  "outcome": {
+                    "type": "string"
+                  },
+                  "questions": {
+                    "type": [
+                      "null",
+                      "array"
+                    ],
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "question": {
+                          "type": "integer"
+                        },
+                        "outcome": {
+                          "type": "string"
+                        },
+                        "error": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "question",
+                        "outcome"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "latencyMs": {
+                    "type": "integer"
+                  },
+                  "timestamp": {
+                    "type": "integer"
+                  },
+                  "error": {
+                    "type": "string"
+                  },
+                  "avoidedInvocation": {
+                    "type": "boolean"
+                  },
+                  "phase": {
+                    "type": "string"
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "index": {
+                    "type": [
+                      "null",
+                      "integer"
+                    ]
+                  }
+                },
+                "required": [
+                  "proposedAttempt",
+                  "outcome",
+                  "questions",
+                  "latencyMs",
+                  "timestamp",
+                  "avoidedInvocation",
+                  "phase",
+                  "path"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "avoided_invocations": {
+              "type": "integer"
             }
           },
           "required": [
@@ -6154,13 +6496,54 @@
             "detection_engine_retries"
           ],
           "additionalProperties": false
+        },
+        "durable_session": {
+          "type": [
+            "null",
+            "object"
+          ],
+          "properties": {
+            "status": {
+              "type": "string"
+            },
+            "engine": {
+              "type": "string"
+            },
+            "storage": {
+              "type": "string"
+            },
+            "parent_run_id": {
+              "type": "string"
+            },
+            "artifact_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "started": {
+              "type": "boolean"
+            },
+            "evidence": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "started"
+          ],
+          "additionalProperties": false
         }
       },
       "required": [
         "schema_version",
         "overview",
         "metrics",
-        "downloaded_files"
+        "downloaded_files",
+        "continuation_requests"
       ],
       "additionalProperties": false
     },

@@ -3,7 +3,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import path from "path";
 
-const { main, classifyDetectionOutcome } = require("./handle_detection_runs.cjs");
+const { main, classifyDetectionOutcome, ensureDetectionRunsIssue } = require("./handle_detection_runs.cjs");
 
 describe("handle_detection_runs", () => {
   let originalEnv;
@@ -15,6 +15,7 @@ describe("handle_detection_runs", () => {
     process.env.GH_AW_PROMPTS_DIR = path.resolve(import.meta.dirname, "../md");
     process.env.GH_AW_WORKFLOW_NAME = "Test Workflow";
     process.env.GH_AW_RUN_URL = "https://github.com/test-owner/test-repo/actions/runs/123";
+    delete process.env.GH_AW_DETECTION_THREAT_KINDS;
     mockCore = { info: vi.fn(), warning: vi.fn() };
     mockGithub = {
       rest: {
@@ -39,10 +40,25 @@ describe("handle_detection_runs", () => {
     vi.unstubAllGlobals();
   });
 
+  it.each([undefined, "area:agentic-workflows", "area:agentic workflows"])("finds and creates the tracker using label %s", async label => {
+    if (label) process.env.GH_AW_ISSUE_LABEL = label;
+    else delete process.env.GH_AW_ISSUE_LABEL;
+    const expectedLabel = label || "agentic-workflows";
+    await expect(ensureDetectionRunsIssue()).resolves.toEqual({ number: 42, node_id: "ID" });
+    expect(mockGithub.rest.search.issuesAndPullRequests).toHaveBeenCalledWith(expect.objectContaining({ q: expect.stringContaining(`label:"${expectedLabel}"`) }));
+    expect(mockGithub.rest.issues.create).not.toHaveBeenCalled();
+
+    mockGithub.rest.search.issuesAndPullRequests.mockResolvedValueOnce({ data: { total_count: 0, items: [] } });
+    mockGithub.rest.issues.create.mockResolvedValueOnce({ data: { number: 43, node_id: "NEW", html_url: "https://github.com/test-owner/test-repo/issues/43" } });
+    await expect(ensureDetectionRunsIssue()).resolves.toEqual({ number: 43, node_id: "NEW" });
+    expect(mockGithub.rest.issues.create).toHaveBeenCalledWith(expect.objectContaining({ labels: [expectedLabel] }));
+  });
+
   it.each([
     ["agent_failure", "detector_execution_failure"],
     ["parse_error", "detector_result_invalid"],
     ["threat_detected", "threat_finding"],
+    ["github_api_quota_exhausted", "detection_deferred"],
     ["", "detection_outcome_unknown"],
   ])("classifies structured reason %s as %s under both policies", async (reason, category) => {
     process.env.GH_AW_DETECTION_REASON = reason;
@@ -79,6 +95,17 @@ describe("handle_detection_runs", () => {
     expect(mockCore.info).toHaveBeenCalledWith(`Detection conclusion: ${conclusion}`);
     expect(mockGithub.rest.search.issuesAndPullRequests).not.toHaveBeenCalled();
     expect(mockGithub.rest.issues.createComment).not.toHaveBeenCalled();
+  });
+
+  it.each(["warning", "failure"])("publishes only allowlisted threat categories under %s policy", async conclusion => {
+    process.env.GH_AW_DETECTION_CONCLUSION = conclusion;
+    process.env.GH_AW_DETECTION_REASON = "threat_detected";
+    process.env.GH_AW_DETECTION_THREAT_KINDS = "secret_leak,malicious_patch,PRIVATE_TEXT";
+    await main();
+    const body = mockGithub.rest.issues.createComment.mock.lastCall[0].body;
+    expect(body).toContain("Detected threat types: secret leak, malicious patch.");
+    expect(body).not.toContain("prompt injection");
+    expect(body).not.toContain("PRIVATE_TEXT");
   });
 
   it.each(["", "private conclusion: warning\nfailure", "SUCCESS", "future_conclusion"])("redacts unrecognized conclusion %s", async conclusion => {

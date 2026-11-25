@@ -4,8 +4,8 @@ set +o histexpand
 # Safe Outputs Specification Conformance Checker
 # This script implements automated checks for the Safe Outputs specification
 # Specification: docs/src/content/docs/specs/safe-outputs-specification.md
-# Spec Version: 1.29.14 (2026-10-31; reviewed through 2026-11-02 changes)
-# Script Version: 1.29.14 (2026-11-02)
+# Spec Version: 1.31.0 (2026-11-19)
+# Script Version: 1.31.0 (2026-11-23)
 
 set -euo pipefail
 
@@ -207,6 +207,11 @@ check_error_codes() {
         # Skip test files and non-safe-output modules
         [[ "$handler" =~ test|_checks\.cjs$ ]] && continue
         [[ "$handler" =~ (apm_unpack|run_apm_unpack|observability|generate_observability) ]] && continue
+
+        # Skip files with a documented USE-001 exemption annotation
+        if grep -q "@safe-outputs-exempt[[:space:]]\\+USE-001" "$handler"; then
+            continue
+        fi
         
         # Only check handlers that interact with GitHub via octokit or record safe output operations
         if ! grep -qE "octokit\.|safe_output|safeOutput|NDJSON" "$handler"; then
@@ -260,7 +265,12 @@ check_staged_mode() {
         # Skip test files and non-safe-output modules
         [[ "$handler" =~ test|_checks\.cjs$ ]] && continue
         [[ "$handler" =~ (apm_unpack|run_apm_unpack|observability|generate_observability) ]] && continue
-        
+
+        # Skip files with a documented USE-003 exemption annotation
+        if grep -q "@safe-outputs-exempt[[:space:]]\\+USE-003" "$handler"; then
+            continue
+        fi
+
         # Only check handlers that explicitly reference the safe outputs staged mode env var
         if grep -q "GH_AW_SAFE_OUTPUTS_STAGED\|logStagedPreviewInfo\|generateStagedPreview" "$handler"; then
             # Check for emoji in preview
@@ -304,13 +314,16 @@ check_type_completeness() {
     local spec_file="docs/src/content/docs/specs/safe-outputs-specification.md"
     local failed=0
     
-    # Extract type names
-    grep "^#### Type:" "$spec_file" 2>/dev/null | sed 's/^#### Type: //' | head -10 | while read -r type_name; do
+    # Extract type names. Process substitution keeps the loop in this shell so its failures reach the summary.
+    while read -r type_name; do
         sections_found=0
-        
+
+        # Bound each type at the next heading. A fixed line window truncates long types and also matches
+        # sibling types that share the name prefix, such as create_pull_request_review_comment.
+        type_section=$(awk -v name="$type_name" '$0 == "#### Type: " name {found=1; next} found && (/^###? / || /^#### Type: /) {exit} found' "$spec_file")
+
         # Check for required sections
         for section in "MCP Tool Schema" "Operational Semantics" "Configuration Parameters" "Security Requirements" "Required Permissions"; do
-            type_section=$(grep -A 200 "^#### Type: $type_name" "$spec_file" 2>/dev/null || true)
             if grep -q "**$section**" <<< "$type_section"; then
                 ((sections_found += 1))
             fi
@@ -320,8 +333,8 @@ check_type_completeness() {
             log_medium "REQ-002: Type '$type_name' has only $sections_found/5 required sections"
             failed=1
         fi
-    done
-    
+    done < <(grep "^#### Type:" "$spec_file" 2>/dev/null | sed 's/^#### Type: //')
+
     if [ $failed -eq 0 ]; then
         log_pass "REQ-002: All safe output types have complete documentation"
     fi
@@ -1664,14 +1677,19 @@ check_wtd_convertible_fallback() {
         fi
 
         # Check that the caution text is emitted in the fallback.
-        # The handler may delegate to threat_detection_warning.cjs via
-        # getThreatWarningPresentation(), so accept that as equivalent evidence.
+        # The handler may delegate to messages_run_status.cjs via
+        # getDetectionWarningBlocks(), which renders the WTD1 caution template
+        # (threat_detection_caution.md) for threat_detected and the WTD1a
+        # engine-error template for tooling failures. Accept that chain as
+        # equivalent evidence.
         local threat_label_found=0
         if grep -q "agentic threat detected" "$push_handler" 2>/dev/null; then
             threat_label_found=1
-        elif grep -q "getThreatWarningPresentation" "$push_handler" 2>/dev/null; then
-            local threat_warning_file="actions/setup/js/threat_detection_warning.cjs"
-            if [ -f "$threat_warning_file" ] && grep -q "agentic threat detected" "$threat_warning_file" 2>/dev/null; then
+        elif grep -q "getDetectionWarningBlocks" "$push_handler" 2>/dev/null; then
+            local threat_status_file="actions/setup/js/messages_run_status.cjs"
+            local threat_caution_template="actions/setup/md/threat_detection_caution.md"
+            if [ -f "$threat_status_file" ] && grep -q "threat_detection_caution.md" "$threat_status_file" 2>/dev/null &&
+                [ -f "$threat_caution_template" ] && grep -q "agentic threat detected" "$threat_caution_template" 2>/dev/null; then
                 threat_label_found=1
             fi
         fi
@@ -3209,6 +3227,778 @@ check_handler_token_global_app_exclusion() {
     fi
 }
 check_handler_token_global_app_exclusion
+
+# WTD-004: Enforceable Pull Request Merge Gate (Section 10.5 WTD4, create_pull_request item 16, T-WTD-004..006, v1.29.17)
+# Detection caution or protected-files request-review MUST leave auto-merge disabled unless
+# enforceable approval policy is verified; a failed required REQUEST_CHANGES review MUST NOT be
+# downgraded to COMMENT, and independent-review guidance MUST be emitted.
+echo "Running WTD-004: Enforceable Pull Request Merge Gate..."
+check_wtd_auto_merge_gate() {
+    local handler="actions/setup/js/create_pull_request.cjs"
+    local failed=0
+
+    if [ ! -f "$handler" ]; then
+        log_high "WTD-004: create_pull_request handler missing: $handler"
+        return
+    fi
+
+    # WTD4: independent-review requirement must gate auto-merge enablement.
+    if ! grep -qE 'requiresIndependentReview\s*=' "$handler" ||
+        ! grep -qE 'autoMerge\s*&&\s*requiresIndependentReview' "$handler"; then
+        log_high "WTD-004: Auto-merge is not withheld when detection caution or protected files require independent review (WTD4)"
+        failed=1
+    fi
+
+    # T-WTD-005: never downgrade the only blocking review to COMMENT.
+    if grep -qE 'event:\s*"COMMENT"' "$handler"; then
+        log_high "WTD-004: create_pull_request may downgrade the required REQUEST_CHANGES review to COMMENT (T-WTD-005)"
+        failed=1
+    fi
+
+    # T-WTD-005/006: independent-review guidance must be emitted.
+    if ! grep -qi 'independent reviewer' "$handler"; then
+        log_medium "WTD-004: create_pull_request does not emit independent-review guidance when auto-merge is withheld (T-WTD-005/006)"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "WTD-004: Auto-merge is withheld for detection caution and independent-review requirements (WTD4)"
+    fi
+}
+check_wtd_auto_merge_gate
+
+# ART-001: Issue Artifacts (Section 7.3 create_issue artifacts, v1.29.18)
+# The unprivileged MCP backend MUST read artifacts[].path into UTF-8 content through guarded,
+# bounded reads before recording a body-only request; invalid UTF-8 and empty content MUST be
+# rejected; the privileged issue processor MUST NOT read agent-supplied paths.
+echo "Running ART-001: Issue Artifacts..."
+check_issue_artifacts() {
+    local artifacts="actions/setup/js/issue_artifacts.cjs"
+    local backend="actions/setup/js/safe_outputs_handlers.cjs"
+    local processor="actions/setup/js/create_issue.cjs"
+    local failed=0
+
+    if [ ! -f "$artifacts" ]; then
+        log_high "ART-001: Issue artifact helper missing: $artifacts"
+        return
+    fi
+
+    local resolver
+    resolver=$(sed -n '/^function resolveIssueArtifactPaths/,/^}/p' "$artifacts")
+    if [ -z "$resolver" ]; then
+        log_high "ART-001: resolveIssueArtifactPaths not found; artifacts[].path cannot be read by the MCP backend"
+        return
+    fi
+
+    # Shape/count validation before any file read, then guarded bounded reads.
+    if ! echo "$resolver" | grep -qE 'normalizeIssueArtifactInputs\(' || ! echo "$resolver" | grep -qE 'readGuardedFile\(.*maxSizeBytes'; then
+        log_high "ART-001: artifacts[].path reads are not preceded by input validation or are not guarded and size-bounded"
+        failed=1
+    fi
+
+    # UTF-8 and empty-content rejection.
+    if ! echo "$resolver" | grep -qE 'isUtf8\(' || ! echo "$resolver" | grep -qE '\.trim\(\)'; then
+        log_high "ART-001: artifacts[].path content is not validated as non-empty UTF-8"
+        failed=1
+    fi
+
+    # The unprivileged MCP backend must resolve paths before recording requests.
+    if [ ! -f "$backend" ] || ! grep -qE 'resolveIssueArtifactPaths\(' "$backend"; then
+        log_high "ART-001: Safe outputs MCP backend does not resolve artifacts[].path before recording requests"
+        failed=1
+    fi
+
+    # The privileged processor must never read agent-supplied paths.
+    if [ -f "$processor" ] && grep -qE 'resolveIssueArtifactPaths|readGuardedFile' "$processor"; then
+        log_critical "ART-001: Privileged create_issue processor reads agent-supplied artifact paths"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "ART-001: Issue artifact paths are read by the MCP backend with guarded, bounded UTF-8 reads"
+    fi
+}
+check_issue_artifacts
+
+# SOF-001: Owner-Only Safeoutputs File Writes (Section 9 safeoutputs backend identity, v1.29.19)
+# Generated safeoutputs config, tools, metadata, validation, and output files MUST use mode 0600
+# on creation and replacement/append, and writes MUST reject symbolic links (O_NOFOLLOW).
+echo "Running SOF-001: Owner-Only Safeoutputs File Writes..."
+check_safeoutputs_private_writes() {
+    local writer="actions/setup/js/create_files.cjs"
+    local appender="actions/setup/js/safe_outputs_append.cjs"
+    local tools_gen="actions/setup/js/generate_safe_outputs_tools.cjs"
+    local failed=0
+
+    local file
+    for file in "$writer" "$appender"; do
+        if [ ! -f "$file" ]; then
+            log_high "SOF-001: Safeoutputs writer missing: $file"
+            failed=1
+            continue
+        fi
+        if ! grep -q 'O_NOFOLLOW' "$file"; then
+            log_high "SOF-001: $file does not reject symbolic links with O_NOFOLLOW"
+            failed=1
+        fi
+        # 0600 on creation and fchmod to 0600 when replacing or appending to existing files.
+        if ! grep -qE 'openSync\(.*0o600' "$file" || ! grep -qE 'fchmodSync\(.*0o600' "$file"; then
+            log_high "SOF-001: $file does not enforce mode 0600 on both creation and replacement"
+            failed=1
+        fi
+    done
+
+    # tools.json, tools_meta.json and validation.json must go through the guarded writer.
+    if [ -f "$tools_gen" ]; then
+        if ! grep -qE 'require\("\./create_files\.cjs"\)' "$tools_gen" || grep -qE 'fs\.writeFileSync\(' "$tools_gen"; then
+            log_high "SOF-001: generate_safe_outputs_tools.cjs bypasses the owner-only no-follow writer"
+            failed=1
+        fi
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "SOF-001: Safeoutputs files are written owner-only (0600) with no-follow semantics"
+    fi
+}
+check_safeoutputs_private_writes
+
+# TID-001: Escaped Temporary-ID References (Section 7.3 create_issue Temporary ID Resolution, v1.29.20)
+# Ordinary, Markdown-escaped, and partially escaped references (#aw_x, \#aw_x, #aw\_x) MUST be
+# recognized; only backslashes immediately preceding # or _ are removed for lookup; unresolved
+# references stay unchanged; a valid prefix of a longer identifier MUST NOT be replaced.
+echo "Running TID-001: Escaped Temporary-ID References..."
+check_escaped_temporary_ids() {
+    local tid="actions/setup/js/temporary_id.cjs"
+    local failed=0
+
+    if [ ! -f "$tid" ]; then
+        log_high "TID-001: Temporary ID helper missing: $tid"
+        return
+    fi
+
+    local pattern
+    pattern=$(grep -E '^const TEMPORARY_ID_PATTERN\s*=' "$tid" || true)
+    if [ -z "$pattern" ]; then
+        log_high "TID-001: TEMPORARY_ID_PATTERN not defined in $tid"
+        return
+    fi
+
+    # Escaped hash and underscore forms must be matched.
+    if ! echo "$pattern" | grep -qF '\\?#' || ! echo "$pattern" | grep -qF 'aw\\?_'; then
+        log_high "TID-001: TEMPORARY_ID_PATTERN does not recognize Markdown-escaped '#' or '_' forms"
+        failed=1
+    fi
+
+    # Complete-identifier requirement: a negative lookahead must prevent prefix matches.
+    if ! echo "$pattern" | grep -qF '(?!'; then
+        log_high "TID-001: TEMPORARY_ID_PATTERN lacks a boundary lookahead and may replace valid prefixes"
+        failed=1
+    fi
+
+    # Normalization removes only escapes immediately preceding # or _.
+    if ! sed -n '/^function normalizeTemporaryId/,/^}/p' "$tid" | grep -qF '.replace(/\\([#_])/g'; then
+        log_high "TID-001: normalizeTemporaryId does not limit unescaping to backslashes before '#' or '_'"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TID-001: Temporary-ID resolution recognizes escaped forms and requires complete identifiers"
+    fi
+}
+check_escaped_temporary_ids
+
+# DEC-001: Invocation Decision Skips (Section 7 noop Invocation Decision Skips, v1.29.21)
+# A deny aggregate MUST suppress the invocation without counting an attempt, append a noop only
+# when no terminal output exists, and diagnose append failures without failing. Requests MUST be
+# bounded to 400,000 UTF-8 bytes; secret matches MUST withhold questions with
+# sensitive_content_blocked; outcomes MUST be recorded as harness.decision evidence.
+echo "Running DEC-001: Invocation Decision Skips..."
+check_invocation_decision_skips() {
+    local decision="actions/setup/js/skip_if_decision.cjs"
+    local runner="actions/setup/js/harness_retry_runner.cjs"
+    local session="actions/setup/js/unified_session.cjs"
+    local failed=0
+
+    if [ ! -f "$decision" ]; then
+        log_high "DEC-001: skip-if-decision evaluator missing: $decision"
+        return
+    fi
+
+    # Conditional noop: only when no terminal output exists; failures diagnosed, not thrown.
+    local skip
+    skip=$(sed -n '/^function recordDecisionSkip/,/^}/p' "$decision")
+    if ! echo "$skip" | grep -qE 'if \(!hasTerminalSafeOutput\(' || ! echo "$skip" | grep -qE 'type: "noop"'; then
+        log_high "DEC-001: Decision skips do not append a noop conditionally on the absence of terminal outputs"
+        failed=1
+    fi
+    if ! echo "$skip" | grep -qE 'catch'; then
+        log_high "DEC-001: noop append failures are not diagnosed without failing the workflow"
+        failed=1
+    fi
+
+    # Request budget: 400,000 UTF-8 bytes (100,000 tokens x 4 bytes).
+    if ! grep -qE 'MAX_DECISION_INPUT_BYTES\s*=\s*(400000|400_000|100000 \* 4|100_000 \* 4)' "$decision"; then
+        log_high "DEC-001: Decision request budget is not bounded to 400,000 UTF-8 bytes"
+        failed=1
+    fi
+
+    # Secret screening withholds questions with sensitive_content_blocked.
+    if ! grep -q 'containsSensitiveContent' "$decision" || ! grep -q 'sensitive_content_blocked' "$decision"; then
+        log_high "DEC-001: Questions and file evidence are not screened for secrets before transmission"
+        failed=1
+    fi
+
+    # A deny suppresses the invocation before the attempt counter advances.
+    if [ -f "$runner" ]; then
+        if ! awk '/decision\.outcome === "deny"/{d=NR} /attempts = attempt \+ 1/{if(!a)a=NR} END{exit !(d && a && d < a)}' "$runner"; then
+            log_high "DEC-001: Denied invocations may be counted as executed attempts"
+            failed=1
+        fi
+    else
+        log_high "DEC-001: Harness retry runner missing: $runner"
+        failed=1
+    fi
+
+    # Decision evidence is recorded separately as harness.decision.
+    if [ ! -f "$session" ] || ! grep -q '"harness.decision"' "$session"; then
+        log_medium "DEC-001: Decision outcomes are not recorded as separate harness.decision unified-session evidence"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "DEC-001: Invocation decision skips are bounded, screened, conditional, and separately recorded"
+    fi
+}
+check_invocation_decision_skips
+
+# TYPE-019: push_to_pull_request_branch Classic Protection via GraphQL Ref.refUpdateRule
+# (Section 7.3 push_to_pull_request_branch Notes, v1.29.22)
+# Classic protection MUST be confirmed through GraphQL Ref.refUpdateRule, not the REST
+# classic-protection endpoint that requires Administration: read. Only an explicit null
+# refUpdateRule may permit a protected-flagged non-default branch; a missing field or failed
+# query MUST leave the push blocked, and a returned object MUST NOT be treated as absence.
+echo "Running TYPE-019: push_to_pull_request_branch Classic Protection Confirmation..."
+check_push_branch_ref_update_rule() {
+    local helpers="actions/setup/js/pr_helpers.cjs"
+    local handler="actions/setup/js/push_to_pull_request_branch.cjs"
+    local failed=0
+
+    if [ ! -f "$helpers" ]; then
+        log_high "TYPE-019: Branch pushability helper missing: $helpers"
+        return
+    fi
+
+    local fn
+    fn=$(sed -n '/^async function checkBranchPushable/,/^}/p' "$helpers")
+    if [ -z "$fn" ]; then
+        log_high "TYPE-019: checkBranchPushable not found in $helpers"
+        return
+    fi
+
+    if ! echo "$fn" | grep -q 'refUpdateRule' || ! echo "$fn" | grep -q 'graphql('; then
+        log_high "TYPE-019: Classic branch protection is not confirmed through GraphQL Ref.refUpdateRule"
+        failed=1
+    fi
+    if echo "$fn" | grep -qE 'getBranchProtection|/protection'; then
+        log_high "TYPE-019: Classic protection uses the REST endpoint that requires Administration: read"
+        failed=1
+    fi
+    # Missing field fails closed; only explicit null clears protection.
+    if ! echo "$fn" | grep -qE '=== undefined' || ! echo "$fn" | grep -qE '=== null'; then
+        log_high "TYPE-019: refUpdateRule absence is not distinguished from a missing field (explicit null required)"
+        failed=1
+    fi
+    if ! echo "$fn" | grep -q 'hasOnlyNonBlockingRules'; then
+        log_high "TYPE-019: Active rules are not inspected before considering a protected-branch exception"
+        failed=1
+    fi
+    # Rules/GraphQL query failures MUST block the push.
+    if ! echo "$fn" | grep -q 'catch (rulesError)' || ! echo "$fn" | grep -q 'Push blocked'; then
+        log_high "TYPE-019: Rules or GraphQL query failures do not leave the push blocked"
+        failed=1
+    fi
+    if [ ! -f "$handler" ] || ! grep -q 'checkBranchPushable' "$handler"; then
+        log_high "TYPE-019: push_to_pull_request_branch does not use the shared checkBranchPushable pre-flight"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TYPE-019: Classic protection is confirmed via GraphQL Ref.refUpdateRule with explicit-null and fail-closed semantics"
+    fi
+}
+check_push_branch_ref_update_rule
+
+# TYPE-020: merge_pull_request Protected Changed Files (Section 7.3 merge_pull_request rule 11, v1.29.23)
+# Unless trusted configuration sets protected-files: allowed, the handler MUST inspect the complete
+# live changed-file list (including both rename paths) with the shared create-pull-request rules,
+# block on missing/malformed/incomplete evidence or >3000 files, and re-check during final
+# revalidation. Only blocked/allowed policies are supported (no creation-only fallbacks).
+echo "Running TYPE-020: merge_pull_request Protected Changed Files..."
+check_merge_pull_request_protected_files() {
+    local handler="actions/setup/js/merge_pull_request.cjs"
+    local go_config="pkg/workflow/merge_pull_request.go"
+    local registry="pkg/workflow/safe_outputs_handler_registry_pull_requests.go"
+    local failed=0
+
+    if [ ! -f "$handler" ]; then
+        log_high "TYPE-020: merge_pull_request handler missing: $handler"
+        return
+    fi
+
+    local fn
+    fn=$(sed -n '/^async function evaluateProtectedFiles/,/^}/p' "$handler")
+    if [ -z "$fn" ]; then
+        log_critical "TYPE-020: merge_pull_request does not evaluate protected changed files"
+        return
+    fi
+
+    if ! echo "$fn" | grep -q 'checkFileProtectionPostApply'; then
+        log_high "TYPE-020: Protected-file evaluation does not reuse the shared create-pull-request protection rules"
+        failed=1
+    fi
+    if ! echo "$fn" | grep -q 'protected_files_policy === "allowed"'; then
+        log_high "TYPE-020: protected-files: allowed is not the only configuration that disables the changed-file gate"
+        failed=1
+    fi
+    if ! echo "$fn" | grep -qE 'pr\.changed_files[[:space:]]*>[[:space:]]*3000'; then
+        log_high "TYPE-020: Changed-file counts above GitHub's 3000-file listing limit are not rejected"
+        failed=1
+    fi
+    if ! echo "$fn" | grep -q 'previous_filename'; then
+        log_high "TYPE-020: Rename/copy source paths are not included in protected-file evaluation"
+        failed=1
+    fi
+    if ! echo "$fn" | grep -qF 'files.length !== pr.changed_files' ||
+        ! echo "$fn" | grep -qF 'new Set(files.map(file => file.filename)).size !== files.length'; then
+        log_high "TYPE-020: Incomplete or duplicate changed-file evidence is not rejected"
+        failed=1
+    fi
+    # Initial evaluation plus final revalidation.
+    local calls
+    calls=$(grep -c 'await evaluateProtectedFiles(' "$handler" || true)
+    if [ "${calls:-0}" -lt 2 ]; then
+        log_high "TYPE-020: Protected files are not re-checked during final revalidation"
+        failed=1
+    fi
+
+    if [ ! -f "$go_config" ] || ! grep -q "must be 'blocked', 'allowed'" "$go_config"; then
+        log_high "TYPE-020: Compiler does not restrict merge-pull-request protected-files to blocked/allowed"
+        failed=1
+    fi
+    if [ ! -f "$registry" ] || ! grep -q 'AddDefault("protected_files_policy", "blocked")' "$registry"; then
+        log_high "TYPE-020: merge-pull-request protected-files policy does not default to blocked"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TYPE-020: merge_pull_request blocks protected changed files by default with complete evidence and revalidation"
+    fi
+}
+check_merge_pull_request_protected_files
+
+# SEC-013: Authenticated Author and Bot Validation (Section 3 GP5d, v1.29.25)
+# Automatic comment selection (add_comment replace-older-comments and comment_memory upserts)
+# MUST validate API author metadata: resolve the login via the handler's effective client,
+# lazily (only when candidates exist) with a shared cached lookup, require exact user.login
+# matches, and fall back to API-identified user.type === "Bot" (not a [bot] suffix) when
+# identity is unavailable, logging the fallback.
+echo "Running SEC-013: Authenticated Author and Bot Validation..."
+check_authenticated_author_validation() {
+    local auth="actions/setup/js/handler_auth.cjs"
+    local failed=0
+
+    if [ ! -f "$auth" ]; then
+        log_high "SEC-013: Handler auth module missing: $auth"
+        return
+    fi
+
+    local resolver
+    resolver=$(sed -n '/^function createAuthenticatedLoginResolver/,/^}/p' "$auth")
+    if [ -z "$resolver" ]; then
+        log_high "SEC-013: createAuthenticatedLoginResolver not found in $auth"
+        return
+    fi
+    if ! echo "$resolver" | grep -q 'githubClient.rest.users.getAuthenticated'; then
+        log_high "SEC-013: Authenticated login is not resolved through the handler's effective GitHub client"
+        failed=1
+    fi
+    # Shared concurrent lookup with cached resolved/unavailable identity.
+    if ! echo "$resolver" | grep -qE 'if \(!authenticatedLoginPromise\)' || ! echo "$resolver" | grep -q 'return null'; then
+        log_high "SEC-013: Authenticated login lookup is not shared and cached (including unavailable identity)"
+        failed=1
+    fi
+    if ! echo "$resolver" | grep -qi 'bot-authored'; then
+        log_medium "SEC-013: Lookup failures do not log the fallback to bot-authored comments"
+        failed=1
+    fi
+
+    local handler
+    for handler in actions/setup/js/add_comment.cjs actions/setup/js/comment_memory.cjs; do
+        if [ ! -f "$handler" ]; then
+            log_high "SEC-013: Comment selection handler missing: $handler"
+            failed=1
+            continue
+        fi
+        if ! grep -q 'createAuthenticatedLoginResolver(' "$handler"; then
+            log_high "SEC-013: $(basename "$handler") does not use the shared authenticated-author resolver"
+            failed=1
+        fi
+        # Lazy lookup: only when matching candidates exist.
+        if ! grep -qE 'length > 0 \? await getAuthenticatedLogin\(\) : null' "$handler"; then
+            log_high "SEC-013: $(basename "$handler") does not limit the authenticated-user lookup to cases with candidates"
+            failed=1
+        fi
+        # Exact login match or API-identified bot fallback; never github.actor/context.actor.
+        if ! grep -qE 'authenticatedLogin \? comment\.user\.login === authenticatedLogin : comment\.user\.type === "Bot"' "$handler"; then
+            log_critical "SEC-013: $(basename "$handler") does not require exact author login or API-identified bot fallback"
+            failed=1
+        fi
+        if grep -qE '(context|github)\.actor[^A-Za-z_]*===?[^=]*user\.login|user\.login[^=]*===?[^=]*(context|github)\.actor' "$handler"; then
+            log_critical "SEC-013: $(basename "$handler") substitutes the triggering actor for the publishing identity"
+            failed=1
+        fi
+    done
+
+    if [ $failed -eq 0 ]; then
+        log_pass "SEC-013: Automatic comment selection validates authenticated author with lazy cached lookup and Bot-type fallback"
+    fi
+}
+check_authenticated_author_validation
+
+# CFG-001: Imported Safe-Output Configuration Precedence (Section 5, v1.29.24)
+# Explicit local values MUST take precedence over imported values for safe-outputs.steer and
+# create-pull-request fields; imported values apply only when the local field is omitted.
+echo "Running CFG-001: Imported Safe-Output Configuration Precedence..."
+check_imported_config_precedence() {
+    local imports="pkg/workflow/imports.go"
+    local failed=0
+
+    if [ ! -f "$imports" ]; then
+        log_high "CFG-001: Imported configuration merger missing: $imports"
+        return
+    fi
+
+    # Explicit local steer (including false) removes the imported value before merging.
+    if ! grep -A2 -E 'topRawSafeOutputs\["steer"\]' "$imports" | grep -q 'delete(config, "steer")'; then
+        log_high "CFG-001: Explicit local safe-outputs.steer does not take precedence over imported steer"
+        failed=1
+    fi
+    # Imported create-pull-request fields apply only when the local field is omitted.
+    if ! grep -qE 'localConfig\["expires"\]; !defined' "$imports"; then
+        log_high "CFG-001: Imported create-pull-request.expires may override an explicit local value"
+        failed=1
+    fi
+    if ! grep -qE 'localConfig\["draft"\]; !defined' "$imports"; then
+        log_high "CFG-001: Imported create-pull-request.draft may override an explicit local value"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "CFG-001: Explicit local steer and create-pull-request values take precedence over imports"
+    fi
+}
+check_imported_config_precedence
+
+# TYPE-021: update_issue Workflow-Configured Body Operation (Section 7.3 update_issue, v1.29.26)
+# safe-outputs.update-issue.operation MUST accept only replace/append/prepend/replace-island
+# (invalid values rejected at configuration validation). The effective operation MUST be the
+# agent operation, then the workflow default, then append; it applies only when body updates are
+# enabled and a body is supplied.
+echo "Running TYPE-021: update_issue Workflow-Configured Body Operation..."
+check_update_issue_default_operation() {
+    local go_config="pkg/workflow/update_issue.go"
+    local registry="pkg/workflow/safe_outputs_handler_registry_issues.go"
+    local schema="pkg/parser/schemas/main_workflow_schema.json"
+    local handler="actions/setup/js/update_issue.cjs"
+    local helpers="actions/setup/js/update_entity_helpers.cjs"
+    local failed=0
+
+    if [ ! -f "$go_config" ] || ! grep -qE 'configMap\["operation"\]' "$go_config"; then
+        log_high "TYPE-021: Compiler does not parse safe-outputs.update-issue.operation"
+        failed=1
+    fi
+    if [ ! -f "$registry" ] || ! grep -q 'AddStringPtr("default_operation", c.Operation)' "$registry"; then
+        log_high "TYPE-021: update-issue operation is not emitted to the handler as default_operation"
+        failed=1
+    fi
+    if [ -f "$schema" ] && command -v python3 >/dev/null 2>&1; then
+        if ! python3 - "$schema" <<'PY'
+import json, sys
+schema = json.load(open(sys.argv[1]))
+node = schema["properties"]["safe-outputs"]["properties"]["update-issue"]
+found = []
+def walk(o):
+    if isinstance(o, dict):
+        op = o.get("properties", {}).get("operation")
+        if isinstance(op, dict):
+            found.append(sorted(op.get("enum", [])))
+        for v in o.values():
+            walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            walk(v)
+walk(node)
+expected = sorted(["replace", "append", "prepend", "replace-island"])
+sys.exit(0 if found and all(f == expected for f in found) else 1)
+PY
+        then
+            log_high "TYPE-021: Schema does not restrict update-issue.operation to replace/append/prepend/replace-island"
+            failed=1
+        fi
+    else
+        log_high "TYPE-021: Cannot validate update-issue.operation schema enum ($schema)"
+        failed=1
+    fi
+    if [ ! -f "$handler" ] || ! grep -q 'configDefaultOperation: config.default_operation' "$handler" || ! grep -q 'defaultOperation: "append"' "$handler"; then
+        log_high "TYPE-021: update_issue does not pass the workflow default operation with an append fallback"
+        failed=1
+    fi
+    if [ ! -f "$helpers" ] || ! grep -qE 'item\.operation \|\| configDefaultOperation \|\| defaultOperation' "$helpers"; then
+        log_high "TYPE-021: Body operation precedence is not agent operation, then workflow default, then fallback"
+        failed=1
+    elif ! sed -n '/item\.body !== undefined && canUpdateBody/,+2p' "$helpers" | grep -q 'resolvedOperation'; then
+        log_high "TYPE-021: Body operation is not limited to enabled body updates with a supplied body"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TYPE-021: update-issue operation is validated and resolved as agent, workflow default, then append"
+    fi
+}
+check_update_issue_default_operation
+
+# SEC-014: Fail-Closed Safe-Output Invocation Authorization (Section 5.2 "Safe-output invocation authorization", v1.30.0-1.31.0)
+# `safe-outputs.authorization` requires an HTTPS endpoint (no credentials/query/fragment) and audience;
+# conflicting authorities MUST fail compilation; builtin diagnostics are exempt from global inheritance only.
+# Staged mode MUST short-circuit as `skipped_staged` before OIDC/authority requests. Requests are bounded
+# (64 KiB request, 8 KiB response, 10 s per HTTP request, 20 s total, validity <= 30 s with >= 2 s remaining),
+# redirects block execution, and the companion TypeSpec definition describes the decision endpoint.
+# v1.31.0: top-level `job_id` sits outside `request_digest`; W3C `traceparent` and
+# `baggage: cicd.pipeline.task.name=<encodeURIComponent(job)>` carry diagnostic correlation only.
+echo "Running SEC-014: Fail-Closed Safe-Output Invocation Authorization..."
+check_safe_output_invocation_authorization() {
+    local spec="docs/src/content/docs/specs/safe-outputs-specification.md"
+    local compiler="pkg/workflow/safe_outputs_authorization.go"
+    local client="actions/setup/js/safe_output_authorization.cjs"
+    local gate="actions/setup/js/safe_output_authorization_gate.cjs"
+    local correlation="actions/setup/js/service_correlation.cjs"
+    local typespec="docs/src/content/docs/specs/safe-output-authorization.tsp"
+    local failed=0
+    local implementation_missing=0
+    local f
+
+    if ! grep -qF '#### Safe-output invocation authorization' "$spec"; then
+        log_high "SEC-014: Specification is missing the safe-output invocation authorization section"
+        failed=1
+    fi
+    for f in "$compiler" "$client" "$gate" "$correlation"; do
+        if [ ! -f "$f" ]; then
+            log_critical "SEC-014: Safe-output authorization implementation file missing: $f"
+            failed=1
+            implementation_missing=1
+        fi
+    done
+    if [ ! -f "$typespec" ]; then
+        log_medium "SEC-014: Companion TypeSpec definition for the authorization decision endpoint missing: $typespec"
+        failed=1
+    fi
+    if [ $implementation_missing -ne 0 ]; then
+        return
+    fi
+
+    # Compiler: HTTPS-only endpoint without credentials/query/fragment, conflicts fail compilation, builtin exemption
+    if ! grep -qF 'u.Scheme != "https"' "$compiler" || ! grep -qF 'u.User != nil' "$compiler" || ! grep -qF 'u.Fragment != ""' "$compiler"; then
+        log_critical "SEC-014: Compiler does not reject non-HTTPS authorization endpoints or endpoints with credentials/fragments"
+        failed=1
+    fi
+    if ! grep -qF 'conflicting safe-outputs authorization authorities across imports' "$compiler" || ! grep -qF 'local authorization conflicts with inherited global authority' "$compiler"; then
+        log_critical "SEC-014: Conflicting global/local/imported authorization authorities do not fail compilation"
+        failed=1
+    fi
+    if ! grep -qF 'builtin-exempt' "$compiler"; then
+        log_high "SEC-014: Builtin diagnostics are not classified separately from global authorization inheritance"
+        failed=1
+    fi
+
+    # Runtime client: staged isolation, fixed bounds, manual redirects (redirects block)
+    local client_body gate_body
+    client_body=$(sed -n '/^async function authorizePreparedInvocation(/,/^}/p' "$client")
+    gate_body=$(sed -n '/^async function main(options = {})/,/^}/p' "$gate")
+    if ! awk '
+        /if \(staged === true\)/ { guard = NR }
+        /return \{ state: "skipped_staged"/ { skipped = NR }
+        /const config = configuration/ { config = NR }
+        /buildServiceRequestHeaders/ { headers = NR }
+        /await acquireToken/ { credential = NR }
+        END { exit !(guard && skipped > guard && config > skipped && headers > config && credential > headers) }
+    ' <<< "$client_body"; then
+        log_critical "SEC-014: Authorization client does not short-circuit staged mode before correlation headers or credential requests"
+        failed=1
+    fi
+    if ! awk '
+        /if \(staged\)/ { guard = NR }
+        /return \{ state: "skipped_staged"/ { skipped = NR }
+        /const batch =/ { batch = NR }
+        /claimIdentity\(/ { claim = NR }
+        END { exit !(guard && skipped > guard && batch > skipped && claim > batch) }
+    ' <<< "$gate_body"; then
+        log_critical "SEC-014: Authorization gate does not short-circuit staged mode before loading invocations or Claims"
+        failed=1
+    fi
+    local bound bound_name bound_value
+    for bound in 'MAX_REQUEST_BYTES:65536' 'MAX_RESPONSE_BYTES:8192' 'HTTP_TIMEOUT_MS:10000' 'TOTAL_TIMEOUT_MS:20000' 'MIN_VALIDITY_MS:2000' 'MAX_VALIDITY_MS:30000'; do
+        IFS=':' read -r bound_name bound_value <<< "$bound"
+        if ! grep -qE "^[[:space:]]*const[[:space:]]+${bound_name}[[:space:]]*=[[:space:]]*${bound_value};[[:space:]]*$" "$client"; then
+            log_high "SEC-014: Authorization client missing specified bound: ${bound_name} = ${bound_value}"
+            failed=1
+        fi
+    done
+    local oidc_request authority_request
+    oidc_request=$(sed -n '/fetchImpl(url, { method: "GET"/,/);/p' "$client")
+    authority_request=$(sed -n '/fetchImpl(config.endpoint, {/,/});/p' "$client")
+    if ! grep -qF 'redirect: "manual"' <<< "$oidc_request"; then
+        log_critical "SEC-014: OIDC credential request does not disable automatic redirects"
+        failed=1
+    fi
+    if ! grep -qF 'redirect: "manual"' <<< "$authority_request"; then
+        log_critical "SEC-014: Authorization decision request does not disable automatic redirects"
+        failed=1
+    fi
+    if ! grep -qF 'response.redirected' "$client"; then
+        log_critical "SEC-014: Authorization responses do not block on redirects"
+        failed=1
+    fi
+
+    # v1.31.0: job_id outside request_digest, correlation headers
+    if ! grep -qE 'request_digest: requestDigest, invocation, .*job_id: jobId' "$client"; then
+        log_high "SEC-014: Authorization request does not carry top-level job_id outside the canonical invocation/request_digest"
+        failed=1
+    fi
+    if ! grep -qF 'buildServiceRequestHeaders' "$client"; then
+        log_medium "SEC-014: Authorization decision POST does not attach W3C trace correlation headers"
+        failed=1
+    fi
+    if ! grep -qF 'cicd.pipeline.task.name' "$correlation" || ! grep -qF 'encodeURIComponent(jobId)' "$correlation"; then
+        log_medium "SEC-014: Job baggage is not emitted as cicd.pipeline.task.name with encodeURIComponent sanitization"
+        failed=1
+    fi
+    if ! grep -qF 'isValidTraceId(traceId) && isValidSpanId(spanId)' "$correlation"; then
+        log_medium "SEC-014: traceparent is not omitted for invalid or incomplete trace context"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "SEC-014: Safe-output invocation authorization is HTTPS-only, conflict-checked, staged-isolated, bounded, redirect-blocking, and carries diagnostic-only job correlation"
+    fi
+}
+check_safe_output_invocation_authorization
+
+# IMP-006: Pull Request Review Target Authorization (Section 7.3 CRC-001-004, SPR-001-004, RRC-001-004)
+# create_pull_request_review_comment, submit_pull_request_review and reply_to_pull_request_review_comment
+# MUST default to target "triggering", ignore agent-supplied pull_request_number for triggering/fixed targets,
+# and accept agent-selected pull requests only with target "*" (CRC/RRC: omission MUST fail the item).
+echo "Running IMP-006: Pull Request Review Target Authorization..."
+check_pr_review_target_authorization() {
+    local spec="docs/src/content/docs/specs/safe-outputs-specification.md"
+    local failed=0
+    local entry type_name prefix handler target_var section n registry_path legacy_path triggering wildcard fixed
+
+    for entry in \
+        "create_pull_request_review_comment:CRC:actions/setup/js/create_pr_review_comment.cjs:commentTarget" \
+        "submit_pull_request_review:SPR:actions/setup/js/submit_pr_review.cjs:targetConfig" \
+        "reply_to_pull_request_review_comment:RRC:actions/setup/js/reply_to_pr_review_comment.cjs:replyTarget"; do
+        IFS=':' read -r type_name prefix handler target_var <<< "$entry"
+        section=$(awk -v hdr="#### Type: ${type_name}" '$0 == hdr {found=1; print; next} found && /^#### Type: / {exit} found {print}' "$spec")
+        if [ -z "$section" ]; then
+            log_high "IMP-006: Specification section missing for $type_name"
+            failed=1
+            continue
+        fi
+        if ! grep -qF '**Target Authorization**' <<< "$section"; then
+            log_high "IMP-006: $type_name is missing a Target Authorization section"
+            failed=1
+        fi
+        for n in 001 002 003 004; do
+            if ! grep -qF "**${prefix}-${n}**" <<< "$section"; then
+                log_high "IMP-006: $type_name is missing ${prefix}-${n} target authorization requirement"
+                failed=1
+            fi
+        done
+        if [ ! -f "$handler" ]; then
+            log_high "IMP-006: Handler missing for $type_name: $handler"
+            failed=1
+            continue
+        fi
+        if ! grep -qE "^[[:space:]]*const ${target_var} = config\.target \|\| \"triggering\";[[:space:]]*$" "$handler"; then
+            log_high "IMP-006: $handler does not default an omitted target to \"triggering\" (${prefix}-001)"
+            failed=1
+        fi
+        if [ "$prefix" = "SPR" ]; then
+            registry_path=$(sed -n '/async function handleWithRegistry/,/async function handleWithLegacyBuffer/p' "$handler")
+            legacy_path=$(sed -n '/async function handleWithLegacyBuffer/,/async function setReviewContextOnBuffer/p' "$handler")
+            if ! grep -qF 'const targetResult = resolveTarget({' <<< "$registry_path" ||
+                ! grep -qF 'targetConfig,' <<< "$registry_path" ||
+                ! grep -qF 'const prNum = targetResult.number;' <<< "$registry_path" ||
+                ! grep -qF 'registry.getOrCreate(repo, prNum)' <<< "$registry_path" ||
+                ! grep -qF 'pull_request_number: prNum' <<< "$registry_path"; then
+                log_high "IMP-006: $handler does not resolve and propagate the configured target in the registry path (SPR-002-004)"
+                failed=1
+            fi
+            if ! grep -qF 'const targetResult = resolveTarget({' <<< "$legacy_path" ||
+                ! grep -qF 'targetConfig,' <<< "$legacy_path" ||
+                ! grep -qF 'const prNum = targetResult.number;' <<< "$legacy_path" ||
+                ! grep -qF 'setReviewContextOnBuffer(buffer, prNum, repo, repoParts, message)' <<< "$legacy_path"; then
+                log_high "IMP-006: $handler does not resolve and propagate the configured target in the legacy path (SPR-002-004)"
+                failed=1
+            fi
+        elif [ "$prefix" = "CRC" ]; then
+            triggering=$(sed -n '/\/\/ Default behavior: use triggering PR/,/if (!pullRequestNumber)/p' "$handler")
+            wildcard=$(sed -n '/if (commentTarget === "\*")/,/} else if (commentTarget && commentTarget !== "triggering")/p' "$handler")
+            fixed=$(sed -n '/} else if (commentTarget && commentTarget !== "triggering")/,/\/\/ Default behavior: use triggering PR/p' "$handler")
+            if ! grep -qF 'pullRequestNumber = effectivePayload.pull_request.number' <<< "$triggering" &&
+                ! grep -qF 'pullRequestNumber = effectivePayload.issue.number' <<< "$triggering" ||
+                grep -qF 'commentItem.pull_request_number' <<< "$triggering"; then
+                log_high "IMP-006: $handler does not bind triggering targets to the triggering PR (CRC-001-003)"
+                failed=1
+            fi
+            if ! grep -qF 'if (commentItem.pull_request_number)' <<< "$wildcard" ||
+                ! grep -qF 'Target is "*" but no pull_request_number specified' <<< "$wildcard"; then
+                log_high "IMP-006: $handler does not require pull_request_number for wildcard targets (CRC-004)"
+                failed=1
+            fi
+            if ! grep -qF 'parseInt(commentTarget, 10)' <<< "$fixed" ||
+                grep -qF 'commentItem.pull_request_number' <<< "$fixed"; then
+                log_high "IMP-006: $handler does not bind fixed targets to configured target (CRC-002-003)"
+                failed=1
+            fi
+        else
+            triggering=$(sed -n '/if (replyTarget === "triggering")/,/} else if (replyTarget === "\*")/p' "$handler")
+            wildcard=$(sed -n '/} else if (replyTarget === "\*")/,/\/\/ Explicit PR number in target/p' "$handler")
+            fixed=$(sed -n '/\/\/ Explicit PR number in target/,/\/\/ Apply required-labels/p' "$handler")
+            if ! grep -qF 'targetPRNumber = triggeringPRNumber' <<< "$triggering" ||
+                grep -qF 'item.pull_request_number' <<< "$triggering"; then
+                log_high "IMP-006: $handler does not bind triggering targets to the triggering PR (RRC-001-003)"
+                failed=1
+            fi
+            if ! grep -qF 'targetPRNumber = item.pull_request_number' <<< "$wildcard" ||
+                ! grep -qF 'if (!targetPRNumber)' <<< "$wildcard" ||
+                ! grep -qF 'pull_request_number is required when target is' <<< "$wildcard"; then
+                log_high "IMP-006: $handler does not require pull_request_number for wildcard targets (RRC-004)"
+                failed=1
+            fi
+            if ! grep -qF 'targetPRNumber = parseInt(replyTarget, 10)' <<< "$fixed" ||
+                grep -qF 'item.pull_request_number' <<< "$fixed"; then
+                log_high "IMP-006: $handler does not bind fixed targets to configured target (RRC-002-003)"
+                failed=1
+            fi
+        fi
+    done
+
+    if [ $failed -eq 0 ]; then
+        log_pass "IMP-006: Pull request review handlers specify and enforce CRC/SPR/RRC target authorization"
+    fi
+}
+check_pr_review_target_authorization
 
 # Summary
 echo ""

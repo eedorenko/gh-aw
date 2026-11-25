@@ -25,8 +25,8 @@
 // document (for example via an import) without swallowing unrelated content
 // that follows it, and lets the block itself contain nested "##" headings.
 //
-// Sub-agent frontmatter keys and their order are preserved without filtering;
-// boundary whitespace is trimmed.
+// Extraction preserves source frontmatter; engine edits use compiler-approved
+// fields. Boundary whitespace is trimmed.
 //
 // If no ## agent: markers are present the content is returned unchanged and no
 // files are written.
@@ -102,67 +102,53 @@ function experimentEnvVarName(experimentName) {
 function resolveSubAgentExperimentReferences(agentName, content, env = process.env) {
   const match = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*\r?(?=\n|$)/.exec(content);
   if (!match) return content;
-  const frontmatter = match[1];
-  const resolved = frontmatter
-    .split("\n")
-    .map(line =>
-      line.replace(EXPERIMENT_REFERENCE_RE, (reference, experimentName, placeholderEnvVar) => {
-        const envVar = experimentName ? experimentEnvVarName(experimentName) : placeholderEnvVar;
-        const field = /^[ \t]*([A-Za-z0-9_-]+)[ \t]*:/.exec(line)?.[1] ?? "frontmatter";
-        const value = env[envVar];
-        if (!value) {
-          throw new Error(
-            `${ERR_CONFIG}: inline sub-agent "${agentName}" field "${field}" references ${reference}, but no experiment assignment is available (${envVar} is not set). Declare the experiment under "experiments:" in the workflow frontmatter.`
-          );
-        }
-        if (!SAFE_EXPERIMENT_VALUE_RE.test(value)) {
-          throw new Error(`${ERR_CONFIG}: inline sub-agent "${agentName}" field "${field}" references ${reference}, whose selected variant ${JSON.stringify(value)} is not a plain model or alias value.`);
-        }
-        core.info(`[extractInlineSubAgents] Sub-agent "${agentName}" ${field}: experiment expression ${reference} → selected variant "${value}"`);
-        return value;
+  const { editMarkdownMetadata, readMarkdownMetadata } = require("./markdown_metadata.cjs");
+  let changed = false;
+  const resolved = editMarkdownMetadata(content, metadata =>
+    Object.fromEntries(
+      Object.entries(metadata).map(([field, item]) => {
+        if (typeof item !== "string") return [field, item];
+        return [
+          field,
+          item.replace(EXPERIMENT_REFERENCE_RE, (reference, experimentName, placeholderEnvVar) => {
+            const envVar = experimentName ? experimentEnvVarName(experimentName) : placeholderEnvVar;
+            const value = env[envVar];
+            if (!value) {
+              throw new Error(
+                `${ERR_CONFIG}: inline sub-agent "${agentName}" field "${field}" references ${reference}, but no experiment assignment is available (${envVar} is not set). Declare the experiment under "experiments:" in the workflow frontmatter.`
+              );
+            }
+            if (!SAFE_EXPERIMENT_VALUE_RE.test(value)) {
+              throw new Error(`${ERR_CONFIG}: inline sub-agent "${agentName}" field "${field}" references ${reference}, whose selected variant ${JSON.stringify(value)} is not a plain model or alias value.`);
+            }
+            core.info(`[extractInlineSubAgents] Sub-agent "${agentName}" ${field}: experiment expression ${reference} → selected variant "${value}"`);
+            changed = true;
+            return value;
+          }),
+        ];
       })
     )
-    .join("\n");
-  if (/^[ \t]*model[ \t]*:[^\n]*(?:\$\{\{|__GH_AW_)/m.test(resolved)) {
+  );
+  const model = readMarkdownMetadata("agent", resolved).value.model;
+  if (typeof model === "string" && /(?:\$\{\{|__GH_AW_)/.test(model)) {
     throw new Error(`${ERR_CONFIG}: inline sub-agent "${agentName}" field "model" contains an unresolved expression or placeholder. Use a literal model selector or a declared experiment assignment.`);
   }
-  if (resolved === frontmatter) return content;
-  const start = match.index + match[0].indexOf("\n") + 1;
-  return content.slice(0, start) + resolved + content.slice(start + frontmatter.length);
+  return changed ? resolved : content;
 }
 
 /**
- * Claude Code skips a project agent file without a frontmatter `name`, so the
- * generated Claude copy gets the declared block name when the author omitted it.
- * An authored `name` (detected by the YAML parser, so quoted keys count) is kept.
- * A flow mapping gets the key inside its braces, so mapping styles are never mixed.
- * Frontmatter that does not parse as a mapping is left unchanged; the model
- * resolution step then rejects it before Claude starts.
+ * Native agent discovery needs a name and description. Keep the compiler-approved
+ * name or use the declared block name, and derive the description from it.
  *
  * @param {string} agentName - Declared sub-agent name from the `## agent:` marker.
  * @param {string} content - Agent block content (frontmatter + prompt).
- * @returns {string} Content with a top-level `name:` in its frontmatter.
+ * @returns {string} Content with a name and name-derived description.
  */
-function ensureClaudeSubAgentName(agentName, content) {
-  const { parseDocument } = require("./work_queue_yaml.cjs");
-  const nameEntry = `name: ${JSON.stringify(agentName)}`;
-  const match = /^---[ \t]*\r?\n(?:([\s\S]*?)\r?\n)?---[ \t]*\r?(?=\n|$)/.exec(content);
-  if (!match) return `---\n${nameEntry}\n---\n${content}`;
-  const frontmatter = match[1] ?? "";
-  const start = content.indexOf("\n") + 1;
-  /** @type {any} */
-  const document = parseDocument(frontmatter.replace(/\x00VALUE_[0-9a-f-]+_\d+\x00/g, token => token.replace(/\x00/g, "_")));
-  if (!document || document.errors.length) return content;
-  const map = document.contents;
-  if (map === null || map === undefined) return content.slice(0, start) + nameEntry + "\n" + content.slice(start);
-  if (!Array.isArray(map.items) || !Array.isArray(map.range)) return content;
-  if (map.items.some((/** @type {any} */ pair) => pair?.key?.value === "name")) return content;
-  const position = start + map.range[0];
-  if (map.flow) {
-    return content.slice(0, position + 1) + nameEntry + (map.items.length > 0 ? ", " : "") + content.slice(position + 1);
-  }
-  const indent = content.slice(content.lastIndexOf("\n", position - 1) + 1, position);
-  return content.slice(0, position) + nameEntry + "\n" + indent + content.slice(position);
+function ensureSubAgentIdentity(agentName, content) {
+  const { editMarkdownMetadata, readMarkdownMetadata } = require("./markdown_metadata.cjs");
+  const replacements = Object.fromEntries([...content.matchAll(/\x00VALUE_[0-9a-f-]+_\d+\x00/g)].map(match => [match[0], match[0]]));
+  const named = readMarkdownMetadata("ensure-name", content, { value: agentName, replacements }).content;
+  return editMarkdownMetadata(named, metadata => ({ ...metadata, description: metadata.name }));
 }
 
 /**
@@ -406,8 +392,7 @@ function writeInlineSubAgents(content, workspaceDir, agentsBaseDir, engineId, re
   }
 
   const baseDir = agentsBaseDir || workspaceDir;
-  // Normalise once so the target directory and the Claude `name:` injection always agree:
-  // every id that stages into .claude/agents also gets the name Claude Code registers by.
+  // Normalize once so native agent identity and the target directory agree.
   const normalizedEngineId = (engineId || "").trim().toLowerCase();
   const { dir, ext } = inlineArtifactTarget("SUB_AGENT", getEngineSubAgentTarget(normalizedEngineId));
   const agentsDir = path.join(baseDir, dir);
@@ -422,7 +407,7 @@ function writeInlineSubAgents(content, workspaceDir, agentsBaseDir, engineId, re
   for (const agent of agents) {
     const agentPath = path.join(agentsDir, agent.name + ext);
     let filteredContent = resolveSubAgentExperimentReferences(agent.name, preserveSubAgentFrontmatter(agent.content));
-    if (normalizedEngineId === "claude") filteredContent = ensureClaudeSubAgentName(agent.name, filteredContent);
+    if (normalizedEngineId === "claude" || normalizedEngineId === "copilot") filteredContent = ensureSubAgentIdentity(agent.name, filteredContent);
     const agentContent = restoreValues(filteredContent.endsWith("\n") ? filteredContent : filteredContent + "\n", agentPath);
     try {
       fs.writeFileSync(agentPath, agentContent, "utf8");
@@ -437,21 +422,37 @@ function writeInlineSubAgents(content, workspaceDir, agentsBaseDir, engineId, re
 }
 
 /**
- * Read repository and workflow-written Copilot agents when the SDK session starts.
+ * Locate the two SDK agent sources staged by activation, in precedence order.
+ * Do not discover agents in the workspace: it can contain a PR or custom checkout.
+ *
+ * @param {string} agentsBaseDir
+ */
+function copilotSDKAgentDirectories(agentsBaseDir) {
+  return {
+    repository: path.join(agentsBaseDir, "base", "copilot-agents"),
+    declared: path.join(agentsBaseDir, getEngineSubAgentTarget("copilot").dir),
+  };
+}
+
+// Generated jobs download activation to a fixed location, regardless of TMPDIR.
+function defaultCopilotSDKAgentsBaseDir() {
+  return process.env.GITHUB_ACTIONS === "true" ? "/tmp/gh-aw" : path.join(require("node:os").tmpdir(), "gh-aw");
+}
+
+/**
+ * Read staged repository and workflow-written Copilot agents.
  * Workflow definitions override repository definitions with the same name.
  *
- * @param {string} workspaceDir
  * @param {string} agentsBaseDir
  * @param {(message: string) => void} logger
- * @returns {import("@github/copilot-sdk").CustomAgentConfig[]}
+ * @returns {import("@microsoft/copilot-sdk").CustomAgentConfig[]}
  */
-function loadCopilotSDKCustomAgents(workspaceDir, agentsBaseDir, logger) {
+function loadCopilotSDKCustomAgents(agentsBaseDir, logger) {
   const { extractFrontmatterAndBody } = require("./frontmatter_hash_pure.cjs");
-  const { parseDocument } = require("./work_queue_yaml.cjs");
-  const target = inlineArtifactTarget("SUB_AGENT", getEngineSubAgentTarget("copilot"));
-  const directories = new Set([path.join(workspaceDir, ".github/agents"), path.join(agentsBaseDir, target.dir)]);
+  const { readMarkdownMetadata, CompilerMetadataUnavailableError } = require("./markdown_metadata.cjs");
+  const { repository, declared } = copilotSDKAgentDirectories(agentsBaseDir);
   const agents = new Map();
-  for (const directory of directories) {
+  for (const directory of [repository, declared]) {
     let entries;
     try {
       entries = fs.readdirSync(directory, { withFileTypes: true });
@@ -463,12 +464,9 @@ function loadCopilotSDKCustomAgents(workspaceDir, agentsBaseDir, logger) {
       if (!entry.isFile() || !entry.name.endsWith(".agent.md")) continue;
       const agentPath = path.join(directory, entry.name);
       try {
-        const { frontmatterText, markdown } = extractFrontmatterAndBody(fs.readFileSync(agentPath, "utf8"));
-        /** @type {any} */
-        const document = parseDocument(frontmatterText);
-        if (!document) throw new Error("cannot parse agent frontmatter");
-        if (document.errors.length) throw new Error(document.errors.map(error => error.message).join("; "));
-        const frontmatter = document.toJS() || {};
+        const content = fs.readFileSync(agentPath, "utf8");
+        const { markdown } = extractFrontmatterAndBody(content);
+        const frontmatter = readMarkdownMetadata("agent", content).value;
         if (typeof frontmatter !== "object" || Array.isArray(frontmatter)) throw new Error("agent frontmatter must be a mapping");
         const name = typeof frontmatter.name === "string" && frontmatter.name.trim() ? frontmatter.name.trim() : entry.name.slice(0, -".agent.md".length);
         let tools = frontmatter.tools;
@@ -487,6 +485,7 @@ function loadCopilotSDKCustomAgents(workspaceDir, agentsBaseDir, logger) {
           ...(tools !== undefined ? { tools } : {}),
         });
       } catch (error) {
+        if (error instanceof CompilerMetadataUnavailableError) throw error;
         logger(`warning: cannot load custom agent ${agentPath}: ${String(error)}`);
       }
     }
@@ -500,7 +499,9 @@ module.exports = {
   getEngineSubAgentTarget,
   preserveSubAgentFrontmatter,
   resolveSubAgentExperimentReferences,
-  ensureClaudeSubAgentName,
+  ensureSubAgentIdentity,
   closeUnterminatedSubAgentMarkers,
+  copilotSDKAgentDirectories,
+  defaultCopilotSDKAgentsBaseDir,
   loadCopilotSDKCustomAgents,
 };

@@ -64,7 +64,11 @@ func (c *Compiler) addActivationSteeringIssueStep(ctx *activationJobBuildContext
 		"        id: create-steering-issue\n",
 	)
 	if hasMaxDailyAICGuardrail(ctx.data) {
-		ctx.steps = append(ctx.steps, "        if: steps.daily-ai-credits-workflow-guardrail.outputs.daily_ai_credits_exceeded != 'true'\n")
+		if ctx.data.MaxDailyAICContinueOnError {
+			ctx.steps = append(ctx.steps, "        if: steps.daily-ai-credits-workflow-guardrail.outputs.daily_ai_credits_exceeded != 'true'\n")
+		} else {
+			ctx.steps = append(ctx.steps, "        if: steps.daily-ai-credits-workflow-guardrail.outputs.daily_ai_credits_exceeded != 'true' && steps.daily-ai-credits-workflow-guardrail.outputs.daily_ai_credits_guardrail_status != 'quota_blocked'\n")
+		}
 	}
 	ctx.steps = append(ctx.steps,
 		fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", ctx.data)),
@@ -75,7 +79,9 @@ func (c *Compiler) addActivationSteeringIssueStep(ctx *activationJobBuildContext
 		fmt.Sprintf("          GH_AW_WORKFLOW_ID: %q\n", ctx.data.WorkflowID),
 		"          GH_AW_ENGINE_ID: ${{ steps.generate_aw_info.outputs.engine_id }}\n",
 	)
-	if ctx.data.EngineConfig == nil || ctx.data.EngineConfig.ModelRouting == nil {
+	if isModelRoutingRuntimeGuarded(ctx.data) {
+		ctx.steps = append(ctx.steps, "          GH_AW_ENGINE_MODEL: ${{ "+modelRoutingInactiveInActivation+" && steps.generate_aw_info.outputs.model || '' }}\n")
+	} else if ctx.data.EngineConfig == nil || ctx.data.EngineConfig.ModelRouting == nil {
 		ctx.steps = append(ctx.steps, "          GH_AW_ENGINE_MODEL: ${{ steps.generate_aw_info.outputs.model }}\n")
 	}
 	if ctx.data.EngineConfig != nil && ctx.data.EngineConfig.Version != "" {

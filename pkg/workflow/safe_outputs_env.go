@@ -154,7 +154,7 @@ func (c *Compiler) buildStandardSafeOutputEnvVars(data *WorkflowData, targetRepo
 	customEnvVars = append(customEnvVars, buildWorkflowMetadataEnvVarsWithTrackerID(data.Name, data.Source, data.TrackerID, buildLocalWorkflowSourceURL(c.markdownPath))...)
 
 	// Add engine metadata (id, version, model) for XML comment marker
-	customEnvVars = append(customEnvVars, buildEngineMetadataEnvVars(data.EngineConfig, data.Model)...)
+	customEnvVars = append(customEnvVars, buildEngineMetadataEnvVars(data.EngineConfig, data.Model, string(constants.AgentJobName))...)
 
 	// Add common safe output job environment variables (staged/target repo)
 	customEnvVars = append(customEnvVars, buildSafeOutputJobEnvVars(
@@ -179,7 +179,7 @@ func (c *Compiler) buildStandardSafeOutputEnvVars(data *WorkflowData, targetRepo
 
 // buildEngineMetadataEnvVars builds engine metadata environment variables (id, version, model)
 // These are used by the JavaScript footer generation to create XML comment markers for traceability
-func buildEngineMetadataEnvVars(engineConfig *EngineConfig, model string) []string {
+func buildEngineMetadataEnvVars(engineConfig *EngineConfig, model, mainJobName string) []string {
 	var customEnvVars []string
 
 	if engineConfig == nil {
@@ -204,12 +204,12 @@ func buildEngineMetadataEnvVars(engineConfig *EngineConfig, model string) []stri
 	if model != "" && engineConfig.ModelRouting == nil {
 		customEnvVars = append(customEnvVars, fmt.Sprintf("          GH_AW_ENGINE_MODEL: %q\n", model))
 	} else {
-		customEnvVars = append(customEnvVars, fmt.Sprintf("          GH_AW_ENGINE_MODEL: ${{ needs.%s.outputs.model }}\n", string(constants.AgentJobName)))
+		customEnvVars = append(customEnvVars, fmt.Sprintf("          GH_AW_ENGINE_MODEL: ${{ needs.%s.outputs.model }}\n", mainJobName))
 	}
 	if engineConfig.ModelRouting != nil {
 		customEnvVars = append(customEnvVars,
-			fmt.Sprintf("          GH_AW_ENGINE_MODEL_EFFORT: ${{ needs.%s.outputs.model_effort }}\n", string(constants.AgentJobName)),
-			fmt.Sprintf("          GH_AW_MODEL_ROUTING_STATUS: ${{ needs.%s.outputs.model_routing_status }}\n", string(constants.AgentJobName)),
+			fmt.Sprintf("          GH_AW_ENGINE_MODEL_EFFORT: ${{ needs.%s.outputs.model_effort }}\n", mainJobName),
+			fmt.Sprintf("          GH_AW_MODEL_ROUTING_STATUS: ${{ needs.%s.outputs.model_routing_status }}\n", mainJobName),
 		)
 	}
 
@@ -233,16 +233,29 @@ func buildModelRoutingOutputEnvVars(engineConfig *EngineConfig, mainJobName stri
 
 // addCustomSafeOutputEnvVars adds custom environment variables to safe output job steps
 func (c *Compiler) addCustomSafeOutputEnvVars(steps *[]string, data *WorkflowData) {
+	c.addSafeOutputEnvVars(steps, data, true)
+}
+
+func (c *Compiler) addSafeOutputEnvVars(steps *[]string, data *WorkflowData, includeConnectorCredentials bool, excludedKeys ...map[string]bool) {
 	if data.SafeOutputs != nil && len(data.SafeOutputs.Env) > 0 {
 		ciTriggerTokenDisabled := isCITriggerTokenDisabled(data.SafeOutputs)
 		for _, key := range sliceutil.SortedKeys(data.SafeOutputs.Env) {
+			if len(excludedKeys) > 0 && excludedKeys[0][strings.ToUpper(key)] {
+				continue
+			}
+			if !includeConnectorCredentials {
+				connectorCredential := false
+				for alias, config := range data.Connectors {
+					if config.SafeOutputs != nil && strings.HasPrefix(key, connectorCredentialEnvPrefix(alias)) {
+						connectorCredential = true
+						break
+					}
+				}
+				if connectorCredential {
+					continue
+				}
+			}
 			if key == "GH_AW_CI_TRIGGER_TOKEN" && ciTriggerTokenDisabled {
-				continue
-			}
-			if hasAnyJiraSafeOutputEnabled(data.SafeOutputs) && jiraSafeOutputDefaultEnv[key] != "" {
-				continue
-			}
-			if data.SafeOutputs.LinearCreateIssue != nil && (key == "LINEAR_TEAM_ID" || key == "LINEAR_PROJECT_ID") {
 				continue
 			}
 			*steps = append(*steps, fmt.Sprintf("          %s: %s\n", key, data.SafeOutputs.Env[key]))
@@ -250,33 +263,14 @@ func (c *Compiler) addCustomSafeOutputEnvVars(steps *[]string, data *WorkflowDat
 	}
 }
 
-func injectProcessorStepEnv(steps []string, env map[string]string) []string {
-	if len(env) == 0 {
-		return steps
-	}
-	processStepFound := false
-	for index, step := range steps {
-		if step == "      - name: Process Safe Outputs\n" {
-			processStepFound = true
-			continue
-		}
-		if processStepFound && step == "        env:\n" {
-			var inserted []string
-			for _, name := range sliceutil.SortedKeys(env) {
-				inserted = append(inserted, fmt.Sprintf("          %s: %s\n", name, env[name]))
-			}
-			tail := append([]string(nil), steps[index+1:]...)
-			return append(append(steps[:index+1], inserted...), tail...)
-		}
-	}
-	return steps
-}
-
 func (c *Compiler) addResolvedSafeOutputGitHubTokenForConfig(steps *[]string, data *WorkflowData, configToken string, resolver func(string) string, allowGitHubApp bool) {
 	*steps = append(*steps, fmt.Sprintf("          github-token: %s\n", resolveSafeOutputGitHubTokenForConfig(data, configToken, resolver, allowGitHubApp)))
 }
 
 func resolveSafeOutputGitHubTokenForConfig(data *WorkflowData, configToken string, resolver func(string) string, allowGitHubApp bool) string {
+	if allowGitHubApp && usesTokenBrokerSafeOutputs(data) && configToken == "" {
+		return "${{ steps.safe-outputs-app-token.outputs.token }}"
+	}
 	var safeOutputsToken string
 	var githubApp *GitHubAppConfig
 	if data.SafeOutputs != nil {
@@ -309,14 +303,11 @@ func (c *Compiler) safeOutputGitHubTokenSource(data *WorkflowData) string {
 	}
 
 	safeOutputs := data.SafeOutputs
+	if safeOutputs.TokenBroker {
+		return `"app"`
+	}
 	if safeOutputs.GitHubApp == nil {
-		if safeOutputs.GitHubToken != "" {
-			if safeOutputs.GitHubToken == "${{ secrets.GITHUB_TOKEN }}" || safeOutputs.GitHubToken == "${{ github.token }}" {
-				return `"github_actions"`
-			}
-			return `"unknown"`
-		}
-		return "${{ secrets.GH_AW_GITHUB_TOKEN != '' && 'pat' || 'github_actions' }}"
+		return safeOutputGitHubTokenSourceForToken(safeOutputs.GitHubToken)
 	}
 
 	if !safeOutputs.GitHubApp.shouldIgnoreMissingKey() && safeOutputsGlobalAppTokenMinted(safeOutputs) {
@@ -328,6 +319,19 @@ func (c *Compiler) safeOutputGitHubTokenSource(data *WorkflowData) string {
 		fallbackSource = "'unknown'"
 	}
 	return fmt.Sprintf("${{ steps.safe-outputs-app-token.outputs.token != '' && 'app' || %s }}", fallbackSource)
+}
+
+func safeOutputGitHubTokenSourceForToken(token string) string {
+	if isExpression(token) {
+		expression := strings.TrimSpace(token[3 : len(token)-2])
+		if strings.EqualFold(expression, "secrets.GITHUB_TOKEN") || strings.EqualFold(expression, "github.token") {
+			return `"github_actions"`
+		}
+	}
+	if token != "" {
+		return `"unknown"`
+	}
+	return "${{ secrets.GH_AW_GITHUB_TOKEN != '' && 'pat' || 'github_actions' }}"
 }
 
 // addSafeOutputGitHubTokenForConfig adds github-token to the with section for standard safe-output operations.

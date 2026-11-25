@@ -20,6 +20,8 @@ const MODEL_IDENTIFIER = /^[A-Za-z0-9*][A-Za-z0-9._:/*@+-]{0,127}$/;
 const ERROR_IDENTIFIER = /^[A-Za-z0-9_.:-]{1,64}$/;
 const ENGINE_HARNESSES = new Set(["copilot-cli", "copilot-sdk"]);
 const NATIVE_ROUTING_PROVIDERS = new Set(["anthropic", "openai"]);
+/** Router model values (`model: router`, `router/<mode>`) that request model routing. */
+const ROUTER_MODEL_VALUES = new Set(["router", "router/economy", "router/balanced", "router/robust"]);
 const MAX_AI_CREDITS_SOURCES = new Set(["frontmatter", "default"]);
 const MAX_AI_CREDITS = /^[1-9][0-9]{0,9}$/;
 const MAX_AI_CREDITS_LIMIT = 2147483647;
@@ -29,6 +31,18 @@ const isObject = value => value !== null && typeof value === "object" && !Array.
 
 /** @param {unknown} value @returns {value is string} */
 const isModelIdentifier = value => typeof value === "string" && MODEL_IDENTIFIER.test(value);
+
+/**
+ * Whether a model value uses the reserved router namespace (`router` or
+ * `router/...`, in any case, with or without parameters).
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isRouterModelValue(value) {
+  if (typeof value !== "string") return false;
+  const base = value.trim().split("?")[0].toLowerCase();
+  return base === "router" || base.startsWith("router/");
+}
 
 /** @param {unknown} value @returns {value is string} */
 const isErrorIdentifier = value => typeof value === "string" && ERROR_IDENTIFIER.test(value);
@@ -67,6 +81,7 @@ function sanitizeModelConfig(value) {
   for (const key of ["goal", "mode"]) {
     if (isModelIdentifier(value.routing[key])) routing[key] = value.routing[key];
   }
+  if (ROUTER_MODEL_VALUES.has(value.routing.requested)) routing.requested = value.routing.requested;
   if (NATIVE_ROUTING_PROVIDERS.has(value.routing.provider)) routing.provider = value.routing.provider;
   const allowedModels = identifierList(value.routing.allowed_models);
   if (allowedModels) routing.allowed_models = allowedModels;
@@ -234,6 +249,40 @@ function matchesDeclaredSubAgent(requested, provider, declarations) {
   });
 }
 
+/**
+ * AWF's per-request routing records by request ID. Conflicting records for one
+ * request are ambiguous and map to null.
+ * @param {unknown[]} routing firewall.model_routing records
+ * @returns {Map<string, Record<string, any> | null>}
+ */
+function routedRequests(routing) {
+  /** @type {Map<string, Record<string, any> | null>} */
+  const requests = new Map();
+  for (const record of routing) {
+    if (!isObject(record) || record.stage !== "request" || typeof record.request_id !== "string" || !record.request_id) continue;
+    const previous = requests.get(record.request_id);
+    requests.set(record.request_id, previous === undefined || (previous && previous.routed === record.routed && previous.requested_model === record.requested_model) ? record : null);
+  }
+  return requests;
+}
+
+/**
+ * Attribute one proxy request from AWF's record of it and the runner-declared
+ * sub-agents: `main` ran as selected, `subagent` is a declared sub-agent's model
+ * that AWF recorded as deviated, `deviated` ran another model or effort, and
+ * anything else, including a missing or conflicting record, is `unattributed`.
+ * @param {Record<string, any> | null | undefined} route
+ * @param {unknown} provider
+ * @param {unknown} subAgentModels aw_info.sub_agent_models
+ * @returns {"main" | "subagent" | "deviated" | "unattributed"}
+ */
+function attributeRequest(route, provider, subAgentModels) {
+  const requested = route?.requested_model;
+  const declared = typeof requested === "string" && matchesDeclaredSubAgent(requested, route?.provider ?? provider, subAgentModels);
+  if (route?.routed === "deviated") return declared ? "subagent" : "deviated";
+  return route?.routed === "as_selected" && !declared ? "main" : "unattributed";
+}
+
 /** @param {unknown} value @returns {number | undefined} */
 const tokenCount = value => (value === undefined || value === null ? 0 : typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined);
 
@@ -255,14 +304,7 @@ const tokenCount = value => (value === undefined || value === null ? 0 : typeof 
 function estimateBaseline({ config, subAgentModels, tokenUsage, routing }) {
   if (config?.routing?.enabled !== true) return undefined;
   const baseline = config.baselineModel;
-  /** @type {Map<string, Record<string, any> | null>} */
-  const requests = new Map();
-  for (const record of routing) {
-    if (!isObject(record) || record.stage !== "request" || typeof record.request_id !== "string" || !record.request_id) continue;
-    // Conflicting proxy records for one request are ambiguous.
-    const previous = requests.get(record.request_id);
-    requests.set(record.request_id, previous === undefined || (previous && previous.routed === record.routed && previous.requested_model === record.requested_model) ? record : null);
-  }
+  const requests = routedRequests(routing);
   const seen = new Set();
   let mainRequests = 0;
   let pricedRequests = 0;
@@ -280,11 +322,9 @@ function estimateBaseline({ config, subAgentModels, tokenUsage, routing }) {
     if (seen.has(id)) continue;
     seen.add(id);
     if (record.purpose === "routing_classification") continue;
-    const route = requests.get(id);
-    const requested = route?.requested_model;
-    const declared = typeof requested === "string" && matchesDeclaredSubAgent(requested, route?.provider ?? record.provider, subAgentModels);
-    if (route?.routed === "deviated" && declared) continue;
-    if (route?.routed !== "as_selected" || declared) {
+    const role = attributeRequest(requests.get(id), record.provider, subAgentModels);
+    if (role === "subagent") continue;
+    if (role !== "main") {
       unattributedRequests++;
       continue;
     }
@@ -332,9 +372,13 @@ module.exports = {
   normalizeEngineHarness,
   sanitizeModelConfig,
   parseCompiledModelConfig,
+  isRouterModelValue,
+  ROUTER_MODEL_VALUES,
   resolveBaselineModel,
   persistModelConfigBaseline,
   projectModelConfig,
   matchesDeclaredSubAgent,
+  routedRequests,
+  attributeRequest,
   estimateBaseline,
 };

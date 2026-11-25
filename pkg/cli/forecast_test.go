@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/github/gh-aw/pkg/workflow"
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -76,21 +77,50 @@ func TestNewForecastCommand_DaysFlagDocumentsAllowedValues(t *testing.T) {
 
 	daysFlag := cmd.Flags().Lookup("days")
 	require.NotNil(t, daysFlag, "forecast command should register --days")
-	assert.Equal(t, "Historical window in days to sample run history (allowed values: 7, 30)", daysFlag.Usage)
+	assert.Equal(t, "Historical window in days to sample run history (allowed values: 7 or 30)", daysFlag.Usage)
 	assert.NotContains(t, cmd.Long, ").  When runs have been", "Long description should not contain duplicate spacing")
 	assert.NotContains(t, cmd.Long, "used.  The", "Long description should not contain duplicate spacing")
 	assert.NotContains(t, cmd.Long, "interval.  Use this", "Long description should not contain duplicate spacing")
 }
 
-func TestNewForecastCommand_TimeoutFlag(t *testing.T) {
+func TestIntegerMinuteTimeoutFlagsExplainUnits(t *testing.T) {
 	t.Parallel()
-	cmd := NewForecastCommand()
-	require.NotNil(t, cmd)
 
-	timeoutFlag := cmd.Flags().Lookup("timeout")
-	require.NotNil(t, timeoutFlag, "forecast command should register --timeout")
-	assert.Equal(t, "Gracefully stop forecast computation after this many minutes (0 = no timeout)", timeoutFlag.Usage)
-	assert.Equal(t, "0", timeoutFlag.DefValue)
+	tests := []struct {
+		name        string
+		cmd         *cobra.Command
+		want        string
+		wantDefault string
+	}{
+		{
+			name:        "logs",
+			cmd:         NewLogsCommand(),
+			want:        "Total download timeout across all targets in minutes or a whole-minute duration (e.g. 10 or 10m; 0 = no timeout)",
+			wantDefault: "0",
+		},
+		{
+			name:        "forecast",
+			cmd:         NewForecastCommand(),
+			want:        "Gracefully stop forecast computation after this many minutes or a whole-minute duration (e.g. 10 or 10m; 0 = no timeout)",
+			wantDefault: "0",
+		},
+		{
+			name:        "trial",
+			cmd:         NewTrialCommand(func(string) error { return nil }),
+			want:        "Execution timeout in minutes or a whole-minute duration (e.g. 10 or 10m; 0 = no timeout)",
+			wantDefault: "30",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			timeoutFlag := tt.cmd.Flags().Lookup("timeout")
+			require.NotNil(t, timeoutFlag, "%s command should register --timeout", tt.name)
+			assert.Equal(t, tt.want, timeoutFlag.Usage)
+			assert.Equal(t, "int", timeoutFlag.Value.Type())
+			assert.Equal(t, tt.wantDefault, timeoutFlag.DefValue)
+		})
+	}
 }
 
 // ── Duration enrichment ───────────────────────────────────────────────────────

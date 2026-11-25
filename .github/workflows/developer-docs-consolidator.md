@@ -7,6 +7,7 @@ on:
 permissions:
   actions: read
   contents: read
+  copilot-requests: write
   issues: read
   pull-requests: read
 
@@ -16,23 +17,24 @@ network:
   - defaults
   - github
 imports:
+- shared/pr-safe-output-defaults.md
 - uses: shared/daily-audit-base.md
   with:
     title-prefix: "[developer-docs] "
 - shared/mcp/serena-go.md
 - shared/otlp.md
 safe-outputs:
-  steer: true
   create-pull-request:
-    draft: false
-    expires: 2d
     labels:
     - documentation
     - automation
     title-prefix: "[docs] "
 description: Consolidates and organizes developer documentation from multiple sources into a unified, searchable knowledge base
 emoji: 📝
-engine: claude
+model: router/balanced
+engine:
+  id: claude
+  model-provider: github
 name: Developer Documentation Consolidator
 strict: true
 timeout-minutes: 30

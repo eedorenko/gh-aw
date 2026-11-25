@@ -8,6 +8,7 @@ permissions:
   discussions: read
   issues: read
   pull-requests: read
+  copilot-requests: write
 
 
 network:
@@ -27,7 +28,10 @@ imports:
 - shared/otlp.md
 description: "Daily Go module usage reviewer - analyzes direct dependencies prioritizing recently updated ones"
 emoji: 🐹
-engine: claude
+model: router/economy
+engine:
+  id: claude
+  model-provider: github
 name: Go Fan
 strict: true
 timeout-minutes: 30

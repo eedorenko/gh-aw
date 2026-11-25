@@ -41,6 +41,11 @@ Baseline rule implementation and test-file locations are maintained in [spec §7
 | CTR-032 | T-CTR-047 |
 | CTR-033 | T-CTR-048 |
 | CTR-034 | T-CTR-049 |
+| CTR-035 | T-CTR-050 |
+| CTR-036 | T-CTR-051 |
+| CTR-037 | T-CTR-052 |
+| CTR-038 | T-CTR-053 |
+| CTR-039 | T-CTR-054 |
 
 Note: `CTR-025`–`CTR-030` map to `T-CTR-039` and `T-CTR-041`–`T-CTR-045` because `T-CTR-024` through `T-CTR-038` and `T-CTR-040` were already allocated to Section 6 false-positive and optimizer protocol norms. The shared `T-CTR-*` sequence is intentionally non-sequential with respect to `CTR-*` rule IDs.
 
@@ -83,9 +88,9 @@ These annotations are verified against the specification artifacts by `pkg/workf
 |---------|------|
 | T-CTR-024 | Suppression validation requires `rule` and a non-empty `reason`. |
 | T-CTR-025 | Active suppressions retain `rule`, `reason`, and `expires` for audit. |
-| T-CTR-026 | MUST-level suppressions have a 10-business-day resolution SLA. |
+| T-CTR-026 | False-positive suppressions affecting non-strict rejection controls MUST be resolved within 10 business days. |
 | T-CTR-027 | SLA breaches include `rule`, `reason`, `age_business_days`, `owner`, and `expires`. |
-| T-CTR-028 | MUST-level suppressions older than 20 business days create a follow-up sync action. |
+| T-CTR-028 | Unresolved false-positive suppressions affecting non-strict rejection controls older than 20 business days MUST create a follow-up sync action. |
 | T-CTR-029 | Expired suppressions are re-evaluated and treated as absent. |
 
 ## Section 6.6 Optimizer Failure Safeguards

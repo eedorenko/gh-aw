@@ -23,22 +23,24 @@ network:
   allowed: []
 runtimes:
   go:
-    version: "1.27.3"
+    version: "1.27.4"
 tools:
   edit:
   bash:
     - "*"
 safe-outputs:
+  steer: false
   create-pull-request:
+    expires: false
     max: 1
     allowed-files:
       - "pkg/**/aider_coverage_test.go"
     title-prefix: "[aider] "
     labels: [automation, testing]
-    draft: false
   missing-tool:
 timeout-minutes: 30
 imports:
+  - shared/pr-safe-output-defaults.md
   - shared/aider.md
   - shared/otlp.md
   - shared/reporting.md

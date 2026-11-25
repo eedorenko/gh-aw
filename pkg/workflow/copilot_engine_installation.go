@@ -30,13 +30,13 @@ type copilotSDKInstallSpec struct {
 	runtimeID string
 	stepName  string
 	command   string
+	npm       *copilotSDKNPMProject
 	// runLines, if non-empty, generates a "run: |" multiline step instead of "run: <command>".
 	runLines []string
 }
 
 const workspaceCommandPrefix = `cd "${GITHUB_WORKSPACE}" && `
 const copilotSDKPythonTargetDir = `${GITHUB_WORKSPACE}/.gh-aw/copilot-sdk/python`
-const copilotSDKWebFetchDependency = "undici@6.28.0"
 
 // inlineMavenVersion is the pinned Maven version used to bootstrap Maven for inline Java drivers
 // on runners that don't have it pre-installed (e.g. self-hosted). GitHub-hosted runners already
@@ -123,27 +123,27 @@ func (e *CopilotEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHu
 	// The shared installer generator binds an omitted version to the compiler's
 	// reviewed default version and checksum instead of resolving it at runtime.
 	copilotVersion := ""
+	checksumsSHA256 := ""
 	if workflowData.EngineConfig != nil {
-		if workflowData.EngineConfig.Version != "" {
-			copilotVersion = workflowData.EngineConfig.Version
+		copilotVersion = workflowData.EngineConfig.Version
+		checksumsSHA256 = workflowData.EngineConfig.ChecksumsSHA256
+		if copilotVersion != "" {
 			copilotInstallLog.Printf("Using engine.version for Copilot CLI installation: %s", copilotVersion)
-		} else {
-			copilotInstallLog.Printf("No engine.version specified; using compiler default version and checksum")
 		}
+	}
+	if copilotVersion == "" && checksumsSHA256 == "" && usesDefaultCopilotSDKNPM(workflowData) {
+		copilotVersion = string(constants.DefaultCopilotSDKNPMCLIVersion)
+		checksumsSHA256 = constants.DefaultCopilotSDKNPMCLIChecksumsSHA256
 	}
 
 	// Use the installer script for global installation
 	copilotInstallLog.Print("Using new installer script for Copilot installation")
-	// On ARC/DinD runners, sudo may not be available (allowPrivilegeEscalation: false).
+	// Unprivileged native runners and ARC/DinD runners may not have sudo.
 	// Pass --rootless so the script installs to ~/.local/bin without sudo.
 	// The "Copy Copilot CLI to daemon-visible path" step in nodejs.go then copies from
 	// the rootless location to ${RUNNER_TEMP}/gh-aw/bin/copilot where AWF expects it.
-	rootless := isArcDindTopology(workflowData)
+	rootless := useRootlessCLIInstallation(workflowData)
 	compiledVersion := workflowData.CompiledVersion
-	checksumsSHA256 := ""
-	if workflowData.EngineConfig != nil {
-		checksumsSHA256 = workflowData.EngineConfig.ChecksumsSHA256
-	}
 	npmSteps := generateCopilotInstallerSteps(copilotVersion, "Install GitHub Copilot CLI", rootless, compiledVersion, string(constants.CopilotSessionIDMinVersion), getNVXGuestLibc(workflowData), checksumsSHA256, resolveEngineCooldownDays(workflowData))
 	if len(inlineDriverWriteStep) > 0 {
 		npmSteps = append(npmSteps, inlineDriverWriteStep)
@@ -191,13 +191,42 @@ func appendCopilotLSPInstallSteps(steps []GitHubActionStep, workflowData *Workfl
 }
 
 func buildCopilotSDKInstallStep(workflowData *WorkflowData) GitHubActionStep {
-	if workflowData == nil || workflowData.EngineConfig == nil || !workflowData.EngineConfig.CopilotSDK {
-		return GitHubActionStep{}
+	spec := selectCopilotSDKInstallSpec(workflowData)
+	if spec.stepName == "" {
+		return nil
 	}
+	copilotInstallLog.Printf("copilot-sdk enabled; runtime=%s", spec.runtimeID)
+	return specToInstallStep(spec)
+}
+
+func usesDefaultCopilotSDKNPM(data *WorkflowData) bool {
+	if data.EngineConfig == nil || data.EngineConfig.Command != "" {
+		return false
+	}
+	project := selectCopilotSDKInstallSpec(data).npm
+	return project != nil && (project.version == "" || project.version == string(constants.DefaultCopilotSDKNPMVersion))
+}
+
+func selectCopilotSDKInstallSpec(workflowData *WorkflowData) copilotSDKInstallSpec {
+	if workflowData == nil || workflowData.EngineConfig == nil || !workflowData.EngineConfig.CopilotSDK {
+		return copilotSDKInstallSpec{}
+	}
+	spec := selectDefaultCopilotSDKInstallSpec(workflowData)
+	if pin := workflowData.EngineConfig.CopilotSDKPin; pin != nil && spec.npm != nil {
+		if !pin.valid() {
+			return copilotSDKInstallSpec{
+				stepName: spec.stepName,
+				command:  `echo "::error::Invalid engine.copilot-sdk version or sha256" >&2; exit 1`,
+			}
+		}
+		spec.npm = &copilotSDKNPMProject{variant: spec.npm.variant, digest: pin.SHA256, version: pin.Version}
+	}
+	return spec
+}
+
+func selectDefaultCopilotSDKInstallSpec(workflowData *WorkflowData) copilotSDKInstallSpec {
 	if inlineRuntimeID := copilotSDKInlineDriverRuntimeID(workflowData); inlineRuntimeID != "" {
-		spec := getInlineCopilotSDKInstallSpec(inlineRuntimeID)
-		copilotInstallLog.Printf("copilot-sdk enabled with inline driver; runtime=%s; install command=%s", spec.runtimeID, spec.command)
-		return specToInstallStep(spec, resolveEngineCooldownDays(workflowData))
+		return getInlineCopilotSDKInstallSpec(inlineRuntimeID)
 	}
 	// When a custom SDK driver is configured without a custom engine command, use the driver's
 	// file extension to determine which language SDK to install. This ensures the correct SDK
@@ -206,20 +235,20 @@ func buildCopilotSDKInstallStep(workflowData *WorkflowData) GitHubActionStep {
 	if command == "" && workflowData.EngineConfig.Driver != "" {
 		command = sdkDriverInstallCommand(workflowData.EngineConfig.Driver)
 	}
-	spec := getCopilotSDKInstallSpec(command)
-	copilotInstallLog.Printf("copilot-sdk enabled; runtime=%s; install command=%s", spec.runtimeID, spec.command)
-	return specToInstallStep(spec, resolveEngineCooldownDays(workflowData))
+	return getCopilotSDKInstallSpec(command)
 }
 
 // specToInstallStep converts a copilotSDKInstallSpec into a GitHubActionStep.
 // When the spec has runLines set it emits a "run: |" multi-line block; otherwise
 // it emits a single "run: <command>" line.
-func specToInstallStep(spec copilotSDKInstallSpec, cooldownDays int) GitHubActionStep {
-	installCommand := spec.command
-	if len(spec.runLines) > 0 {
-		installCommand = strings.Join(spec.runLines, "\n")
+func specToInstallStep(spec copilotSDKInstallSpec) GitHubActionStep {
+	if spec.npm != nil {
+		return GitHubActionStep{
+			"      - name: " + spec.stepName,
+			"        shell: bash",
+			"        run: " + spec.npm.installCommand(),
+		}
 	}
-	usesNpm := strings.Contains(installCommand, "npm install ")
 	if len(spec.runLines) > 0 {
 		step := GitHubActionStep{
 			"      - name: " + spec.stepName,
@@ -228,22 +257,12 @@ func specToInstallStep(spec copilotSDKInstallSpec, cooldownDays int) GitHubActio
 		for _, line := range spec.runLines {
 			step = append(step, "          "+line)
 		}
-		if usesNpm {
-			step = append(step,
-				"        env:",
-				fmt.Sprintf("          NPM_CONFIG_MIN_RELEASE_AGE: '%d'", cooldownDays),
-			)
-		}
 		return step
 	}
-	step := GitHubActionStep{
+	return GitHubActionStep{
 		"      - name: " + spec.stepName,
 		"        run: " + spec.command,
 	}
-	if usesNpm {
-		step = append(step, "        env:", fmt.Sprintf("          NPM_CONFIG_MIN_RELEASE_AGE: '%d'", cooldownDays))
-	}
-	return step
 }
 
 // sdkDriverInstallCommand returns a synthetic command string for the given driver filename
@@ -271,7 +290,6 @@ func getCopilotSDKInstallSpec(command string) copilotSDKInstallSpec {
 	spec := copilotSDKInstallSpec{
 		runtimeID: runtimeID,
 		stepName:  "Install GitHub Copilot SDK (Node.js)",
-		command:   workspaceCommandPrefix + "npm install --ignore-scripts --no-save @github/copilot-sdk@" + version + " " + copilotSDKWebFetchDependency,
 	}
 
 	switch runtimeID {
@@ -284,7 +302,7 @@ func getCopilotSDKInstallSpec(command string) copilotSDKInstallSpec {
 		)
 	case "typescript":
 		spec.stepName = "Install GitHub Copilot SDK (TypeScript)"
-		spec.command = workspaceCommandPrefix + "npm install --ignore-scripts --no-save @github/copilot-sdk@" + version + " " + copilotSDKWebFetchDependency + " ts-node@10.9.2 typescript@5.8.3"
+		spec.npm = copilotSDKTypeScriptProject
 	case "go":
 		spec.stepName = "Install GitHub Copilot SDK (Go)"
 		spec.command = workspaceCommandPrefix + "go get github.com/github/copilot-sdk/go@v" + version
@@ -297,6 +315,8 @@ func getCopilotSDKInstallSpec(command string) copilotSDKInstallSpec {
 	case "java":
 		spec.stepName = "Install GitHub Copilot SDK (Java)"
 		spec.command = workspaceCommandPrefix + "mvn -q org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get -Dartifact=com.github:copilot-sdk-java:" + version
+	default:
+		spec.npm = copilotSDKNodeProject
 	}
 
 	return spec
@@ -308,7 +328,6 @@ func getInlineCopilotSDKInstallSpec(runtimeID string) copilotSDKInstallSpec {
 	spec := copilotSDKInstallSpec{
 		runtimeID: runtimeID,
 		stepName:  "Install GitHub Copilot SDK (Node.js)",
-		command:   workspaceCommandPrefix + "npm install --ignore-scripts --no-save @github/copilot-sdk@" + version + " " + copilotSDKWebFetchDependency,
 	}
 
 	switch runtimeID {
@@ -352,6 +371,8 @@ func getInlineCopilotSDKInstallSpec(runtimeID string) copilotSDKInstallSpec {
 				classpathFile,
 			),
 		}
+	default:
+		spec.npm = copilotSDKNodeProject
 	}
 
 	return spec
@@ -456,9 +477,6 @@ func generateAWFInstallationStep(version string, agentConfig *AgentSandboxConfig
 
 	stepLines := []string{
 		"      - name: Install AWF binary",
-		"        env:",
-		"          GH_TOKEN: ${{ github.token }}",
-		"          GH_HOST: github.com",
 		"        run: " + installCmd,
 	}
 
@@ -484,8 +502,6 @@ func generateDockerEnclaveStorageHelperInstallStep(version string, agentConfig *
 		"      - name: Install authenticated Docker enclave storage helper",
 		"        shell: bash",
 		"        env:",
-		"          GH_TOKEN: ${{ github.token }}",
-		"          GH_HOST: github.com",
 		"          AWF_HELPER_VERSION: " + version,
 	}
 	if agentConfig != nil && agentConfig.ChecksumsSHA256 != "" {
@@ -512,7 +528,7 @@ func dockerEnclaveStorageHelperSetupLines() []string {
 		`          mkdir -m 700 "$install_dir"`,
 		`          installer_dir=""`,
 		`          cleanup() {`,
-		`            rm -f "$install_dir/checksums.txt" "$install_dir/release-identity.txt" "$install_dir/enclave-storage-helper.py"`,
+		`            rm -f "$install_dir/checksums.txt" "$install_dir/enclave-storage-helper.py"`,
 		`            rmdir "$install_dir"`,
 		`            if [[ -n "$installer_dir" ]]; then /usr/bin/sudo -n /usr/bin/rm -rf -- "$installer_dir"; fi`,
 		`          }`,
@@ -522,18 +538,14 @@ func dockerEnclaveStorageHelperSetupLines() []string {
 
 func dockerEnclaveStorageHelperReleaseLines() []string {
 	return []string{
-		`          for asset in checksums.txt release-identity.txt; do`,
-		`            curl --proto '=https' --proto-redir '=https' -fsSL --retry 8 --retry-max-time 180 --connect-timeout 15 --max-time 60 \`,
-		`              "https://github.com/github/gh-aw-firewall/releases/download/$AWF_HELPER_VERSION/$asset" \`,
-		`              -o "$install_dir/$asset"`,
-		`          done`,
-		`          verify_release_identity "$install_dir/checksums.txt" "$install_dir/release-identity.txt" \`,
-		`            github/gh-aw-firewall "$AWF_HELPER_VERSION" "$checksums_sha256"`,
+		`          curl --proto '=https' --proto-redir '=https' -fsSL --retry 8 --retry-max-time 180 --connect-timeout 15 --max-time 60 \`,
+		`            "https://github.com/github/gh-aw-firewall/releases/download/$AWF_HELPER_VERSION/checksums.txt" \`,
+		`            -o "$install_dir/checksums.txt"`,
+		`          verify_release_digest "$install_dir/checksums.txt" "$checksums_sha256"`,
 		`          helper_sha256=$(awk '$2 == "enclave-storage-helper.py" { count++; digest = $1 } END { if (count != 1 || digest !~ /^[0-9a-f]{64}$/) exit 1; print digest }' "$install_dir/checksums.txt")`,
 		`          curl --proto '=https' --proto-redir '=https' -fsSL --retry 8 --retry-max-time 180 --connect-timeout 15 --max-time 60 \`,
 		`            "https://github.com/github/gh-aw-firewall/releases/download/$AWF_HELPER_VERSION/enclave-storage-helper.py" \`,
 		`            -o "$install_dir/enclave-storage-helper.py"`,
-		`          verify_release_attestation "$install_dir/enclave-storage-helper.py" github/gh-aw-firewall`,
 		`          verify_release_digest "$install_dir/enclave-storage-helper.py" "$helper_sha256"`,
 	}
 }

@@ -2,12 +2,11 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { minimatch } from "minimatch";
-import { parseDocument } from "./work_queue_yaml.cjs";
+import { readDocumentMetadata } from "../../../scripts/markdown_metadata_test_adapter.cjs";
 
 const root = resolve(import.meta.dirname, "../../..");
-const document = parseDocument(readFileSync(resolve(root, ".github/workflows/work-queue-stress.yml"), "utf8"), { version: "1.2", uniqueKeys: true });
-if (document.errors.length) throw new AggregateError(document.errors, "Invalid work queue stress workflow");
-const workflow = document.toJS();
+const document = readDocumentMetadata(readFileSync(resolve(root, ".github/workflows/work-queue-stress.yml"), "utf8"), { version: "1.2", uniqueKeys: true });
+const workflow = document.value;
 const pins = JSON.parse(readFileSync(resolve(root, ".github/aw/actions-lock.json"), "utf8")).entries;
 
 describe("local work queue stress CI", () => {
@@ -27,6 +26,8 @@ describe("local work queue stress CI", () => {
     }
     expect(workflow.on.push.branches).toEqual(["main"]);
     expect(workflow.on.pull_request_target).toBeUndefined();
+    expect(workflow.on.workflow_dispatch.inputs.lifecycle_items.default).toBe("1024");
+    expect(workflow.on.workflow_dispatch.inputs.history_items.default).toBe("100000");
     expect(Object.keys(workflow.jobs)).toEqual(["stress"]);
     expect(workflow.jobs.stress.needs).toBeUndefined();
   });
@@ -34,7 +35,7 @@ describe("local work queue stress CI", () => {
   it("uses read-only checkout, pinned actions, bounded execution and failure diagnostics", () => {
     expect(workflow.permissions).toEqual({ contents: "read" });
     expect(workflow.defaults.run.shell).toBe("bash");
-    expect(workflow.jobs.stress["timeout-minutes"]).toBe(20);
+    expect(workflow.jobs.stress["timeout-minutes"]).toBe(30);
     const steps = workflow.jobs.stress.steps;
     const checkout = steps.find(step => step.uses?.startsWith("actions/checkout@"));
     expect(checkout.with["persist-credentials"]).toBe(false);
@@ -51,11 +52,11 @@ describe("local work queue stress CI", () => {
 
   it("separates retained-history scale from live completions and admission limits", () => {
     expect(workflow.jobs.stress.env).toEqual({
-      HISTORY_ITEMS: "${{ github.event_name == 'pull_request' && '256' || '100000' }}",
-      LIFECYCLE_ITEMS: "${{ github.event_name == 'pull_request' && '16' || '1024' }}",
+      HISTORY_ITEMS: "${{ github.event_name == 'workflow_dispatch' && inputs.history_items || github.event_name == 'pull_request' && '256' || '100000' }}",
+      LIFECYCLE_ITEMS: "${{ github.event_name == 'workflow_dispatch' && inputs.lifecycle_items || github.event_name == 'pull_request' && '128' || '1024' }}",
     });
     const commands = workflow.jobs.stress.steps.filter(step => step.run).map(step => step.run);
-    expect(commands.some(command => command.includes('--mode history --items "$HISTORY_ITEMS" --workers 2') && command.includes("--timeout-seconds 300"))).toBe(true);
+    expect(commands.some(command => command.includes('--mode history --items "$HISTORY_ITEMS" --workers 2') && command.includes("--timeout-seconds 600"))).toBe(true);
     expect(commands.some(command => command.includes('--items "$LIFECYCLE_ITEMS" --workers 4 --queue-items 64') && command.includes("--timeout-seconds 600"))).toBe(true);
     expect(commands.some(command => command.includes("--mode saturation --items 100000 --workers 4") && command.includes("--timeout-seconds 60"))).toBe(true);
     const invariants = workflow.jobs.stress.steps.find(step => step.id === "invariants");

@@ -110,6 +110,15 @@ The package is designed to adapt to the execution environment. Native builds det
 | `ShowInteractiveList` | `func ShowInteractiveList(title string, items []ListItem) (string, error)` | Shows a single-selection interactive list; native builds use `huh` when stdin and stderr are terminals, fall back to numbered text input when only stderr is non-terminal, and reject non-terminal stdin. |
 | `ShowWelcomeBanner` | `func ShowWelcomeBanner(description string)` | Clears the screen and prints the interactive welcome banner and description to stderr. |
 | `ToRelativePath` | `func ToRelativePath(path string) string` | Converts an absolute path to a cwd-relative display path when possible. |
+| `FormatCommandMessageStdout` | `func FormatCommandMessageStdout(command string) string` | Formats a command execution message using stdout terminal and color settings. |
+| `FormatErrorStdout` | `func FormatErrorStdout(err CompilerError) string` | Formats a `CompilerError` using stdout terminal and color settings. |
+| `FormatListItemStdout` | `func FormatListItemStdout(item string) string` | Formats a list item using stdout terminal and color settings. |
+| `FormatProgressMessageStdout` | `func FormatProgressMessageStdout(message string) string` | Formats a progress message using stdout terminal and color settings. |
+| `FormatPromptMessageStdout` | `func FormatPromptMessageStdout(message string) string` | Formats a prompt message using stdout terminal and color settings. |
+| `FormatSectionHeaderStdout` | `func FormatSectionHeaderStdout(header string) string` | Formats a section header using stdout terminal and color settings. |
+| `FormatSuccessMessageStdout` | `func FormatSuccessMessageStdout(message string) string` | Formats a success message using stdout terminal and color settings. |
+| `FormatVerboseMessageStdout` | `func FormatVerboseMessageStdout(message string) string` | Formats verbose output using stdout terminal and color settings. |
+| `FormatWarningMessageStdout` | `func FormatWarningMessageStdout(message string) string` | Formats a warning message using stdout terminal and color settings. |
 
 ### Constants
 
@@ -165,7 +174,7 @@ output := console.RenderStruct([]Overview{{
 fmt.Print(output)
 ```
 
-`RenderStruct` uses reflection and `console` struct tags such as `header`, `title`, `omitempty`, and `-` to choose headings, omit zero values, and build tables for slices of structs.
+`RenderStruct` uses reflection and `console` struct tags such as `header`, `title`, `omitempty`, and `-` to choose headings, omit zero-valued scalar fields, and build tables for slices of structs. Zero-valued nested struct fields remain visible in single-struct rendering. In a slice table, an `omitempty` column is omitted only when every row has a zero value for that field, including struct and array values.
 
 ### Spinner lifecycle
 

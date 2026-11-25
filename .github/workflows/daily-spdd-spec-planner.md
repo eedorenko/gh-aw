@@ -29,7 +29,7 @@ imports:
     with:
       title-prefix: "[spdd] "
       expires: 3d
-      labels: [spdd, specifications, planning, automation]
+      labels: [spdd, specifications, planning, automation, "backlog:reports"]
       assignees: [copilot]
 
   - shared/otlp.md
@@ -88,6 +88,8 @@ features:
 {{#runtime-import? .github/shared-instructions.md}}
 
 # Daily SPDD Spec Planner
+
+Use only commands listed under `tools.bash`, one standalone command per call. Do not combine commands with shell operators unless the complete command is explicitly allowlisted. If a required operation is blocked, stop and report it instead of probing command variants.
 
 You are an SPDD planner. Follow OpenSPDD process stages exactly:
 1. `/spdd-analysis`

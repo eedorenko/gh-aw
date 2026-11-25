@@ -34,7 +34,7 @@ let cachePath;
 beforeEach(() => {
   directory = fs.mkdtempSync(path.join(os.tmpdir(), "aic-scan-test-"));
   cachePath = path.join(directory, "scan.jsonl");
-  global.core = { info: vi.fn(), warning: vi.fn() };
+  global.core = { info: vi.fn(), warning: vi.fn(), exportVariable: vi.fn(), setOutput: vi.fn() };
   vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
 });
 afterEach(() => {
@@ -55,6 +55,7 @@ function fixture(runs = [run(1), run(2), run(3)]) {
     rest: {
       actions: {
         getWorkflowRun: vi.fn(async () => response({ workflow_id: 7 })),
+        listWorkflowRuns: vi.fn(async () => response({ workflow_runs: [] })),
         listJobsForWorkflowRun: vi.fn(async () =>
           response({
             jobs: [
@@ -98,6 +99,196 @@ function fixture(runs = [run(1), run(2), run(3)]) {
 function writeEntries(entries) {
   fs.writeFileSync(cachePath, entries.map(entry => JSON.stringify(entry)).join("\n"));
 }
+
+function emptyHistoryDiagnostics() {
+  const prefix = "[daily-workflow-aic] Empty history check: ";
+  return global.core.info.mock.calls.filter(([message]) => message.startsWith(prefix)).map(([message]) => JSON.parse(message.slice(prefix.length)));
+}
+
+describe("empty daily AIC history", () => {
+  it.each(["restored observations", "unfiltered history"])("fails activation with unknown usage when %s contradict an empty listing", async evidence => {
+    const f = fixture([]);
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    vi.stubEnv("GH_AW_MAX_DAILY_AI_CREDITS", "20000");
+    vi.stubEnv("GH_AW_GITHUB_TOKEN", "synthetic");
+    vi.stubEnv("GITHUB_EVENT_NAME", "pull_request_target");
+    global.github = f.github;
+    global.context = f.context;
+    global.core.setFailed = vi.fn();
+    if (evidence === "restored observations") writeEntries([scanCacheEntry(run(1), 10, repository, 7, now)]);
+    else f.github.rest.actions.listWorkflowRuns.mockImplementation(async params => response({ workflow_runs: params.status ? [] : [run(1)] }));
+    await guardrail.main({ cachePath });
+    expect(global.core.setOutput).toHaveBeenCalledWith("daily_ai_credits_guardrail_status", "transient_error");
+    expect(global.core.setOutput).not.toHaveBeenCalledWith("daily_ai_credits_guardrail_status", "under_budget");
+    expect(global.core.setOutput).not.toHaveBeenCalledWith("daily_ai_credits_total", "0");
+    expect(global.core.setFailed).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("AI Credits are unknown"));
+  });
+
+  it.each(["workflow_id", "repo_workflow_id_fallback"])("rejects an empty first source page contradicted by restored observations in %s mode", async lookupMode => {
+    const f = fixture([]);
+    f.pageRead.mockResolvedValue({ response: response({ workflow_runs: [] }), sourceRunCount: 0, lookupMode });
+    writeEntries([scanCacheEntry(run(1), 0, repository, 7, now)]);
+    await expect(scanDailyAIC(f)).rejects.toThrow("Empty daily AIC workflow history");
+    expect(f.getRunAIC).not.toHaveBeenCalled();
+    expect(emptyHistoryDiagnostics()).toEqual([{ lookupMode, outcome: "contradictory_observations", observedRuns: 1, pagesAttempted: 0, runsReturned: 0, responsesObserved: 0 }]);
+  });
+
+  it.each([time, new Date(now - 86400000).toISOString(), new Date(now + 1).toISOString()])("rejects an empty completed listing contradicted by unfiltered workflow history at %s", async created_at => {
+    const f = fixture([]);
+    f.github.rest.actions.listWorkflowRuns = vi.fn(async () => response({ workflow_runs: [run(1, { created_at })] }));
+    await expect(scanDailyAIC(f)).rejects.toThrow("Empty daily AIC workflow history");
+    expect(f.github.rest.actions.listWorkflowRuns).toHaveBeenCalledExactlyOnceWith({
+      owner: "example",
+      repo: "project",
+      workflow_id: 7,
+      created: `>=${new Date(now - 86400000).toISOString()}`,
+      per_page: 100,
+      page: 1,
+    });
+    expect(f.budget.snapshot().requests).toBe(3);
+    expect(f.getRunAIC).not.toHaveBeenCalled();
+  });
+
+  it("pages through unfiltered runs to find an in-window completed run", async () => {
+    const f = fixture([]);
+    const queuedRuns = Array.from({ length: 100 }, (_, index) => run(index + 1, { status: "queued" }));
+    f.github.rest.actions.listWorkflowRuns.mockImplementation(async ({ page }) => response({ workflow_runs: page === 1 ? queuedRuns : [run(101)] }));
+
+    await expect(scanDailyAIC(f)).rejects.toThrow("Empty daily AIC workflow history");
+
+    expect(f.github.rest.actions.listWorkflowRuns).toHaveBeenCalledTimes(2);
+    expect(emptyHistoryDiagnostics()).toEqual([{ lookupMode: "workflow_id", outcome: "contradictory_history", observedRuns: 0, pagesAttempted: 2, runsReturned: 101, responsesObserved: 2 }]);
+    expect(f.github.rest.actions.listWorkflowRuns).toHaveBeenNthCalledWith(2, {
+      owner: "example",
+      repo: "project",
+      workflow_id: 7,
+      created: `>=${new Date(now - 86400000).toISOString()}`,
+      per_page: 100,
+      page: 2,
+    });
+  });
+
+  it("fails closed when unfiltered history exceeds its pagination limit", async () => {
+    const f = fixture([]);
+    f.github.rest.actions.listWorkflowRuns.mockResolvedValue(response({ workflow_runs: Array.from({ length: 100 }, (_, index) => run(index + 1, { status: "queued" })) }));
+
+    await expect(scanDailyAIC(f)).rejects.toThrow("exceeds the complete pagination window");
+
+    expect(f.github.rest.actions.listWorkflowRuns).toHaveBeenCalledTimes(10);
+    expect(emptyHistoryDiagnostics()).toEqual([{ lookupMode: "workflow_id", outcome: "pagination_limit", observedRuns: 0, pagesAttempted: 10, runsReturned: 1000, responsesObserved: 10 }]);
+  });
+
+  it("checks unfiltered repository history when workflow-ID lookup falls back", async () => {
+    const f = fixture([]);
+    f.pageRead.mockResolvedValue({ response: response({ workflow_runs: [] }), sourceRunCount: 0, lookupMode: "repo_workflow_id_fallback" });
+    f.github.rest.actions.listWorkflowRunsForRepo = vi.fn(async () => response({ workflow_runs: [run(1)] }));
+
+    await expect(scanDailyAIC(f)).rejects.toThrow("Empty daily AIC workflow history");
+
+    expect(f.github.rest.actions.listWorkflowRunsForRepo).toHaveBeenCalledExactlyOnceWith({
+      owner: "example",
+      repo: "project",
+      created: `>=${new Date(now - 86400000).toISOString()}`,
+      per_page: 100,
+      page: 1,
+    });
+  });
+
+  it("ignores other workflows when checking unfiltered repository history", async () => {
+    const f = fixture([]);
+    f.pageRead.mockResolvedValue({ response: response({ workflow_runs: [] }), sourceRunCount: 0, lookupMode: "repo_workflow_id_fallback" });
+    f.github.rest.actions.listWorkflowRunsForRepo = vi.fn(async () => response({ workflow_runs: [run(1, { workflow_id: 8 })] }));
+
+    expect(await scanDailyAIC(f)).toMatchObject({ countedRuns: [], candidateRunsCount: 0 });
+    expect(emptyHistoryDiagnostics()).toEqual([{ lookupMode: "repo_workflow_id_fallback", outcome: "verified_empty", observedRuns: 0, pagesAttempted: 1, runsReturned: 1, responsesObserved: 1 }]);
+  });
+
+  it.each([[], [run(99)], [run(1, { status: "in_progress" })], [run(1, { status: "queued" })], [run(1, { created_at: new Date(now - 86400001).toISOString() })]].map(runs => [runs]))(
+    "allows zero usage with no other completed run in the window (%j)",
+    async runs => {
+      const f = fixture([]);
+      f.github.rest.actions.listWorkflowRuns = vi.fn(async () => response({ workflow_runs: runs }));
+      writeEntries([
+        scanCacheEntry(run(1, { created_at: new Date(now - 86400001).toISOString() }), 10, repository, 7, now),
+        scanCacheEntry(run(2), 10, repository, 8, now),
+        scanCacheEntry(run(3), 10, "other/project", 7, now),
+        scanCacheEntry(run(99), 10, repository, 7, now),
+      ]);
+      expect(await scanDailyAIC(f)).toMatchObject({ countedRuns: [], candidateRunsCount: 0 });
+      expect(f.github.rest.actions.listWorkflowRuns).toHaveBeenCalledOnce();
+      expect(f.getRunAIC).not.toHaveBeenCalled();
+    }
+  );
+
+  it("counts a completed run created exactly at the start of the inspection window", async () => {
+    const f = fixture([]);
+    f.github.rest.actions.listWorkflowRuns.mockResolvedValue(response({ workflow_runs: [run(1, { created_at: new Date(now - 86400000).toISOString() })] }));
+
+    await expect(scanDailyAIC(f)).rejects.toThrow("Empty daily AIC workflow history");
+  });
+
+  it.each(["workflow_id", "repo_workflow_id_fallback"])("validates current-run and status exclusions in %s mode", async lookupMode => {
+    const f = fixture([]);
+    f.pageRead.mockResolvedValue({ response: response({ workflow_runs: [] }), sourceRunCount: 0, lookupMode });
+    const runs = [run(99), run(1, { status: "in_progress" }), run(2, { status: "queued" })];
+    if (lookupMode === "workflow_id") {
+      f.github.rest.actions.listWorkflowRuns.mockResolvedValue(response({ workflow_runs: runs }));
+    } else {
+      f.github.rest.actions.listWorkflowRunsForRepo = vi.fn(async () => response({ workflow_runs: runs }));
+    }
+
+    expect(await scanDailyAIC(f)).toMatchObject({ countedRuns: [], candidateRunsCount: 0 });
+  });
+
+  it.each([undefined, null, "invalid"])("rejects malformed unfiltered history (%s)", async workflow_runs => {
+    const f = fixture([]);
+    f.github.rest.actions.listWorkflowRuns = vi.fn(async () => response({ workflow_runs }));
+    await expect(scanDailyAIC(f)).rejects.toThrow("Incomplete daily AIC workflow history");
+    expect(emptyHistoryDiagnostics()).toEqual([{ lookupMode: "workflow_id", outcome: "invalid_history", observedRuns: 0, pagesAttempted: 1, runsReturned: 0, responsesObserved: 1 }]);
+  });
+
+  it("rejects completed runs with unknown creation times in unfiltered history", async () => {
+    const f = fixture([]);
+    f.github.rest.actions.listWorkflowRuns.mockResolvedValue(response({ workflow_runs: [run(1, { created_at: "invalid" })] }));
+    await expect(scanDailyAIC(f)).rejects.toThrow("unknown creation time");
+  });
+
+  it("propagates failure of the unfiltered history check", async () => {
+    const f = fixture([]);
+    const error = apiError(403, {}, "private response content");
+    f.github.rest.actions.listWorkflowRuns = vi.fn().mockRejectedValue(error);
+    await expect(scanDailyAIC(f)).rejects.toBe(error);
+    expect(f.getRunAIC).not.toHaveBeenCalled();
+    expect(emptyHistoryDiagnostics()).toEqual([{ lookupMode: "workflow_id", outcome: "request_failed", observedRuns: 0, pagesAttempted: 1, runsReturned: 0, responsesObserved: 1 }]);
+    expect(JSON.stringify(emptyHistoryDiagnostics())).not.toContain("private response content");
+  });
+
+  it("counts retry responses without counting another page", async () => {
+    vi.useFakeTimers();
+    const f = fixture([]);
+    f.github.rest.actions.listWorkflowRuns.mockResolvedValueOnce({ status: 503, headers: {}, data: {} }).mockResolvedValueOnce(response({ workflow_runs: [] }));
+    const scan = scanDailyAIC(f);
+    await vi.runAllTimersAsync();
+    await expect(scan).resolves.toMatchObject({ countedRuns: [] });
+    expect(emptyHistoryDiagnostics()).toEqual([{ lookupMode: "workflow_id", outcome: "verified_empty", observedRuns: 0, pagesAttempted: 1, runsReturned: 0, responsesObserved: 2 }]);
+  });
+
+  it("does not mistake a filtered repository page for an empty source page", async () => {
+    const f = fixture([]);
+    f.pageRead.mockResolvedValue({ response: response({ workflow_runs: [] }), sourceRunCount: 1, lookupMode: "repo_workflow_id_fallback" });
+    writeEntries([scanCacheEntry(run(1), 10, repository, 7, now)]);
+    expect(await scanDailyAIC(f)).toMatchObject({ countedRuns: [], candidateRunsCount: 0 });
+    expect(emptyHistoryDiagnostics()).toEqual([]);
+  });
+
+  it("does not include response fields in empty-history diagnostics", async () => {
+    const f = fixture([]);
+    f.github.rest.actions.listWorkflowRuns.mockResolvedValue(response({ workflow_runs: [run(1, { status: "queued", name: "private workflow data" })] }));
+    expect(await scanDailyAIC(f)).toMatchObject({ countedRuns: [] });
+    expect(emptyHistoryDiagnostics()).toEqual([{ lookupMode: "workflow_id", outcome: "verified_empty", observedRuns: 0, pagesAttempted: 1, runsReturned: 1, responsesObserved: 1 }]);
+    expect(JSON.stringify(emptyHistoryDiagnostics())).not.toContain("private workflow data");
+  });
+});
 
 describe("complete daily AIC phase recovery", () => {
   function recoveryClock() {
@@ -198,6 +389,29 @@ describe("complete daily AIC phase recovery", () => {
     expect(f.github.rest.actions.getWorkflowRun).toHaveBeenCalledTimes(2);
     expect(f.listPage).not.toHaveBeenCalled();
     expect(f.getRunAIC).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["reset beyond the ten-minute budget", { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(now / 1000 + 900) }, "1", 0],
+    ["rerun ineligible for recovery", { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(now / 1000 + 60) }, "2", 0],
+    ["unknown reset", { "x-ratelimit-remaining": "0" }, "1", 0],
+    ["renewed exhaustion", { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(now / 1000 + 60) }, "1", 1],
+  ])("publishes an explicit quota-blocked restore outcome for %s without authorizing accounting", async (_case, headers, runAttempt, sleeps) => {
+    const recovery = { ...recoveryClock(), runAttempt };
+    const getWorkflowRun = vi.fn().mockRejectedValue(apiError(403, { ...headers, "x-ratelimit-limit": "15000", "x-ratelimit-used": "15000", "x-ratelimit-resource": "core" }, "API rate limit exceeded"));
+    const listWorkflowRuns = vi.fn();
+    global.context = { repo: { owner: "example", repo: "project" }, runId: 99, payload: {} };
+    global.github = { rest: { actions: { getWorkflowRun, listWorkflowRuns } } };
+    const summary = { addRaw: vi.fn().mockReturnThis(), write: vi.fn().mockResolvedValue(undefined) };
+    global.core.summary = summary;
+    await expect(restore(cachePath, { recovery })).resolves.toBeUndefined();
+    expect(recovery.sleep).toHaveBeenCalledTimes(sleeps);
+    expect(getWorkflowRun).toHaveBeenCalledTimes(sleeps + 1);
+    expect(listWorkflowRuns).not.toHaveBeenCalled();
+    expect(summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("### GitHub API quota exhausted"));
+    expect(summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("Accounting remains unverified; agent startup is blocked"));
+    expect(JSON.parse(global.core.exportVariable.mock.calls[0][1])).toMatchObject({ resource: "core", limit: 15000, remaining: 0, used: 15000, operation: "current_run" });
+    expect(fs.existsSync(cachePath)).toBe(false);
   });
 
   it("bounds snapshot misses on normal workflow history before a fresh full scan", async () => {
@@ -1052,10 +1266,13 @@ describe("trusted artifact fallback without writable Actions cache", () => {
       },
     };
     global.core.summary = { addRaw: vi.fn().mockReturnThis(), write: vi.fn().mockResolvedValue(undefined) };
-    await expect(restore(cachePath)).rejects.toMatchObject({ code: "DAILY_AIC_QUOTA_STOP" });
+    await expect(restore(cachePath)).resolves.toBeUndefined();
+    expect(global.core.exportVariable).toHaveBeenCalledWith("GH_AW_DAILY_AIC_QUOTA_BLOCKED", expect.stringContaining('"operation":"repository_history"'));
     expect(listWorkflowRunsForRepo).toHaveBeenCalledTimes(2);
     expect(listWorkflowRunArtifacts).not.toHaveBeenCalled();
     expect(global.core.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("restore stopped at repository_history after 1 attempt(s)"));
+    expect(global.core.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("API responses observed by this restore: 4"));
+    expect(global.core.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("a cache miss has not been established"));
     expect(fs.existsSync(cachePath)).toBe(false);
   });
 
@@ -1067,13 +1284,22 @@ describe("trusted artifact fallback without writable Actions cache", () => {
     global.github = { rest: { actions: { getWorkflowRun, listWorkflowRuns } } };
     const summary = { addRaw: vi.fn().mockReturnThis(), write: vi.fn().mockResolvedValue(undefined) };
     global.core.summary = summary;
-    await expect(restore(cachePath)).rejects.toMatchObject({ code: "DAILY_AIC_QUOTA_STOP", status: 403 });
+    await expect(restore(cachePath)).resolves.toBeUndefined();
     expect(getWorkflowRun).toHaveBeenCalledOnce();
+    expect(summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("### GitHub API quota exhausted"));
+    expect(global.core.setOutput).toHaveBeenCalledWith("github_api_quota_blocked", "true");
+    expect(JSON.parse(global.core.exportVariable.mock.calls[0][1])).toMatchObject({ status: 403, resource: "unknown", limit: 15000, remaining: 0, used: 15000, reset: "2026-10-14T10:06:00.000Z", operation: "current_run" });
     expect(listWorkflowRuns).not.toHaveBeenCalled();
     expect(summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("restore stopped at current_run after 1 attempt(s)"));
     expect(summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("quota_exhausted"));
     expect(summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("reset=2026-10-14T10:06:00.000Z"));
     expect(summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("Accounting remains unverified; agent startup is blocked"));
+    expect(summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("Activation stage: Restore daily AIC scan observations"));
+    expect(summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("API responses observed by this restore: 1; shared quota used is not this step's request count"));
+    expect(summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("Snapshot discovery has not started in the failed restore phase attempt; earlier attempts may have queried history or artifacts"));
+    expect(summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("Blocked until at least 2026-10-14T10:06:00.000Z"));
+    expect(summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("Check existing scheduled runs after the deadline before retrying"));
+    expect(summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("github-token reference"));
     expect(JSON.stringify([global.core.info.mock.calls, summary.addRaw.mock.calls])).not.toContain("secret-test-value");
     expect(fs.existsSync(cachePath)).toBe(false);
   });
@@ -1098,11 +1324,42 @@ describe("trusted artifact fallback without writable Actions cache", () => {
     global.github = { rest: { actions: { getWorkflowRun } } };
     const summary = { addRaw: vi.fn().mockReturnThis(), write: vi.fn().mockResolvedValue(undefined) };
     global.core.summary = summary;
-    await expect(restore(cachePath)).rejects.toBe(wrapped);
+    await expect(restore(cachePath)).resolves.toBeUndefined();
+    expect(global.core.exportVariable).toHaveBeenCalledWith("GH_AW_DAILY_AIC_QUOTA_BLOCKED", expect.any(String));
     expect(getWorkflowRun).toHaveBeenCalledOnce();
     expect(summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("quota_exhausted"));
     expect(summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("retry_not_before=2026-10-14T10:06:00.000Z"));
+    expect(summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("Blocked until at least 2026-10-14T10:06:00.000Z"));
+    expect(global.core.info).toHaveBeenCalledWith("[daily-aic-cache] No further API requests before 2026-10-14T10:06:00.000Z");
     expect(JSON.stringify([global.core.info.mock.calls, summary.addRaw.mock.calls])).not.toContain("private payload");
+  });
+
+  it.each([
+    [{ "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1791972360", "retry-after": "120" }, "2026-10-14T10:06:13.000Z"],
+    [{ "x-ratelimit-remaining": "4000", "x-ratelimit-reset": "1791972900", "retry-after": "120" }, "2026-10-14T10:06:13.000Z"],
+    [{ "x-ratelimit-remaining": "100", "x-ratelimit-reset": "1791972900", "retry-after": "120" }, "2026-10-14T10:15:00.000Z"],
+    [{ "x-ratelimit-remaining": "4000", "x-ratelimit-reset": "1791972900", "retry-after": "invalid" }, null],
+    [{ "retry-after": "120" }, "2026-10-14T10:06:13.000Z"],
+    [{ "x-ratelimit-remaining": "0" }, null],
+    [{ "x-ratelimit-remaining": "0", "x-ratelimit-reset": "9999999999999999", "retry-after": "private-header-value" }, null],
+    [{ "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1" }, null],
+  ])("reports a safe recovery deadline without retrying restricted reads: %j", async (headers, deadline) => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-10-14T10:04:13Z"));
+    const failure = apiError(403, headers, "private API payload");
+    const getWorkflowRun = vi.fn().mockRejectedValue(failure);
+    const listWorkflowRuns = vi.fn();
+    global.context = { repo: { owner: "example", repo: "project" }, runId: 99, payload: {} };
+    global.github = { rest: { actions: { getWorkflowRun, listWorkflowRuns } } };
+    const summary = { addRaw: vi.fn().mockReturnThis(), write: vi.fn().mockResolvedValue(undefined) };
+    global.core.summary = summary;
+    await expect(restore(cachePath)).resolves.toBeUndefined();
+    expect(global.core.exportVariable).toHaveBeenCalledOnce();
+    expect(getWorkflowRun).toHaveBeenCalledOnce();
+    expect(listWorkflowRuns).not.toHaveBeenCalled();
+    expect(summary.addRaw).toHaveBeenCalledWith(expect.stringContaining(deadline ? `Blocked until at least ${deadline}` : "Blocked until: unknown"));
+    expect(summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("A reset does not verify accounting or authorize agent startup"));
+    expect(JSON.stringify([global.core.info.mock.calls, summary.addRaw.mock.calls])).not.toMatch(/private API payload|private-header-value/);
+    expect(fs.existsSync(cachePath)).toBe(false);
   });
 
   it.each([

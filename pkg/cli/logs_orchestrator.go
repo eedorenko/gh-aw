@@ -305,6 +305,14 @@ var logsExportHarborJob = exportHarborJob
 // DownloadWorkflowLogs downloads and analyzes workflow logs with metrics
 func DownloadWorkflowLogs(ctx context.Context, opts LogsDownloadOptions) (err error) {
 	opts = normalizeLogsDownloadOptions(opts)
+	if opts.Delivery || opts.Outcomes {
+		var cancel context.CancelFunc
+		ctx, cancel = lifecycleLogsContext(ctx, opts.TimeoutMinutes, opts.TimeoutSeconds, opts.MaxGitHubAPIRateLimit)
+		defer cancelLogsDownload(cancel)
+	}
+	ctx, stream, finish := startLogsJSONL(ctx, opts.Format, opts.Verbose, workQueueEvidenceRequested(opts.ArtifactSets) || len(ResolveArtifactFilter(opts.ArtifactSets)) == 0)
+	defer finish(&err)
+	opts.jsonlStream = stream
 	logsOrchestratorLog.Printf("Downloading workflow logs: workflow=%q, count=%d, outputDir=%q", opts.WorkflowName, opts.Count, opts.OutputDir)
 	if err := prepareCachedLogsJSONL(&opts); err != nil {
 		return err
@@ -331,9 +339,12 @@ func DownloadWorkflowLogs(ctx context.Context, opts LogsDownloadOptions) (err er
 			return fmt.Errorf("harbor export: %w", err)
 		}
 	}
-	if opts.Outcomes {
-		outcomeReports, err = collectLogsOutcomes(ctx, result.processedRuns, opts.OutcomesDir, opts.Verbose)
+	if opts.Outcomes || opts.Delivery {
+		outcomeReports, err = collectLogsLifecycles(ctx, result.processedRuns, opts.OutcomesDir, opts.Verbose, opts.Outcomes, opts.cachedJSONLCache)
 		if err != nil {
+			return err
+		}
+		if err := cacheLogsLifecycles(opts.cachedJSONLWriter, outcomeReports); err != nil {
 			return err
 		}
 	}
@@ -350,30 +361,17 @@ func DownloadWorkflowLogs(ctx context.Context, opts LogsDownloadOptions) (err er
 }
 
 func renderCollectedWorkflowLogs(result workflowLogsResult, opts LogsDownloadOptions, apiRateLimit *GitHubAPIRateLimitReport, outcomeReports []OutcomesData) error {
-	return renderLogsOutput(result.processedRuns, renderLogsOutputOptions{
-		outputDir:         opts.OutputDir,
-		summaryFile:       opts.SummaryFile,
-		format:            opts.Format,
-		reportFile:        opts.ReportFile,
-		jsonOutput:        opts.JSONOutput,
-		episodes:          opts.Episodes,
-		toolGraph:         opts.ToolGraph,
-		train:             opts.Train,
-		drain3Weights:     opts.Drain3Weights,
-		audit:             opts.Audit,
-		continuation:      result.continuation,
-		verbose:           opts.Verbose,
-		artifactFilter:    result.artifactFilter,
-		includeWorkQueue:  workQueueEvidenceRequested(opts.ArtifactSets),
-		startDate:         opts.StartDate,
-		endDate:           opts.EndDate,
-		checkStaleness:    true,
-		countLimitReached: result.countLimitReached,
-		suppressRender:    opts.SuppressRender,
-		apiRateLimit:      apiRateLimit,
-		cachedJSONLWriter: opts.cachedJSONLWriter,
-		outcomeReports:    outcomeReports,
-	})
+	renderOpts := newRenderLogsOutputOptions(opts, result.artifactFilter)
+	renderOpts.continuation = result.continuation
+	renderOpts.startDate = opts.StartDate
+	renderOpts.endDate = opts.EndDate
+	renderOpts.checkStaleness = true
+	renderOpts.countLimitReached = result.countLimitReached
+	renderOpts.suppressRender = opts.SuppressRender
+	renderOpts.apiRateLimit = apiRateLimit
+	renderOpts.cachedJSONLWriter = opts.cachedJSONLWriter
+	renderOpts.outcomeReports = outcomeReports
+	return renderLogsOutput(result.processedRuns, renderOpts)
 }
 
 func collectWorkflowLogs(ctx context.Context, opts LogsDownloadOptions) (workflowLogsResult, error) {

@@ -8,13 +8,20 @@ Use `evals:` with `safe-outputs` to judge whether an agent achieved its intended
 
 The evals job sends all questions and shared agent output in one OpenAI-compatible
 `POST /decisions` request. Each question uses `choice` with `YES`, `NO`, and
-`UNKNOWN` (insufficient evidence or not applicable). The job does not install or
-run an agentic engine or AWF. A trusted JavaScript step calls the provider directly
-with its credential. Response token usage (including cache and reasoning tokens)
-is saved with catalog-derived AIC and USD costs for summaries and daily accounting.
+`UNKNOWN` (insufficient evidence or not applicable). The job runs no agentic engine
+or AWF; a trusted JavaScript step calls the provider with its credential. Token usage
+(including cache and reasoning tokens) is saved with catalog-derived AIC and USD costs.
 Missing usage or pricing is reported as unavailable, not zero. AWF per-request
 credit limits and sandbox target overrides do not apply to evals.
 Request failures produce a `not_evaluated` marker, not `UNKNOWN` question results.
+If an HTTP 400 or 422 response explicitly reports a recognized model-unavailability
+code, the runtime warns and records `not_evaluated` with reason code
+`model_unavailable` without failing the execution step. It does not retry or
+fall back to a chat model. Select a Decisions-compatible `evals.model` offered
+to the workflow. Every HTTP 404 response remains an error, even with a model code,
+because a wrong base URL, removed route, or intermediary can return the same response.
+Authentication, transport, and other request errors also fail the execution step
+and are recorded as `judge_failed`.
 Both providers use `/v1/decisions`. Configure the actual provider model ID:
 `copilot/gpt-6-luna-decisions` for Copilot or `openai/gpt-6-luna` for OpenAI.
 Model IDs are sent without provider-specific name mapping.
@@ -72,7 +79,9 @@ evals:
 - `runs-on:` — optional runner override.
 
 Copilot requests use `COPILOT_GITHUB_TOKEN` or the workflow's
-`copilot-requests: write` permission. OpenAI requests use `CODEX_API_KEY` or
+`copilot-requests: write` permission and send
+`Copilot-Integration-Id: agentic-workflows`, matching the firewall's default
+integration identity. OpenAI requests omit that header and use `CODEX_API_KEY` or
 `OPENAI_API_KEY`. Per-question model overrides are not supported because the
 entire batch shares one request.
 
@@ -154,8 +163,7 @@ Do not combine mutually exclusive scenarios into one question list. If a questio
 ## Anti-Patterns
 
 - ❌ **Compound questions** — "Did the agent update CHANGELOG and bump the version?" splits into two questions. A single NO is ambiguous.
-- ❌ **Unobservable questions** — "Did the agent try its best?" cannot be answered from output text.
+- ❌ **Unobservable questions** — "Did the agent try its best?" cannot be answered from output text; never require external evidence.
 - ❌ **Duplicate IDs** — `id` must be unique within a workflow; the compiler rejects duplicates.
 - ❌ **Empty questions** — both `id` and `question` must be non-empty strings.
 - ❌ **Using a chat-only model** — evals require a model that supports `/decisions`.
-- ❌ **Questions that require external evidence** — questions must be answerable from agent output alone.

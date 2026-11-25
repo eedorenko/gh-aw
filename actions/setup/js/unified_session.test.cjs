@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { collectUnifiedSession, mergeSessionSources, normalizeRuntimeEvent, parseEngineSession, sessionTimestamp, writeUnifiedSession } from "./unified_session.cjs";
+import { collectUnifiedSession, main, mergeSessionSources, normalizeRuntimeEvent, parseEngineSession, sessionTimestamp, writeUnifiedSession } from "./unified_session.cjs";
 import { serializeSessionArtifact, writeSessionArtifact } from "./session_artifact.cjs";
 import { normalizeUnifiedSessionEvent } from "./unified_session_payload.cjs";
 import { validateSession } from "./scripts/validate_session.cjs";
+import { compactUnifiedSession } from "./compact_unified_session.cjs";
+import { sendSessionLogs } from "./send_otlp_session_logs.cjs";
 
 const req = require;
 const { writeDetectionUsageResult } = req("./generate_usage_activity_summary.cjs");
@@ -13,14 +14,16 @@ const { parseCustomLog } = req("./parse_custom_log.cjs");
 const { success: piSuccess } = req("./fixtures/pi_ci_stream.cjs");
 const claudeFixtures = req("./fixtures/claude_ci_sessions.cjs");
 const { dynamicWorkflow } = req("./fixtures/claude_dynamic_workflow.cjs");
+const { useModelOverrides } = req("./fixtures/model_overrides.cjs");
 const codexNoTools = fs.readFileSync(new URL("./test_data/codex_ci_no_tools.jsonl", import.meta.url), "utf8");
 
 describe("Unified conclusion session", () => {
   let root;
   let originalEnv;
   let originalCore;
+  let restoreModels;
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-unified-session-"));
+    root = fs.mkdtempSync(path.resolve(".gh-aw-unified-session-"));
     originalEnv = { ...process.env };
     process.env.GITHUB_RUN_ID = "123";
     process.env.GITHUB_RUN_ATTEMPT = "2";
@@ -28,6 +31,8 @@ describe("Unified conclusion session", () => {
     global.core = { info: vi.fn(), warning: vi.fn() };
   });
   afterEach(() => {
+    restoreModels?.();
+    restoreModels = undefined;
     process.env = originalEnv;
     global.core = originalCore;
     vi.restoreAllMocks();
@@ -40,6 +45,94 @@ describe("Unified conclusion session", () => {
     fs.writeFileSync(target, typeof entries === "string" ? entries : file.endsWith(".json") ? JSON.stringify(entries) : entries.map(entry => JSON.stringify(entry)).join("\n") + "\n");
     return target;
   }
+
+  it.each(["file_reference_failed", "sensitive_content_blocked"])("publishes typed skip decisions with %s in the agent unified session without model inputs", error => {
+    const decision = {
+      proposedAttempt: 1,
+      outcome: "deny",
+      questions: [
+        { question: 1, outcome: "unknown", error },
+        { question: 2, outcome: "deny" },
+      ],
+      timestamp: 1000,
+      latencyMs: 25,
+      avoidedInvocation: true,
+      privateProviderBody: "private",
+    };
+    write("agent/harness_retry.json", { attempts: 0, exit_code: 0, attempt_results: [], decision_results: [decision] });
+    const outputPath = path.join(root, "usage/aw_session.jsonl");
+    const events = writeUnifiedSession({ rootDir: root, outputPath });
+    const event = events.find(event => event.type === "harness.decision");
+    expect(event?.data).toMatchObject({ proposedAttempt: 1, outcome: "deny", latencyMs: 25, avoidedInvocation: true, questions: decision.questions });
+    expect(event?.provenance).toMatchObject({ component: "harness", phase: "agent", path: "agent/harness_retry.json" });
+    const content = fs.readFileSync(outputPath, "utf8");
+    expect(content).not.toContain("private");
+    expect(validateSession(content)).toBe(events.length);
+  });
+
+  it("rejects malformed decision telemetry rather than treating it as a skip", () => {
+    write("agent/harness_retry.json", {
+      attempts: 0,
+      exit_code: 0,
+      attempt_results: [],
+      decision_results: [{ proposedAttempt: 1, outcome: "deny", questions: [{ question: 1, outcome: "unknown" }], timestamp: 1000, latencyMs: 1, avoidedInvocation: true }],
+    });
+    const { events } = collectUnifiedSession({ rootDir: root });
+    expect(events.some(event => event.type === "harness.decision")).toBe(false);
+    expect(events.some(event => event.type === "session.collection_warning" && event.data.code === "invalid_harness_retry")).toBe(true);
+  });
+
+  it("collects and exports only run-scoped durable metadata without historical top-level content", async () => {
+    const metadata = { engine: "codex", storage: "artifact", runId: "123", runAttempt: "2", parentRunId: "122" };
+    write("agent/durable-session.jsonl", [
+      {
+        type: "durable.restore",
+        timestamp: "2026-11-08T15:00:00+01:00",
+        provenance: { transcript: "historical provenance" },
+        metadata: "historical metadata",
+        id: "historical id",
+        data: { ...metadata, status: "restored", artifactId: "99", transcript: "historical instructions" },
+      },
+      { type: "durable.session", metadata: "historical startup", data: { ...metadata, status: "resumed", sessionId: "native-id" } },
+      { type: "durable.session", data: { ...metadata, runAttempt: "1", status: "fresh", sessionId: "previous-attempt" } },
+      { type: "durable.session", timestamp: "historical timestamp", data: { ...metadata, status: "resumed", sessionId: "invalid-timestamp" } },
+    ]);
+    const output = path.join(root, "usage/aw_session.jsonl");
+    const events = writeUnifiedSession({ rootDir: root, outputPath: output });
+    const durable = events.filter(event => event.type.startsWith("durable."));
+    expect(durable).toHaveLength(2);
+    expect(durable[1].data).toMatchObject({ status: "resumed", parentRunId: "122", sessionId: "native-id" });
+    expect(durable[0].provenance).toMatchObject({ component: "durable", phase: "agent", path: "agent/durable-session.jsonl" });
+    expect(durable[0].timestamp).toBe("2026-11-08T14:00:00.000Z");
+    expect(durable[0].provenance).not.toHaveProperty("native");
+    expect(events).toContainEqual(expect.objectContaining({ type: "session.collection_warning", data: expect.objectContaining({ code: "invalid_durable_session" }) }));
+    const content = fs.readFileSync(output, "utf8");
+    expect(content).not.toContain("historical");
+    expect(validateSession(content)).toBe(events.length);
+    expect(JSON.stringify(compactUnifiedSession(events))).not.toContain("historical");
+    const otlp = require("./send_otlp_span.cjs");
+    vi.spyOn(otlp, "parseOTLPEndpoints").mockReturnValue([{ url: "https://collector.example/otlp", headers: {} }]);
+    const send = vi.spyOn(otlp, "sendOTLPToAllEndpoints").mockResolvedValue(undefined);
+    process.env.GH_AW_OTLP_LOGS_ENABLED = "true";
+    await sendSessionLogs({ sessionPath: output });
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(send.mock.calls[0])).not.toContain("historical");
+  });
+
+  it("reports malformed durable evidence instead of synthesizing a resumed session", () => {
+    write("usage/agent/durable-session.jsonl", [{ type: "durable.session", data: { status: "resumed", engine: "codex" } }]);
+    const { events } = collectUnifiedSession({ rootDir: root, warn() {} });
+    expect(events.some(event => event.type === "durable.session")).toBe(false);
+    expect(events).toContainEqual(expect.objectContaining({ type: "session.collection_warning", data: expect.objectContaining({ code: "invalid_durable_session" }) }));
+  });
+
+  it.each(["2026-02-30T12:00:00Z", "2026-11-08T24:00:00Z", "historical secret", 123, { secret: "historical instructions" }])("rejects invalid durable timestamps without retaining their content: %j", timestamp => {
+    write("agent/durable-session.jsonl", [{ type: "durable.session", timestamp, data: { engine: "codex", storage: "artifact", runId: "123", runAttempt: "2", status: "fresh", sessionId: "native-id" } }]);
+    const { events } = collectUnifiedSession({ rootDir: root, warn() {} });
+    expect(events.some(event => event.type === "durable.session")).toBe(false);
+    expect(events).toContainEqual(expect.objectContaining({ type: "session.collection_warning", data: expect.objectContaining({ code: "invalid_durable_session" }) }));
+    expect(JSON.stringify(events)).not.toContain("historical");
+  });
 
   it("records the selected PR revision in the unified session", () => {
     const selectedSha = "ABCDEF0123456789ABCDEF0123456789ABCDEF01";
@@ -775,6 +868,89 @@ describe("Unified conclusion session", () => {
     expect(events.filter(event => event.type === "grader.result")).toHaveLength(1);
   });
 
+  it.each(["aw_info.json", "activation/aw_info.json", "runtime/aw_info.json"])("reconciles reused successful activation from %s at the live conclusion boundary, not offline replay", async metadataPath => {
+    const workflowId = "org/repo/.github/workflows/worker.lock.yml@refs/heads/main";
+    const callerWorkflowRef = "org/parent/.github/workflows/caller.yml@refs/heads/main";
+    const snapshot = {
+      run_id: "123",
+      run_attempt: 1,
+      workflow_id: workflowId,
+      workflow_call_id: `123-1:${workflowId}`,
+      caller_workflow_ref: callerWorkflowRef,
+      engine_id: "codex",
+      model: "fixture-model",
+      context: {
+        episode_id: "100-1:root",
+        hop_id: "122-1:caller",
+        parent_hop_id: "100-1:root",
+        root_run_id: "100",
+        repo: "org/parent",
+        run_id: "122",
+        run_attempt: "1",
+        workflow_id: callerWorkflowRef,
+        workflow_call_id: `122-1:${callerWorkflowRef}`,
+      },
+    };
+    const metadataFile = write(metadataPath, snapshot);
+    const durable = ["1", "2"].flatMap(runAttempt => {
+      const identity = { engine: "codex", storage: "artifact", runId: "123", runAttempt, parentRunId: "122" };
+      return [
+        { type: "durable.restore", data: { ...identity, status: "restored", artifactId: runAttempt } },
+        { type: "durable.session", data: { ...identity, status: "resumed", sessionId: `session-${runAttempt}` } },
+      ];
+    });
+    const durableFile = write("agent/durable-session.jsonl", durable);
+    write(
+      "evals.jsonl",
+      ["1", "2"].map(runAttempt => ({ id: `attempt-${runAttempt}`, runid: "123", runAttempt, answer: "YES" }))
+    );
+    write(
+      "agent/graders/grader_results.json",
+      [1, 2].map(attempt => ({ run: { id: "123", attempt }, results: [{ id: `attempt-${attempt}` }] }))
+    );
+    const recorded = collectUnifiedSession({ rootDir: root, dailyAIC: { GITHUB_RUN_ID: "456", GITHUB_RUN_ATTEMPT: "3" } }).events;
+    expect(recorded.filter(event => event.type.startsWith("durable.")).map(event => event.data.runAttempt)).toEqual(["1", "1"]);
+    const recordedInfo = recorded.find(event => event.type === "workflow.info").data;
+    expect(recordedInfo).toMatchObject({ runId: "123", runAttempt: 1, workflowId, workflowCallId: `123-1:${workflowId}` });
+    expect(recorded.find(event => event.type === "grader.result").data.run).toMatchObject({ id: "123", attempt: 1 });
+
+    global.core.summary = { addDetails: vi.fn(), write: vi.fn().mockResolvedValue(undefined) };
+    process.env.GITHUB_STEP_SUMMARY = path.join(root, "step-summary.md");
+    await main({ rootDir: root, jobDurations: {} });
+
+    const content = fs.readFileSync(path.join(root, "usage/aw_session.jsonl"), "utf8");
+    const events = content.trim().split("\n").map(JSON.parse);
+    expect(validateSession(content)).toBe(events.length);
+    expect(events.find(event => event.type === "workflow.info")).toMatchObject({
+      data: {
+        runId: "123",
+        runAttempt: 2,
+        workflowId,
+        workflowCallId: `123-2:${workflowId}`,
+        callerWorkflowRef,
+        engineId: "codex",
+        model: "fixture-model",
+        awContext: recordedInfo.awContext,
+        episode: recordedInfo.episode,
+      },
+      provenance: { component: "workflow", phase: metadataPath.startsWith("runtime/") ? "agent" : "activation", path: metadataPath },
+    });
+    expect(events.filter(event => event.type.startsWith("durable."))).toMatchObject([
+      { type: "durable.restore", data: { runId: "123", runAttempt: "2", parentRunId: "122", artifactId: "2" } },
+      { type: "durable.session", data: { runId: "123", runAttempt: "2", parentRunId: "122", sessionId: "session-2" } },
+    ]);
+    expect(events.filter(event => event.type.startsWith("durable."))).toHaveLength(2);
+    expect(events.filter(event => event.type === "eval.result").map(event => event.data.id)).toEqual(["attempt-2"]);
+    expect(events.find(event => event.type === "grader.result").data.run).toMatchObject({ id: "123", attempt: 2, graderCount: 10 });
+    const graderOutput = JSON.parse(fs.readFileSync(path.join(root, "usage/graders/grader_results.json"), "utf8"));
+    expect(graderOutput.run).toMatchObject({ id: "123", attempt: 2 });
+    expect(fs.readFileSync(metadataFile, "utf8")).toBe(JSON.stringify(snapshot));
+    expect(fs.readFileSync(durableFile, "utf8")).toBe(durable.map(record => JSON.stringify(record)).join("\n") + "\n");
+    const replay = collectUnifiedSession({ rootDir: root, dailyAIC: {} }).events;
+    expect(replay.filter(event => event.type.startsWith("durable.")).map(event => event.data.runAttempt)).toEqual(["1", "1"]);
+    expect(replay.find(event => event.type === "workflow.info").data).toEqual(recordedInfo);
+  });
+
   it("warns and omits results when the current run cannot be identified", () => {
     delete process.env.GITHUB_RUN_ID;
     delete process.env.GITHUB_RUN_ATTEMPT;
@@ -1297,6 +1473,43 @@ describe("Unified conclusion session", () => {
     expect(events.find(event => event.type === "workflow.info").data).not.toHaveProperty("secret");
   });
 
+  it("publishes downloaded Kiro activation metadata and preserves observed session.init fields", () => {
+    // Synthetic transport regression, not native Kiro structured-stream evidence.
+    write("aw_info.json", {
+      engine_id: "kiro",
+      agent_version: "2.31.1",
+      model: "kiro/auto",
+      event_name: "schedule",
+      sha: "a".repeat(40),
+      run_id: 123,
+      run_attempt: 2,
+      workflow_id: "example/repo/.github/workflows/smoke-kiro.lock.yml@refs/heads/main",
+    });
+    write("agent-session.jsonl", [{ type: "session.init", data: { sourceEngine: "kiro", agentVersion: "2.31.1" } }]);
+
+    const events = writeUnifiedSession({ rootDir: root });
+    const metadata = events.filter(event => event.type === "workflow.info");
+    expect(metadata).toHaveLength(1);
+    expect(metadata[0]).toMatchObject({
+      data: {
+        engineId: "kiro",
+        agentVersion: "2.31.1",
+        model: "kiro/auto",
+        requestedModel: "kiro/auto",
+        triggerType: "schedule",
+        sha: "a".repeat(40),
+        runId: 123,
+        runAttempt: 2,
+        workflowId: "example/repo/.github/workflows/smoke-kiro.lock.yml@refs/heads/main",
+      },
+      provenance: { component: "workflow", phase: "activation", path: "aw_info.json", index: 0 },
+    });
+    expect(events.find(event => event.type === "session.init").data).toEqual({ sourceEngine: "kiro", agentVersion: "2.31.1" });
+    const persisted = fs.readFileSync(path.join(root, "usage/aw_session.jsonl"), "utf8");
+    expect(persisted.trim().split("\n").map(JSON.parse)).toEqual(events);
+    expect(validateSession(persisted)).toBe(events.length);
+  });
+
   it("prefers runner routing metadata over agent metadata and preserves the harness outcome", () => {
     write("aw_info.json", {
       engine_id: "claude",
@@ -1554,6 +1767,7 @@ describe("Unified conclusion session", () => {
   });
 
   it("resolves detection and eval AIC per observation without adding overlapping checkpoints", () => {
+    restoreModels = useModelOverrides({ openai: { models: { "gpt-4o-mini": { cost: { input: "0.000002", output: "0.000004" } } } } });
     write("threat-detection/detection_usage.jsonl", [
       { provider: "openai", model: "gpt-4o-mini", input_tokens: 1000, output_tokens: 100 },
       { provider: "openai", model: "unknown-model", input_tokens: 10 },
@@ -1670,6 +1884,70 @@ describe("Unified conclusion session", () => {
     expect(summary).toContain("Tools: 1/1 succeeded");
   });
 
+  it.each([
+    ["complete", { aiCreditsStatus: "complete", totalNanoAiu: 833979000 }, 833979000, { aiCreditsStatus: "complete", totalNanoAiu: 833979000 }],
+    ["verified zero", { aiCreditsStatus: "complete", totalNanoAiu: 0 }, 0, { aiCreditsStatus: "complete", totalNanoAiu: 0 }],
+    ["partial subtotal", { aiCreditsStatus: "partial", totalNanoAiu: 17 }, 17, { aiCreditsStatus: "partial", totalNanoAiu: 17 }],
+    ["unavailable zero", { aiCreditsStatus: "unavailable", totalNanoAiu: 0 }, 0, { aiCreditsStatus: "unavailable" }],
+    ["missing snapshot", undefined, 0, { aiCreditsStatus: "unavailable" }],
+    ["missing amount", { aiCreditsStatus: "complete" }, 0, { aiCreditsStatus: "unavailable" }],
+    ["contradictory total", { aiCreditsStatus: "complete", totalNanoAiu: 0 }, 17, { aiCreditsStatus: "unavailable" }],
+  ])("publishes %s Copilot terminal credits without substituting a proxy estimate", (_label, accountingSnapshot, totalNanoAiu, expected) => {
+    write("sandbox/agent/logs/copilot-session-state/native/events.jsonl", [
+      { type: "session.start", data: { sessionId: "native" } },
+      { type: "assistant.message", data: { content: "Done." } },
+      { type: "session.shutdown", data: { accountingSnapshot, totalNanoAiu } },
+    ]);
+    write("sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl", [{ event: "token_usage", model: "fixture-model", ai_credits_total: 12.5 }]);
+    const outputPath = path.join(root, "usage/aw_session.jsonl");
+    writeUnifiedSession({ rootDir: root, engine: "copilot", outputPath });
+    const content = fs.readFileSync(outputPath, "utf8");
+    const events = content.trimEnd().split("\n").map(JSON.parse);
+    expect(validateSession(content)).toBe(events.length);
+    const [shutdown] = events.filter(event => event.type === "session.shutdown");
+    expect(shutdown.data).toEqual(expected);
+    expect(normalizeUnifiedSessionEvent(shutdown).data).toEqual(expected);
+    expect(req("./session_cli.cjs").sessionCLI(["markdown", outputPath])).toContain(`aiCreditsStatus=${expected.aiCreditsStatus}`);
+    expect(events.find(event => event.type === "firewall.token_usage")?.data.totalAic).toBe(12.5);
+    expect(JSON.stringify(events)).not.toContain("primaryAic");
+  });
+
+  it("does not infer Copilot terminal credits from a legacy total or a different engine", () => {
+    const legacy = { type: "session.shutdown", data: { totalNanoAiu: 0 } };
+    expect(normalizeUnifiedSessionEvent(legacy)).toEqual(legacy);
+    const source = { component: "agent", phase: "agent", path: "agent-session.jsonl", events: [{ ...legacy, data: { ...legacy.data, accountingSnapshot: { aiCreditsStatus: "complete", totalNanoAiu: 0 } } }] };
+    expect(mergeSessionSources([source], "custom")[0].data).toEqual(legacy.data);
+  });
+
+  it.each([
+    [
+      { aiCreditsStatus: "complete", totalNanoAiu: 0 },
+      { aiCreditsStatus: "complete", totalNanoAiu: 0 },
+    ],
+    [undefined, { aiCreditsStatus: "unavailable" }],
+  ])("reconstructs Copilot terminal credits from canonical session identity without workflow metadata: %j", (accountingSnapshot, expected) => {
+    write("agent-session.jsonl", [
+      { type: "session.init", data: { sessionId: "native", sourceEngine: "copilot" } },
+      { type: "session.shutdown", provenance: { component: "agent", phase: "agent", path: "copilot-session-state/native/events.jsonl", index: 1 }, data: { totalNanoAiu: 0, accountingSnapshot } },
+    ]);
+    const { events } = collectUnifiedSession({ rootDir: root });
+    expect(events.find(event => event.type === "session.shutdown").data).toEqual(expected);
+  });
+
+  it.each(["agent-stdio.log", "pi-streaming.jsonl", "agent-session.jsonl"])("does not publish Copilot terminal credits from fallback %s", file => {
+    const native = { component: "agent", phase: "agent", path: "sandbox/agent/logs/copilot-session-state/native/events.jsonl", index: 0 };
+    write(file, [
+      { type: "session.start", provenance: native, data: { sessionId: "native" } },
+      {
+        type: "session.shutdown",
+        provenance: file === "agent-session.jsonl" ? { ...native, path: "agent-stdio.log" } : native,
+        data: { totalNanoAiu: 17, aiCreditsStatus: "complete", accountingSnapshot: { aiCreditsStatus: "complete", totalNanoAiu: 17 } },
+      },
+    ]);
+    const { events } = collectUnifiedSession({ rootDir: root, engine: "copilot" });
+    expect(events.find(event => event.type === "session.shutdown")?.data).toEqual({ aiCreditsStatus: "unavailable" });
+  });
+
   it.each([[`{"type":"session.start","data":{"sessionId":"native"}}\n`], [`{"type":"session.start","data":{"sessionId":"native"}}\n{"type":"assistant.message",`]])(
     "falls back to stdio when native Copilot events are incomplete",
     nativeContent => {
@@ -1693,11 +1971,21 @@ describe("Unified conclusion session", () => {
       { timestamp: "2026-10-02T00:00:01Z", event: "token_usage", request_id: "credit", purpose: "agent", model: "claude-sonnet-5", input_tokens: 1, steering: { type: "ai_credit", threshold: 80 } },
       { timestamp: "2026-10-02T00:00:02Z", event: "token_usage", request_id: "plain", purpose: "agent", model: "claude-sonnet-5", input_tokens: 1 },
       { timestamp: "2026-10-02T00:00:03Z", event: "token_usage", request_id: "time", purpose: "agent", model: "claude-sonnet-5", input_tokens: 1, steering: { type: "timeout", threshold: 90 } },
+      {
+        timestamp: "2026-10-02T00:00:05Z",
+        event: "token_usage",
+        request_id: "little",
+        purpose: "agent",
+        model: "claude-sonnet-5",
+        input_tokens: 1,
+        steering_delivery: { type: "ai_credit", trigger: "little_left", threshold: null, conversation: "0123456789ab", first: true },
+      },
     ]);
     write("sandbox/firewall/logs/api-proxy-logs/events.jsonl", [
       { timestamp: "2026-10-02T00:00:01Z", level: "info", event: "ai_credit_steering", request_id: "credit", provider: "copilot", threshold: 80, message: "[AWF AI CREDIT WARNING] budget" },
       { timestamp: "2026-10-02T00:00:03Z", level: "info", event: "timeout_steering", request_id: "time", provider: "copilot", threshold: 90, message: "[AWF TIME WARNING] time" },
       { timestamp: "2026-10-02T00:00:04Z", payload: { event: "TOKEN_STEERING" }, request_id: "tokens", threshold: 95, message: "[AWF TOKEN WARNING] tokens" },
+      { timestamp: "2026-10-02T00:00:05Z", level: "info", event: "ai_credit_steering", request_id: "little", threshold: null, trigger: "little_left", conversation: "0123456789ab", message: "[AWF AI CREDIT WARNING] little" },
     ]);
     const { events } = collectUnifiedSession({ rootDir: root });
     const usage = events.filter(event => event.type === "firewall.token_usage");
@@ -1705,16 +1993,20 @@ describe("Unified conclusion session", () => {
       ["credit", { type: "ai_credit", threshold: 80 }],
       ["plain", undefined],
       ["time", { type: "timeout", threshold: 90 }],
+      ["little", undefined],
     ]);
+    expect(usage[3].data.steeringDelivery).toEqual({ type: "ai_credit", trigger: "little_left", threshold: null, conversation: "0123456789ab", first: true });
     expect(usage[1].data).not.toHaveProperty("steering");
     expect(events.filter(event => event.type === "firewall.steering").map(event => event.data)).toEqual([
       { event: "ai_credit_steering", level: "info", message: "[AWF AI CREDIT WARNING] budget", requestId: "credit", threshold: 80 },
       { event: "timeout_steering", level: "info", message: "[AWF TIME WARNING] time", requestId: "time", threshold: 90 },
       { event: "token_steering", message: "[AWF TOKEN WARNING] tokens", requestId: "tokens", threshold: 95 },
+      { event: "ai_credit_steering", level: "info", message: "[AWF AI CREDIT WARNING] little", requestId: "little", threshold: null, trigger: "little_left", conversation: "0123456789ab" },
     ]);
     const validate = req("./scripts/validate_session.cjs").createSessionValidator("unified").event;
     for (const event of events) expect(validate(event), JSON.stringify(validate.errors)).toBe(true);
     expect(validate({ ...usage[0], data: { ...usage[0].data, steering: { type: "ai_credit", threshold: 80, message: "PRIVATE" } } })).toBe(false);
+    expect(validate({ ...usage[3], data: { ...usage[3].data, steeringDelivery: { ...usage[3].data.steeringDelivery, conversation: "PRIVATE" } } })).toBe(false);
   });
 
   it("prefers persisted canonical events over raw logs and avoids replicated firewall accounting", () => {

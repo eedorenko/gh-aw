@@ -27,17 +27,21 @@ const { generateTemporaryId, getOrGenerateTemporaryId } = require("./temporary_i
 const { parseAllowedExtensionsEnv } = require("./allowed_extensions_helpers.cjs");
 const { buildExcludePathspecs, getStagedPatchDiffSizeBytes } = require("./git_patch_utils.cjs");
 const { sanitizeTitle, applyTitlePrefix } = require("./sanitize_title.cjs");
-const { parseDeduplicateByTitle, normalizeTitleForDedup, findDuplicateByTitle } = require("./issue_title_dedup.cjs");
+const { parseDeduplicateByTitle, normalizeTitleForDedup, normalizeDeduplicationLabels, hasDeduplicationLabels, findDuplicateIssue } = require("./issue_title_dedup.cjs");
+const { sanitizeLabelContent } = require("./sanitize_label_content.cjs");
 const { isProbingNoopMessage, validateCreatePullRequestIntent, validatePushToPullRequestBranchIntent, validateCreateIssueIntent, validateAddCommentIntent } = require("./intent_probe.cjs");
 const { globPatternToRegex } = require("./glob_pattern_helpers.cjs");
 const { resolveInvocationContext } = require("./invocation_context_helpers.cjs");
-const { lstatGuard, normalizeGuardedPath, readGuardedFile, writeGuardedFile } = require("./symlink_guard.cjs");
+const { lstatGuard, normalizeGuardedPath, resolveWorkspaceOrTmpPath, validateUploadSourcePath, readGuardedFile, writeGuardedFile } = require("./symlink_guard.cjs");
+const { resolveIssueArtifactPaths } = require("./issue_artifacts.cjs");
 const { validateValueAgainstSchema } = require("./schema-validation.cjs");
 const { resolveDataSchema } = require("./data_schema_normalizer.cjs");
 const { normalizeBlankOptionalFields } = require("./optional_field_normalizer.cjs");
 const { clearValidationMarker, formatJSONFiles, runCustomMemoryValidation, writeValidationMarker } = require("./memory_custom_validation.cjs");
 const { compileFileGlobPatterns, isMemoryFileEligible } = require("./memory_file_eligibility.cjs");
+const { copyFileExclusive, copyDirectoryExclusive } = require("./staging_conflicts.cjs");
 const { normalizeRuntimeMessage, readClaimScopeContext, withClaimExecution, currentClaimHandle, claimArtifactPath } = require("./work_queue_claim_scope.cjs");
+const { createSubmissionTracker, isDependencyUnsupportedType } = require("./safe_output_submission.cjs");
 
 function createEligibleMemoryValidationView(memoryDir, isEligibleFile) {
   let validationDir;
@@ -443,6 +447,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
    * @type {Map<string, number>}
    */
   const operationCounts = new Map();
+  const submissions = createSubmissionTracker();
   const uploadedAssetPaths = new Set();
   const scopedKey = value => JSON.stringify([currentClaimHandle() || null, value]);
 
@@ -522,7 +527,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     }
     const type = entry?.type;
     if (type) enforcePerTypeMax(type);
-    appendSafeOutput(entry);
+    submissions.append(entry, appendSafeOutput);
     if (type) operationCounts.set(scopedKey(type), (operationCounts.get(scopedKey(type)) || 0) + 1);
   };
 
@@ -642,7 +647,19 @@ function createHandlers(server, appendSafeOutput, config = {}) {
    * @returns {Function} Handler function
    */
   const defaultHandler = type => args => {
-    const entry = { ...(args || {}), type };
+    let entry = { ...(args || {}), type };
+    const stagedFiles = getSafeOutputsToolConfig(config, type)?.staged_files;
+    if (stagedFiles) {
+      try {
+        entry = require("./connector_file.cjs").stageConnectorFiles(entry, stagedFiles, {
+          root: path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw", "safeoutputs", "upload-artifacts"),
+          workspace: process.env.GITHUB_WORKSPACE,
+          rejectPath: validateUploadSourcePath,
+        });
+      } catch (error) {
+        return buildIntentErrorResponse(`Connector file staging failed: ${getErrorMessage(error)}`);
+      }
+    }
     if (entry.data !== undefined) {
       const toolConfig = getSafeOutputsToolConfig(config, type);
       const dataEnabled = toolConfig?.data_enabled === true || (toolConfig?.data_schema && typeof toolConfig.data_schema === "object");
@@ -670,8 +687,13 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     if (wildcardTargetValidationError) {
       return wildcardTargetValidationError;
     }
+    const temporaryField = getSafeOutputsToolConfig(config, type)?.temporary_id_field;
+    if (temporaryField && entry[temporaryField] === undefined) entry[temporaryField] = generateTemporaryId();
     const largeContentResponse = maybeHandleLargeContent(entry);
-    if (largeContentResponse) return largeContentResponse;
+    if (largeContentResponse) {
+      if (temporaryField) largeContentResponse.content.push({ type: "text", text: JSON.stringify({ temporary_id: entry[temporaryField] }) });
+      return largeContentResponse;
+    }
 
     // Normal case - no large content
     appendSafeOutputCounted(entry);
@@ -679,7 +701,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       content: [
         {
           type: "text",
-          text: JSON.stringify({ result: "success" }),
+          text: JSON.stringify({ result: "success", ...(temporaryField ? { temporary_id: entry[temporaryField] } : {}) }),
         },
       ],
     };
@@ -725,6 +747,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
   };
 
   const createIssueConfig = config.create_issue || {};
+  const deduplicateByLabels = normalizeDeduplicationLabels(createIssueConfig.deduplicate_by_labels);
   let deduplicateByTitle = { enabled: false, maxDistance: 0 };
   try {
     deduplicateByTitle = parseDeduplicateByTitle(createIssueConfig.deduplicate_by_title);
@@ -749,20 +772,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     const { path: filePath } = args;
 
     // Validate file path is within allowed directories
-    const absolutePath = normalizeGuardedPath(filePath);
-    const workspaceDir = process.env.GITHUB_WORKSPACE || process.cwd();
-    const tmpDir = "/tmp";
-
-    const isWithin = root => {
-      const relative = path.relative(normalizeGuardedPath(root), absolutePath);
-      return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
-    };
-    const isInWorkspace = isWithin(workspaceDir);
-    const isInTmp = isWithin(tmpDir);
-
-    if (!isInWorkspace && !isInTmp) {
-      throw new Error(`${ERR_CONFIG}: File path must be within workspace directory (${workspaceDir}) or /tmp directory. ` + `Provided path: ${filePath} (resolved to: ${absolutePath})`);
-    }
+    const absolutePath = resolveWorkspaceOrTmpPath(filePath);
     if (uploadedAssetPaths.has(scopedKey(absolutePath))) {
       throw new Error(`${ERR_VALIDATION}: Duplicate upload_asset source path is not allowed: ${filePath}`);
     }
@@ -814,7 +824,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     const stagedFileName = `${crypto.createHash("sha256").update(filePath).digest("hex")}${fileExt}`;
     const targetPath = path.join(assetsDir, stagedFileName);
     try {
-      writeGuardedFile(targetPath, fileContent);
+      writeGuardedFile(targetPath, fileContent, { mode: 0o600, directoryMode: 0o700 });
     } catch (err) {
       if (err && typeof err === "object" && "code" in err && err.code === ERR_VALIDATION) throw err;
       throw new Error(`${ERR_SYSTEM}: Failed to copy file ${filePath} to ${targetPath}: ${getErrorMessage(err)}`, { cause: err });
@@ -2241,6 +2251,10 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     }
     const resolvedRepo = repoResult.repo;
 
+    if (entry.artifacts !== undefined) {
+      entry.artifacts = resolveIssueArtifactPaths(entry.artifacts, createIssueConfig.max_issue_artifacts, createIssueConfig.max_issue_artifact_size);
+    }
+
     let resolvedTitle = entry.title?.trim() || "";
     if (!resolvedTitle) {
       // Use the first non-empty line of the body as the title fallback rather than
@@ -2253,10 +2267,10 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     }
     resolvedTitle = applyTitlePrefix(sanitizeTitle(resolvedTitle, createIssueTitlePrefix), createIssueTitlePrefix);
 
-    if (deduplicateByTitle.enabled) {
+    if (deduplicateByTitle.enabled || deduplicateByLabels.length > 0) {
       const normalizedTitle = normalizeTitleForDedup(resolvedTitle);
       const seenTitles = seenIssueTitlesByRepo.get(scopedKey(resolvedRepo)) || [];
-      const duplicate = findDuplicateByTitle(normalizedTitle, seenTitles, deduplicateByTitle.maxDistance);
+      const duplicate = findDuplicateIssue(normalizedTitle, seenTitles, deduplicateByTitle);
       if (duplicate) {
         const droppedEntry = {
           ...entry,
@@ -2281,8 +2295,15 @@ function createHandlers(server, appendSafeOutput, config = {}) {
           ],
         };
       }
-      seenTitles.push({ title: resolvedTitle, normalizedTitle });
-      seenIssueTitlesByRepo.set(scopedKey(resolvedRepo), seenTitles);
+      const defaultLabels = Array.isArray(createIssueConfig.labels) ? createIssueConfig.labels : (createIssueConfig.labels || "").split(",");
+      const labels = [...defaultLabels, ...(Array.isArray(entry.labels) ? entry.labels : [])]
+        .filter(Boolean)
+        .map(label => sanitizeLabelContent(String(label).trim()).slice(0, 64))
+        .filter(Boolean);
+      if (hasDeduplicationLabels(labels, deduplicateByLabels)) {
+        seenTitles.push({ title: resolvedTitle, normalizedTitle });
+        seenIssueTitlesByRepo.set(scopedKey(resolvedRepo), seenTitles);
+      }
     }
 
     const largeContentResponse = maybeHandleLargeContent(entry);
@@ -2296,90 +2317,6 @@ function createHandlers(server, appendSafeOutput, config = {}) {
           text: JSON.stringify({ result: "success" }),
         },
       ],
-    };
-  };
-
-  const createWorkItemHandler = args => {
-    const temporaryId = `#${generateTemporaryId()}`;
-    const entry = { ...(args || {}), type: "ado_create_work_item", temporary_id: temporaryId };
-    appendSafeOutputCounted(entry);
-    const output = { result: "success", temporary_id: temporaryId };
-    return {
-      content: [{ type: "text", text: JSON.stringify(output) }],
-      structuredContent: output,
-    };
-  };
-
-  const createAzureDevOpsWorkItemHandler = type => args => {
-    const entry = { ...(args || {}), type };
-    appendSafeOutputCounted(entry);
-    return {
-      content: [{ type: "text", text: JSON.stringify({ result: "success" }) }],
-    };
-  };
-
-  const uploadWorkItemAttachmentHandler = args => {
-    const entry = { ...(args || {}), type: "ado_upload_workitem_attachment" };
-    const rawPath = typeof entry.file_path === "string" ? entry.file_path.trim() : "";
-    if (!rawPath || path.isAbsolute(rawPath) || rawPath.includes(":")) {
-      return buildIntentErrorResponse("ado_upload_workitem_attachment file_path must be a workspace-relative path without ':'");
-    }
-
-    const segments = rawPath.split(/[\\/]+/);
-    if (segments.some(segment => !segment || segment === "." || segment === "..")) {
-      return buildIntentErrorResponse("ado_upload_workitem_attachment file_path must not contain empty, '.' or '..' path segments");
-    }
-
-    const workspace = path.resolve(process.env.GITHUB_WORKSPACE || process.cwd());
-    const sourcePath = path.resolve(workspace, ...segments);
-    if (sourcePath !== workspace && !sourcePath.startsWith(workspace + path.sep)) {
-      return buildIntentErrorResponse("ado_upload_workitem_attachment file_path resolves outside the workspace");
-    }
-
-    let current = workspace;
-    let sourceStat;
-    try {
-      for (const segment of segments) {
-        current = path.join(current, segment);
-        sourceStat = lstatGuard(current);
-        if (!sourceStat) {
-          return buildIntentErrorResponse("ado_upload_workitem_attachment does not accept symbolic links");
-        }
-      }
-    } catch (error) {
-      return buildIntentErrorResponse(`ado_upload_workitem_attachment could not read file_path: ${getErrorMessage(error)}`);
-    }
-    if (!sourceStat?.isFile()) {
-      return buildIntentErrorResponse("ado_upload_workitem_attachment file_path must identify one regular file");
-    }
-
-    const attachmentConfig = getSafeOutputsToolConfig(config, "ado_upload_workitem_attachment");
-    const maxFileSize = Number(attachmentConfig.max_file_size || 5 * 1024 * 1024);
-    if (!Number.isSafeInteger(maxFileSize) || maxFileSize < 1 || sourceStat.size > maxFileSize) {
-      return buildIntentErrorResponse(`ado_upload_workitem_attachment file exceeds the configured max-file-size of ${maxFileSize} bytes`);
-    }
-    const allowedExtensions = Array.isArray(attachmentConfig.allowed_extensions) ? attachmentConfig.allowed_extensions : [];
-    if (allowedExtensions.length > 0 && !allowedExtensions.some(extension => rawPath.toLowerCase().endsWith(String(extension).toLowerCase()))) {
-      return buildIntentErrorResponse("ado_upload_workitem_attachment file extension is not allowed by the workflow configuration");
-    }
-
-    try {
-      const stagingRoot = path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw", "safeoutputs", "upload-artifacts");
-      const stagingDirectory = path.join(stagingRoot, "azure-devops-work-items");
-      fs.mkdirSync(stagingDirectory, { recursive: true, mode: 0o700 });
-      const stagedName = `${crypto.randomUUID()}-${segments[segments.length - 1]}`;
-      const stagedPath = path.join(stagingDirectory, stagedName);
-      fs.copyFileSync(sourcePath, stagedPath, fs.constants.COPYFILE_EXCL);
-      fs.chmodSync(stagedPath, 0o600);
-      entry.staged_file = path.posix.join("azure-devops-work-items", stagedName);
-    } catch (error) {
-      throw new Error(`${ERR_SYSTEM}: Failed to stage Azure DevOps work-item attachment: ${getErrorMessage(error)}`, { cause: error });
-    }
-
-    entry.file_path = rawPath;
-    appendSafeOutputCounted(entry);
-    return {
-      content: [{ type: "text", text: JSON.stringify({ result: "success", file_path: rawPath }) }],
     };
   };
 
@@ -2665,61 +2602,35 @@ function createHandlers(server, appendSafeOutput, config = {}) {
   }
 
   /**
-   * Validate that a canonical absolute path does not refer to sensitive system or credential
-   * locations. Returns an error message string, or null if the path is safe.
-   *
-   * Rejected patterns:
-   *  - Any path with a ".git" directory component (prevents .git/config leakage).
-   *  - System directories: /etc, /proc, /sys, /dev, /run, /boot, /lib*, /usr/lib*.
-   *  - HOME credential/config subtrees: .ssh, .aws, .netrc, .npmrc, .gitconfig, .gnupg,
-   *    .config, .docker, .kube, .azure, .gcp.
-   *
-   * @param {string} canonicalPath - Resolved absolute path (output of fs.realpathSync or path.resolve)
-   * @returns {string|null}
-   */
-  function validateUploadSourcePath(canonicalPath) {
-    const parts = canonicalPath.split(path.sep);
-    if (parts.some(p => p === ".git")) {
-      return `path contains sensitive repository metadata (.git): ${canonicalPath}`;
-    }
-
-    const systemDenied = ["/etc", "/proc", "/sys", "/dev", "/run", "/boot", "/lib", "/lib64", "/usr/lib", "/usr/local/lib"];
-    for (const denied of systemDenied) {
-      const normalDenied = path.resolve(denied);
-      if (canonicalPath === normalDenied || canonicalPath.startsWith(normalDenied + path.sep)) {
-        return `path refers to a system directory: ${canonicalPath}`;
-      }
-    }
-
-    const homeDir = os.homedir();
-    if (homeDir) {
-      const sensitiveNames = [".ssh", ".aws", ".gnupg", ".docker", ".kube", ".azure", ".gcp", ".config", ".netrc", ".npmrc", ".gitconfig", ".gitcredentials", ".git-credentials"];
-      for (const name of sensitiveNames) {
-        const sensitive = path.join(path.resolve(homeDir), name);
-        if (canonicalPath === sensitive || canonicalPath.startsWith(sensitive + path.sep)) {
-          return `path refers to a sensitive HOME location: ${canonicalPath}`;
-        }
-      }
-    }
-
-    return null;
-  }
-
-  /**
    * Recursively copy all regular files from srcDir into destDir, preserving the relative
    * path structure under srcDir. Non-regular entries (sockets, devices, pipes, symlinks)
    * are skipped silently.
    * @param {string} srcDir - Absolute source directory path
    * @param {string} destDir - Absolute destination directory path
    */
-  function copyDirectoryRecursive(srcDir, destDir) {
-    if (!fs.existsSync(destDir)) {
+  function copyDirectoryRecursive(srcDir, destDir, transactional = true) {
+    if (transactional) {
+      let copyResult;
       try {
-        fs.mkdirSync(destDir, { recursive: true });
+        copyResult = copyDirectoryExclusive(srcDir, destDir, tempDir => copyDirectoryRecursive(srcDir, tempDir, false));
       } catch (err) {
-        throw new Error(`${ERR_SYSTEM}: Failed to create directory ${destDir}: ${getErrorMessage(err)}`, { cause: err });
+        throw new Error(`${ERR_SYSTEM}: Failed to stage directory ${srcDir} to ${destDir}: ${getErrorMessage(err)}`, { cause: err });
       }
+      if (copyResult === "conflict") {
+        throw {
+          code: -32602,
+          message: `${ERR_VALIDATION}: upload_artifact: staging name conflict for ${path.basename(destDir)}; rename the directory or use a distinct path`,
+        };
+      }
+      return;
     }
+
+    try {
+      fs.mkdirSync(destDir, { recursive: true });
+    } catch (err) {
+      throw new Error(`${ERR_SYSTEM}: Failed to create directory ${destDir}: ${getErrorMessage(err)}`, { cause: err });
+    }
+
     let entries;
     try {
       entries = fs.readdirSync(srcDir, { withFileTypes: true });
@@ -2744,8 +2655,8 @@ function createHandlers(server, appendSafeOutput, config = {}) {
             message: `${ERR_VALIDATION}: upload_artifact: ${sensitiveErr}`,
           };
         }
-        copyDirectoryRecursive(srcPath, destPath);
-      } else if (ent.isFile() && !ent.isSymbolicLink() && !fs.existsSync(destPath)) {
+        copyDirectoryRecursive(srcPath, destPath, false);
+      } else if (ent.isFile() && !ent.isSymbolicLink()) {
         // Revalidate each file's canonical path before copying.
         let canonicalSrcPath;
         try {
@@ -2760,11 +2671,18 @@ function createHandlers(server, appendSafeOutput, config = {}) {
             message: `${ERR_VALIDATION}: upload_artifact: ${sensitiveErr}`,
           };
         }
+        let copyResult;
         try {
-          fs.copyFileSync(srcPath, destPath);
-          fs.chmodSync(destPath, 0o600);
+          copyResult = copyFileExclusive(srcPath, destPath);
+          if (copyResult === "copied") fs.chmodSync(destPath, 0o600);
         } catch (err) {
           throw new Error(`${ERR_SYSTEM}: Failed to copy file ${srcPath} to ${destPath}: ${getErrorMessage(err)}`, { cause: err });
+        }
+        if (copyResult === "conflict") {
+          throw {
+            code: -32602,
+            message: `${ERR_VALIDATION}: upload_artifact: staging name conflict for ${path.basename(destPath)}; rename the file or use a distinct path`,
+          };
         }
       }
       // Skip symlinks, sockets, pipes, block/char devices — non-regular file types.
@@ -2891,16 +2809,48 @@ function createHandlers(server, appendSafeOutput, config = {}) {
 
       if (!alreadyStaged) {
         if (stat.isDirectory()) {
+          const validateDirectorySourcePaths = dir => {
+            let entries;
+            try {
+              entries = fs.readdirSync(dir, { withFileTypes: true });
+            } catch (err) {
+              throw new Error(`${ERR_SYSTEM}: Failed to read directory ${dir}: ${getErrorMessage(err)}`, { cause: err });
+            }
+            for (const ent of entries) {
+              if (!ent.isDirectory() && !ent.isFile()) continue;
+              const sourcePath = path.join(dir, ent.name);
+              let canonicalSourcePath;
+              try {
+                canonicalSourcePath = fs.realpathSync(sourcePath);
+              } catch (err) {
+                throw new Error(`${ERR_SYSTEM}: Failed to resolve canonical path for ${sourcePath}: ${getErrorMessage(err)}`, { cause: err });
+              }
+              const sensitiveError = validateUploadSourcePath(canonicalSourcePath);
+              if (sensitiveError) {
+                throw {
+                  code: -32602,
+                  message: `${ERR_VALIDATION}: upload_artifact: ${sensitiveError}`,
+                };
+              }
+              if (ent.isDirectory()) validateDirectorySourcePaths(sourcePath);
+            }
+          };
+          validateDirectorySourcePaths(filePath);
           copyDirectoryRecursive(filePath, path.join(stagingDir, destName));
         } else {
           const destPath = path.join(stagingDir, destName);
-          if (!fs.existsSync(destPath)) {
-            try {
-              fs.copyFileSync(filePath, destPath);
-              fs.chmodSync(destPath, 0o600);
-            } catch (err) {
-              throw new Error(`${ERR_SYSTEM}: Failed to copy file ${filePath} to ${destPath}: ${getErrorMessage(err)}`, { cause: err });
-            }
+          let copyResult;
+          try {
+            copyResult = copyFileExclusive(filePath, destPath);
+            if (copyResult === "copied") fs.chmodSync(destPath, 0o600);
+          } catch (err) {
+            throw new Error(`${ERR_SYSTEM}: Failed to copy file ${filePath} to ${destPath}: ${getErrorMessage(err)}`, { cause: err });
+          }
+          if (copyResult === "conflict") {
+            throw {
+              code: -32602,
+              message: `${ERR_VALIDATION}: upload_artifact: staging name conflict for ${destName}; rename the file or use a distinct path`,
+            };
           }
         }
 
@@ -3061,7 +3011,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       content: [
         {
           type: "text",
-          text: JSON.stringify({ result: "success" }),
+          text: JSON.stringify({ result: "success", delegated: true }),
         },
       ],
     };
@@ -3078,7 +3028,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
    */
   const updateIssueHandler = args => {
     const normalizedArgs = normalizeBlankOptionalFields(args, safeOutputsToolMap.get("update_issue").inputSchema.properties);
-    const updateFields = ["status", "title", "body", "labels", "assignees", "milestone"];
+    const updateFields = ["status", "title", "body", "labels", "assignees", "milestone", "artifacts"];
     if (!updateFields.some(field => normalizedArgs[field] !== undefined && normalizedArgs[field] !== false && (normalizedArgs[field] !== null || field === "milestone"))) {
       throw {
         code: -32602,
@@ -3118,28 +3068,10 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       }
     }
 
-    return defaultHandler("update_issue")(normalizedArgs);
-  };
-
-  const jiraCreateIssueHandler = args => {
-    const temporaryId = `#${generateTemporaryId()}`;
-    const entry = { ...(args || {}), type: "jira_create_issue", temporary_id: temporaryId };
-    appendSafeOutputCounted(entry);
-    const output = { result: "success", temporary_id: temporaryId };
-    return {
-      content: [{ type: "text", text: JSON.stringify(output) }],
-      structuredContent: output,
-    };
-  };
-  const jiraAddCommentHandler = defaultHandler("jira_add_comment");
-  const jiraAddLabelHandler = defaultHandler("jira_add_label");
-  const jiraUpdateIssueHandler = args => {
-    const summary = typeof args?.summary === "string" ? args.summary.trim() : "";
-    const description = typeof args?.description === "string" ? args.description.trim() : "";
-    if (!summary && !description) {
-      return buildIntentErrorResponse("jira_update_issue requires at least one non-empty field: summary or description");
+    if (normalizedArgs.artifacts !== undefined) {
+      normalizedArgs.artifacts = resolveIssueArtifactPaths(normalizedArgs.artifacts, updateIssueConfig.max_issue_artifacts, updateIssueConfig.max_issue_artifact_size, "update_issue");
     }
-    return defaultHandler("jira_update_issue")(args || {});
+    return defaultHandler("update_issue")(normalizedArgs);
   };
 
   /**
@@ -3448,16 +3380,6 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     pushToPullRequestBranchHandler,
     pushRepoMemoryHandler,
     createIssueHandler,
-    createWorkItemHandler,
-    updateWorkItemHandler: createAzureDevOpsWorkItemHandler("ado_update_work_item"),
-    commentOnWorkItemHandler: createAzureDevOpsWorkItemHandler("ado_comment_on_work_item"),
-    assignWorkItemHandler: createAzureDevOpsWorkItemHandler("ado_assign_work_item"),
-    linkWorkItemsHandler: createAzureDevOpsWorkItemHandler("ado_link_work_items"),
-    uploadWorkItemAttachmentHandler,
-    jiraCreateIssueHandler,
-    jiraUpdateIssueHandler,
-    jiraAddCommentHandler,
-    jiraAddLabelHandler,
     createProjectHandler,
     addCommentHandler,
     createPullRequestReviewCommentHandler,
@@ -3491,8 +3413,12 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     Object.entries(handlers).map(([name, handler]) => [
       name,
       ["defaultHandler", "ledgerBuiltinHandler"].includes(name)
-        ? (...args) => scopedHandler(Reflect.apply(handler, undefined, args), name === "defaultHandler" ? args[0] : "ledger_append")
-        : scopedHandler(handler, name === "ledgerAgentAppendHandler" ? "ledger_append" : undefined),
+        ? (...args) =>
+            submissions.wrap(
+              scopedHandler(Reflect.apply(handler, undefined, args), name === "defaultHandler" ? args[0] : "ledger_append"),
+              name !== "defaultHandler" || (!isDependencyUnsupportedType(args[0]) && getSafeOutputsToolConfig(config, args[0]).supports_dependencies !== false)
+            )
+        : submissions.wrap(scopedHandler(handler, name === "ledgerAgentAppendHandler" ? "ledger_append" : undefined), !["uploadAssetHandler", "pushRepoMemoryHandler"].includes(name)),
     ])
   );
 }

@@ -25,12 +25,11 @@ engine:
   id: claude
   model-provider: github
   bare: true
-  model-routing:
-    goal: cost
-    mode: economy
-    # claude-haiku-4.5 is excluded: it supports no reasoning effort, and Claude
-    # Code on GitHub inference sends one (see smoke-claude-on-copilot's 400).
-    allowed-models: [claude-sonnet-5]
+model: router/economy
+model-routing:
+  # claude-haiku-4.5 is excluded: it supports no reasoning effort, and Claude
+  # Code on GitHub inference sends one (see smoke-claude-on-copilot's 400).
+  allowed-models: [claude-sonnet-5]
 imports:
   - shared/smoke-test-brevity.md
   - shared/reporting.md
@@ -43,7 +42,7 @@ safe-outputs:
     group: true
     close-older-issues: true
     close-older-key: "smoke-claude-routed"
-    labels: [automation, testing]
+    labels: [automation, testing, "backlog:smoke-tests"]
 timeout-minutes: 10
 features:
   gh-aw-detection: false

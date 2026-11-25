@@ -116,13 +116,34 @@ safe-outputs:
 | `prompt` | string | Custom instructions appended to default detection prompt |
 | `engine` | string/object/false | AI engine config (`"copilot"`, full config object, or `false` for no AI) |
 | `ca-cert` | string/false | Absolute host path to a CA certificate for the detection API proxy. Inherits `sandbox.agent.ca-cert` when unset or empty and the detection engine matches the agent engine; set to `false` to disable inheritance. Requires AWF v0.28.10 or later. |
-| `runs-on` | string/array/object | Runner for the detection job (default: inherits from workflow `runs-on`) |
+| `runs-on` | string/array/object | Runner for the detection job (default: GitHub-hosted `ubuntu-latest`; does not inherit the workflow `runs-on`) |
 | `artifact-base-url` | string | HTTPS base URL for a mirror of the pinned detector release assets. The compiler appends the pinned release tag and asset name; the embedded digest cannot be overridden. |
 | `steps` | array | Additional GitHub Actions steps to run **before** AI analysis (pre-steps) |
 | `post-steps` | array | Additional GitHub Actions steps to run **after** AI analysis (post-steps) |
 | `max-ai-credits` | integer | AI Credits cap for the detection run, independent of the main agent budget. Defaults to `400` when unset, with runtime override via `vars.GH_AW_DEFAULT_DETECTION_MAX_AI_CREDITS`. Accepts plain integers; `-1` disables the detection budget. |
 | `continue-on-error` | boolean | When `true` (default), detected threats and detection engine failures apply the warn-mode policy (annotate reviewable outputs, convert branch pushes, abort non-reviewable outputs) instead of blocking all safe outputs. When `false`, they fail the detection job and safe outputs are not applied. |
 | `report-as-issue` | boolean | When `true` (default), detection warnings/failures create or update the `[aw] Detection Runs` tracking issue. Set to `false` to keep threat detection and its enforcement enabled while skipping the tracking issue; results remain visible in the GitHub Actions run logs. |
+
+### Issue reporting permissions
+
+When detection is runnable and `report-as-issue` is enabled (the default), the
+`conclusion` job and its GitHub App token request `issues: write`. Reusable workflow
+callers must grant this permission throughout the caller chain. When
+`safe-outputs.github-app` is configured, the App must have **Issues: write** access;
+otherwise, token creation can fail. Reusable callers without the required scope
+can fail workflow validation before any job runs.
+
+The existing opt-out disables the tracking issue and its detection-specific
+permission grant without disabling threat detection or enforcement:
+
+```aw wrap
+safe-outputs:
+  threat-detection:
+    report-as-issue: false
+```
+
+Other enabled issue-writing outputs or conclusion reporters can still require
+`issues: write`.
 
 ### Private CA certificates
 
@@ -218,7 +239,7 @@ When unset, the compiler emits a runtime resolution that falls back to the built
 ${{ vars.GH_AW_DEFAULT_DETECTION_MAX_AI_CREDITS || '400' }}
 ```
 
-Set the org-wide default with the [`GH_AW_DEFAULT_DETECTION_MAX_AI_CREDITS`](/gh-aw/reference/compiler-enterprise-environment-controls/) GitHub Actions variable. A value of `-1` disables AWF budget steering for detection runs.
+Set the org-wide default with the [`GH_AW_DEFAULT_DETECTION_MAX_AI_CREDITS`](/gh-aw/reference/compiler-enterprise-environment-controls/) GitHub Actions variable. It accepts a plain whole number, or `-1` to disable the configured detection budget. Set `safe-outputs.threat-detection.max-ai-credits: -1` in frontmatter to disable it for a specific workflow. Other variable values, including `K`/`M` suffixes, fall back to the built-in default of `400`. AWF's operator-controlled hard cap still applies when the configured budget is disabled.
 
 ## AI-Based Detection (Default)
 
@@ -478,7 +499,9 @@ safe-outputs:
 
 **Threat Findings and Detector Failures:**
 
-A detected threat has reason `threat_detected`. A detector execution failure (for example a provider outage or retired model) has reason `agent_failure`; an invalid result has reason `parse_error`. The latter two mean the security assessment is incomplete, not that a threat was found or that the output is clean. For all three outcomes, enforcement depends on `safe-outputs.threat-detection.continue-on-error`:
+A detected threat has reason `threat_detected`. A detector execution failure (for example a provider outage or retired model) has reason `agent_failure`; an invalid result has reason `parse_error`. The latter two mean the security assessment is incomplete, not that a threat was found or that the output is clean.
+
+For detected threats, detector failures, and invalid results, enforcement depends on `safe-outputs.threat-detection.continue-on-error`:
 
 - **Warn mode** (`continue-on-error: true`, the default): the run continues and detection concludes `warning`. Safe outputs get the warn-mode policy from the [safe outputs specification](/gh-aw/specs/safe-outputs-specification/) instead of being applied as if detection passed:
   - Reviewable outputs (such as `create-issue`, `add-comment`, `create-pull-request`) carry a `[!CAUTION]` block, `agentic threat detected` label string, and `<!-- gh-aw-threat-detected -->` marker for an actual threat; detector failures use a `[!WARNING]` block, `Threat detection engine error` label string, and `<!-- gh-aw-threat-engine-error -->` marker.

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -25,6 +26,7 @@ type ExperimentsAnalyzeConfig struct {
 	ExperimentName string
 	RepoOverride   string
 	JSONOutput     bool
+	Outcome        bool
 }
 
 // NewExperimentsCommand creates the experiments command with its subcommands.
@@ -106,24 +108,31 @@ The experiment argument is the workflow ID (branch name without the "experiments
 prefix, e.g., "my-workflow" for the "experiments/my-workflow" branch).
 
 Reads the state.jsonl/state.json file from the branch and shows per-variant counts, total
-runs, and the most recent run assignments.`,
+runs, and the most recent run assignments.
+
+Adoption-backed metrics require --adoption to opt into additional GitHub API requests
+for live safe-output evidence.`,
 		Example: `  ` + string(constants.CLIExtensionPrefix) + ` experiments analyze my-workflow              # Analyze experiments/my-workflow
   ` + string(constants.CLIExtensionPrefix) + ` experiments analyze my-workflow --json       # Output in JSON format
+  ` + string(constants.CLIExtensionPrefix) + ` experiments analyze my-workflow --adoption    # Evaluate live adoption metrics
   ` + string(constants.CLIExtensionPrefix) + ` experiments analyze my-workflow --repo owner/repo  # Analyze in a specific repository`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			jsonOutput, _ := cmd.Flags().GetBool("json")
 			repoOverride, _ := cmd.Flags().GetString("repo")
-			return RunExperimentsAnalyze(ExperimentsAnalyzeConfig{
+			outcome, _ := cmd.Flags().GetBool("adoption")
+			return runExperimentsAnalyze(cmd.Context(), ExperimentsAnalyzeConfig{
 				ExperimentName: args[0],
 				RepoOverride:   repoOverride,
 				JSONOutput:     jsonOutput,
+				Outcome:        outcome,
 			})
 		},
 	}
 
 	addJSONFlag(cmd)
 	addRepoFlag(cmd)
+	cmd.Flags().Bool("adoption", false, "Evaluate live adoption-backed metrics (additional GitHub API requests)")
 
 	return cmd
 }
@@ -173,8 +182,7 @@ func RunExperimentsList(config ExperimentsListConfig) error {
 	return nil
 }
 
-// RunExperimentsAnalyze analyzes a specific experiment branch.
-func RunExperimentsAnalyze(config ExperimentsAnalyzeConfig) error {
+func runExperimentsAnalyze(ctx context.Context, config ExperimentsAnalyzeConfig) error {
 	experimentsLog.Printf("Analyzing experiment: name=%s, repo=%s, json=%v",
 		config.ExperimentName, config.RepoOverride, config.JSONOutput)
 
@@ -192,9 +200,11 @@ func RunExperimentsAnalyze(config ExperimentsAnalyzeConfig) error {
 	}
 
 	metricObservationSets, cleanup, err := loadMetricObservationSetsForAnalysis(
+		ctx,
 		details,
 		frontmatterResult,
 		config.RepoOverride,
+		config.Outcome,
 	)
 	if err != nil {
 		return err
@@ -243,9 +253,17 @@ func loadExperimentAnalysisInputs(
 	experimentsLog.Printf("Loaded %d experiment config(s) for %s", len(frontmatter.ExperimentConfigs), config.ExperimentName)
 	reconcileExperimentDetailsWithConfigs(details, frontmatter.ExperimentConfigs)
 	if config.RepoOverride != "" {
-		return frontmatter, details, loadRemoteMetricEvalResults(config.RepoOverride, details.WorkflowID), nil
+		metricEvalResults, err := loadRemoteMetricEvalResults(config.RepoOverride, details.WorkflowID)
+		if err != nil {
+			return frontmatter, details, nil, err
+		}
+		return frontmatter, details, metricEvalResults, nil
 	}
-	return frontmatter, details, loadLocalMetricEvalResults(details.WorkflowID), nil
+	metricEvalResults, err := loadLocalMetricEvalResults(details.WorkflowID)
+	if err != nil {
+		return frontmatter, details, nil, err
+	}
+	return frontmatter, details, metricEvalResults, nil
 }
 
 // reconcileExperimentDetailsWithConfigs filters each experiment's persisted variant counts
@@ -273,22 +291,38 @@ func reconcileExperimentDetailsWithConfigs(details *ExperimentDetails, configs m
 	}
 }
 
-// loadMetricObservationSetsForAnalysis resolves grader-backed and eval-backed experiment
+// loadMetricObservationSetsForAnalysis resolves grader-, eval-, and adoption-backed experiment
 // metrics and attributes their per-run measurements to variants using the persisted
 // assignment history, returning one merged map of observation sets and a single cleanup
-// closure. An experiment's metric references exactly one of a grader or an eval, so the
-// two resolved maps never collide.
+// closure. Each metric references exactly one source, so the resolved maps never collide.
 type experimentMetricObservationSets struct {
 	Primary    map[string]*graderMetricObservationSet
+	Secondary  map[string]map[string]*graderMetricObservationSet
 	Guardrails map[string]map[string]*graderMetricObservationSet
 }
 
 func loadMetricObservationSetsForAnalysis(
+	ctx context.Context,
 	details *ExperimentDetails,
 	frontmatter experimentFrontmatterResult,
 	repoOverride string,
+	outcome bool,
 ) (*experimentMetricObservationSets, func(), error) {
-	graderSets, graderGuardrails, cleanup, err := loadGraderObservationSetsForAnalysis(details, frontmatter, repoOverride)
+	if !outcome {
+		_, _, windows, _, err := resolveOutcomeMetricReferences(frontmatter.ExperimentConfigs)
+		if err != nil {
+			return nil, func() {}, err
+		}
+		if len(windows) > 0 {
+			return nil, func() {}, errors.New("adoption-backed experiment metrics require --adoption to enable additional GitHub API requests. Example: gh aw experiments analyze <workflow> --adoption")
+		}
+	}
+	graderSets, graderGuardrails, cleanup, err := loadGraderObservationSetsForAnalysis(
+		ctx, details, frontmatter, repoOverride,
+		func(baseDir, repoOverride string) graderRunArtifactSource {
+			return newGitHubGraderRunArtifactSource(baseDir, repoOverride)
+		},
+	)
 	if err != nil {
 		return nil, func() {}, err
 	}
@@ -306,13 +340,33 @@ func loadMetricObservationSetsForAnalysis(
 		graderGuardrails = make(map[string]map[string]*graderMetricObservationSet, len(evalGuardrails))
 	}
 	mergeGuardrailObservationSets(graderGuardrails, evalGuardrails)
-	return &experimentMetricObservationSets{Primary: graderSets, Guardrails: graderGuardrails}, cleanup, nil
+	if !outcome {
+		return &experimentMetricObservationSets{Primary: graderSets, Guardrails: graderGuardrails}, cleanup, nil
+	}
+	outcomeSets, outcomeSecondary, outcomeGuardrails, outcomeCleanup, err := loadOutcomeObservationSetsForAnalysis(
+		ctx, details, frontmatter, repoOverride,
+		func(baseDir, repoOverride string) outcomeRunSource {
+			return &githubOutcomeRunSource{artifacts: newGitHubGraderRunArtifactSource(baseDir, repoOverride)}
+		},
+	)
+	if err != nil {
+		cleanup()
+		return nil, func() {}, err
+	}
+	maps.Copy(graderSets, outcomeSets)
+	mergeGuardrailObservationSets(graderGuardrails, outcomeGuardrails)
+	return &experimentMetricObservationSets{Primary: graderSets, Secondary: outcomeSecondary, Guardrails: graderGuardrails}, func() {
+		cleanup()
+		outcomeCleanup()
+	}, nil
 }
 
 func loadGraderObservationSetsForAnalysis(
+	ctx context.Context,
 	details *ExperimentDetails,
 	frontmatter experimentFrontmatterResult,
 	repoOverride string,
+	sourceFactory func(baseDir, repoOverride string) graderRunArtifactSource,
 ) (map[string]*graderMetricObservationSet, map[string]map[string]*graderMetricObservationSet, func(), error) {
 	refs, err := resolveGraderMetricReferences(frontmatter.ExperimentConfigs, frontmatter.Graders)
 	if err != nil {
@@ -333,8 +387,8 @@ func loadGraderObservationSetsForAnalysis(
 	cleanup := func() {
 		_ = os.RemoveAll(tempDir)
 	}
-	source := newGitHubGraderRunArtifactSource(tempDir, repoOverride)
-	runData := loadGraderRunData(context.Background(), details.Runs, runRefs, source)
+	source := sourceFactory(tempDir, repoOverride)
+	runData := loadGraderRunData(ctx, details.Runs, runRefs, source)
 	sets := buildGraderMetricObservationSets(details.Experiments, details.Runs, refs, runData, frontmatter.Graders)
 	guardrailSets := buildGraderGuardrailObservationSets(details, guardrailRefs, runData, frontmatter.Graders)
 	return sets, guardrailSets, cleanup, nil
@@ -361,9 +415,12 @@ func loadEvalObservationSetsForAnalysis(
 	}
 	var evalRecords []evalResultRecord
 	if repoOverride != "" {
-		evalRecords = loadRemoteEvalResultRecords(repoOverride, details.WorkflowID)
+		evalRecords, err = loadRemoteEvalResultRecords(repoOverride, details.WorkflowID)
 	} else {
-		evalRecords = loadLocalEvalResultRecords(details.WorkflowID)
+		evalRecords, err = loadLocalEvalResultRecords(details.WorkflowID)
+	}
+	if err != nil {
+		return nil, nil, err
 	}
 	sets := buildEvalMetricObservationSets(details.Experiments, details.Runs, refs, evalRecords)
 	guardrailSets := buildEvalGuardrailObservationSets(details, guardrailRefs, evalRecords)
@@ -389,14 +446,26 @@ func computeExperimentAnalysesWithObservationBundle(
 		if configs != nil {
 			cfg = configs[exp.Name]
 		}
-		analyses = append(analyses, computeExperimentAnalysisWithObservationBundle(
+		analysis := computeExperimentAnalysisWithObservationBundle(
 			exp,
 			cfg,
 			evals,
 			metricEvalResults,
 			observationSets.Primary[exp.Name],
 			observationSets.Guardrails[exp.Name],
-		))
+		)
+		analysis.SecondaryMetrics = computeOutcomeSecondaryMetricAnalyses(
+			cfg, observationSets.Secondary[exp.Name], analysis.Variants,
+		)
+		if analysis.OutcomeWindow == nil {
+			for _, set := range observationSets.Secondary[exp.Name] {
+				if set != nil && set.OutcomeWindow != nil {
+					analysis.OutcomeWindow = set.OutcomeWindow
+					break
+				}
+			}
+		}
+		analyses = append(analyses, analysis)
 	}
 	return analyses
 }

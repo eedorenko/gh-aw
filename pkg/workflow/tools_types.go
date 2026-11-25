@@ -370,7 +370,7 @@ func parseGitHubReposScope(value any) (GitHubReposScope, error) {
 		}
 		return result, nil
 	default:
-		return nil, fmt.Errorf("repository scope must be a string or array of strings, got %T", value)
+		return nil, fmt.Errorf("repository scope must be a string or array of strings, got %T. Example: allowed-repos: all", value)
 	}
 }
 
@@ -415,14 +415,16 @@ type GitHubToolConfig struct {
 	Toolset     GitHubToolsets     `yaml:"toolsets,omitempty"`
 	Lockdown    bool               `yaml:"lockdown,omitempty"`
 	GitHubApp   *GitHubAppConfig   `yaml:"github-app,omitempty"` // GitHub App configuration for token minting
+	TokenBroker bool               `yaml:"token-broker,omitempty" json:"token-broker,omitempty"`
 
 	// Guard policy fields (flat syntax under github:)
 	// AllowedRepos defines the access scope for policy enforcement.
 	// Supports: "all", "public", or an array of patterns ["owner/repo", "owner/*"] (lowercase)
 	AllowedRepos GitHubReposScope `yaml:"allowed-repos,omitempty"`
 	// Repos is deprecated. Use AllowedRepos (yaml:"allowed-repos") instead.
-	Repos         GitHubReposScope `yaml:"repos,omitempty"`
-	reposParseErr error
+	Repos                          GitHubReposScope `yaml:"repos,omitempty"`
+	reposParseErr                  error
+	unsupportedAccessControlFields []string
 	// MinIntegrity defines the minimum integrity level required: "none", "unapproved", "approved", "merged"
 	MinIntegrity GitHubIntegrityLevel `yaml:"min-integrity,omitempty"`
 	// BlockedUsers is an optional list of GitHub usernames whose content is unconditionally blocked.

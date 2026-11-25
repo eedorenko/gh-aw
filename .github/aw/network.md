@@ -46,7 +46,7 @@ Keywords expanding to curated domain lists:
 
 | Identifier | Runtime / Tool | Key Domains Enabled |
 |---|---|---|
-| `defaults` | Basic infrastructure | Certificate authorities, Ubuntu package verification, JSON schema |
+| `defaults` | Basic infrastructure (implicit when `network:` is omitted) | Certificate CRL/OCSP hosts, JSON schema, stock Ubuntu archive/keyserver only — no GitHub, engine, or package-registry hosts |
 | `github` | GitHub domains | `*.githubusercontent.com`, `codeload.github.com`, `docs.github.com` |
 | `github-actions` | GitHub Actions artifacts | Azure Blob storage for action caches and artifacts |
 | `node` | npm / yarn / pnpm | `registry.npmjs.org`, `npmjs.com`, `yarnpkg.com` |
@@ -63,7 +63,7 @@ Keywords expanding to curated domain lists:
 | `perl` | CPAN | `cpan.org`, `metacpan.org` |
 | `containers` | Docker / GHCR | `ghcr.io`, `registry.hub.docker.com`, `*.docker.io` |
 | `playwright` | Playwright browsers | `playwright.download.prss.microsoft.com`, `cdn.playwright.dev` |
-| `linux-distros` | apt / yum / apk | `deb.debian.org`, `security.debian.org`, Ubuntu/Alpine mirrors |
+| `linux-distros` | apt / yum / apk | Debian, Fedora, CentOS, Alpine, Arch, openSUSE mirrors, and third-party apt sources (`ppa.launchpad.net`, `packagecloud.io`, `api.snapcraft.io`, `packages.microsoft.com`, `packages.cloud.google.com`) |
 | `terraform` | HashiCorp | `releases.hashicorp.com`, `registry.terraform.io` |
 | `local` | Loopback addresses | `127.0.0.1`, `::1`, `localhost` |
 | `bazel` | Bazel build | `releases.bazel.build`, `bcr.bazel.build` |
@@ -85,16 +85,17 @@ Keywords expanding to curated domain lists:
 | `latex` | LaTeX / TeX | `ctan.org`, `mirror.ctan.org`, `miktex.org`, `tug.org` |
 | `lean` | Lean theorem prover | `lean-lang.org`, `elan.lean-lang.org`, `reservoir.lean-lang.org` |
 | `python-native` | Python native build deps | Native toolchain mirrors for building Python packages from source |
-| `copilot-vendor` | Copilot plan-specific APIs / telemetry | `api.business.githubcopilot.com`, `api.enterprise.githubcopilot.com`, `api.individual.githubcopilot.com`, `telemetry.enterprise.githubcopilot.com` |
-| `codex-vendor` | Optional Codex authentication / telemetry (explicit opt-in) | `auth.openai.com`, `ab.chatgpt.com` |
-| `copilot` | Copilot engine transport | `api.githubcopilot.com`, GitHub API/web, `host.docker.internal`, `raw.githubusercontent.com` |
-| `claude` | Claude engine transport | `api.github.com`, `github.com`, `host.docker.internal`, `raw.githubusercontent.com`; direct Anthropic API is added only when the effective target is Anthropic |
-| `codex` | Codex engine transport | `172.30.0.1`, `api.openai.com`, GitHub API/web, `host.docker.internal` |
-| `gemini` | Gemini engine transport (deprecated, prefer `agy`) | `generativelanguage.googleapis.com`, GitHub web, `host.docker.internal`, `raw.githubusercontent.com` |
+| `copilot-vendor` | Direct Copilot API / telemetry (explicit opt-in) | `api.business.githubcopilot.com`, `api.enterprise.githubcopilot.com`, `api.githubcopilot.com`, `api.individual.githubcopilot.com`, `telemetry.enterprise.githubcopilot.com` |
+| `codex-vendor` | Direct OpenAI API and optional authentication / telemetry (explicit opt-in) | `api.openai.com`, `auth.openai.com`, `ab.chatgpt.com` |
+| `gemini-vendor` | Direct Gemini API (explicit opt-in) | `generativelanguage.googleapis.com` |
+| `copilot` | Copilot gateway/GitHub transport | GitHub API/web, `host.docker.internal`, `raw.githubusercontent.com` |
+| `claude` | Claude gateway/GitHub transport | `api.github.com`, `github.com`, `host.docker.internal`, `raw.githubusercontent.com` |
+| `codex` | Codex gateway/GitHub transport | `172.30.0.1`, `api.github.com`, `github.com`, `host.docker.internal` |
+| `gemini` | Gemini gateway/GitHub transport (deprecated, prefer `agy`) | GitHub web, `host.docker.internal`, `raw.githubusercontent.com` |
 | `agy` | Agy (Antigravity CLI) engine transport (experimental) | `github.com`, `api.github.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com`, `host.docker.internal` |
-| `pi` | Pi engine transport | `api.githubcopilot.com`, GitHub web, `host.docker.internal`, `raw.githubusercontent.com` |
+| `pi` | Pi gateway/GitHub transport | GitHub web, `host.docker.internal`, `raw.githubusercontent.com` |
 | `pi-base` | Pi provider-independent baseline | `github.com`, `host.docker.internal`, `raw.githubusercontent.com` |
-| `threat-detection` | Compatibility alias for Copilot threat detection | Copilot API hosts, GitHub API/web, `host.docker.internal`, `registry.npmjs.org` |
+| `threat-detection` | Compatibility alias for Copilot threat detection | Copilot API hosts, GitHub API/web, `host.docker.internal` |
 
 ## Engine Domain Sets
 
@@ -113,11 +114,15 @@ API proxy.
 | `gemini` | `generativelanguage.googleapis.com`, `github.com`, `host.docker.internal`, `raw.githubusercontent.com` |
 | `pi` | `api.githubcopilot.com`, `github.com`, `host.docker.internal`, `raw.githubusercontent.com`; provider-scoped models replace the API host with the selected provider endpoint |
 | `pi-base` | `github.com`, `host.docker.internal`, `raw.githubusercontent.com`; applied as the provider-independent baseline before a provider prefix is resolved |
-| `threat-detection` | Applied automatically only to Copilot threat-detection runs and available as a compatibility alias: Copilot API hosts, `api.github.com`, `github.com`, `host.docker.internal`, and `registry.npmjs.org` for read-only lockfile validation. Vendor telemetry is available only when `copilot-vendor` is explicitly added to `network.allowed`. |
+| `threat-detection` | Applied automatically only to inline Copilot threat-detection runs and available as a compatibility alias: Copilot API hosts, `api.github.com`, `github.com`, and `host.docker.internal`. Vendor telemetry requires an explicit `copilot-vendor` opt-in. |
 
-The `codex` set excludes the broad `openai.com` and `chatgpt.com` suffixes. Add `codex-vendor` explicitly for the listed authentication/telemetry hosts; any other required vendor host needs its own explicit domain. GitHub-hosted Codex detection uses Copilot transport without direct `api.openai.com` access. The `gemini` set excludes `*.googleapis.com`; package downloads such as `storage.googleapis.com` require an ecosystem opt-in such as `dart`, or an explicit domain.
+Inline Copilot detection no longer automatically allows `registry.npmjs.org`, including through the compatibility alias. To retain its npm lockfile metadata validation, set `features.gh-aw-detection: false`, add `node` or `registry.npmjs.org` to `network.allowed`, and recompile. Inline detection inherits only the registry host from `node`; runtime configuration alone does not opt it in. Host access is not read-only, and explicit `network.blocked` rules take precedence. Without access, registry verification is unavailable. The default external detector uses its own prompt and does not provide this metadata verification.
 
-The `claude` set excludes certificate/OCSP services, package metadata, telemetry, and Playwright downloads. Add the required domain or ecosystem explicitly; configuring the Playwright tool also enables its download domains.
+The `copilot`, `codex`, and `gemini` sets exclude direct provider API hosts. Add the matching `*-vendor` identifier for intentional direct access; any other required vendor host needs its own explicit domain. External Codex detection with the OpenAI provider retains its `api.openai.com` transport; GitHub-hosted detection uses GitHub transport without direct Copilot API access. The `gemini` set excludes `*.googleapis.com`; package downloads such as `storage.googleapis.com` require an ecosystem opt-in such as `dart`, or an explicit domain.
+
+Pi provider endpoint metadata remains model-aware, but the selectable `pi` bundle grants only gateway/GitHub transport. Add the matching vendor bundle for intentional direct provider access.
+
+The `claude` set does not grant direct access to the default Anthropic API target, which uses the AWF API proxy. Add `api.anthropic.com` explicitly for intentional direct access. `engine.api-target` and `ANTHROPIC_BASE_URL` retain their configured-target behavior. The set also excludes certificate/OCSP services, package metadata, telemetry, and Playwright downloads; add the required domain or ecosystem explicitly, and note that configuring the Playwright tool enables its download domains.
 
 AWF treats bare domains as suffix rules, not exact-host rules. Retaining `github.com` for repository access also permits GitHub Packages subdomains. Set `network.blocked: [pkg.github.com]` to exclude them while preserving repository access; blocked domains take precedence.
 
@@ -171,6 +176,7 @@ network:
 - Setting `hosted-web` on any engine other than Claude or Codex is a compile error.
 - On import merge, allowed/blocked lists from imported files combine with the main workflow's, but only when both policies are enabled; the main workflow's scalar settings (such as `max-uses`) and an explicit `hosted-web: false` on either side win — see [syntax-tools-imports.md](syntax-tools-imports.md).
 - Copilot has no `hosted-web` policy. Its native web tools are unavailable in offline BYOK mode, so `tools.web-search` and CLI-mode `tools.web-fetch` are compile errors regardless of network restrictions. Use a web MCP server, a supported engine, or SDK mode for custom proxy-aware `web-fetch`.
+- GitHub Copilot inference (for example `model: copilot/...` or `engine.model-provider: github`) runs offline too: Claude's native `tools.web-fetch`/`tools.web-search` and Codex's `network.hosted-web` are compile errors on that provider, even for allowlisted domains. Switch to native Anthropic/OpenAI inference or use an MCP fetch/search server.
 
 ## Inferring Ecosystem From Repository Files
 

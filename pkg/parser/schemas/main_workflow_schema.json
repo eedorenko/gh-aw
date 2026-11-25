@@ -5,8 +5,43 @@
   "description": "JSON Schema for validating agentic workflow frontmatter configuration",
   "version": "1.0.0",
   "type": "object",
-  "required": ["on"],
+  "anyOf": [
+    { "required": ["on"] },
+    {
+      "required": ["connectors"],
+      "properties": {
+        "connectors": {
+          "not": {
+            "additionalProperties": {
+              "not": {
+                "required": ["on"],
+                "properties": { "on": { "type": "array" } }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
   "properties": {
+    "connectors": {
+      "description": "Experimental. Declare third-party endpoints, credential secret names, resource grants and capability definitions directly in AW Markdown. Import normally and select capabilities from the main workflow.",
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 32,
+      "propertyNames": { "$ref": "#/$defs/connectorName" },
+      "additionalProperties": {
+        "if": { "required": ["endpoints"] },
+        "then": { "$ref": "#/$defs/connectorDeclaration" },
+        "else": { "$ref": "#/$defs/connectorRegistration" }
+      }
+    },
+    "skip-if-decision": {
+      "description": "Experimental. Up to 64 advisory skip questions evaluated inside AWF before each eligible agent invocation. Nonempty lists emit a compile-time experimental warning; configuration and behavior may change without deprecation. Any deny skips; allow or all unknown preserves deterministic harness eligibility. Runtime @file references use sandbox filesystem restrictions. Nonempty lists cannot be combined with declarative protected-session-capture.",
+      "type": "array",
+      "maxItems": 64,
+      "items": { "type": "string", "minLength": 1, "pattern": "\\S" }
+    },
     "token-broker": {
       "description": "Experimental. Select independent Copilot capabilities to authenticate through the OIDC token broker. Using this field emits a compile-time warning. Configuration and behavior may change without deprecation.",
       "type": "object",
@@ -26,147 +61,6 @@
         { "properties": { "copilot-request": { "const": true } }, "required": ["copilot-request"] },
         { "properties": { "copilot-task": { "const": true } }, "required": ["copilot-task"] }
       ]
-    },
-    "work-queue-policy": {
-      "description": "Deprecated legacy version-3 Policy proposal. Use scheduling-only work_queue in .github/workflows/aw.json and AW-approved dispatch targets. Cannot be combined with repository work_queue settings. Installed Policy remains authoritative and historical ledgers remain readable.",
-      "deprecated": true,
-      "x-deprecation-message": "Move scheduling configuration to the repository-level work_queue in .github/workflows/aw.json and retain only AW-approved dispatch targets in the workflow. Installed Policies remain authoritative and historical ledgers remain readable.",
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "mode": { "enum": ["weighted-priority", "strict-priority"] },
-        "class-weights": {
-          "type": "array",
-          "minItems": 5,
-          "maxItems": 5,
-          "items": { "type": "integer", "minimum": 1, "maximum": 1000 }
-        },
-        "accounting-weights": {
-          "type": "object",
-          "maxProperties": 1024,
-          "propertyNames": { "maxLength": 128 },
-          "additionalProperties": { "type": "integer", "minimum": 1, "maximum": 1000 }
-        },
-        "outstanding": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "claims": { "type": "integer", "minimum": 1, "maximum": 4096 },
-            "dispatches": { "type": "integer", "minimum": 1, "maximum": 4096 },
-            "per-account-claims": { "type": "integer", "minimum": 1, "maximum": 4096 }
-          }
-        },
-        "worker-profiles": {
-          "type": "object",
-          "minProperties": 1,
-          "maxProperties": 256,
-          "additionalProperties": { "$ref": "#/$defs/work_queue_worker_profile" }
-        },
-        "pools": {
-          "type": "object",
-          "minProperties": 1,
-          "maxProperties": 64,
-          "additionalProperties": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["default-profile", "profiles", "logical-limit", "native-limit"],
-            "properties": {
-              "default-profile": { "type": "string", "minLength": 1, "maxLength": 256 },
-              "profiles": {
-                "type": "object",
-                "minProperties": 1,
-                "maxProperties": 256,
-                "additionalProperties": { "$ref": "#/$defs/work_queue_worker_profile" }
-              },
-              "logical-limit": { "type": "integer", "minimum": 1, "maximum": 4096 },
-              "native-limit": { "type": "integer", "minimum": 1, "maximum": 4096 },
-              "per-account-limit": { "type": "integer", "minimum": 1, "maximum": 4096 },
-              "allowed-repositories": { "type": "array", "maxItems": 64, "items": { "type": "string", "anyOf": [{ "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$" }, { "const": "${{ github.repository }}" }] } },
-              "max-observation-age-ms": { "type": "integer", "minimum": 1, "maximum": 3600000 },
-              "retry": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["max-attempts", "backoff-ms"],
-                "properties": {
-                  "max-attempts": { "type": "integer", "minimum": 1, "maximum": 16 },
-                  "backoff-ms": { "type": "integer", "minimum": 1, "maximum": 3600000 }
-                }
-              },
-              "reconciliation": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["max-attempts", "deadline-ms"],
-                "properties": {
-                  "max-attempts": { "type": "integer", "minimum": 1, "maximum": 64 },
-                  "deadline-ms": { "type": "integer", "minimum": 1, "maximum": 3600000 }
-                }
-              }
-            }
-          }
-        },
-        "producers": {
-          "type": "object",
-          "maxProperties": 1024,
-          "additionalProperties": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["pools", "priorities", "fairness-keys"],
-            "properties": {
-              "pools": { "type": "array", "minItems": 1, "maxItems": 64, "items": { "type": "string", "minLength": 1 } },
-              "priorities": { "type": "array", "minItems": 1, "maxItems": 5, "items": { "type": "integer", "minimum": 1, "maximum": 5 } },
-              "fairness-keys": { "type": "array", "minItems": 1, "maxItems": 1024, "items": { "type": "string", "maxLength": 128 } }
-            }
-          }
-        },
-        "projectors": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 256,
-          "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["principal", "workflow", "ref", "pools", "repositories"],
-            "properties": {
-              "principal": { "type": "string", "pattern": "^[1-9][0-9]*$", "maxLength": 256 },
-              "workflow": { "type": "string", "pattern": "^\\.github/workflows/[^\\s]+\\.lock\\.yml$" },
-              "ref": { "type": "string", "pattern": "^[a-f0-9]{40}$|^[a-f0-9]{64}$" },
-              "pools": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "type": "string", "minLength": 1 } },
-              "repositories": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$" } }
-            }
-          }
-        },
-        "dependencies": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "repositories": { "type": "array", "maxItems": 64, "items": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$" } },
-            "max-observation-age": { "type": "string", "pattern": "^[1-9][0-9]*(ms|s|m)$" },
-            "read-credentials": {
-              "description": "Separate read-only repository credentials, never part of a Policy proposal or snapshot. Credential-only configuration uses the installed Policy's allowed repositories.",
-              "type": "object",
-              "maxProperties": 64,
-              "additionalProperties": { "type": "string", "pattern": "^\\$\\{\\{ secrets\\.[A-Za-z_][A-Za-z0-9_]* \\}\\}$" }
-            }
-          }
-        },
-        "limits": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "ledger-bytes": { "type": "integer", "minimum": 1, "maximum": 67108864 },
-            "recovery-bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 },
-            "payload-bytes": { "type": "integer", "minimum": 1, "maximum": 16384 },
-            "graph-nodes": { "type": "integer", "minimum": 1, "maximum": 4096 },
-            "predecessors": { "type": "integer", "minimum": 1, "maximum": 64 },
-            "pending-nodes": { "type": "integer", "minimum": 1, "maximum": 4096 },
-            "operations": { "type": "integer", "minimum": 1, "maximum": 256 },
-            "assignment-bytes": { "type": "integer", "minimum": 1, "maximum": 49152 },
-            "result-bytes": { "type": "integer", "minimum": 1, "maximum": 4096 },
-            "evidence-bytes": { "type": "integer", "minimum": 1, "maximum": 1024 },
-            "observation-writes": { "type": "integer", "minimum": 1, "maximum": 4096 }
-          }
-        }
-      }
     },
     "name": {
       "type": "string",
@@ -201,6 +95,11 @@
       "type": "string",
       "description": "Optional source reference indicating where this workflow was added from. Format: owner/repo/path@ref (e.g., githubnext/agentics/workflows/ci-doctor.md@v1.0.0). Rendered as a comment in the generated lock file.",
       "examples": ["githubnext/agentics/workflows/ci-doctor.md", "githubnext/agentics/workflows/daily-perf-improver.md@1f181b37d3fe5862ab590648f25a292e345b5de6"]
+    },
+    "source-sha": {
+      "type": "string",
+      "pattern": "^[a-fA-F0-9]{40}$",
+      "description": "Installed source commit, managed by gh aw add and update. Used as the immutable base for three-way merges while source retains the tracking ref."
     },
     "redirect": {
       "type": "string",
@@ -245,7 +144,8 @@
       "description": "Optional array of labels to categorize and organize workflows. Labels can be used to filter workflows in status/list commands.",
       "items": {
         "type": "string",
-        "minLength": 1
+        "minLength": 1,
+        "maxLength": 50
       },
       "examples": [
         ["automation", "security"],
@@ -764,7 +664,7 @@
           "minLength": 1,
           "description": "Simple trigger event name (e.g., 'push', 'issues', 'pull_request', 'discussion', 'schedule', 'fork', 'create', 'delete', 'public', 'watch', 'workflow_call'), schedule shorthand (e.g., 'daily', 'weekly'), or slash command shorthand (e.g., '/my-bot' expands to slash_command + workflow_dispatch)",
           "not": {
-            "enum": ["gateway-dispatch", "orgs", "projects-items", "code-scanning-alert", "dependabot-alerts", "security-alerts", "jira-issue", "linear-issue", "azure-devops-issue", "slash-command", "label-command"]
+            "enum": ["gateway-dispatch", "orgs", "projects-items", "code-scanning-alert", "dependabot-alerts", "security-alerts", "jira-issue", "slash-command", "label-command"]
           },
           "examples": ["push", "issues", "workflow_dispatch", "daily", "/my-bot"]
         },
@@ -814,19 +714,43 @@
             "slash-command": false,
             "label-command": false,
             "jira-issue": false,
-            "linear-issue": false,
-            "azure-devops-issue": false,
             "gateway-dispatch": {
               "type": "object",
-              "additionalProperties": false,
+              "additionalProperties": { "$ref": "#/$defs/connectorCapabilities" },
               "description": "Experimental exclusive trigger. Every nested key and value must be literal; GitHub Actions expressions are not supported anywhere in this section. No other triggers may coexist with gateway-dispatch; non-trigger on settings such as roles and bots remain supported. Contains independent nested gateway subscriptions with shared repository and organization selection. Forward only canonical resource URIs, event types, and declared matching filter literals; resolve all other data through provider-authenticated access. Requires aw.json gateway-dispatch: true and does not grant gateway authority.",
               "anyOf": [
+                {
+                  "not": {
+                    "propertyNames": {
+                      "enum": [
+                        "repos",
+                        "orgs",
+                        "connectors",
+                        "projects-items",
+                        "code-scanning-alert",
+                        "dependabot-alerts",
+                        "jira-issue",
+                        "security-alerts",
+                        "slash-command",
+                        "label-command",
+                        "issue",
+                        "pull-request",
+                        "discussion",
+                        "issue-comment",
+                        "pull-request-comment",
+                        "pull-request-review",
+                        "pull-request-review-comment",
+                        "pull-request-review-thread",
+                        "discussion-comment",
+                        "commit-comment"
+                      ]
+                    }
+                  }
+                },
                 { "required": ["projects-items"] },
                 { "required": ["code-scanning-alert"] },
                 { "required": ["dependabot-alerts"] },
                 { "required": ["jira-issue"] },
-                { "required": ["linear-issue"] },
-                { "required": ["azure-devops-issue"] },
                 { "required": ["slash-command"] },
                 { "required": ["label-command"] },
                 { "required": ["issue"] },
@@ -841,6 +765,7 @@
                 { "required": ["commit-comment"] }
               ],
               "properties": {
+                "connectors": false,
                 "issue": { "$ref": "#/$defs/webhookGitHubNotification" },
                 "pull-request": { "$ref": "#/$defs/webhookGitHubNotification" },
                 "discussion": { "$ref": "#/$defs/webhookGitHubNotification" },
@@ -912,18 +837,6 @@
                 "dependabot-alerts": {
                   "$ref": "#/$defs/webhookSecurityAlert",
                   "description": "Experimental. Dependabot alert events from optionally selected repositories. Independent types, severity, and filters apply only to dependabot_alert. Requires a hosted CAO server and aw.json gateway-dispatch: true."
-                },
-                "jira-issue": {
-                  "$ref": "#/$defs/webhookJiraIssue",
-                  "description": "Experimental. Jira Cloud issue lifecycle and label activities normalized from native issue webhooks. Requires nested on.gateway-dispatch, the repository gateway-dispatch opt-in, and an approved provider bridge; does not register webhooks or grant source access."
-                },
-                "linear-issue": {
-                  "$ref": "#/$defs/webhookLinearIssue",
-                  "description": "Experimental. Linear Issue create/update/remove webhooks with payload-derived lifecycle and label activities. Requires nested on.gateway-dispatch, the repository gateway-dispatch opt-in, and an approved provider bridge; does not register webhooks or grant source access."
-                },
-                "azure-devops-issue": {
-                  "$ref": "#/$defs/webhookAzureDevOpsIssue",
-                  "description": "Experimental. Azure DevOps work item webhooks with payload-derived lifecycle and tag activities. Closed/reopened require explicit closed-states. Requires nested on.gateway-dispatch, the repository gateway-dispatch opt-in, and an approved provider bridge."
                 }
               }
             },
@@ -1489,7 +1402,8 @@
                       "typed",
                       "untyped",
                       "field_added",
-                      "field_removed"
+                      "field_removed",
+                      "status_changed"
                     ]
                   }
                 },
@@ -1568,12 +1482,12 @@
               }
             },
             "schedule": {
-              "description": "Scheduled trigger events using fuzzy schedules or standard cron expressions. Supports shorthand string notation (e.g., 'daily', 'daily around 2pm') or array of schedule objects. Fuzzy schedules automatically distribute execution times to prevent load spikes.",
+              "description": "Scheduled trigger events using fuzzy schedules or standard cron expressions. Supports shorthand string notation (e.g., 'daily', 'daily around 2pm', 'every 2 days', 'every 2w', 'every 2mo') or array of schedule objects. Fuzzy schedules automatically distribute execution times to prevent load spikes; day, week, and month intervals also scatter times, and month intervals scatter the day of month.",
               "oneOf": [
                 {
                   "type": "string",
                   "minLength": 1,
-                  "description": "Shorthand schedule string using fuzzy or cron format. Examples: 'daily', 'daily around 14:00', 'daily between 9:00 and 17:00', 'weekly', 'weekly on monday', 'weekly on friday around 5pm', 'hourly', 'every 2h', 'every 10 minutes', '0 9 * * 1'. Fuzzy schedules distribute execution times to prevent load spikes. For fixed times, use standard cron syntax. Minimum interval is 5 minutes."
+                  "description": "Shorthand schedule string using fuzzy or cron format. Examples: 'daily', 'daily around 14:00', 'daily between 9:00 and 17:00', 'weekly', 'weekly on monday', 'weekly on friday around 5pm', 'hourly', 'every 2h', 'every 10 minutes', 'every 2 days', 'every 2w', 'every 2mo', '0 9 * * 1'. Fuzzy schedules distribute execution times to prevent load spikes; day, week, and month intervals scatter execution times, and month intervals also scatter the day of month. For fixed times, use standard cron syntax. Minimum interval is 5 minutes."
                 },
                 {
                   "type": "array",
@@ -1584,7 +1498,7 @@
                     "properties": {
                       "cron": {
                         "type": "string",
-                        "description": "Cron expression using standard format (e.g., '0 9 * * 1') or fuzzy format (e.g., 'daily', 'daily around 14:00', 'daily between 9:00 and 17:00', 'weekly', 'weekly on monday', 'weekly on friday around 5pm', 'hourly', 'every 2h', 'every 10 minutes'). Fuzzy formats support: daily/weekly schedules with optional time windows, hourly intervals with scattered minutes, interval schedules (minimum 5 minutes), short duration units (m/h/d/w), and UTC timezone offsets (utc+N or utc+HH:MM)."
+                        "description": "Cron expression using standard format (e.g., '0 9 * * 1') or fuzzy format (e.g., 'daily', 'daily around 14:00', 'daily between 9:00 and 17:00', 'weekly', 'weekly on monday', 'weekly on friday around 5pm', 'hourly', 'every 2h', 'every 10 minutes', 'every 2 days', 'every 2w', 'every 2mo'). Fuzzy formats support: daily/weekly schedules with optional time windows, hourly intervals with scattered minutes, day/week/month intervals with scattered execution times (month intervals also scatter the day of month), interval schedules (minimum 5 minutes), short duration units (m/h/d/w/mo), and UTC timezone offsets (utc+N or utc+HH:MM)."
                       },
                       "timezone": {
                         "type": "string",
@@ -2064,7 +1978,7 @@
                       }
                     }
                   ],
-                  "description": "Filter fork pull requests by repository pattern (string or list). Omission and an empty list both allow only same-repository PRs. Exact owner/repo entries or trusted owner/* patterns admit matching forks; '*' allows all forks. Strict mode warns on any '*' entry and recommends narrower admission, but compilation continues. Strict mode rejects expressions and unsupported pattern forms. Same-repository PRs remain allowed. Actor authorization and checkout restrictions remain mandatory in strict mode; acknowledge-risk neither bypasses them nor suppresses the fork warning. This does not change GitHub's base-repository permissions or secret availability for pull_request_target."
+                  "description": "Filter fork pull requests by repository pattern (string or list). Omission and an empty list both allow only same-repository PRs. Exact owner/repo entries or trusted owner/* patterns admit matching forks; '*' allows all forks. Strict mode rejects any '*' entry unless the main workflow's top-level features.dangerously-allow-pull-request-target-forks-all is true; imported features do not enable this opt-in. Non-strict mode warns. The warning remains when the flag is enabled. Strict mode rejects expressions and unsupported pattern forms. Same-repository PRs remain allowed. Actor authorization and checkout restrictions remain mandatory; acknowledge-risk neither bypasses them nor suppresses the fork warning. This does not change GitHub's base-repository permissions or secret availability for pull_request_target."
                 },
                 "acknowledge-risk": {
                   "type": "boolean",
@@ -2307,7 +2221,7 @@
               "oneOf": [
                 {
                   "type": "string",
-                  "description": "GitHub search query string to check before running workflow (implies max=1). If the search returns any results, the workflow will be skipped. Query is automatically scoped to the current repository. Example: 'is:issue is:open label:bug'"
+                  "description": "GitHub search query string to check before running workflow (implies max=1). If the search returns any results, the workflow will be skipped. Query is automatically scoped to the current repository. Simple queries using only is:/type:/state:, label:, author:, assignee:, mentions:, and sort: qualifiers are evaluated via GraphQL/REST instead of the rate-limited search API; free text, in:, negation, and comma label lists require search. Example: 'is:issue is:open label:bug'"
                 },
                 {
                   "type": "object",
@@ -2347,7 +2261,7 @@
               "oneOf": [
                 {
                   "type": "string",
-                  "description": "GitHub search query string to check before running workflow (implies min=1). If the search returns no results, the workflow will be skipped. Query is automatically scoped to the current repository. Example: 'is:pr is:open label:ready-to-deploy'"
+                  "description": "GitHub search query string to check before running workflow (implies min=1). If the search returns no results, the workflow will be skipped. Query is automatically scoped to the current repository. Simple queries using only is:/type:/state:, label:, author:, assignee:, mentions:, and sort: qualifiers are evaluated via GraphQL/REST instead of the rate-limited search API; free text, in:, negation, and comma label lists require search. Example: 'is:pr is:open label:ready-to-deploy'"
                 },
                 {
                   "type": "object",
@@ -2563,6 +2477,11 @@
                         }
                       ],
                       "description": "Reaction type. Defaults to 'eyes' when omitted."
+                    },
+                    "remove-on-complete": {
+                      "type": "boolean",
+                      "default": false,
+                      "description": "Remove the trigger reaction in conclusion, including failed or skipped agent runs. Independent of status-comment."
                     },
                     "issues": {
                       "type": "boolean",
@@ -2793,7 +2712,7 @@
             "admission": {
               "type": "boolean",
               "default": false,
-              "description": "Enable admission and conclusion_admission jobs for this workflow. Also enabled when aw.json sets admission to true."
+              "description": "Generate admission steps in activation and conclusion. An explicit admission setting in aw.json takes precedence."
             },
             "stale-check": {
               "oneOf": [
@@ -3190,6 +3109,18 @@
                   "url": {
                     "type": "string",
                     "description": "The URL to set as the environment URL in the deployment."
+                  },
+                  "deployment": {
+                    "oneOf": [
+                      {
+                        "type": "boolean"
+                      },
+                      {
+                        "type": "string",
+                        "pattern": "^\\$\\{\\{.*\\}\\}$"
+                      }
+                    ],
+                    "description": "Set to false to use the environment's secrets and protection rules without creating a GitHub deployment."
                   }
                 },
                 "required": ["name"]
@@ -3301,13 +3232,18 @@
     },
     "runner": {
       "type": "object",
-      "description": "Runner topology configuration. Tells gh-aw and AWF what kind of runner environment the workflow targets, so they can activate topology-specific behaviors automatically (split-filesystem handling, network isolation, sysroot images, tool cache redirection). The runner.topology key is the single stable contract between gh-aw and AWF for runner environment detection.",
+      "description": "Runner configuration. Installation privilege is independent of runner topology. The runner.topology key tells gh-aw and AWF to activate topology-specific behaviors (split-filesystem handling, sysroot images, tool cache redirection).",
       "additionalProperties": false,
       "properties": {
         "topology": {
           "type": "string",
           "description": "Runner execution topology. When set to 'arc-dind', gh-aw emits the topology in the AWF config, redirects the tool cache to a shared volume, and validates that no generated steps require root. AWF then activates split-filesystem handling, network isolation, sysroot image staging, and DinD pre-staging automatically.",
           "enum": ["arc-dind"]
+        },
+        "installation": {
+          "type": "string",
+          "description": "Installation privilege for Copilot CLI and threat-detect in the agent and detection jobs. Rootless installs to ~/.local/bin without sudo. Defaults to rootless for arc-dind and privileged (/usr/local/bin via sudo) otherwise. Privileged is not supported with arc-dind. Does not change AWF runtime privileges or enable split-filesystem handling.",
+          "enum": ["rootless", "privileged"]
         }
       }
     },
@@ -3416,6 +3352,12 @@
           "default": false,
           "description": "Suppress the non-strict warning when pull_request_target is combined with on.roles containing read or all. Strict mode still rejects this configuration.",
           "examples": [true, false]
+        },
+        "dangerously-allow-pull-request-target-forks-all": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow forks: '*' under pull_request_target in strict mode when declared in the main workflow's top-level features. Imported features do not enable this opt-in. The unrestricted fork admission warning remains visible.",
+          "examples": [true, false]
         }
       },
       "examples": [
@@ -3491,13 +3433,17 @@
       }
     },
     "experiments": {
-      "description": "A/B testing experiments. Each key is an experiment name; the value is either an array of two or more variant strings (bare-array form) or an object with a 'variants' field plus optional metadata fields (description, metric, weight, issue, start_date, end_date, hypothesis, secondary_metrics, guardrail_metrics, min_samples, analysis_type, decision). The reserved 'storage' key controls how experiment state is persisted: 'repo' (default) commits state to a git branch named 'experiments/{sanitizedWorkflowID}' (workflow ID lowercased with hyphens removed) for durability; 'cache' uses GitHub Actions cache. At runtime the activation job picks a variant and persists the updated counters. Use ${{ experiments.<name> }} in the workflow prompt to reference the selected variant. When multiple experiments are declared, assignments are statistically balanced using a least-used counter that round-robins across variants (or weighted when 'weight' is provided); ties are broken randomly so no variant is systematically favoured on the first run.",
+      "description": "A/B testing experiments. Each key is an experiment name; the value is either an array of two or more variant strings (bare-array form) or an object with a 'variants' field plus optional metadata fields (description, metric, weight, issue, start_date, end_date, hypothesis, secondary_metrics, guardrail_metrics, min_samples, analysis_type, decision). The reserved 'storage' key controls persistence: 'repo' (default) commits state to 'experiments/{sanitizedWorkflowID}'; 'cache' uses GitHub Actions cache; opt-in 'broker' delegates variant selection and aggregate result reporting to an OIDC-authenticated API. The optional 'broker-url' configures its HTTPS endpoint. Broker dry-runs use local ephemeral selection without broker calls or broker OIDC grants. Use ${{ experiments.<name> }} in the workflow prompt to reference the selected variant. Repo and cache modes use local least-used counters (weighted when 'weight' is provided), with random tie-breaking; in broker mode the API owns selection and cumulative counts.",
       "type": "object",
       "propertyNames": {
         "anyOf": [
           {
             "const": "storage",
             "description": "Reserved key for storage mode configuration."
+          },
+          {
+            "const": "broker-url",
+            "description": "Reserved key for the experiments broker endpoint."
           },
           {
             "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$",
@@ -3533,7 +3479,13 @@
               },
               "metric": {
                 "type": "string",
-                "description": "Primary metric to observe (e.g. 'ai_credits_total')."
+                "description": "Primary metric to observe (e.g. 'ai_credits_total', 'adoption:accepted', or 'adoption:zero_touch')."
+              },
+              "adoption_window": {
+                "type": "string",
+                "minLength": 1,
+                "default": "auto",
+                "description": "Use 'auto' to learn the maturity window from outcome decision times, or specify a positive Go duration (e.g. '72h' or '1h30m'). Defaults to auto."
               },
               "weight": {
                 "type": "array",
@@ -3567,7 +3519,7 @@
                 "items": {
                   "type": "string"
                 },
-                "description": "Additional metrics to collect and report alongside the primary metric (e.g. ['duration_ms', 'discussion_word_count'])."
+                "description": "Additional metrics to collect and report alongside the primary metric (e.g. ['duration_ms', 'adoption:accepted', 'adoption:zero_touch'])."
               },
               "guardrail_metrics": {
                 "type": "array",
@@ -3577,7 +3529,7 @@
                   "properties": {
                     "name": {
                       "type": "string",
-                      "description": "Name of the guardrail metric (e.g. 'success_rate', 'empty_output_rate')."
+                      "description": "Name of the guardrail metric (e.g. 'success_rate', 'adoption:accepted', or 'adoption:zero_touch')."
                     },
                     "direction": {
                       "type": "string",
@@ -3730,9 +3682,15 @@
       "properties": {
         "storage": {
           "type": "string",
-          "enum": ["cache", "repo"],
+          "enum": ["cache", "repo", "broker"],
           "default": "repo",
-          "description": "Storage backend for experiment state. 'repo' (default) persists state to a git branch named 'experiments/{sanitizedWorkflowID}' (workflow ID lowercased with hyphens removed, e.g. 'my-workflow' -> 'experiments/myworkflow') for durability across cache evictions. 'cache' uses GitHub Actions cache (legacy behavior). Repo storage is recommended because experiment data is valuable and more durable than cache."
+          "description": "Storage backend for experiment state. 'repo' (default) persists state to a git branch named 'experiments/{sanitizedWorkflowID}' (workflow ID lowercased with hyphens removed, e.g. 'my-workflow' -> 'experiments/myworkflow') for durability across cache evictions. 'cache' uses GitHub Actions cache (legacy behavior). 'broker' delegates assignment and aggregate reporting to an OIDC-authenticated service without git or cache persistence. Broker dry-runs use local ephemeral assignments and never contact the broker."
+        },
+        "broker-url": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^https://[^$]*$",
+          "description": "Literal HTTPS broker endpoint without credentials or expressions. Defaults to the GH_AW_EXPERIMENTS_BROKER_URL secret."
         }
       }
     },
@@ -3798,6 +3756,18 @@
             "url": {
               "type": "string",
               "description": "A deployment URL"
+            },
+            "deployment": {
+              "oneOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "string",
+                  "pattern": "^\\$\\{\\{.*\\}\\}$"
+                }
+              ],
+              "description": "Set to false to use the environment's secrets and protection rules without creating a GitHub deployment."
             }
           },
           "required": ["name"],
@@ -4342,7 +4312,7 @@
                     },
                     "token-steering": {
                       "type": "boolean",
-                      "description": "Enable or disable API proxy token steering. Set to false to preserve the explicitly configured provider and model.",
+                      "description": "Enable or disable AWF budget notices, which warn the agent when the run's AI credits or time are nearly spent. Notices are on by default; set to false to turn them off. Steering never changes the provider or model.",
                       "examples": [false]
                     },
                     "ca-cert": {
@@ -4921,7 +4891,7 @@
     "max-ai-credits": {
       "$ref": "#/$defs/max_ai_credits_limit",
       "default": 1000,
-      "description": "Per-run AI Credits budget control for firewall cost enforcement. Enabled by default at 1000 (1k) when omitted. Set to -1 to disable both budget enforcement and token steering. Supports GitHub Actions expressions."
+      "description": "Per-run AI Credits budget control for firewall cost enforcement. Enabled by default at 1000 (1k) when omitted. Set to -1 to disable budget enforcement; with AWF releases after v0.29.11, budget notices continue unless sandbox.agent.token-steering is false. Supports GitHub Actions expressions."
     },
     "max-turn-cache-misses": {
       "type": "integer",
@@ -5083,6 +5053,10 @@
                 "github-token": {
                   "$ref": "#/$defs/github_token_same_job",
                   "description": "Optional custom GitHub token (e.g., '${{ secrets.CUSTOM_PAT }}'). For 'remote' type, defaults to GH_AW_GITHUB_TOKEN if not specified."
+                },
+                "token-broker": {
+                  "type": ["boolean", "null"],
+                  "description": "Exchange GitHub Actions OIDC for a broker-policy-scoped GitHub App token. Mutually exclusive with github-app and github-token when true."
                 },
                 "toolsets": {
                   "description": "GitHub MCP server toolset name(s) to enable. Accepts a single toolset name (string) or an array of toolset names.",
@@ -5307,141 +5281,6 @@
             false
           ]
         },
-        "linear": {
-          "description": "Linear tools provided by Linear's official hosted MCP server",
-          "oneOf": [
-            {
-              "type": "null",
-              "description": "Enable Linear using the well-known LINEAR_API_KEY secret"
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "token": {
-                  "type": "string",
-                  "description": "Optional Linear API key or OAuth access token secret reference. Defaults to ${{ secrets.LINEAR_API_KEY }}.",
-                  "pattern": "^\\$\\{\\{\\s*secrets\\.[A-Z_][A-Z0-9_]*\\s*\\}\\}$"
-                },
-                "toolsets": {
-                  "description": "Linear MCP toolset name(s) to enable. Toolsets are expanded to gateway-enforced allowed tools.",
-                  "oneOf": [
-                    {
-                      "$ref": "#/$defs/linear_toolset_name"
-                    },
-                    {
-                      "type": "array",
-                      "description": "Array of Linear MCP toolset names",
-                      "items": {
-                        "$ref": "#/$defs/linear_toolset_name"
-                      },
-                      "minItems": 1,
-                      "uniqueItems": true,
-                      "examples": [["issues", "projects"]]
-                    }
-                  ]
-                },
-                "allowed": {
-                  "type": "array",
-                  "description": "List of allowed Linear MCP tool names or wildcard patterns. When toolsets are set, every pattern must match a tool in those toolsets.",
-                  "items": {
-                    "type": "string",
-                    "minLength": 1
-                  },
-                  "minItems": 1,
-                  "uniqueItems": true
-                },
-                "required": {
-                  "type": "boolean",
-                  "description": "Whether failure to connect to Linear should fail MCP gateway startup. Defaults to true.",
-                  "default": true
-                }
-              }
-            }
-          ]
-        },
-        "jira": {
-          "description": "Jira tools provided by Atlassian's remote Rovo MCP service. This integration supports non-interactive CI/CD authentication only.",
-          "oneOf": [
-            {
-              "type": "boolean",
-              "enum": [false],
-              "description": "Disable the Jira integration, including a Jira configuration inherited from an import."
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["auth", "allowed"],
-              "properties": {
-                "url": {
-                  "type": "string",
-                  "format": "uri",
-                  "pattern": "^https://",
-                  "default": "https://mcp.atlassian.com/v1/mcp",
-                  "description": "Atlassian Rovo MCP endpoint. Defaults to the official hosted endpoint."
-                },
-                "allowed": {
-                  "type": "array",
-                  "minItems": 1,
-                  "uniqueItems": true,
-                  "items": {
-                    "type": "string",
-                    "enum": [
-                      "*",
-                      "getIssueLinkTypes",
-                      "getJiraIssue",
-                      "getJiraIssueRemoteIssueLinks",
-                      "getJiraIssueTypeMetaWithFields",
-                      "getJiraProjectIssueTypesMetadata",
-                      "getTransitionsForJiraIssue",
-                      "getVisibleJiraProjects",
-                      "lookupJiraAccountId",
-                      "searchJiraIssuesUsingJql"
-                    ]
-                  },
-                  "description": "Approved read-only Jira MCP tools the agent may call. Required; write-capable tools are not supported. \"*\" expands to all approved read-only tools; the full, unrestricted MCP tool set can never be enabled."
-                },
-                "auth": {
-                  "description": "Non-interactive authentication for GitHub Actions.",
-                  "oneOf": [
-                    {
-                      "type": "object",
-                      "additionalProperties": false,
-                      "required": ["type", "token"],
-                      "properties": {
-                        "type": {
-                          "const": "service-account"
-                        },
-                        "token": {
-                          "$ref": "#/$defs/ci_secret_expression",
-                          "description": "Atlassian service account API key, sent with the HTTP bearer scheme."
-                        }
-                      }
-                    },
-                    {
-                      "type": "object",
-                      "additionalProperties": false,
-                      "required": ["type", "email", "token"],
-                      "properties": {
-                        "type": {
-                          "const": "api-token"
-                        },
-                        "email": {
-                          "$ref": "#/$defs/ci_secret_expression",
-                          "description": "Atlassian account email stored as a GitHub Actions secret."
-                        },
-                        "token": {
-                          "$ref": "#/$defs/ci_secret_expression",
-                          "description": "Atlassian API token stored as a GitHub Actions secret."
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
-            }
-          ]
-        },
         "bash": {
           "description": "Bash shell command execution tool. Supports wildcards: '*' (all commands), 'command *' (command with any args, e.g., 'date *', 'echo *'). Default safe commands: echo, ls, pwd, cat, head, tail, grep, wc, sort, uniq, date.",
           "oneOf": [
@@ -5614,7 +5453,7 @@
           "examples": [true, null]
         },
         "work-queue": {
-          "description": "Read the immutable version-3 activation snapshot. Nonworkers without approved dispatch targets are read-only observers; workers and approved dispatchers may stage scoped queue intents. The installed ledger Policy is authoritative. Only Git storage is supported.",
+          "description": "Read the version-4 activation snapshot of the Git-backed work queue. Workflows without approved dispatch targets are read-only observers; workers and approved dispatchers may stage queue intents that trusted steps publish. Pool limits come from aw.json work_queue at compile time. Only Git storage is supported.",
           "oneOf": [
             {
               "type": "boolean",
@@ -5635,10 +5474,10 @@
                 },
                 "worker": {
                   "type": "boolean",
-                  "description": "Declare this workflow as a work-queue worker eligible to receive trusted queue claims."
+                  "description": "Declare this workflow as a work-queue worker. Every pool may route Claims to it; it receives work_queue_assignment {version: 4, dispatch_id} when dispatched."
                 },
                 "issues": {
-                  "description": "Mirror only this run's admitted Work and original authenticated Claims to GitHub Issues. Git remains authoritative; requires installed projector rules.",
+                  "description": "Workflow-level Issue projection setting; conflicts with aw.json work_queue.issues, which is preferred. Git remains authoritative; projection is best-effort.",
                   "oneOf": [
                     { "type": "boolean" },
                     {
@@ -5651,7 +5490,7 @@
                           "maxLength": 33,
                           "pattern": "\\S",
                           "default": "work",
-                          "description": "Repository label prefix; GitHub labels are limited to 50 characters, leaving at most 33 bytes for the prefix before the longest status suffix, ': Needs attention'."
+                          "description": "Label applied to projected Issues; at most 33 bytes."
                         }
                       }
                     }
@@ -5665,7 +5504,7 @@
                   "properties": {
                     "name": { "type": "string", "pattern": "^[A-Za-z][A-Za-z_0-9]*$", "maxLength": 64, "default": "persist_work_queue_memory" },
                     "path": { "type": "string", "minLength": 1, "maxLength": 256, "description": "Fixed relative JSON file path in the snapshot tree." },
-                    "target-repo": { "type": "string", "description": "Fixed repository also authorized by the installed immutable Work scope." },
+                    "target-repo": { "type": "string", "description": "Fixed repository that receives the memory snapshot; it must equal the worker profile's effect scope." },
                     "base-revision": { "type": "string", "pattern": "^[a-f0-9]{40}$|^[a-f0-9]{64}$" },
                     "branch-prefix": { "type": "string", "minLength": 1 },
                     "max-bytes": { "type": "integer", "minimum": 1, "maximum": 262144, "default": 262144 },
@@ -6105,7 +5944,7 @@
                 },
                 "issue-intent": {
                   "type": "boolean",
-                  "description": "Enable issue-intent metadata support (rationale/confidence/suggest) for this output type."
+                  "description": "Experimental: Enable issue-intent metadata support (rationale/confidence/suggest) for this output type. Disabled by default; set to true to opt in (makes rationale and confidence required)."
                 },
                 "samples": {
                   "description": "Internal hidden feature. Optional list of declarative sample payloads that exercise this safe-output handler. Used by the hidden `gh aw compile --use-samples` flag to replace the agentic step with a deterministic replay through the safe-outputs MCP server. Each entry should conform to the corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch` for create-pull-request and push-to-pull-request-branch) are stripped before schema validation and consumed by the replay driver.",
@@ -6179,9 +6018,13 @@
           "x-removal-message": "tools.serena built-in support has been removed. Import shared/mcp/serena.md instead:\n  imports:\n    - uses: shared/mcp/serena.md\n      with:\n        languages: [\"go\", \"typescript\"]"
         },
         "ledger": {
-          "description": "Standalone Git-backed ledger configuration. Declare type: log, set, map, table, counter, or notes for trusted built-in replay. Custom replay and compaction scripts are not supported. Tables require key (the string primary-key field). Built-ins accept typed operations via the configured ledger safe-output tools. Each ledger may set compaction; compaction is lossless and preserves all source transactions.",
+          "description": "Standalone ledger configuration. Storage defaults to git; storage: comment-memory uses the configured tools.comment-memory target without Git branches or compaction. Declare type: log, set, map, table, counter, or notes for trusted built-in replay. Tables require key (the string primary-key field). Custom replay and compaction scripts are not supported.",
           "type": "object",
           "properties": {
+            "storage": {
+              "oneOf": [{ "type": "string", "enum": ["git", "comment-memory"] }, { "type": "object" }],
+              "description": "Persistence backend, or a named object-valued ledger. Comment storage requires tools.comment-memory."
+            },
             "type": {
               "oneOf": [{ "type": "string", "enum": ["log", "set", "map", "table", "counter", "notes"] }, { "type": "object" }],
               "description": "Built-in ledger reducer type, or a named object-valued ledger."
@@ -6201,6 +6044,7 @@
                   { "required": ["max-patch-kb"] },
                   { "required": ["type"], "properties": { "type": { "type": "string" } } },
                   { "required": ["key"], "properties": { "key": { "type": "string" } } },
+                  { "required": ["storage"], "properties": { "storage": { "type": "string" } } },
                   {
                     "required": ["compaction"],
                     "properties": {
@@ -6247,6 +6091,17 @@
               "type": "object",
               "description": "Repo-memory configuration object",
               "properties": {
+                "github-app": {
+                  "$ref": "#/$defs/repo_memory_github_app"
+                },
+                "github-app-read": {
+                  "$ref": "#/$defs/repo_memory_github_app",
+                  "description": "GitHub App for memory restores and daily-credit ledger clones. Overrides github-app for reads only."
+                },
+                "github-app-write": {
+                  "$ref": "#/$defs/repo_memory_github_app",
+                  "description": "GitHub App for memory pushes. Overrides github-app for writes only."
+                },
                 "branch-prefix": {
                   "type": "string",
                   "minLength": 4,
@@ -6375,6 +6230,17 @@
               "items": {
                 "type": "object",
                 "properties": {
+                  "github-app": {
+                    "$ref": "#/$defs/repo_memory_github_app"
+                  },
+                  "github-app-read": {
+                    "$ref": "#/$defs/repo_memory_github_app",
+                    "description": "GitHub App for memory restores and daily-credit ledger clones. Overrides github-app for reads only."
+                  },
+                  "github-app-write": {
+                    "$ref": "#/$defs/repo_memory_github_app",
+                    "description": "GitHub App for memory pushes. Overrides github-app for writes only."
+                  },
                   "id": {
                     "type": "string",
                     "description": "Memory identifier (required for array notation, default: 'default')"
@@ -6560,7 +6426,7 @@
             "version": {
               "type": "string",
               "minLength": 1,
-              "description": "Package version to install for this language server (e.g. \"5.8.3\"). Overrides the built-in pinned default. Has no effect for custom servers not in the built-in install spec table."
+              "description": "Package version to install for built-in language servers that support overrides. The built-in TypeScript server accepts only its bundled lockfile version. Has no effect for custom servers."
             }
           },
           "required": ["command", "fileExtensions"],
@@ -6733,6 +6599,7 @@
         }
       ],
       "properties": {
+        "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
         "steer": {
           "type": "boolean",
           "description": "⚠️ Experimental. Create a run-scoped issue and let the agent read user-authored issue comments containing the keyword 'steer'. The issue is reused for agent failure reporting. Requires top-level issues: read permission.",
@@ -6781,6 +6648,7 @@
               "type": "object",
               "description": "Configuration for automatically creating GitHub issues from AI workflow output. The main job does not need 'issues: write' permission.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "title-prefix": {
                   "type": "string",
                   "description": "Optional prefix to add to the beginning of the issue title (e.g., '[ai] ' or '[analysis] ')"
@@ -6797,7 +6665,8 @@
                   "type": "array",
                   "description": "Optional list of labels to automatically attach to created issues (e.g., ['automation', 'ai-generated'])",
                   "items": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 50
                   }
                 },
                 "allowed-labels": {
@@ -6813,6 +6682,20 @@
                   "items": {
                     "type": "string"
                   }
+                },
+                "max-issue-artifacts": {
+                  "type": "integer",
+                  "default": 10,
+                  "description": "Maximum number of artifacts attached per created issue (default: 10). Zero or a negative value disables issue artifacts."
+                },
+                "max-issue-artifact-size": {
+                  "type": ["integer", "string"],
+                  "minimum": 1,
+                  "maximum": 9007199254740991,
+                  "maxLength": 64,
+                  "pattern": "^\\s*[0-9]+(?:\\.[0-9]+)?\\s*(?:[bB]|[kKmMgGtT](?:[iI]?[bB])?)?\\s*$",
+                  "default": 1048576,
+                  "description": "Maximum UTF-8 size of each issue artifact body (default: 1mb = 1048576 bytes). Accepts positive integer bytes or a human-friendly size such as 512kb, 1mb, or 1.5mb. Units B, K/KB/KiB, M/MB/MiB, G/GB/GiB, and T/TB/TiB are case-insensitive and use multiples of 1024. The size must resolve to a positive whole byte count. Oversized bodies are rejected, not truncated."
                 },
                 "assignees": {
                   "oneOf": [
@@ -6852,6 +6735,17 @@
                     }
                   ],
                   "description": "Title-based deduplication for create-issue. Set to true for exact title matching, or provide a non-negative integer (0\u2013100) to deduplicate by Levenshtein edit distance (e.g., 1 allows one-character differences). Accepts a GitHub Actions expression that resolves to a boolean or integer at runtime. Applies within-run and against open/recently-closed repository issues."
+                },
+                "deduplicate-by-labels": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "not": {
+                      "pattern": "\\$\\{\\{"
+                    }
+                  },
+                  "description": "Deduplicate against issues with all listed labels. When deduplicate-by-title is also enabled, both the title and all labels must match (AND). Applies within-run and against open/recently-closed repository issues. Omitted or empty lists disable label filtering. Labels must be literal strings, not GitHub Actions expressions. Does not change labels applied at creation."
                 },
                 "target-repo": {
                   "type": "string",
@@ -6921,7 +6815,7 @@
                 },
                 "issue-intent": {
                   "type": "boolean",
-                  "description": "Enable issue-intent metadata support (rationale/confidence/suggest) for this output type."
+                  "description": "Experimental: Enable issue-intent metadata support (rationale/confidence/suggest) for this output type. Disabled by default; set to true to opt in (makes rationale and confidence required)."
                 },
                 "samples": {
                   "description": "Internal hidden feature. Optional list of declarative sample payloads that exercise this safe-output handler. Used by the hidden `gh aw compile --use-samples` flag to replace the agentic step with a deterministic replay through the safe-outputs MCP server. Each entry should conform to the corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch` for create-pull-request and push-to-pull-request-branch) are stripped before schema validation and consumed by the replay driver.",
@@ -6991,6 +6885,7 @@
               "deprecated": true,
               "x-deprecation-message": "'create-agent-task' is deprecated. Use 'create-agent-session' instead.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "base": {
                   "type": "string",
                   "description": "Base branch for the agent session pull request. Defaults to the current branch or repository default branch."
@@ -7032,7 +6927,7 @@
                 },
                 "issue-intent": {
                   "type": "boolean",
-                  "description": "Enable issue-intent metadata support (rationale/confidence/suggest) for this output type."
+                  "description": "Experimental: Enable issue-intent metadata support (rationale/confidence/suggest) for this output type. Disabled by default; set to true to opt in (makes rationale and confidence required)."
                 },
                 "samples": {
                   "description": "Internal hidden feature. Optional list of declarative sample payloads that exercise this safe-output handler. Used by the hidden `gh aw compile --use-samples` flag to replace the agentic step with a deterministic replay through the safe-outputs MCP server. Each entry should conform to the corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch` for create-pull-request and push-to-pull-request-branch) are stripped before schema validation and consumed by the replay driver.",
@@ -7070,6 +6965,7 @@
               "type": "object",
               "description": "Configuration for creating GitHub Copilot coding agent sessions from agentic workflow output using gh agent-task CLI. The main job does not need write permissions.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "base": {
                   "type": "string",
                   "description": "Base branch for the agent session pull request. Defaults to the current branch or repository default branch."
@@ -7146,6 +7042,7 @@
               "description": "Configuration for managing GitHub Projects boards. Enable agents to add issues and pull requests to projects, update custom field values (status, priority, effort, dates), create project fields and views. By default it is update-only: if the project does not exist, the job fails with instructions to create it. To allow workflows to create missing projects, explicitly opt in via agent output field create_if_missing=true. Requires a Personal Access Token (PAT) or GitHub App token with Projects permissions (default GITHUB_TOKEN cannot be used). Agent output includes: project (full URL or temporary project ID like aw_XXXXXXXXXXXX or #aw_XXXXXXXXXXXX from create_project), content_type (issue|pull_request|draft_issue), content_number, fields, create_if_missing. For specialized operations, agent can also provide: operation (create_fields|create_view), field_definitions (array of field configs when operation=create_fields), view (view config object when operation=create_view).",
               "required": ["project"],
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of project operations to perform (default: 10). Each operation may add a project item, or update its fields. Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -7315,6 +7212,7 @@
               "type": "object",
               "description": "Configuration for creating new GitHub Projects boards. Enables agents to create new project boards with optional custom fields, views, and an initial item. Requires a Personal Access Token (PAT) or GitHub App token with Projects write permission (default GITHUB_TOKEN cannot be used). Agent output includes: title (project name), owner (org/user login, uses default if omitted), owner_type ('org' or 'user'), optional item_url (issue to add as first item), and optional field_definitions. Returns a temporary project ID for use in subsequent update_project operations.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of create operations to perform (default: 1). Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -7450,6 +7348,7 @@
               "description": "Configuration for posting status updates to GitHub Projects. Status updates provide stakeholder communication about project progress, health, and timeline. Each update appears in the project's Updates tab and creates a historical record. Requires a Personal Access Token (PAT) or GitHub App token with Projects read & write permission (default GITHUB_TOKEN cannot be used). Typically used by scheduled workflows or orchestrators to post regular progress summaries with status indicators (on-track, at-risk, off-track, complete, inactive), dates, and progress details.",
               "required": ["project"],
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of status updates to create (default: 1). Typically 1 per orchestrator run. Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -7525,6 +7424,7 @@
               "type": "object",
               "description": "Configuration for creating GitHub discussions from agentic workflow output",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "title-prefix": {
                   "type": "string",
                   "description": "Optional prefix for the discussion title"
@@ -7542,7 +7442,8 @@
                 "labels": {
                   "type": "array",
                   "items": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 50
                   },
                   "description": "Optional list of labels to attach to created discussions. Also used for matching when close-older-discussions is enabled - discussions must have ALL specified labels (AND logic)."
                 },
@@ -7698,6 +7599,7 @@
               "type": "object",
               "description": "Configuration for closing GitHub discussions with comment and resolution from agentic workflow output",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "required-labels": {
                   "type": "array",
                   "items": {
@@ -7803,6 +7705,7 @@
               "type": "object",
               "description": "Configuration for updating GitHub discussions from agentic workflow output",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "target": {
                   "type": "string",
                   "description": "Target for updates: 'triggering' (default), '*' (any discussion), or explicit discussion number"
@@ -7902,6 +7805,7 @@
               "type": "object",
               "description": "Configuration for closing GitHub issues with comment from agentic workflow output",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "required-labels": {
                   "type": "array",
                   "items": {
@@ -7964,7 +7868,7 @@
                 },
                 "issue-intent": {
                   "type": "boolean",
-                  "description": "Enable issue-intent metadata support (rationale/confidence/suggest) for this output type."
+                  "description": "Experimental: Enable issue-intent metadata support (rationale/confidence/suggest) for this output type. Disabled by default; set to true to opt in (makes rationale and confidence required)."
                 },
                 "samples": {
                   "description": "Internal hidden feature. Optional list of declarative sample payloads that exercise this safe-output handler. Used by the hidden `gh aw compile --use-samples` flag to replace the agentic step with a deterministic replay through the safe-outputs MCP server. Each entry should conform to the corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch` for create-pull-request and push-to-pull-request-branch) are stripped before schema validation and consumed by the replay driver.",
@@ -8027,6 +7931,7 @@
               "type": "object",
               "description": "Configuration for closing GitHub pull requests without merging, with comment from agentic workflow output",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "required-labels": {
                   "type": "array",
                   "items": {
@@ -8128,6 +8033,7 @@
               "type": "object",
               "description": "Configuration for marking draft pull requests as ready for review, with comment from agentic workflow output",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "required-labels": {
                   "type": "array",
                   "items": {
@@ -8229,6 +8135,7 @@
               "type": "object",
               "description": "Configuration for approving workflow runs that are awaiting required approval.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of workflow runs to approve (default: 1). Supports an integer or GitHub Actions expression.",
                   "oneOf": [
@@ -8336,268 +8243,17 @@
           ],
           "description": "Enable AI agents to approve pending workflow runs in the action required state."
         },
-        "jira-create-issue": {
-          "oneOf": [
-            {
-              "type": "object",
-              "description": "Configuration for creating Jira Cloud issues through the privileged safe-output execution path.",
-              "properties": {
-                "max": {
-                  "description": "Maximum number of Jira issues to create (default: 1).",
-                  "oneOf": [
-                    {
-                      "type": "integer",
-                      "minimum": 1,
-                      "maximum": 100
-                    },
-                    {
-                      "type": "string",
-                      "pattern": "^\\$\\{\\{.*\\}\\}$"
-                    }
-                  ]
-                },
-                "staged": {
-                  "description": "Preview Jira issue creation without sending an HTTP mutation.",
-                  "oneOf": [
-                    {
-                      "type": "boolean"
-                    },
-                    {
-                      "type": "string",
-                      "pattern": "^\\$\\{\\{.*\\}\\}$"
-                    }
-                  ]
-                }
-              },
-              "additionalProperties": false
-            },
-            {
-              "type": "null",
-              "description": "Enable Jira issue creation with default configuration."
-            }
-          ]
-        },
-        "jira-update-issue": {
-          "oneOf": [
-            {
-              "type": "object",
-              "description": "Configuration for updating Jira Cloud issue summaries or descriptions through the privileged safe-output execution path.",
-              "properties": {
-                "max": {
-                  "description": "Maximum number of Jira issues to update (default: 1).",
-                  "oneOf": [
-                    {
-                      "type": "integer",
-                      "minimum": 1,
-                      "maximum": 100
-                    },
-                    {
-                      "type": "string",
-                      "pattern": "^\\$\\{\\{.*\\}\\}$"
-                    }
-                  ]
-                },
-                "staged": {
-                  "description": "Preview Jira issue updates without sending an HTTP mutation.",
-                  "oneOf": [
-                    {
-                      "type": "boolean"
-                    },
-                    {
-                      "type": "string",
-                      "pattern": "^\\$\\{\\{.*\\}\\}$"
-                    }
-                  ]
-                }
-              },
-              "additionalProperties": false
-            },
-            {
-              "type": "null",
-              "description": "Enable Jira issue updates with default configuration."
-            }
-          ]
-        },
-        "jira-add-comment": {
-          "oneOf": [
-            {
-              "type": "object",
-              "description": "Configuration for commenting on Jira Cloud issues through the privileged safe-output execution path.",
-              "properties": {
-                "max": {
-                  "description": "Maximum number of Jira comments to add (default: 1).",
-                  "oneOf": [
-                    {
-                      "type": "integer",
-                      "minimum": 1,
-                      "maximum": 100
-                    },
-                    {
-                      "type": "string",
-                      "pattern": "^\\$\\{\\{.*\\}\\}$"
-                    }
-                  ]
-                },
-                "staged": {
-                  "description": "Preview Jira comments without sending an HTTP mutation.",
-                  "oneOf": [
-                    {
-                      "type": "boolean"
-                    },
-                    {
-                      "type": "string",
-                      "pattern": "^\\$\\{\\{.*\\}\\}$"
-                    }
-                  ]
-                }
-              },
-              "additionalProperties": false
-            },
-            {
-              "type": "null",
-              "description": "Enable Jira comments with default configuration."
-            }
-          ]
-        },
-        "jira-add-label": {
-          "oneOf": [
-            {
-              "type": "object",
-              "description": "Configuration for adding labels to Jira Cloud issues through the privileged safe-output execution path.",
-              "properties": {
-                "max": {
-                  "description": "Maximum number of Jira labels to add (default: 1).",
-                  "oneOf": [
-                    {
-                      "type": "integer",
-                      "minimum": 1,
-                      "maximum": 100
-                    },
-                    {
-                      "type": "string",
-                      "pattern": "^\\$\\{\\{.*\\}\\}$"
-                    }
-                  ]
-                },
-                "staged": {
-                  "description": "Preview Jira label additions without sending an HTTP mutation.",
-                  "oneOf": [
-                    {
-                      "type": "boolean"
-                    },
-                    {
-                      "type": "string",
-                      "pattern": "^\\$\\{\\{.*\\}\\}$"
-                    }
-                  ]
-                }
-              },
-              "additionalProperties": false
-            },
-            {
-              "type": "null",
-              "description": "Enable Jira label additions with default configuration."
-            }
-          ]
-        },
-        "linear-create-issue": {
-          "type": "object",
-          "description": "Experimental. Create Linear issues through the isolated safe_outputs job.",
-          "properties": {
-            "team-id": {
-              "type": "string",
-              "minLength": 1,
-              "description": "Optional trusted Linear team model UUID, key, name, or GitHub Actions expression. Defaults to LINEAR_TEAM_ID."
-            },
-            "project-id": {
-              "type": "string",
-              "pattern": "^(?:[0-9a-fA-F]{12}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$",
-              "description": "Optional trusted Linear project identifier from a project URL or model UUID."
-            },
-            "max": {
-              "oneOf": [
-                { "type": "integer", "minimum": 1, "maximum": 100 },
-                { "type": "string", "pattern": "^\\$\\{\\{.*\\}\\}$" }
-              ],
-              "description": "Maximum number of Linear issues to create (default: 1)."
-            },
-            "staged": { "$ref": "#/$defs/templatable_boolean" },
-            "samples": {
-              "oneOf": [
-                { "type": "array", "items": { "type": "object", "additionalProperties": true } },
-                { "type": "object", "additionalProperties": true }
-              ]
-            }
-          },
-          "additionalProperties": false
-        },
-        "linear-add-comment": {
-          "type": "object",
-          "description": "Experimental. Add comments to one trusted Linear issue through the isolated safe_outputs job.",
-          "properties": {
-            "target": {
-              "$ref": "#/$defs/linear_issue_identifier",
-              "description": "Trusted Linear issue UUID or shorthand identifier such as ENG-123."
-            },
-            "max": {
-              "oneOf": [
-                { "type": "integer", "minimum": 1, "maximum": 100 },
-                { "type": "string", "pattern": "^\\$\\{\\{.*\\}\\}$" }
-              ],
-              "description": "Maximum number of Linear comments to add (default: 1)."
-            },
-            "staged": { "$ref": "#/$defs/templatable_boolean" },
-            "samples": {
-              "oneOf": [
-                { "type": "array", "items": { "type": "object", "additionalProperties": true } },
-                { "type": "object", "additionalProperties": true }
-              ]
-            }
-          },
-          "required": ["target"],
-          "additionalProperties": false
-        },
-        "linear-update-issue": {
-          "type": "object",
-          "description": "Experimental. Update explicitly enabled fields on one trusted Linear issue through the isolated safe_outputs job.",
-          "properties": {
-            "target": {
-              "$ref": "#/$defs/linear_issue_identifier",
-              "description": "Trusted Linear issue UUID or shorthand identifier such as ENG-123."
-            },
-            "title": {
-              "const": true,
-              "description": "Allow the agent to update the Linear issue title."
-            },
-            "body": {
-              "const": true,
-              "description": "Allow the agent to replace the Linear issue description."
-            },
-            "max": {
-              "oneOf": [
-                { "type": "integer", "minimum": 1, "maximum": 100 },
-                { "type": "string", "pattern": "^\\$\\{\\{.*\\}\\}$" }
-              ],
-              "description": "Maximum number of updates to apply (default: 1)."
-            },
-            "staged": { "$ref": "#/$defs/templatable_boolean" },
-            "samples": {
-              "oneOf": [
-                { "type": "array", "items": { "type": "object", "additionalProperties": true } },
-                { "type": "object", "additionalProperties": true }
-              ]
-            }
-          },
-          "required": ["target"],
-          "anyOf": [{ "required": ["title"] }, { "required": ["body"] }],
-          "additionalProperties": false
-        },
         "add-comment": {
           "oneOf": [
             {
               "type": "object",
               "description": "Configuration for automatically creating GitHub issue or pull request comments from AI workflow output. The main job does not need write permissions.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
+                "collapse-data": {
+                  "type": "boolean",
+                  "description": "Render safe-output data in a collapsed Structured data details block. Default: false (visible fenced JSON). Requires safe-outputs.data to accept structured data."
+                },
                 "max-links": {
                   "type": "integer",
                   "minimum": 1,
@@ -8786,6 +8442,7 @@
               "type": "object",
               "description": "Configuration for creating GitHub pull requests from agentic workflow output. Supports creating multiple PRs in a single run when max > 1.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of pull requests to create (default: 1). Each PR requires distinct changes on a separate branch. Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -8824,9 +8481,21 @@
                     {
                       "type": "array",
                       "description": "Array of label names",
-                      "items": {
-                        "type": "string"
-                      }
+                      "anyOf": [
+                        {
+                          "items": {
+                            "type": "string",
+                            "maxLength": 50
+                          }
+                        },
+                        {
+                          "maxItems": 1,
+                          "items": {
+                            "type": "string",
+                            "pattern": "^\\$\\{\\{.*\\}\\}$"
+                          }
+                        }
+                      ]
                     },
                     {
                       "type": "string",
@@ -8894,7 +8563,8 @@
                   "type": "array",
                   "description": "Optional labels to apply to fallback issues created when pull request creation cannot proceed. When omitted, fallback issues reuse pull request labels. A managed label is always added for triage.",
                   "items": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 50
                   }
                 },
                 "draft": {
@@ -8963,12 +8633,17 @@
                       "type": "string",
                       "pattern": "^[0-9]+[hHdDwWmMyY]$",
                       "description": "Relative time (e.g., '2h', '7d', '2w', '1m', '1y'); minimum 2h for hour values"
+                    },
+                    {
+                      "type": "boolean",
+                      "enum": [false],
+                      "description": "Set to false to explicitly disable expiration"
                     }
                   ],
-                  "description": "Time until the pull request expires and should be automatically closed (only for same-repo PRs without target-repo). Supports integer (days) or relative time format. Minimum duration: 2 hours."
+                  "description": "Time until the pull request expires and should be automatically closed (only for same-repo PRs without target-repo). Supports integer (days), relative time format, or false to disable expiration. Minimum duration: 2 hours."
                 },
                 "auto-merge": {
-                  "description": "Enable auto-merge for the pull request. Accepts true/false, an explicit merge method (squash, merge, rebase), or a GitHub Actions expression resolving to any of those values. When enabled, the PR will be automatically merged once all required checks pass and required approvals are met. Defaults to false.",
+                  "description": "Enable auto-merge for the pull request. Accepts true/false, an explicit merge method (squash, merge, rebase), or a GitHub Actions expression resolving to any of those values. When enabled, the PR will be automatically merged once all required checks pass and required approvals are met. Auto-merge is withheld and independent review is required when protected-file changes trigger the request-review policy, detection produces a caution (including detection engine errors), or a required review fails (including when the bot authored the PR). Configured reviewers or a successful REQUEST_CHANGES review do not bypass these gates. Defaults to false.",
                   "default": false,
                   "oneOf": [
                     {
@@ -9244,6 +8919,7 @@
               "type": "object",
               "description": "Configuration for creating GitHub pull request review comments from agentic workflow output",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of review comments to create (default: 10) Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -9339,6 +9015,7 @@
               "type": "object",
               "description": "Configuration for submitting a consolidated PR review with a status decision (APPROVE, REQUEST_CHANGES, COMMENT). All create-pull-request-review-comment outputs are collected and submitted as part of this review.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of reviews to submit (default: 1) Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -9456,6 +9133,7 @@
               "type": "object",
               "description": "Configuration for dismissing pull request reviews previously submitted by the current workflow actor.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of review dismissals to perform (default: 10) Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -9545,6 +9223,7 @@
               "type": "object",
               "description": "Configuration for replying to existing pull request review comments",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of replies to create (default: 10) Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -9636,6 +9315,7 @@
               "type": "object",
               "description": "Configuration for resolving review threads on pull requests. By default, resolution is scoped to the triggering PR only. When target, target-repo, or allowed-repos are specified, cross-repository thread resolution is supported.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of review threads to resolve (default: 10) Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -9722,6 +9402,7 @@
               "type": "object",
               "description": "Configuration for creating repository security advisories (SARIF format) from agentic workflow output",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of security findings to include (default: unlimited) Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -9801,6 +9482,7 @@
               "type": "object",
               "description": "Configuration for creating autofixes for code scanning alerts",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of autofixes to create (default: 10) Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -9854,30 +9536,13 @@
           ],
           "description": "Enable AI agents to create autofixes for code scanning alerts using the GitHub REST API."
         },
-        "ado-create-work-item": {
-          "$ref": "#/$defs/azure_devops_create_work_item"
-        },
-        "ado-update-work-item": {
-          "$ref": "#/$defs/azure_devops_update_work_item"
-        },
-        "ado-comment-on-work-item": {
-          "$ref": "#/$defs/azure_devops_comment_on_work_item"
-        },
-        "ado-assign-work-item": {
-          "$ref": "#/$defs/azure_devops_assign_work_item"
-        },
-        "ado-link-work-items": {
-          "$ref": "#/$defs/azure_devops_link_work_items"
-        },
-        "ado-upload-workitem-attachment": {
-          "$ref": "#/$defs/azure_devops_upload_workitem_attachment"
-        },
         "create-check-run": {
           "oneOf": [
             {
               "type": "object",
               "description": "Configuration for creating GitHub Check Runs to surface agent analysis results on commits and pull requests",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "name": {
                   "type": "string",
                   "description": "Check run name shown in the GitHub Checks UI (e.g., 'Security Analysis'). If omitted, defaults to the workflow name."
@@ -9966,6 +9631,7 @@
               "type": "object",
               "description": "Configuration for adding labels to issues/PRs from agentic workflow output. Labels must already exist in the repository unless 'create-if-missing' is enabled.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "allowed": {
                   "type": "array",
                   "description": "Optional list of allowed labels that can be added. Labels must already exist in the repository unless 'create-if-missing' is enabled. If omitted, any labels are allowed.",
@@ -10054,7 +9720,7 @@
                 },
                 "issue-intent": {
                   "type": "boolean",
-                  "description": "Enable issue-intent metadata support (rationale/confidence/suggest) for this output type."
+                  "description": "Experimental: Enable issue-intent metadata support (rationale/confidence/suggest) for this output type. Disabled by default; set to true to opt in (makes rationale and confidence required)."
                 },
                 "create-if-missing": {
                   "type": "boolean",
@@ -10106,6 +9772,7 @@
               "type": "object",
               "description": "Configuration for removing labels from issues/PRs from agentic workflow output.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "allowed": {
                   "type": "array",
                   "description": "Optional list of allowed labels that can be removed. If omitted, any labels can be removed.",
@@ -10219,6 +9886,7 @@
               "type": "object",
               "description": "Configuration for adding reviewers to pull requests from agentic workflow output",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "allowed-reviewers": {
                   "type": "array",
                   "description": "Optional list of allowed reviewer usernames. If omitted, any reviewers are allowed.",
@@ -10358,6 +10026,7 @@
               "type": "object",
               "description": "Configuration for assigning issues to milestones from agentic workflow output",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "allowed": {
                   "type": "array",
                   "description": "Optional list of allowed milestone titles that can be assigned. If omitted, any milestones are allowed.",
@@ -10456,6 +10125,7 @@
               "type": "object",
               "description": "Configuration for assigning GitHub Copilot coding agent to issues from agentic workflow output",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "name": {
                   "type": "string",
                   "description": "Default agent name to assign (default: 'copilot')"
@@ -10551,7 +10221,7 @@
                 },
                 "issue-intent": {
                   "type": "boolean",
-                  "description": "Enable issue-intent metadata support (rationale/confidence/suggest) for this output type."
+                  "description": "Experimental: Enable issue-intent metadata support (rationale/confidence/suggest) for this output type. Disabled by default; set to true to opt in (makes rationale and confidence required)."
                 },
                 "samples": {
                   "description": "Internal hidden feature. Optional list of declarative sample payloads that exercise this safe-output handler. Used by the hidden `gh aw compile --use-samples` flag to replace the agentic step with a deterministic replay through the safe-outputs MCP server. Each entry should conform to the corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch` for create-pull-request and push-to-pull-request-branch) are stripped before schema validation and consumed by the replay driver.",
@@ -10589,6 +10259,7 @@
               "type": "object",
               "description": "Configuration for assigning users to issues from agentic workflow output",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "allowed": {
                   "type": "array",
                   "items": {
@@ -10648,7 +10319,7 @@
                 },
                 "issue-intent": {
                   "type": "boolean",
-                  "description": "Enable issue-intent metadata support (rationale/confidence/suggest) for this output type."
+                  "description": "Experimental: Enable issue-intent metadata support (rationale/confidence/suggest) for this output type. Disabled by default; set to true to opt in (makes rationale and confidence required)."
                 },
                 "samples": {
                   "description": "Internal hidden feature. Optional list of declarative sample payloads that exercise this safe-output handler. Used by the hidden `gh aw compile --use-samples` flag to replace the agentic step with a deterministic replay through the safe-outputs MCP server. Each entry should conform to the corresponding MCP tool inputSchema; recognized sidecar keys (currently `patch` for create-pull-request and push-to-pull-request-branch) are stripped before schema validation and consumed by the replay driver.",
@@ -10697,6 +10368,7 @@
               "type": "object",
               "description": "Configuration for removing assignees from issues in agentic workflow output",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "allowed": {
                   "type": "array",
                   "items": {
@@ -10796,6 +10468,7 @@
               "type": "object",
               "description": "Configuration for linking issues as sub-issues from agentic workflow output",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of sub-issue links to create (default: 5) Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -10903,6 +10576,21 @@
               "type": "object",
               "description": "Configuration for updating GitHub issues from agentic workflow output",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
+                "max-issue-artifacts": {
+                  "type": "integer",
+                  "default": 10,
+                  "description": "Maximum number of artifacts attached per updated issue (default: 10). Zero or a negative value disables issue artifacts."
+                },
+                "max-issue-artifact-size": {
+                  "type": ["integer", "string"],
+                  "minimum": 1,
+                  "maximum": 9007199254740991,
+                  "maxLength": 64,
+                  "pattern": "^\\s*[0-9]+(?:\\.[0-9]+)?\\s*(?:[bB]|[kKmMgGtT](?:[iI]?[bB])?)?\\s*$",
+                  "default": 1048576,
+                  "description": "Maximum UTF-8 size of each issue artifact body (default: 1mb = 1048576 bytes). Accepts positive integer bytes or a human-friendly size such as 512kb, 1mb, or 1.5mb. Units B, K/KB/KiB, M/MB/MiB, G/GB/GiB, and T/TB/TiB are case-insensitive and use multiples of 1024. The size must resolve to a positive whole byte count. Oversized bodies are rejected, not truncated."
+                },
                 "status": {
                   "type": "null",
                   "description": "Allow updating issue status (open/closed) - presence of key indicates field can be updated"
@@ -10919,6 +10607,11 @@
                   "type": ["boolean", "null"],
                   "description": "Allow updating issue body. Set to true to enable body updates, false to disable. For backward compatibility, null (body:) also enables body updates.",
                   "default": true
+                },
+                "operation": {
+                  "type": "string",
+                  "description": "Default operation for body updates when the agent omits operation: 'append' (add to end), 'prepend' (add to start), 'replace' (overwrite completely), or 'replace-island' (update a workflow-specific section). An explicit agent operation takes precedence. Defaults to 'append' if not specified.",
+                  "enum": ["append", "prepend", "replace", "replace-island"]
                 },
                 "footer": {
                   "type": "boolean",
@@ -11011,6 +10704,7 @@
               "type": "object",
               "description": "Configuration for updating GitHub pull requests from agentic workflow output. Both title and body updates are enabled by default.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "target": {
                   "type": "string",
                   "description": "Target for updates: 'triggering' (default), '*' (any PR), or explicit PR number"
@@ -11120,13 +10814,54 @@
         "merge-pull-request": {
           "oneOf": [
             {
-              "type": "null",
-              "description": "Enable pull request merge with default policy configuration"
-            },
-            {
               "type": "object",
               "description": "Experimental configuration for controlled pull request merges. The merge is blocked unless all configured gates pass.",
+              "required": ["allowed-base-branches"],
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
+                "allowed-base-branches": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "^[^\\s!+?\\[\\]{}()\\\\]+$",
+                    "not": { "pattern": "^[*/]+$" }
+                  },
+                  "description": "Required static scoped patterns for destination (base) branches declared by the owner as non-consequential automated integration targets. Only * and ** glob operators are supported; expressions, negation, character classes, braces, extglobs, and escapes are forbidden. Patterns consisting only of * and /, such as *, **, */*, and **/*, are forbidden. Default and protected branches remain blocked. This declaration is not proof of harmless downstream effects."
+                },
+                "protected-files": {
+                  "oneOf": [
+                    {
+                      "type": "string",
+                      "enum": ["blocked", "allowed"],
+                      "default": "blocked"
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^\\$\\{\\{.*\\}\\}$",
+                      "description": "GitHub Actions expression resolving to blocked or allowed. Unrecognized resolved values block protected-file changes."
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "policy": {
+                          "oneOf": [
+                            { "type": "string", "enum": ["blocked", "allowed"], "default": "blocked" },
+                            { "type": "string", "pattern": "^\\$\\{\\{.*\\}\\}$" }
+                          ]
+                        },
+                        "exclude": {
+                          "type": "array",
+                          "items": { "type": "string", "pattern": "^[^\\s]*[A-Za-z0-9_-][^\\s]*$" },
+                          "description": "Same exclusions as create-pull-request: basenames or protected directory prefixes, or repository-root globs with a leading /. Each pattern must contain a letter, digit, underscore, or hyphen and no whitespace."
+                        }
+                      },
+                      "additionalProperties": false
+                    }
+                  ],
+                  "description": "Block merges modifying protected files by default, using create-pull-request's protected set and exclusions. allowed explicitly disables this file gate, not other merge gates. Creation-specific request-review and fallback-to-issue policies are not supported."
+                },
                 "max": {
                   "description": "Maximum number of pull request merges to perform per run (default: 1). Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -11236,7 +10971,7 @@
               "additionalProperties": false
             }
           ],
-          "description": "Enable AI agents to merge pull requests under configured policy gates."
+          "description": "Enable AI agents to merge pull requests under configured policy gates. Merging is blocked by detection, protected-file, or other caution notices in the live PR or review bodies, or by current detection warnings or failures, even when approvals and checks pass. Independent manual review and manual merge are required in these cases."
         },
         "push-to-pull-request-branch": {
           "oneOf": [
@@ -11248,6 +10983,7 @@
               "type": "object",
               "description": "Configuration for pushing changes to a specific branch from agentic workflow output. Supports pushing to multiple PRs in a single run when max > 1.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of push operations to perform (default: 1). Each push targets a different pull request branch. Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -11537,6 +11273,7 @@
               "type": "object",
               "description": "Configuration for hiding comments on GitHub issues, pull requests, or discussions from agentic workflow output",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of comments to hide (default: 5) Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -11616,6 +11353,7 @@
               "type": "object",
               "description": "Configuration for setting the type of GitHub issues from agentic workflow output",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "allowed": {
                   "type": "array",
                   "description": "Optional list of allowed issue type names (e.g. 'Bug', 'Feature'). If omitted, any type is allowed. Empty string is always allowed to clear the type.",
@@ -11664,7 +11402,7 @@
                 },
                 "issue-intent": {
                   "type": "boolean",
-                  "description": "Enable issue-intent metadata support (rationale/confidence/suggest) for this output type."
+                  "description": "Experimental: Enable issue-intent metadata support (rationale/confidence/suggest) for this output type. Disabled by default; set to true to opt in (makes rationale and confidence required)."
                 },
                 "staged": {
                   "$ref": "#/$defs/templatable_boolean",
@@ -11718,6 +11456,7 @@
               "type": "object",
               "description": "Configuration for setting one issue field value by field name and value.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Optional maximum number of set-issue-field operations (default: 5). Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -11760,7 +11499,7 @@
                 },
                 "issue-intent": {
                   "type": "boolean",
-                  "description": "Enable issue-intent metadata support (rationale/confidence/suggest) for this output type."
+                  "description": "Experimental: Enable issue-intent metadata support (rationale/confidence/suggest) for this output type. Disabled by default; set to true to opt in (makes rationale and confidence required)."
                 },
                 "staged": {
                   "$ref": "#/$defs/templatable_boolean",
@@ -11810,6 +11549,7 @@
               "type": "object",
               "description": "Configuration for dispatching workflow_dispatch events to other workflows. Orchestrators use this to delegate work to worker workflows.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "workflows": {
                   "type": "array",
                   "description": "List of workflow names (without .md extension) to allow dispatching. Each workflow must exist in .github/workflows/.",
@@ -11924,12 +11664,16 @@
         },
         "dispatch-repository": {
           "type": "object",
+          "properties": {
+            "authorization": { "$ref": "#/$defs/safeOutputAuthorization" }
+          },
           "description": "Dispatch repository_dispatch events to external repositories. Each sub-key defines a named dispatch tool with its own event_type, target repository, input schema, and execution limits. Note: nested keys use snake_case (event_type, allowed_repositories) rather than the kebab-case used by other safe-output fields.",
           "x-example-key": "trigger-ci",
           "additionalProperties": {
             "type": "object",
             "description": "Configuration for a single repository dispatch tool",
             "properties": {
+              "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
               "description": {
                 "type": "string",
                 "description": "Human-readable description of what this dispatch tool does"
@@ -12036,6 +11780,7 @@
               "type": "object",
               "description": "Configuration for calling reusable workflows via workflow_call fan-out. The compiler generates conditional `uses:` jobs at compile time; the agent selects which worker to activate at runtime.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "workflows": {
                   "type": "array",
                   "description": "List of workflow names (without .md extension) to allow calling. Each workflow must exist in .github/workflows/ and declare a workflow_call trigger.",
@@ -12120,6 +11865,7 @@
               "type": "object",
               "description": "Configuration for reporting missing tools from agentic workflow output",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of missing tool reports (default: unlimited) Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -12139,6 +11885,10 @@
                   "description": "Whether to create or update GitHub issues when tools are missing (default: true). Supports literal boolean or GitHub Actions expression (e.g. '${{ inputs.create-issue }}').",
                   "default": true
                 },
+                "report-as-failure": {
+                  "$ref": "#/$defs/templatable_boolean",
+                  "description": "Whether to surface missing tools as agent failures (default: true). Supports literal boolean or GitHub Actions expression."
+                },
                 "title-prefix": {
                   "type": "string",
                   "description": "Prefix for issue titles when creating issues for missing tools (default: '[missing tool]')",
@@ -12148,7 +11898,8 @@
                   "type": "array",
                   "description": "Labels to add to created issues for missing tools",
                   "items": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 50
                   },
                   "default": []
                 },
@@ -12208,6 +11959,7 @@
               "type": "object",
               "description": "Configuration for reporting missing data required to achieve workflow goals. Encourages AI agents to be truthful about data gaps instead of hallucinating information.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of missing data reports (default: unlimited) Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -12227,6 +11979,10 @@
                   "description": "Whether to create or update GitHub issues when data is missing (default: true). Supports literal boolean or GitHub Actions expression (e.g. '${{ inputs.create-missing-data-issue }}').",
                   "default": true
                 },
+                "report-as-failure": {
+                  "$ref": "#/$defs/templatable_boolean",
+                  "description": "Whether to surface missing data as agent failures (default: true). Supports literal boolean or GitHub Actions expression."
+                },
                 "title-prefix": {
                   "type": "string",
                   "description": "Prefix for issue titles when creating issues for missing data (default: '[missing data]')",
@@ -12236,7 +11992,8 @@
                   "type": "array",
                   "description": "Labels to add to created issues for missing data",
                   "items": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 50
                   },
                   "default": []
                 },
@@ -12290,6 +12047,7 @@
               "type": "object",
               "description": "Configuration for no-op safe output (logging only, no GitHub API calls). Always available as a fallback to ensure human-visible artifacts.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of noop messages (default: 2) Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -12360,6 +12118,7 @@
               "type": "object",
               "description": "Configuration for publishing assets to an orphaned git branch",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "branch": {
                   "type": "string",
                   "description": "Branch name (default: 'assets/${{ github.workflow }}')",
@@ -12440,6 +12199,7 @@
               "type": "object",
               "description": "Configuration for uploading files as run-scoped GitHub Actions artifacts",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max-uploads": {
                   "type": "integer",
                   "description": "Maximum number of upload_artifact tool calls allowed per run (default: 1)",
@@ -12549,6 +12309,7 @@
               "type": "object",
               "description": "Configuration for uploading a code coverage report via actions/upload-code-coverage",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "target-ref": {
                   "type": "string",
                   "pattern": "^refs/(heads|tags)/[A-Za-z0-9._/-]+$",
@@ -12619,12 +12380,74 @@
           ],
           "description": "Enable AI agents to upload a code coverage report (e.g. a Cobertura XML file) to GitHub's code coverage API via actions/upload-code-coverage. The agent stages the report file and calls the tool with file/language/label; a separate job performs the actual upload with dedicated code-quality: write permissions."
         },
+        "add-security-advisory-comment": {
+          "description": "Experimental. Add comments to repository security advisories. Requires an external token or GitHub App with Repository security advisories write permission; GITHUB_TOKEN is not supported.",
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
+                "max": {
+                  "description": "Maximum number of advisory comments per run (default: 1).",
+                  "oneOf": [
+                    { "type": "integer", "minimum": 1, "maximum": 10 },
+                    { "type": "string", "pattern": "^\\$\\{\\{.*\\}\\}$" }
+                  ]
+                },
+                "github-token": { "$ref": "#/$defs/github_token_same_job" },
+                "github-app": { "$ref": "#/$defs/github_app" },
+                "footer": { "type": "boolean", "description": "Include the standard AI-generated attribution footer (default: true)." },
+                "staged": { "$ref": "#/$defs/templatable_boolean" },
+                "samples": {
+                  "description": "Internal hidden feature. Declarative tool argument samples for deterministic safe-outputs replay through --use-samples or features.samples.",
+                  "oneOf": [
+                    { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+                    { "type": "object", "additionalProperties": true }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            },
+            { "type": "null" }
+          ]
+        },
+        "create-security-advisory": {
+          "description": "Experimental. Create draft repository security advisories only. Requires an external token or GitHub App with Repository security advisories write permission; GITHUB_TOKEN is not supported.",
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
+                "max": {
+                  "description": "Maximum number of draft advisories per run (default: 1).",
+                  "oneOf": [
+                    { "type": "integer", "minimum": 1, "maximum": 10 },
+                    { "type": "string", "pattern": "^\\$\\{\\{.*\\}\\}$" }
+                  ]
+                },
+                "github-token": { "$ref": "#/$defs/github_token_same_job" },
+                "github-app": { "$ref": "#/$defs/github_app" },
+                "staged": { "$ref": "#/$defs/templatable_boolean" },
+                "samples": {
+                  "description": "Internal hidden feature. Declarative tool argument samples for deterministic safe-outputs replay through --use-samples or features.samples.",
+                  "oneOf": [
+                    { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+                    { "type": "object", "additionalProperties": true }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            },
+            { "type": "null" }
+          ]
+        },
         "update-release": {
           "oneOf": [
             {
               "type": "object",
               "description": "Configuration for updating GitHub release descriptions",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of releases to update (default: 1) Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -12682,6 +12505,11 @@
           ],
           "description": "Enable AI agents to edit and update GitHub release content, including release notes, assets, and metadata."
         },
+        "require-agent-success": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, require the agent job to succeed before running detection or processing safe outputs"
+        },
         "staged": {
           "$ref": "#/$defs/templatable_boolean",
           "description": "When true, emit step summary messages instead of making GitHub API calls (preview mode)",
@@ -12703,10 +12531,9 @@
           "description": "GitHub token to use for safe output jobs. Typically a secret reference like ${{ secrets.GITHUB_TOKEN }} or ${{ secrets.CUSTOM_PAT }}",
           "examples": ["${{ secrets.GITHUB_TOKEN }}", "${{ secrets.CUSTOM_PAT }}", "${{ secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}"]
         },
-        "linear-token": {
-          "$ref": "#/$defs/linear_token",
-          "description": "Linear personal API key expression used only by the trusted safe_outputs job.",
-          "examples": ["${{ secrets.LINEAR_API_KEY }}"]
+        "token-broker": {
+          "type": ["boolean", "null"],
+          "description": "Exchange GitHub Actions OIDC for a broker-policy-scoped GitHub App token. Mutually exclusive with github-app and github-token when true."
         },
         "github-app": {
           "$ref": "#/$defs/github_app",
@@ -12757,12 +12584,14 @@
                       "description": "Disable AI engine for threat detection (only run custom steps)"
                     },
                     {
-                      "$ref": "#/$defs/engine_config"
+                      "$ref": "#/$defs/engine_config",
+                      "not": { "type": "object", "required": ["inference"] }
                     }
                   ]
                 },
                 "engine-config": {
                   "$ref": "#/$defs/engine_config",
+                  "not": { "type": "object", "required": ["inference"] },
                   "description": "Extended engine configuration for threat detection."
                 },
                 "model": {
@@ -12869,6 +12698,8 @@
               "type": "object",
               "description": "Custom safe-output job configuration. The job name will be normalized to use underscores instead of dashes.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
+                "staged": { "$ref": "#/$defs/templatable_boolean" },
                 "name": {
                   "type": "string",
                   "description": "Display name for the job"
@@ -13203,6 +13034,8 @@
               "type": "object",
               "description": "Inline script handler configuration. The script body has access to 'config' (the handler config object) and should return an async function that processes individual safe-output messages.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
+                "staged": { "$ref": "#/$defs/templatable_boolean" },
                 "name": {
                   "type": "string",
                   "description": "Display name for the script handler"
@@ -13590,6 +13423,18 @@
                 "url": {
                   "type": "string",
                   "description": "A deployment URL"
+                },
+                "deployment": {
+                  "oneOf": [
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^\\$\\{\\{.*\\}\\}$"
+                    }
+                  ],
+                  "description": "Set to false to use the environment's secrets and protection rules without creating a GitHub deployment."
                 }
               },
               "required": ["name"],
@@ -13632,6 +13477,8 @@
               "type": "object",
               "description": "Configuration for a custom safe output action.",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
+                "staged": { "$ref": "#/$defs/templatable_boolean" },
                 "uses": {
                   "type": "string",
                   "description": "The GitHub Action to use. Supports owner/repo@ref, owner/repo/subdir@ref, or ./local/path.",
@@ -13685,12 +13532,66 @@
             }
           }
         },
+        "request-continuation": {
+          "description": "Opt-in request for follow-up work. Without route it is metadata only and does not resume work or dispatch a workflow. With route, one accepted request starts one new task: a dependent queue successor (workqueue), a queue successor gated on operator approval of a new issue (issue), or a dispatch of another workflow in this repository (dispatch).",
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
+                "max": {
+                  "description": "Maximum number of continuation requests (default: 1). A routed continuation accepts exactly one request: omit max or set max: 1.",
+                  "oneOf": [
+                    { "type": "integer", "minimum": 1 },
+                    { "type": "string", "pattern": "^\\$\\{\\{.*\\}\\}$" }
+                  ]
+                },
+                "route": {
+                  "description": "Hand an accepted request to a new task. workqueue and issue require a work-queue worker (tools.work-queue.worker: true); dispatch requires an ordinary workflow.",
+                  "type": "string",
+                  "enum": ["workqueue", "issue", "dispatch"]
+                },
+                "workflow": {
+                  "description": "Workflow ID (file basename without extension) in this repository to dispatch. Required for route: dispatch only. The target must declare a workflow_dispatch string input named gh_aw_continuation.",
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+                },
+                "max-depth": {
+                  "description": "Maximum number of automatic continuation hops in one chain (default: 1). Valid for route: workqueue or dispatch.",
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 16
+                }
+              },
+              "additionalProperties": false,
+              "allOf": [
+                {
+                  "if": { "required": ["route"] },
+                  "then": { "properties": { "max": { "const": 1 } } },
+                  "else": { "not": { "anyOf": [{ "required": ["workflow"] }, { "required": ["max-depth"] }] } }
+                },
+                {
+                  "if": { "properties": { "route": { "const": "dispatch" } }, "required": ["route"] },
+                  "then": { "required": ["workflow"] },
+                  "else": { "not": { "required": ["workflow"] } }
+                },
+                {
+                  "if": { "properties": { "route": { "const": "issue" } }, "required": ["route"] },
+                  "then": { "not": { "required": ["max-depth"] } }
+                }
+              ]
+            },
+            { "type": "null" },
+            { "type": "boolean" }
+          ]
+        },
         "report-incomplete": {
           "oneOf": [
             {
               "type": "object",
               "description": "Configuration for report_incomplete safe output",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "max": {
                   "description": "Maximum number of report_incomplete signals (default: 5). Supports integer or GitHub Actions expression (e.g. '${{ inputs.max }}').",
                   "oneOf": [
@@ -13719,7 +13620,8 @@
                   "type": "array",
                   "description": "Labels to add to created issues for incomplete runs",
                   "items": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 50
                   },
                   "default": []
                 },
@@ -13777,6 +13679,7 @@
               "type": "object",
               "description": "Configuration for replacing one label with another on issues/PRs in a single atomic operation. Enables clear state transitions (e.g. 'in-progress' \u2192 'done').",
               "properties": {
+                "authorization": { "$ref": "#/$defs/safeOutputAuthorization" },
                 "allowed-transitions": {
                   "type": "array",
                   "description": "Optional list of allowed label state transitions. Each entry specifies a (from, to) pair that is permitted. When specified, the agent may ONLY perform the listed transitions, regardless of allowed-add/allowed-remove. Useful for enforcing a strict state machine (e.g. only 'in-review' \u2192 'approved' is allowed).",
@@ -13932,6 +13835,18 @@
       "description": "Optional observability output settings for workflow runs.",
       "properties": {
         "otlp": {
+          "oneOf": [
+            { "$ref": "#/properties/observability/$defs/otlp_config" },
+            {
+              "type": "boolean",
+              "const": false,
+              "description": "Disable compiler-managed OTLP configuration, including defaults and imported settings, when set in the main workflow."
+            }
+          ]
+        }
+      },
+      "$defs": {
+        "otlp_config": {
           "type": "object",
           "description": "OTLP (OpenTelemetry Protocol) trace export configuration.",
           "properties": {
@@ -14504,6 +14419,11 @@
                     "type": "string",
                     "enum": ["string", "number", "boolean"],
                     "description": "Type of each array item."
+                  },
+                  "maxLength": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Maximum Unicode code points in a string item."
                   }
                 },
                 "additionalProperties": false
@@ -14602,15 +14522,51 @@
     },
     "model": {
       "type": "string",
-      "description": "Default LLM model, overridden by nested engine.model. Sets the default model used by the agentic engine for this workflow. Acts as a fallback when an engine instance does not specify its own 'model'; a nested 'engine.model' (e.g. safe-outputs.threat-detection.engine.model) takes precedence over this field for that engine instance. Supports full model IDs (e.g. 'claude-3-5-sonnet-20241022', 'gpt-5.4') and model aliases (e.g. 'small', 'large').",
+      "description": "Default LLM model, overridden by nested engine.model. Sets the default model used by the agentic engine for this workflow. Acts as a fallback when an engine instance does not specify its own 'model'; a nested 'engine.model' (e.g. safe-outputs.threat-detection.engine.model) takes precedence over this field for that engine instance. Supports full model IDs (e.g. 'claude-3-5-sonnet-20241022', 'gpt-5.4') and model aliases (e.g. 'small', 'large'). Router values ('router', 'router/economy', 'router/balanced', 'router/robust') choose model routing for the main agent instead of a fixed model.",
       "examples": ["gpt-5.4", "claude-3-5-sonnet-20241022", "gpt-4"]
     },
+    "model-routing": {
+      "description": "Set false to disable implicit main-agent routing without pinning a model, or give a shortlist for an explicit router model value. The shortlist changes no other model requests.",
+      "oneOf": [
+        {
+          "type": "boolean",
+          "const": false,
+          "description": "Keep the normal model overrides and engine default without using the router."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowed-models"],
+          "properties": {
+            "allowed-models": {
+              "$ref": "#/$defs/engine_config/oneOf/1/properties/model-routing/oneOf/0/properties/allowed-models",
+              "description": "Specify at least one exact model name or gh-aw alias. Declare one list across the workflow and its imports. The engine's capabilities and models.allowed/blocked still apply."
+            }
+          }
+        }
+      ]
+    },
+    "adaptive-routing": {
+      "description": "Record each run of a routed workflow in its adaptive routing history on the memory/adaptive-routing/<workflow> branch. observe keeps the ordinary router pick and records the selected model and effort, whether the run completed its task, and what it cost; false turns it off, including a repository default from aw.json. Requires model routing on a Copilot, Claude, or Codex engine and tools.repo-memory.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": ["observe"],
+          "description": "Record every eligible run without changing which model runs."
+        },
+        {
+          "type": "boolean",
+          "enum": [false, true],
+          "description": "false turns adaptive routing off. true is reserved for live adaptive routing, which is not available yet."
+        }
+      ]
+    },
     "graders": {
-      "description": "Graders over the unified session. Fast built-ins run in conclusion; custom JavaScript and operational-value.run Bash evaluators run only in the separate graders job.",
+      "description": "Graders over the unified session, including reserved operational-value JavaScript. Fast built-ins run in conclusion; executable custom graders run only in the separate graders job.",
       "type": "object",
       "propertyNames": {
         "pattern": "^[a-z][a-z0-9-]{0,63}$",
-        "description": "Built-in ID, custom JavaScript grader ID, or operational-value for a repository Bash evaluator."
+        "description": "Built-in ID, custom JavaScript grader ID, or reserved operational-value ID."
       },
       "additionalProperties": {
         "oneOf": [
@@ -14664,12 +14620,7 @@
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 262144,
-                "description": "Synchronous JavaScript body for a custom grader. Receives session, config, and helpers; runs only in the separate restricted graders job. Cannot override a built-in."
-              },
-              "run": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Only for operational-value: a repository-relative .sh evaluator path (./ is relative to the workflow). Frozen at compilation and run only in the separate graders job with the unified-session JSONL file as its first argument."
+                "description": "Synchronous JavaScript body for a custom grader. Receives session, config, and helpers; runs only in the separate restricted graders job. Distinct IDs return one numeric/null result; operational-value returns a nonempty ordered array of unique {id,value} metrics. Cannot override a built-in."
               }
             }
           }
@@ -14828,6 +14779,290 @@
     }
   ],
   "$defs": {
+    "safeOutputAuthorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["endpoint", "audience"],
+      "properties": {
+        "endpoint": { "type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^https://[^/@?#\\s]+(?:/[^?#\\s]*)?$" },
+        "audience": { "type": "string", "minLength": 1, "maxLength": 2048 }
+      }
+    },
+    "connectorRegistration": {
+      "description": "Compiler-normalized registration; also accepts the earlier external-file prototype.",
+      "type": "object",
+      "anyOf": [{ "required": ["connection"] }, { "required": ["spec", "credentials", "resources"] }],
+      "oneOf": [
+        { "required": ["definition"], "not": { "required": ["spec"] } },
+        { "required": ["spec"], "not": { "required": ["definition"] } }
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "experimental": { "type": "boolean", "default": false },
+        "docs": { "$ref": "#/$defs/connectorDocumentationURLs" },
+        "definition": { "type": "string", "minLength": 1 },
+        "spec": {
+          "type": "object",
+          "required": ["apiVersion", "kind", "id", "endpoints", "credentials"],
+          "additionalProperties": true
+        },
+        "connection": { "type": "string", "minLength": 1 },
+        "credentials": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["secret"],
+            "additionalProperties": false,
+            "properties": { "secret": { "type": "string", "minLength": 1 } }
+          }
+        },
+        "resources": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string" } } },
+        "github-apps": { "type": "object", "additionalProperties": { "$ref": "#/$defs/connectorGitHubApp" } },
+        "oidc-tokens": { "type": "object", "additionalProperties": { "$ref": "#/$defs/connectorGitHubOIDC" } },
+        "azure-oidc": { "type": "object", "additionalProperties": { "$ref": "#/$defs/connectorAzureOIDC" } },
+        "selected-inference": { "$ref": "#/$defs/connectorInferenceSelection" },
+        "on": { "$ref": "#/$defs/connectorCapabilities" },
+        "tools": { "$ref": "#/$defs/connectorCapabilities" },
+        "safe-outputs": { "$ref": "#/$defs/connectorCapabilities" },
+        "safe-output-options": {
+          "description": "Compiler-normalized per-operation selection options.",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/connectorName" },
+          "additionalProperties": { "$ref": "#/$defs/connectorOperationOptions" }
+        },
+        "context": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "$ref": "#/$defs/connectorName" },
+          "additionalProperties": { "type": "object", "additionalProperties": { "type": ["string", "number", "boolean"] } }
+        }
+      }
+    },
+    "connectorOperationOptions": {
+      "description": "Workflow-owned delivery controls and deterministic replay samples for a selected connector operation. Global staging cannot be disabled here.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max": { "type": "integer", "minimum": 1, "maximum": 100, "default": 1 },
+        "staged": { "$ref": "#/$defs/templatable_boolean" },
+        "samples": {
+          "description": "Internal hidden feature. Sample MCP tool arguments for the existing --use-samples or features.samples replay mode. Payloads must conform to the generated connector tool inputSchema; they do not grant resources or override delivery controls.",
+          "oneOf": [
+            { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+            { "type": "object", "additionalProperties": true }
+          ]
+        }
+      }
+    },
+    "connectorDeclaration": {
+      "description": "A reusable connector declared in ordinary AW Markdown. Capability maps define APIs; only the consuming workflow selects them.",
+      "type": "object",
+      "required": ["endpoints", "credentials"],
+      "additionalProperties": false,
+      "properties": {
+        "experimental": {
+          "type": "boolean",
+          "default": false,
+          "description": "Marks this connector as experimental. Selecting its capabilities emits a compile-time warning; this metadata does not change grants or runtime protections."
+        },
+        "docs": { "$ref": "#/$defs/connectorDocumentationURLs" },
+        "endpoints": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "string" } },
+        "credentials": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/connectorName" },
+          "additionalProperties": {
+            "type": "object",
+            "required": ["phase", "header", "scheme", "scopes"],
+            "additionalProperties": false,
+            "properties": {
+              "phase": { "enum": ["agent", "safe-output", "inference"] },
+              "header": { "enum": ["Authorization", "X-API-Key", "PRIVATE-TOKEN"] },
+              "scheme": { "enum": ["bearer", "token", "basic", "raw"] },
+              "scopes": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+              "secret": { "type": "string", "minLength": 1, "description": "GitHub Actions secret name, not a credential value or expression." },
+              "github-app": { "$ref": "#/$defs/connectorGitHubApp" },
+              "github-oidc": { "$ref": "#/$defs/connectorGitHubOIDC" },
+              "azure-oidc": { "$ref": "#/$defs/connectorAzureOIDC" },
+              "token": {
+                "type": "object",
+                "required": ["secret"],
+                "additionalProperties": false,
+                "properties": { "secret": { "type": "string", "minLength": 1 } }
+              }
+            }
+          }
+        },
+        "resources": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string" } } },
+        "inference": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "$ref": "#/$defs/connectorName" },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["endpoint", "path", "protocol", "credential", "models"],
+            "properties": {
+              "endpoint": { "$ref": "#/$defs/connectorName" },
+              "path": { "type": "string", "minLength": 1, "maxLength": 2048 },
+              "protocol": { "enum": ["openai-responses", "openai-chat-completions"] },
+              "credential": { "$ref": "#/$defs/connectorName" },
+              "models": { "$ref": "#/$defs/connectorName" },
+              "model-catalog": {
+                "type": "boolean",
+                "default": true,
+                "description": "Whether the provider exposes a live model catalogue (/models). False sets engine.model-catalog: false on consumers so engine.model is passed through verbatim instead of being resolved as a gh-aw alias."
+              }
+            }
+          }
+        },
+        "triggers": { "$ref": "#/$defs/connectorTriggers" },
+        "tools": { "$ref": "#/$defs/connectorDefinitions" },
+        "mcp-servers": { "$ref": "#/$defs/connectorDefinitions" },
+        "safe-outputs": { "$ref": "#/$defs/connectorDefinitions" }
+      }
+    },
+    "connectorGitHubApp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["private-key", "permissions"],
+      "anyOf": [{ "required": ["client-id"] }, { "required": ["app-id"] }],
+      "properties": {
+        "client-id": { "type": "string", "minLength": 1 },
+        "app-id": { "type": "string", "minLength": 1 },
+        "private-key": { "type": "string", "minLength": 1 },
+        "owner": { "type": "string" },
+        "repositories": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string" } },
+        "permissions": { "type": "object", "additionalProperties": { "enum": ["read", "write", "none"] } }
+      }
+    },
+    "connectorInferenceSelection": {
+      "description": "Explicit workflow inference selection. Model is an exact granted wire alias, separate from engine.model metadata. Initially supports Copilot OpenAI-compatible BYOK only.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["connector", "profile", "model"],
+      "properties": {
+        "connector": { "$ref": "#/$defs/connectorName" },
+        "profile": { "$ref": "#/$defs/connectorName" },
+        "model": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    },
+    "connectorAzureOIDC": {
+      "description": "Inference-only Azure Entra federation through the existing AWF engine transport. Scope is explicit; no Azure OpenAI default is assumed.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["azure-tenant-id", "azure-client-id", "azure-scope"],
+      "properties": {
+        "azure-tenant-id": { "type": "string", "minLength": 1, "maxLength": 2048, "pattern": "\\S" },
+        "azure-client-id": { "type": "string", "minLength": 1, "maxLength": 2048, "pattern": "\\S" },
+        "azure-scope": { "type": "string", "minLength": 1, "maxLength": 2048, "pattern": "\\S" },
+        "audience": { "type": "string", "minLength": 1, "maxLength": 2048, "format": "uri" },
+        "azure-cloud": { "enum": ["public", "usgovernment", "china"] }
+      }
+    },
+    "connectorDocumentationURLs": {
+      "description": "Official documentation URLs used to author the connector. References only: never fetched automatically or treated as endpoint or resource grants.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "format": "uri", "pattern": "^https://" }
+    },
+    "connectorGitHubOIDC": {
+      "type": "object",
+      "required": ["audience"],
+      "additionalProperties": false,
+      "properties": { "audience": { "type": "string", "minLength": 1, "maxLength": 2048 } }
+    },
+    "connectorEventPredicate": {
+      "description": "Bounded source-evidence rule; missing transition evidence never matches. Semantic validation enforces 64 nodes, depth 6, operator-specific options and array bounds.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "all": { "type": "array", "minItems": 1, "maxItems": 64, "items": { "$ref": "#/$defs/connectorEventPredicate" } },
+        "any": { "type": "array", "minItems": 1, "maxItems": 64, "items": { "$ref": "#/$defs/connectorEventPredicate" } },
+        "path": { "type": "string", "pattern": "^/", "maxLength": 1024 },
+        "op": { "enum": ["equals", "present", "absent", "null", "timestamp", "text", "changed", "set-added", "set-removed", "enters", "leaves", "length", "any-item", "prefix", "path-prefix", "member-prefix", "url-id"] },
+        "value": { "type": ["string", "integer", "boolean"] },
+        "other": { "type": "string", "pattern": "^/", "maxLength": 1024 },
+        "fallback": { "type": "string", "pattern": "^/", "maxLength": 1024 },
+        "values": { "type": "array", "maxItems": 100, "items": { "type": "string", "minLength": 1, "maxLength": 1024 } },
+        "separator": { "type": "string", "minLength": 1, "maxLength": 1 },
+        "root": { "type": "boolean" },
+        "items": { "$ref": "#/$defs/connectorEventPredicate" }
+      },
+      "oneOf": [
+        { "required": ["all"], "maxProperties": 1 },
+        { "required": ["any"], "maxProperties": 1 },
+        { "required": ["path", "op"], "not": { "anyOf": [{ "required": ["all"] }, { "required": ["any"] }] } }
+      ]
+    },
+    "connectorEventFilters": {
+      "type": "object",
+      "maxProperties": 16,
+      "propertyNames": { "$ref": "#/$defs/connectorName" },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["path", "type"],
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string", "pattern": "^/", "maxLength": 1024 },
+          "type": { "enum": ["string", "integer", "boolean"] },
+          "values": { "type": "array", "maxItems": 100, "items": { "type": ["string", "integer", "boolean"] } }
+        }
+      }
+    },
+    "connectorTriggers": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/connectorName" },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["verificationProfile", "nativeEvents", "match", "normalize"],
+        "additionalProperties": false,
+        "properties": {
+          "resourceOrigins": { "type": "array", "maxItems": 16, "items": { "type": "string" } },
+          "verificationProfile": { "type": "string" },
+          "nativeEvents": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+          "match": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "string" } },
+          "normalize": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "string" } },
+          "resources": { "type": "object", "additionalProperties": { "type": "string" } },
+          "types": { "type": "object", "additionalProperties": { "enum": ["string", "integer", "number", "boolean"] } },
+          "when": { "$ref": "#/$defs/connectorEventPredicate" },
+          "filters": { "$ref": "#/$defs/connectorEventFilters" },
+          "urlIdentity": { "type": "string", "pattern": "^/" },
+          "urlPathPrefix": { "type": "string", "pattern": "^/" },
+          "variants": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {
+              "type": "object",
+              "required": ["when", "normalize", "resources"],
+              "additionalProperties": false,
+              "properties": {
+                "when": { "$ref": "#/$defs/connectorEventPredicate" },
+                "normalize": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "string" } },
+                "resources": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "string" } },
+                "types": { "type": "object", "additionalProperties": { "enum": ["string", "integer", "number", "boolean"] } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "connectorDefinitions": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/connectorName" },
+      "additionalProperties": { "type": "object" }
+    },
+    "connectorName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,62}$"
+    },
+    "connectorCapabilities": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/connectorName" }
+    },
     "webhookProviderIssueTypes": {
       "type": "array",
       "minItems": 1,
@@ -14837,92 +15072,6 @@
     },
     "webhookProviderSelectorValues": {
       "oneOf": [{ "type": "string" }, { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string" } }]
-    },
-    "webhookJiraIssue": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["project"],
-      "properties": {
-        "types": { "$ref": "#/$defs/webhookProviderIssueTypes" },
-        "project": {
-          "$ref": "#/$defs/webhookStringValues",
-          "description": "Experimental. Required Jira project key or nonempty list of keys; sibling of types."
-        },
-        "issue_id": { "$ref": "#/$defs/webhookProviderSelectorValues" },
-        "issue_key": { "$ref": "#/$defs/webhookProviderSelectorValues" },
-        "labels": { "$ref": "#/$defs/webhookProviderSelectorValues" },
-        "status": { "$ref": "#/$defs/webhookProviderSelectorValues" },
-        "resolution": { "$ref": "#/$defs/webhookProviderSelectorValues" },
-        "sender": { "$ref": "#/$defs/webhookProviderSelectorValues" }
-      }
-    },
-    "webhookLinearIssue": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["organization-id"],
-      "properties": {
-        "types": { "$ref": "#/$defs/webhookProviderIssueTypes" },
-        "organization-id": {
-          "$ref": "#/$defs/webhookStringValues",
-          "description": "Experimental. Required literal Linear organization ID or nonempty list of IDs; sibling of types."
-        },
-        "team-id": {
-          "$ref": "#/$defs/webhookStringValues",
-          "description": "Experimental. Optional literal Linear team model ID or nonempty list of IDs. Matches delivered data.teamId without API resolution."
-        },
-        "issue_id": { "$ref": "#/$defs/webhookProviderSelectorValues" },
-        "labels": { "$ref": "#/$defs/webhookProviderSelectorValues" },
-        "sender": { "$ref": "#/$defs/webhookProviderSelectorValues" }
-      }
-    },
-    "webhookAzureDevOpsIssue": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["project_id"],
-      "properties": {
-        "project_id": {
-          "$ref": "#/$defs/webhookStringValues",
-          "description": "Experimental. Required Azure DevOps project ID or nonempty list of IDs; sibling of types."
-        },
-        "collection_id": { "$ref": "#/$defs/webhookProviderSelectorValues" },
-        "types": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": { "type": "string", "enum": ["opened", "edited", "closed", "reopened", "labeled", "unlabeled", "deleted", "restored"] }
-        },
-        "closed-states": {
-          "$ref": "#/$defs/webhookStringValues",
-          "description": "Literal terminal state name or nonempty list from the project's work item process. Required for closed/reopened; no state names are assumed."
-        },
-        "state": {
-          "type": "object",
-          "minProperties": 1,
-          "additionalProperties": false,
-          "properties": {
-            "from": { "$ref": "#/$defs/webhookProviderSelectorValues" },
-            "to": { "$ref": "#/$defs/webhookProviderSelectorValues" }
-          }
-        },
-        "tags": {
-          "type": "object",
-          "minProperties": 1,
-          "additionalProperties": false,
-          "properties": {
-            "from": { "$ref": "#/$defs/webhookProviderSelectorValues" },
-            "to": { "$ref": "#/$defs/webhookProviderSelectorValues" }
-          }
-        }
-      },
-      "allOf": [
-        {
-          "if": {
-            "required": ["types"],
-            "properties": { "types": { "contains": { "enum": ["closed", "reopened"] } } }
-          },
-          "then": { "required": ["closed-states"] }
-        }
-      ]
     },
     "webhookSecurityAlert": {
       "type": "object",
@@ -15018,24 +15167,13 @@
         "not": { "anyOf": [{ "pattern": "/\\.{1,2}$" }, { "pattern": "\\s" }] }
       }
     },
-    "work_queue_worker_profile": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["workflow", "ref", "principal", "trust-domain", "credential-scope", "effect-scope"],
-      "properties": {
-        "workflow": { "type": "string", "pattern": "^\\.github/workflows/[A-Za-z0-9_.-]+\\.(lock\\.yml|yml|yaml)$" },
-        "ref": { "type": "string", "pattern": "^[a-f0-9]{40}$|^[a-f0-9]{64}$" },
-        "principal": { "type": "string", "pattern": "^[1-9][0-9]{0,255}$" },
-        "trust-domain": { "type": "string", "minLength": 1, "maxLength": 256 },
-        "credential-scope": { "type": "string", "minLength": 1, "maxLength": 256 },
-        "effect-scope": { "type": "string", "minLength": 1, "maxLength": 256 },
-        "max-claims-per-dispatch": { "type": "integer", "minimum": 1, "maximum": 16, "default": 1 },
-        "share-keys": { "type": "boolean", "default": false }
-      }
-    },
     "ledgerScriptRestrictions": {
       "type": "object",
       "properties": {
+        "storage": {
+          "type": "string",
+          "enum": ["git", "comment-memory"]
+        },
         "replay": {
           "not": {},
           "description": "Removed. Use a built-in ledger type instead of custom replay."
@@ -15052,7 +15190,7 @@
     },
     "repoMemoryLedger": {
       "type": ["object", "null"],
-      "description": "Experimental. Enable the repo-memory ledger projection, optionally validated against a repository-relative JSON schema. Ledger workflows require AWF Cloud Hypervisor filesystem isolation. Using this field emits a compile-time warning.",
+      "description": "Enable the ledger projection, optionally validated against a repository-relative JSON schema. Ledger workflows require AWF Cloud Hypervisor filesystem isolation.",
       "properties": {
         "schema": {
           "type": "string",
@@ -15110,191 +15248,6 @@
         }
       },
       "additionalProperties": false
-    },
-    "azure_devops_create_work_item": {
-      "description": "Experimental. Create Azure DevOps work items through a trusted safe-output handler. Using this field emits a compile-time warning.",
-      "oneOf": [
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "work-item-type": { "type": "string", "minLength": 1, "maxLength": 128, "default": "Task" },
-            "description-field": { "$ref": "#/$defs/azure_devops_field_reference" },
-            "area-path": { "type": "string", "minLength": 1, "maxLength": 512 },
-            "iteration-path": { "type": "string", "minLength": 1, "maxLength": 512 },
-            "assignee": { "type": "string", "minLength": 1, "maxLength": 256 },
-            "tags": { "$ref": "#/$defs/azure_devops_string_list" },
-            "allowed-tags": { "$ref": "#/$defs/azure_devops_string_list" },
-            "custom-fields": {
-              "type": "object",
-              "propertyNames": { "pattern": "^[A-Za-z][A-Za-z0-9_.]*$" },
-              "additionalProperties": { "type": "string", "maxLength": 4096 }
-            },
-            "artifact-link": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "enabled": { "type": "boolean", "default": false },
-                "repository": { "type": "string", "minLength": 1, "maxLength": 256 },
-                "branch": { "type": "string", "minLength": 1, "maxLength": 256, "default": "main" }
-              }
-            },
-            "max": { "$ref": "#/$defs/templatable_positive_integer" },
-            "staged": { "$ref": "#/$defs/templatable_boolean" },
-            "samples": { "$ref": "#/$defs/azure_devops_samples" }
-          }
-        },
-        { "type": "null" }
-      ]
-    },
-    "azure_devops_update_work_item": {
-      "description": "Experimental. Update explicitly scoped Azure DevOps work items and explicitly enabled fields. Using this field emits a compile-time warning.",
-      "oneOf": [
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["target"],
-          "properties": {
-            "target": { "$ref": "#/$defs/azure_devops_work_item_target" },
-            "status": { "type": "boolean", "default": false },
-            "title": { "type": "boolean", "default": false },
-            "body": { "type": "boolean", "default": false },
-            "markdown-body": { "type": "boolean", "default": false },
-            "title-prefix": { "type": "string", "minLength": 1, "maxLength": 255 },
-            "tag-prefix": { "type": "string", "minLength": 1, "maxLength": 256 },
-            "area-path": { "type": "boolean", "default": false },
-            "iteration-path": { "type": "boolean", "default": false },
-            "assignee": { "type": "boolean", "default": false },
-            "tags": { "type": "boolean", "default": false },
-            "allowed-tags": { "$ref": "#/$defs/azure_devops_string_list" },
-            "allowed-area-prefixes": { "$ref": "#/$defs/azure_devops_string_list" },
-            "allowed-iteration-prefixes": { "$ref": "#/$defs/azure_devops_string_list" },
-            "max": { "$ref": "#/$defs/templatable_positive_integer" },
-            "staged": { "$ref": "#/$defs/templatable_boolean" },
-            "samples": { "$ref": "#/$defs/azure_devops_samples" }
-          }
-        },
-        { "type": "null" }
-      ]
-    },
-    "azure_devops_comment_on_work_item": {
-      "description": "Experimental. Comment on explicitly scoped Azure DevOps work items. Using this field emits a compile-time warning.",
-      "oneOf": [
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["target"],
-          "properties": {
-            "target": { "$ref": "#/$defs/azure_devops_work_item_target" },
-            "max": { "$ref": "#/$defs/templatable_positive_integer" },
-            "staged": { "$ref": "#/$defs/templatable_boolean" },
-            "samples": { "$ref": "#/$defs/azure_devops_samples" }
-          }
-        },
-        { "type": "null" }
-      ]
-    },
-    "azure_devops_assign_work_item": {
-      "description": "Experimental. Assign an Azure DevOps identity to a work item. Using this field emits a compile-time warning.",
-      "oneOf": [
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "target": { "$ref": "#/$defs/azure_devops_work_item_target" },
-            "allowed": { "$ref": "#/$defs/azure_devops_string_list" },
-            "blocked": { "$ref": "#/$defs/azure_devops_string_list" },
-            "max": { "$ref": "#/$defs/templatable_positive_integer" },
-            "staged": { "$ref": "#/$defs/templatable_boolean" },
-            "samples": { "$ref": "#/$defs/azure_devops_samples" }
-          }
-        },
-        { "type": "null" }
-      ]
-    },
-    "azure_devops_link_work_items": {
-      "description": "Experimental. Link explicitly scoped Azure DevOps work items. Using this field emits a compile-time warning.",
-      "oneOf": [
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["target"],
-          "properties": {
-            "target": { "$ref": "#/$defs/azure_devops_work_item_target" },
-            "allowed-link-types": {
-              "type": "array",
-              "uniqueItems": true,
-              "items": {
-                "type": "string",
-                "enum": ["parent", "child", "related", "predecessor", "successor", "duplicate", "duplicate-of"]
-              }
-            },
-            "max": { "$ref": "#/$defs/templatable_positive_integer" },
-            "staged": { "$ref": "#/$defs/templatable_boolean" },
-            "samples": { "$ref": "#/$defs/azure_devops_samples" }
-          }
-        },
-        { "type": "null" }
-      ]
-    },
-    "azure_devops_upload_workitem_attachment": {
-      "description": "Experimental. Upload a staged workspace file to an Azure DevOps work item. Using this field emits a compile-time warning.",
-      "oneOf": [
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "target": { "$ref": "#/$defs/azure_devops_work_item_target" },
-            "max-file-size": { "type": "integer", "minimum": 1, "maximum": 104857600, "default": 5242880 },
-            "allowed-extensions": {
-              "type": "array",
-              "uniqueItems": true,
-              "items": { "type": "string", "pattern": "^\\.[A-Za-z0-9]+$", "maxLength": 16 }
-            },
-            "comment-prefix": { "type": "string", "maxLength": 256 },
-            "max": { "$ref": "#/$defs/templatable_positive_integer" },
-            "staged": { "$ref": "#/$defs/templatable_boolean" },
-            "samples": { "$ref": "#/$defs/azure_devops_samples" }
-          }
-        },
-        { "type": "null" }
-      ]
-    },
-    "azure_devops_work_item_target": {
-      "oneOf": [
-        { "type": "integer", "minimum": 1 },
-        { "const": "*" },
-        {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": { "type": "integer", "minimum": 1 }
-        },
-        { "type": "string", "minLength": 1, "maxLength": 512, "not": { "const": "*" } }
-      ]
-    },
-    "azure_devops_field_reference": {
-      "type": "string",
-      "pattern": "^[A-Za-z][A-Za-z0-9_.]*$",
-      "maxLength": 256
-    },
-    "azure_devops_string_list": {
-      "type": "array",
-      "uniqueItems": true,
-      "items": { "type": "string", "minLength": 1, "maxLength": 256 }
-    },
-    "azure_devops_samples": {
-      "description": "Internal hidden feature. Optional declarative sample payloads for deterministic safe-output replay.",
-      "oneOf": [
-        {
-          "type": "array",
-          "items": { "type": "object", "additionalProperties": true }
-        },
-        {
-          "type": "object",
-          "additionalProperties": true
-        }
-      ]
     },
     "enclave-repos": {
       "type": "array",
@@ -15446,11 +15399,6 @@
         "users"
       ]
     },
-    "linear_toolset_name": {
-      "type": "string",
-      "description": "A Linear MCP toolset name that enables a related group of read-only Linear tools.",
-      "enum": ["all", "attachments", "comments", "customers", "cycles", "diffs", "documentation", "documents", "initiatives", "issues", "milestones", "projects", "status_updates", "teams", "users"]
-    },
     "non_empty_string": {
       "type": "string",
       "minLength": 1,
@@ -15580,7 +15528,7 @@
       ]
     },
     "max_ai_credits_limit": {
-      "description": "Maximum AI Credits budget for AWF API proxy enforcement. Accepts positive integers (including K/M suffix strings and expressions). Set to -1 to disable both budget enforcement and token steering.",
+      "description": "Maximum AI Credits budget for AWF API proxy enforcement. Accepts positive integers (including K/M suffix strings and expressions). Set to -1 to disable budget enforcement; with AWF releases after v0.29.11, budget notices continue unless sandbox.agent.token-steering is false.",
       "oneOf": [
         {
           "$ref": "#/$defs/positive_ai_credits_limit"
@@ -15638,6 +15586,43 @@
           "minimum": 1,
           "description": "Maximum number of jobs to run simultaneously when using a matrix strategy."
         }
+      },
+      "additionalProperties": false
+    },
+    "durable_config": {
+      "type": "object",
+      "description": "Experimental. Persist engine-declared session files in GitHub Actions artifacts. Using this field emits a compile-time warning. Configuration and behavior may change without deprecation. Copilot, Claude, Codex, and Pi resume the exact native session with the current workflow prompt; other session-based engines receive a continuation prompt. Starts fresh when no prior history exists. No memory tool is required.",
+      "properties": {
+        "retention-days": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 90,
+          "default": 7,
+          "description": "Number of days to retain durable checkpoint artifacts, subject to repository and organization artifact retention policy."
+        }
+      },
+      "additionalProperties": false
+    },
+    "pi_engine_config": {
+      "type": "object",
+      "properties": {
+        "durable": { "$ref": "#/$defs/durable_config" },
+        "model": { "$ref": "#/$defs/engine_config/oneOf/1/properties/model" },
+        "version": { "$ref": "#/$defs/engine_config/oneOf/1/properties/version" },
+        "config": { "$ref": "#/$defs/engine_config/oneOf/1/properties/config" },
+        "env": { "$ref": "#/$defs/engine_config/oneOf/1/properties/env" },
+        "args": { "$ref": "#/$defs/engine_config/oneOf/1/properties/args" },
+        "mcp": { "$ref": "#/$defs/engine_config/oneOf/1/properties/mcp" },
+        "driver": { "$ref": "#/$defs/engine_config/oneOf/1/properties/driver" },
+        "extensions": { "$ref": "#/$defs/engine_config/oneOf/1/properties/extensions" },
+        "command": { "$ref": "#/$defs/engine_config/oneOf/1/properties/command" },
+        "bare": { "$ref": "#/$defs/engine_config/oneOf/1/properties/bare" },
+        "model-catalog": { "$ref": "#/$defs/engine_config/oneOf/1/properties/model-catalog" },
+        "cooldown": { "$ref": "#/$defs/engine_config/oneOf/1/properties/cooldown" },
+        "cwd": { "$ref": "#/$defs/engine_config/oneOf/1/properties/cwd" },
+        "model-routing": { "$ref": "#/$defs/engine_config/oneOf/1/properties/model-routing" },
+        "model-provider": { "$ref": "#/$defs/engine_config/oneOf/1/properties/model-provider" },
+        "max-turns": { "$ref": "#/$defs/engine_config/oneOf/1/properties/max-turns" }
       },
       "additionalProperties": false
     },
@@ -15742,11 +15727,11 @@
               "type": "integer",
               "minimum": 0,
               "default": 3,
-              "description": "Minimum release age in days for compiler-managed engine installs. Zero disables the cooldown only outside strict mode."
+              "description": "Minimum release age in days for compiler-managed engine installs. Zero disables the cooldown, including in strict mode."
             },
             "model": {
               "type": "string",
-              "description": "Model for this engine, overriding the top-level model. Has sensible defaults and can typically be omitted. Supports full model IDs (e.g., 'claude-3-5-sonnet-20241022', 'gpt-4'), which is useful when a nested engine (e.g. safe-outputs.threat-detection.engine) needs a different model than the main agent engine."
+              "description": "Model for this engine, overriding the top-level model. Has sensible defaults and can typically be omitted. Supports full model IDs (e.g., 'claude-3-5-sonnet-20241022', 'gpt-4'), which is useful when a nested engine (e.g. safe-outputs.threat-detection.engine) needs a different model than the main agent engine. For the main agent engine, router values ('router', 'router/economy', 'router/balanced', 'router/robust') choose model routing; they are rejected for other engines."
             },
             "fallback-models": {
               "type": "array",
@@ -15761,41 +15746,50 @@
               "description": "Ordered alternative models after model-specific failures, supported by engines with a built-in retry harness. Each model receives its own harness retry budget. Cannot be combined with model-routing or a custom driver or harness."
             },
             "model-routing": {
-              "type": "object",
-              "description": "Experimental per-run model and reasoning-effort selection from the task text for Copilot, Claude, Codex, and pi engines, on GitHub Copilot or, for Claude and Codex, natively on Anthropic or OpenAI; requires the AWF firewall and ignores fixed model and effort settings. See https://github.github.com/gh-aw/reference/model-routing/.",
-              "required": ["goal", "mode"],
-              "additionalProperties": false,
-              "properties": {
-                "goal": {
-                  "type": "string",
-                  "enum": ["cost", "cost-speed"],
-                  "description": "Routing objective: cost prefers the cheapest model and effort that meet the mode's target; cost-speed prefers the fastest model and effort that meet it."
-                },
-                "mode": {
-                  "type": "string",
-                  "enum": ["economy", "balanced", "robust", "auto"],
-                  "description": "Routing quality profile: economy, balanced, and robust set increasing quality bars, generally with increasing cost; auto lets the classifier recommend one of these profiles per task."
-                },
-                "allowed-models": {
-                  "type": "array",
-                  "minItems": 1,
-                  "uniqueItems": true,
-                  "items": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 200,
-                    "anyOf": [
-                      {
-                        "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"
+              "description": "Deprecated. Use a router model value for cost routing, or top-level model-routing: false to opt out. The cost-speed objective requires an AWF pin older than v0.29.17 and has no equivalent cost selector. See https://github.github.com/gh-aw/reference/model-routing/.",
+              "oneOf": [
+                {
+                  "type": "object",
+                  "required": ["goal", "mode"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "goal": {
+                      "type": "string",
+                      "enum": ["cost", "cost-speed"],
+                      "description": "Routing objective: cost prefers the cheapest model and effort that meet the mode's target; cost-speed prefers the fastest model and effort that meet it, but requires an AWF pin older than v0.29.17."
+                    },
+                    "mode": {
+                      "type": "string",
+                      "enum": ["economy", "balanced", "robust", "auto"],
+                      "description": "Routing quality profile: economy, balanced, and robust set increasing quality bars, generally with increasing cost; auto lets the classifier recommend one of these profiles per task."
+                    },
+                    "allowed-models": {
+                      "type": "array",
+                      "minItems": 1,
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200,
+                        "anyOf": [
+                          {
+                            "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"
+                          },
+                          {
+                            "pattern": "\\$\\{\\{[^}]+\\}\\}"
+                          }
+                        ]
                       },
-                      {
-                        "pattern": "\\$\\{\\{[^}]+\\}\\}"
-                      }
-                    ]
-                  },
-                  "description": "Optional exact model names of the routing provider or gh-aw model aliases (such as small or sonnet) that narrow the router's choice for the main agent only. Aliases expand to their model patterns for the routing provider (GitHub Copilot, or Anthropic or OpenAI for native Claude and Codex routing), limited to the engine's model family for Claude and Codex. This is not a request policy; put patterns such as gpt-* in models.allowed or models.blocked. When omitted, the router chooses from the models that policy allows (Claude and Codex only from their own model family). Among workflows that enable routing for the same engine, if any omits allowed-models, the router has no shortlist; otherwise, their lists are combined. GitHub Actions expressions are allowed only when neither models.allowed nor models.blocked is set."
+                      "description": "Optional exact model names of the routing provider or gh-aw model aliases (such as small or sonnet) that narrow the router's choice for the main agent only. Aliases expand to their model patterns for the routing provider (GitHub Copilot, or Anthropic or OpenAI for native Claude and Codex routing), limited to the engine's model family for Claude and Codex. This is not a request policy; put patterns such as gpt-* in models.allowed or models.blocked. When omitted, the router chooses from the models that policy allows (Claude and Codex only from their own model family). Among workflows that enable routing for the same engine, if any omits allowed-models, the router has no shortlist; otherwise, their lists are combined. GitHub Actions expressions are allowed only when neither models.allowed nor models.blocked is set."
+                    }
+                  }
+                },
+                {
+                  "type": "boolean",
+                  "const": false,
+                  "description": "Disable the implicit cost/auto model-routing default without pinning a model; the existing model variables and fallback model apply."
                 }
-              }
+              ]
             },
             "context-window": {
               "type": "integer",
@@ -15950,6 +15944,7 @@
                 "type": "string"
               }
             },
+            "inference": { "$ref": "#/$defs/connectorInferenceSelection" },
             "auth": {
               "type": "object",
               "description": "Engine-level authentication configuration for AWF API proxy sidecar integration (for example, Azure OpenAI via GitHub OIDC). Values are mapped to AWF_AUTH_* environment variables.",
@@ -15982,7 +15977,8 @@
                 },
                 "provider": {
                   "type": "string",
-                  "description": "Optional WIF provider discriminator. Recognized values are 'azure', 'anthropic', and 'gcp'."
+                  "enum": ["azure", "anthropic", "gcp", "openai"],
+                  "description": "Optional WIF provider discriminator. Recognized values are 'azure', 'anthropic', 'gcp', and 'openai'."
                 },
                 "federation-rule-id": {
                   "type": "string",
@@ -15994,7 +15990,7 @@
                 },
                 "service-account-id": {
                   "type": "string",
-                  "description": "Anthropic WIF service account ID (e.g., svac_...)."
+                  "description": "Provider service account ID (Anthropic e.g., svac_...; OpenAI as configured in the OpenAI admin console)."
                 },
                 "workspace-id": {
                   "type": "string",
@@ -16015,6 +16011,10 @@
                 "location": {
                   "type": "string",
                   "description": "Google Cloud region for Vertex AI inference (e.g., us-central1). Defaults to us-central1 when omitted."
+                },
+                "identity-provider-id": {
+                  "type": "string",
+                  "description": "OpenAI Workload Identity Provider ID configured in the OpenAI admin console."
                 }
               },
               "required": ["type"],
@@ -16045,6 +16045,11 @@
               "description": "When true, disables automatic loading of context and custom instructions where supported. Copilot uses --no-custom-instructions, Claude uses --bare, and Pi disables context-file, skill, prompt-template, extension, and theme discovery while retaining explicit workflow infrastructure extensions. Codex and Gemini do not support this option and emit a warning. Defaults to false.",
               "default": false
             },
+            "model-catalog": {
+              "type": "boolean",
+              "description": "Whether the engine harness resolves the configured model against the live model catalogue (/models). Defaults to true: gh-aw model aliases, including built-in aliases that look like model ids such as gpt-5-mini, are resolved and the run stops if no catalogue is available. Set to false for BYOK providers without a /models route (for example Azure AI Gateway): configured models are then passed to the engine verbatim, without alias resolution, and model routing (implicit or model: router) is disabled because it selects models from the catalogue. Not supported with engine.copilot-sdk: true, which needs the catalogue at startup.",
+              "default": true
+            },
             "dynamic-workflows": {
               "type": "boolean",
               "description": "Whether dynamic workflows are enabled for engines that support them. Defaults to false. Copilot dynamic workflows are experimental.",
@@ -16068,8 +16073,27 @@
               "additionalProperties": false
             },
             "copilot-sdk": {
-              "type": "boolean",
-              "description": "Enables the experimental GitHub Copilot SDK integration (copilot engine only). When true, the harness starts a separate headless Copilot CLI sidecar on the configured localhost port and sets COPILOT_SDK_URI on child processes."
+              "description": "Enables Copilot SDK integration. An object pins a checked-in npm project for a Node.js or TypeScript driver.",
+              "oneOf": [
+                { "type": "boolean" },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["version", "sha256"],
+                  "properties": {
+                    "version": {
+                      "type": "string",
+                      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+                      "description": "Exact stable version of @microsoft/copilot-sdk, independent of engine.version."
+                    },
+                    "sha256": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}$",
+                      "description": "Lowercase SHA-256 of the checked-in manifest, a NUL byte, and the npm lockfile."
+                    }
+                  }
+                }
+              ]
             },
             "driver": {
               "description": "Custom driver script, command, or inline source for the engine. String values accept a workspace-relative path or bare name. Inline object values are supported for the Copilot engine and materialize runtime files before execution. Supported inline runtimes are node, python, go, and java.",
@@ -16106,6 +16130,9 @@
                 }
               ]
             },
+            "durable": {
+              "$ref": "#/$defs/durable_config"
+            },
             "extensions": {
               "type": "array",
               "items": {
@@ -16129,7 +16156,7 @@
               "type": "integer",
               "minimum": 0,
               "default": 3,
-              "description": "Minimum release age in days for compiler-managed engine installs. Zero disables the cooldown only outside strict mode."
+              "description": "Minimum release age in days for compiler-managed engine installs. Zero disables the cooldown, including in strict mode."
             },
             "runtime": {
               "type": "object",
@@ -16249,6 +16276,11 @@
               "description": "When true, disables automatic loading of context and custom instructions where supported. Copilot uses --no-custom-instructions, Claude uses --bare, and Pi disables context-file, skill, prompt-template, extension, and theme discovery while retaining explicit workflow infrastructure extensions. Codex and Gemini do not support this option and emit a warning. Defaults to false.",
               "default": false
             },
+            "model-catalog": {
+              "type": "boolean",
+              "description": "Whether the engine harness resolves the configured model against the live model catalogue (/models). Defaults to true: gh-aw model aliases, including built-in aliases that look like model ids such as gpt-5-mini, are resolved and the run stops if no catalogue is available. Set to false for BYOK providers without a /models route (for example Azure AI Gateway): configured models are then passed to the engine verbatim, without alias resolution, and model routing (implicit or model: router) is disabled because it selects models from the catalogue. Not supported with engine.copilot-sdk: true, which needs the catalogue at startup.",
+              "default": true
+            },
             "dynamic-workflows": {
               "type": "boolean",
               "description": "Whether dynamic workflows are enabled for engines that support them. Defaults to false. Copilot dynamic workflows are experimental.",
@@ -16286,6 +16318,9 @@
               "type": "boolean",
               "description": "Whether the engine supports MCP. When false, the compiler automatically enables gh-proxy and cli-proxy and rejects attempts to disable either proxy.",
               "default": true
+            },
+            "durable": {
+              "$ref": "#/$defs/durable_config"
             },
             "runtime-id": {
               "type": "string",
@@ -16414,6 +16449,28 @@
               "type": "object",
               "description": "Declarative custom-engine runtime behavior used to materialize a shared CLI engine from frontmatter.",
               "properties": {
+                "durable": {
+                  "type": "object",
+                  "description": "Experimental native durability or session-file continuation. Declares persisted files and the continuation invocation; pinned dependency installation is optional. Enabling engine.durable emits a compile-time warning. The harness receives GH_AW_DURABLE_RESUMED and GH_AW_DURABLE_PARENT_RUN_ID.",
+                  "properties": {
+                    "files": {
+                      "type": "array",
+                      "minItems": 1,
+                      "uniqueItems": true,
+                      "items": { "type": "string", "minLength": 1 },
+                      "description": "Explicit files or directories under /tmp/gh-aw/agent/ to persist. $GH_AW_DURABLE_CHECKPOINT refers to the compiler-managed native checkpoint file. Globs and overlapping paths are unsupported."
+                    },
+                    "installation": {
+                      "type": "array",
+                      "minItems": 1,
+                      "items": { "$ref": "#/$defs/engine_config/oneOf/3/properties/behaviors/properties/installation" }
+                    },
+                    "execution": { "$ref": "#/$defs/engine_config/oneOf/3/properties/behaviors/properties/execution" },
+                    "harness-script": { "type": "string", "minLength": 1 }
+                  },
+                  "required": ["files", "execution"],
+                  "additionalProperties": false
+                },
                 "secret-strategy": {
                   "type": "string",
                   "description": "Secret resolution mode for the engine (for example 'universal-llm-consumer')."
@@ -16425,17 +16482,37 @@
                   },
                   "description": "Secret or env var keys the engine accepts through engine.env."
                 },
+                "output-files": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^/tmp/gh-aw/agent/[A-Za-z0-9._/-]+\\.(txt|json|log|md|mdx|yml|jsonl|patch|html)$"
+                  },
+                  "description": "Untrusted diagnostic files retained in the unified agent artifact after secret redaction and recovery-envelope validation, including failed executions. Paths must be literal files under /tmp/gh-aw/agent/ without traversal or wildcards and have a secret-redactable extension. Does not enable structured session parsing."
+                },
                 "capabilities": {
                   "type": "object",
                   "properties": {
                     "tools-allowlist": {
                       "type": "boolean"
                     },
+                    "github-cli-proxy": {
+                      "type": "boolean",
+                      "description": "Include the GitHub CLI bridge when tools.cli-proxy is enabled, excluding it from native MCP configuration."
+                    },
+                    "auto-mcp-cli": {
+                      "type": "boolean",
+                      "description": "Augment active CLI mounts with configured GitHub, work-queue and custom MCP servers."
+                    },
                     "max-turns": {
                       "type": "boolean"
                     },
                     "web-search": {
                       "type": "boolean"
+                    },
+                    "web-fetch-fallback": {
+                      "type": "boolean",
+                      "description": "Use the built-in sandboxed web-fetch MCP server when the workflow enables tools.web-fetch. Requires MCP support and a config adapter that registers the stdio server."
                     },
                     "max-continuations": {
                       "type": "boolean"
@@ -16499,13 +16576,38 @@
                   "type": "object",
                   "properties": {
                     "package-manager": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Package manager used to install the engine: 'npm' installs 'package-name' globally; 'pip' installs the hash-locked 'requirements', when declared, before the agent sandbox starts."
                     },
                     "package-name": {
                       "type": "string"
                     },
                     "version": {
                       "type": "string"
+                    },
+                    "requirements": {
+                      "type": "array",
+                      "description": "pip only. Complete hash-locked dependency list, including 'package-name' at the engine version. The runtime installs binary wheels with pip --require-hashes into /tmp/gh-aw/agent/<engine-id>-python/site-packages, verifies the installed version, and exposes the directory to execution as GH_AW_PYTHON_PACKAGES.",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string",
+                            "description": "Python distribution name."
+                          },
+                          "version": {
+                            "type": "string",
+                            "description": "Exact distribution version. Quote it so YAML keeps it a string."
+                          },
+                          "sha256": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$",
+                            "description": "SHA-256 of the wheel to install."
+                          }
+                        },
+                        "required": ["name", "version", "sha256"],
+                        "additionalProperties": false
+                      }
                     },
                     "step-name": {
                       "type": "string"
@@ -16687,6 +16789,15 @@
             }
           },
           "required": ["model"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Pi engine options, including optional durable execution.",
+          "properties": {
+            "pi": { "$ref": "#/$defs/pi_engine_config" }
+          },
+          "required": ["pi"],
           "additionalProperties": false
         }
       ]
@@ -16911,7 +17022,7 @@
     },
     "http_mcp_auth": {
       "type": "object",
-      "description": "Upstream authentication configuration for the HTTP MCP server. When configured, the gateway dynamically acquires tokens and injects them as Authorization headers on every outgoing request to this server. Currently only GitHub Actions OIDC is supported.",
+      "description": "Upstream HTTP MCP authentication. The gateway acquires GitHub OIDC tokens directly or exchanges them for Microsoft Entra tokens. Azure federation requires MCP gateway v0.5.12 or newer.",
       "properties": {
         "type": {
           "type": "string",
@@ -16920,11 +17031,50 @@
         },
         "audience": {
           "type": "string",
-          "description": "The intended audience for the OIDC token (the 'aud' claim). If omitted, defaults to the server's url field.",
-          "format": "uri"
+          "description": "GitHub assertion audience. Defaults to the server URL for direct OIDC or api://AzureADTokenExchange for Azure. Accepts an Actions expression.",
+          "anyOf": [{ "format": "uri" }, { "pattern": "^\\$\\{\\{[\\s\\S]+\\}\\}$" }]
+        },
+        "provider": {
+          "type": "string",
+          "enum": ["azure"],
+          "description": "Exchange the GitHub assertion for a Microsoft Entra token. Omit for direct GitHub OIDC."
+        },
+        "azure-tenant-id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "Entra tenant ID. Required for provider: azure. Accepts Actions expressions."
+        },
+        "azure-client-id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "Federated Entra application client ID. Required for provider: azure. Accepts Actions expressions."
+        },
+        "azure-scope": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "Entra token scope. Defaults to https://cognitiveservices.azure.com/.default; Azure AI Gateway requires its own scope."
+        },
+        "azure-cloud": {
+          "type": "string",
+          "enum": ["public", "usgovernment", "china"],
+          "description": "Azure authority cloud. Defaults to public."
         }
       },
       "required": ["type"],
+      "allOf": [
+        {
+          "if": { "required": ["provider"], "properties": { "provider": { "const": "azure" } } },
+          "then": { "required": ["azure-tenant-id", "azure-client-id"] },
+          "else": {
+            "not": {
+              "anyOf": [{ "required": ["azure-tenant-id"] }, { "required": ["azure-client-id"] }, { "required": ["azure-scope"] }, { "required": ["azure-cloud"] }]
+            }
+          }
+        }
+      ],
       "additionalProperties": false
     },
     "github_token": {
@@ -16966,17 +17116,26 @@
         "${{ env.GH_TOKEN }}"
       ]
     },
-    "linear_token": {
-      "type": "string",
-      "pattern": "^\\$\\{\\{\\s*(secrets\\.[A-Za-z_][A-Za-z0-9_]*(\\s*\\|\\|\\s*secrets\\.[A-Za-z_][A-Za-z0-9_]*)*|needs\\.[A-Za-z_][A-Za-z0-9_]*\\.outputs\\.[A-Za-z_][A-Za-z0-9_]*|steps\\.[A-Za-z_][A-Za-z0-9_-]*\\.outputs\\.[A-Za-z_][A-Za-z0-9_-]*)\\s*\\}\\}$",
-      "description": "Linear API key expression resolved only in the trusted safe_outputs job."
-    },
-    "linear_issue_identifier": {
-      "type": "string",
-      "minLength": 3,
-      "maxLength": 100,
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[A-Z][A-Z0-9]{0,15}-[1-9][0-9]*)$",
-      "description": "Linear issue model UUID or uppercase shorthand identifier."
+    "repo_memory_github_app": {
+      "type": "object",
+      "description": "GitHub App credentials for repo-memory. Push tokens request only contents: write; cross-repository clone tokens request only contents: read.",
+      "properties": {
+        "client-id": { "$ref": "#/$defs/github_app/properties/client-id" },
+        "app-id": { "$ref": "#/$defs/github_app/properties/app-id" },
+        "private-key": { "$ref": "#/$defs/github_app/properties/private-key" },
+        "owner": { "$ref": "#/$defs/github_app/properties/owner" },
+        "repositories": { "$ref": "#/$defs/github_app/properties/repositories" },
+        "ignore-if-missing": { "$ref": "#/$defs/github_app/properties/ignore-if-missing" }
+      },
+      "anyOf": [
+        { "required": ["client-id", "private-key"] },
+        { "required": ["app-id", "private-key"] },
+        {
+          "required": ["ignore-if-missing"],
+          "properties": { "ignore-if-missing": { "const": true } }
+        }
+      ],
+      "additionalProperties": false
     },
     "github_app": {
       "type": "object",
@@ -17149,6 +17308,11 @@
       "description": "Configuration for a single actions/checkout step",
       "additionalProperties": false,
       "properties": {
+        "data-only": {
+          "type": "boolean",
+          "default": false,
+          "description": "Acknowledge that host steps consume a separate checkout only as data, not executable scripts, hooks, or configuration. Suppresses only that checkout's checkout-ref warning; does not suppress the default workspace checkout warning, enforce isolation, or change runtime behavior. Every merged request for the same checkout target must opt in. Requires a literal boolean."
+        },
         "multi": {
           "type": "boolean",
           "default": false,
@@ -17545,6 +17709,11 @@
           "type": "string",
           "enum": ["read", "none"],
           "description": "Permission level for secret scanning alerts (read/none). Forwarded as permission-secret-scanning-alerts input for actions/create-github-app-token."
+        },
+        "repository-advisories": {
+          "type": "string",
+          "enum": ["read", "none", "write"],
+          "description": "Repository security advisories permission. GitHub App-only; forwarded as permission-repository-advisories when minting a token."
         },
         "repository-hooks": {
           "type": "string",

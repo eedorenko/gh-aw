@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 
 const require = createRequire(import.meta.url);
+const { parseCopilotRetryAfterMs } = require("./copilot_retry_after.cjs");
 const {
   captureExecutionEvidenceConfiguration,
   recordStartupAttempt,
@@ -74,6 +75,214 @@ describe("harness_retry_runner.cjs", () => {
       sleepFn: async () => {},
     };
   }
+
+  function gateResult(outcome) {
+    return { outcome, questions: [{ question: 1, outcome }], latencyMs: 1 };
+  }
+
+  it("normalizes guard-zero before success and records the engine's terminal veto", async () => {
+    const options = telemetryOptions([0]);
+    options.runAttempt = async () => ({ exitCode: 0, output: "guard", hasOutput: true, runtimeGuardFired: true, retryAfterMs: 5 });
+    options.handleFailure = vi.fn(({ result }) => {
+      expect(result.exitCode).toBe(1);
+      result.failureClasses = ["engine_guard"];
+      return { action: "stop" };
+    });
+    expect(await runHarnessRetryLoop(options)).toMatchObject({ exitCode: 1, attempts: 1, lastResult: { exitCode: 1, retryAfterMs: 5 } });
+    expect(options.handleFailure).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(fs.readFileSync(options.telemetryPath, "utf8")).attempt_results[0]).toMatchObject({ exit_code: 1, outcome: "failure", failure_classes: ["engine_guard"] });
+  });
+
+  it("preserves cancellation precedence over a guard-zero failure handler", async () => {
+    const options = telemetryOptions([0]);
+    options.runAttempt = async () => ({ exitCode: 0, output: "", hasOutput: false, runtimeGuardFired: true, cancelled: true });
+    options.handleFailure = vi.fn();
+    expect(await runHarnessRetryLoop(options)).toMatchObject({ exitCode: 1, attempts: 1 });
+    expect(options.handleFailure).not.toHaveBeenCalled();
+    expect(JSON.parse(fs.readFileSync(options.telemetryPath, "utf8")).attempt_results[0]).toMatchObject({ exit_code: 1, outcome: "cancelled", failure_classes: ["cancelled"] });
+  });
+
+  it.each([
+    [5, 10, null, 2, "rate_limit_error"],
+    [11, 10, null, 2, "rate_limit_error"],
+    [60000, 10, null, 2, "rate_limit_error"],
+    [60001, 100000, null, 1, "rate_limit_wait_exceeded"],
+    [1728000000, 100000, null, 1, "rate_limit_wait_exceeded"],
+    [257000, 60000, 600000, 2, "rate_limit_error"],
+    [2147483648, 60000, null, 1, "rate_limit_wait_exceeded"],
+    [1000, 2000, 500, 1, "rate_limit_wait_exceeded"],
+  ])("honors retry-after %i beyond backoff cap %i within deadline %s", async (requested, cap, deadline, attempts, failureClass) => {
+    vi.stubEnv("GH_AW_SAFE_OUTPUTS", "");
+    const options = telemetryOptions([1, 0]);
+    options.maxDelayMs = cap;
+    options.softTimeoutGuard = deadline === null ? null : { timeoutMinutes: 1, softDeadlineMs: Date.now() + deadline };
+    options.runAttempt = async attempt => ({ exitCode: attempt === 0 ? 1 : 0, output: "error", hasOutput: true, retryAfterMs: requested });
+    options.sleepFn = vi.fn();
+    expect(await runHarnessRetryLoop(options)).toMatchObject({ attempts, exitCode: attempts === 2 ? 0 : 1 });
+    expect(options.sleepFn.mock.calls).toEqual(attempts === 2 ? [[requested]] : []);
+    expect(JSON.parse(fs.readFileSync(options.telemetryPath, "utf8")).attempt_results[0].failure_classes).toEqual([failureClass]);
+  });
+
+  it("does not override a terminal failure decision with Retry-After", async () => {
+    const options = telemetryOptions([1]);
+    options.runAttempt = async () => ({ exitCode: 1, output: "quota", hasOutput: true, retryAfterMs: 5 });
+    options.handleFailure = ({ result }) => {
+      result.failureClasses = ["invocation_cap_exceeded"];
+      return { action: "stop" };
+    };
+    expect(await runHarnessRetryLoop(options)).toMatchObject({ exitCode: 1, attempts: 1 });
+    expect(JSON.parse(fs.readFileSync(options.telemetryPath, "utf8")).attempt_results[0].failure_classes).toEqual(["invocation_cap_exceeded"]);
+  });
+
+  it.each(["257", "Wed, 11 Nov 2026 08:47:17 GMT"])("waits the full Azure token-limit Retry-After %s with default backoff settings", async header => {
+    let now = Date.parse("Wed, 11 Nov 2026 08:43:00 GMT");
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const options = telemetryOptions([1, 0]);
+    options.initialDelayMs = 5000;
+    options.maxDelayMs = 60000;
+    options.softTimeoutGuard = { timeoutMinutes: 10, softDeadlineMs: now + 510000 };
+    options.runAttempt = async attempt => ({
+      exitCode: attempt === 0 ? 1 : 0,
+      output: "429 Token limit is exceeded. Try again in 257 seconds.",
+      hasOutput: true,
+      retryAfterMs: attempt === 0 ? parseCopilotRetryAfterMs(`429 Token limit is exceeded.\nRetry-After: ${header}`) : null,
+    });
+    options.sleepFn = vi.fn(async delay => {
+      now += delay;
+    });
+    expect(await runHarnessRetryLoop(options)).toMatchObject({ attempts: 2, exitCode: 0 });
+    expect(options.sleepFn).toHaveBeenCalledExactlyOnceWith(257000);
+    expect(JSON.parse(fs.readFileSync(options.telemetryPath, "utf8")).attempt_results[1].backoff_ms).toBe(257000);
+  });
+
+  it.each(["", "[]"])("does not request decisions without nonempty configured questions: %j", async configuration => {
+    vi.stubEnv("GH_AW_SKIP_IF_DECISION", configuration);
+    vi.stubEnv("AWF_REFLECT_ENABLED", "1");
+    const fetchImpl = vi.fn();
+    vi.stubGlobal("fetch", fetchImpl);
+    try {
+      const options = telemetryOptions();
+      options.runAttempt = vi.fn(options.runAttempt);
+      expect(await runHarnessRetryLoop(options)).toMatchObject({ exitCode: 0, attempts: 1 });
+      expect(options.runAttempt).toHaveBeenCalledTimes(1);
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(JSON.parse(fs.readFileSync(options.telemetryPath, "utf8")).decision_results).toBeUndefined();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("honors a deny through the default evaluator only after configured opt-in", async () => {
+    vi.stubEnv("GH_AW_SKIP_IF_DECISION", '["Is further work unnecessary?"]');
+    vi.stubEnv("AWF_REFLECT_ENABLED", "1");
+    vi.stubEnv("GH_AW_PHASE", "agent");
+    vi.stubEnv("GH_AW_SAFE_OUTPUTS", "");
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ endpoints: [{ configured: true, provider: "openai", models_url: "http://api-proxy:10000/v1/models" }] })))
+      .mockResolvedValueOnce(new Response('{"answers":[{"name":"skip_1","type":"choice","choice":"deny"}]}'));
+    vi.stubGlobal("fetch", fetchImpl);
+    try {
+      const options = telemetryOptions();
+      options.runAttempt = vi.fn();
+      expect(await runHarnessRetryLoop(options)).toMatchObject({ exitCode: 0, attempts: 0 });
+      expect(options.runAttempt).not.toHaveBeenCalled();
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(fs.readFileSync(options.telemetryPath, "utf8")).decision_results).toMatchObject([{ outcome: "deny", avoidedInvocation: true }]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("can deny the initial invocation without counting a process attempt", async () => {
+    const options = telemetryOptions();
+    options.evaluateDecision = vi.fn().mockResolvedValue(gateResult("deny"));
+    options.runAttempt = vi.fn();
+    options.handleFailure = vi.fn();
+    expect(await runHarnessRetryLoop(options)).toMatchObject({ exitCode: 0, attempts: 0, lastResult: null });
+    expect(options.runAttempt).not.toHaveBeenCalled();
+    expect(options.handleFailure).not.toHaveBeenCalled();
+    expect(JSON.parse(fs.readFileSync(options.telemetryPath, "utf8"))).toMatchObject({
+      attempts: 0,
+      exit_code: 0,
+      attempt_results: [],
+      decision_results: [{ proposedAttempt: 1, outcome: "deny", avoidedInvocation: true }],
+    });
+  });
+
+  it.each(["fresh restart", "--continue", "resume native session"])("evaluates the %s retry path once and can avoid its next invocation", async mode => {
+    const options = telemetryOptions([1, 0]);
+    options.getRetryMode = () => mode;
+    options.evaluateDecision = vi.fn().mockResolvedValueOnce(gateResult("unknown")).mockResolvedValueOnce(gateResult("deny"));
+    options.runAttempt = vi.fn(options.runAttempt);
+    options.sleepFn = vi.fn(options.sleepFn);
+    expect(await runHarnessRetryLoop(options)).toMatchObject({ exitCode: 0, attempts: 1 });
+    expect(options.runAttempt).toHaveBeenCalledTimes(1);
+    expect(options.evaluateDecision).toHaveBeenCalledTimes(2);
+    expect(options.sleepFn).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(fs.readFileSync(options.telemetryPath, "utf8")).decision_results).toMatchObject([
+      { proposedAttempt: 1, outcome: "unknown", avoidedInvocation: false },
+      { proposedAttempt: 2, outcome: "deny", avoidedInvocation: true },
+    ]);
+  });
+
+  it.each(["allow", "unknown"])("preserves existing retry counts, backoff and failure handling for %s", async outcome => {
+    const options = telemetryOptions([1, 1, 0]);
+    options.evaluateDecision = vi.fn().mockResolvedValue(gateResult(outcome));
+    options.runAttempt = vi.fn(options.runAttempt);
+    options.handleFailure = vi.fn(options.handleFailure);
+    options.sleepFn = vi.fn(options.sleepFn);
+    expect(await runHarnessRetryLoop(options)).toMatchObject({ exitCode: 0, attempts: 3 });
+    expect(options.evaluateDecision).toHaveBeenCalledTimes(3);
+    expect(options.runAttempt).toHaveBeenCalledTimes(3);
+    expect(options.handleFailure).toHaveBeenCalledTimes(2);
+    expect(options.sleepFn.mock.calls).toEqual([[1], [2]]);
+  });
+
+  it("does not consult decisions after a nonrecoverable failure", async () => {
+    const options = telemetryOptions([1]);
+    options.evaluateDecision = vi.fn().mockResolvedValue(gateResult("allow"));
+    options.handleFailure = () => ({ action: "stop" });
+    expect(await runHarnessRetryLoop(options)).toMatchObject({ exitCode: 1, attempts: 1 });
+    expect(options.evaluateDecision).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not consult decisions for retries outside the deterministic retry budget", async () => {
+    const options = telemetryOptions([1]);
+    options.maxRetries = 0;
+    options.evaluateDecision = vi.fn().mockResolvedValue(gateResult("unknown"));
+    expect(await runHarnessRetryLoop(options)).toMatchObject({ exitCode: 1, attempts: 1 });
+    expect(options.evaluateDecision).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not consult the decision model once the deterministic deadline is exhausted", async () => {
+    const options = telemetryOptions();
+    options.softTimeoutGuard = { timeoutMinutes: 1, softDeadlineMs: Date.now() - 1 };
+    options.evaluateDecision = vi.fn().mockResolvedValue(gateResult("allow"));
+    expect(await runHarnessRetryLoop(options)).toMatchObject({ exitCode: 1, attempts: 0 });
+    expect(options.evaluateDecision).not.toHaveBeenCalled();
+  });
+
+  it("cannot let allow or unknown bypass a deadline consumed by evaluation", async () => {
+    const options = telemetryOptions();
+    options.softTimeoutGuard = { timeoutMinutes: 1, softDeadlineMs: Date.now() + 1000 };
+    options.evaluateDecision = async () => {
+      options.softTimeoutGuard.softDeadlineMs = Date.now() - 1;
+      return gateResult("unknown");
+    };
+    options.runAttempt = vi.fn();
+    expect(await runHarnessRetryLoop(options)).toMatchObject({ exitCode: 1, attempts: 0 });
+    expect(options.runAttempt).not.toHaveBeenCalled();
+  });
+
+  it("retains decisions across outer startup/recovery loops", async () => {
+    const options = telemetryOptions();
+    options.evaluateDecision = vi.fn().mockResolvedValueOnce(gateResult("unknown")).mockResolvedValueOnce(gateResult("deny"));
+    await runHarnessRetryLoop(options);
+    await runHarnessRetryLoop(options);
+    expect(options.evaluateDecision).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(fs.readFileSync(options.telemetryPath, "utf8")).decision_results.map(decision => decision.outcome)).toEqual(["unknown", "deny"]);
+  });
 
   it.each([
     [{}, "/tmp/gh-aw/agent/harness_retry.json"],

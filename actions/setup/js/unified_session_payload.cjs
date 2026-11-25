@@ -5,14 +5,15 @@
 const { computeInferenceAIC, findModelPricing } = require("./model_costs.cjs");
 const { COPILOT_WORKFLOW_EVENT_FIELDS } = require("./copilot_workflow_events.cjs");
 const { DYNAMIC_WORKFLOW_EVENT_TYPES } = require("./dynamic_workflow_session.cjs");
-const { sessionContext } = require("./agent_session.cjs");
+const { isTokenCount, sessionContext } = require("./agent_session.cjs");
 const { normalizeMcpConfigurationData } = require("./mcp_configuration.cjs");
 const { ERR_VALIDATION } = require("./error_codes.cjs");
 const { getMcpRateLimitHint, getRpcRateLimitHint } = require("./mcp_rate_limit.cjs");
 const { redactWebhookPayloads } = require("./webhook_context.cjs");
 const { isErrorIdentifier, normalizeEngineHarness } = require("./routing_analytics.cjs");
-const { projectSafeOutputData } = require("./safe_output_outcomes.cjs");
-const { normalizeHarnessRetryRecord, normalizeHarnessAttemptEvent } = require("./harness_retry_record.cjs");
+const { projectSafeOutputData } = require("./safe_output_execution.cjs");
+const { normalizeHarnessRetryRecord, normalizeHarnessAttemptEvent, normalizeHarnessDecisionData } = require("./harness_retry_record.cjs");
+const { sessionMessageTimestamp } = require("./unified_session_order.cjs");
 
 /** AWF failed-request origins: provider response versus AWF-originated rejection. */
 const ERROR_SOURCES = new Set(["upstream", "awf"]);
@@ -55,6 +56,8 @@ const AIC_RESOLVABLE_PHASES = new Set(["detection", "evals"]);
 const TOOL_FIELDS = {
   toolCallId: ["toolCallId", "tool_call_id", "tool_use_id"],
   toolName: ["toolName", "tool_name"],
+  messageId: ["messageId", "message_id"],
+  model: ["model"],
   mcpServerName: ["mcpServerName"],
   parentToolCallId: ["parentToolCallId"],
   stepIndex: ["stepIndex", "step_index"],
@@ -72,6 +75,27 @@ const RUNTIME_FIELDS = {
 const STEERING_FIELDS = { type: ["type"], threshold: ["threshold"] };
 const STEERING_TYPES = new Set(["ai_credit", "timeout", "token"]);
 const STEERING_THRESHOLDS = new Set([80, 90, 95, 99]);
+/** @type {Fields} */
+const STEERING_DELIVERY_FIELDS = { type: ["type"], trigger: ["trigger"], threshold: ["threshold"], conversation: ["conversation"], first: ["first"] };
+const STEERING_DELIVERY_TYPES = new Set(["ai_credit", "timeout"]);
+const STEERING_CONVERSATION = /^[0-9a-f]{12}$/;
+
+/**
+ * Projects an AWF steering_delivery record, or returns undefined when it does not
+ * match the AWF contract: a threshold notice carries 80, 90, 95 or 99, a
+ * little_left notice a null threshold, and the conversation is a 12-hex-digit
+ * per-run key or null.
+ * @param {any} value
+ * @returns {Record<string, any> | undefined}
+ */
+function normalizeSteeringDelivery(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const delivery = selectFields(value, STEERING_DELIVERY_FIELDS);
+  if (!STEERING_DELIVERY_TYPES.has(delivery.type) || typeof delivery.first !== "boolean") return undefined;
+  if (delivery.trigger === "threshold" ? !STEERING_THRESHOLDS.has(delivery.threshold) : delivery.trigger !== "little_left" || delivery.threshold !== null) return undefined;
+  if (delivery.conversation !== null && !(typeof delivery.conversation === "string" && STEERING_CONVERSATION.test(delivery.conversation))) return undefined;
+  return delivery;
+}
 /** @type {Fields} */
 const MCP_FIELDS = {
   serverName: ["serverName", "server_name", "server_id"],
@@ -193,6 +217,8 @@ const TASK_FIELDS = {
 
 /** @type {Record<string, Fields>} */
 const EVENT_FIELDS = {
+  "durable.restore": { engine: ["engine"], storage: ["storage"], runId: ["runId"], runAttempt: ["runAttempt"], status: ["status"], parentRunId: ["parentRunId"], artifactId: ["artifactId"] },
+  "durable.session": { engine: ["engine"], storage: ["storage"], runId: ["runId"], runAttempt: ["runAttempt"], status: ["status"], parentRunId: ["parentRunId"], sessionId: ["sessionId"] },
   "model.inventory": {},
   "plugin.installation": {
     plugin: ["plugin"],
@@ -208,12 +234,21 @@ const EVENT_FIELDS = {
   "agent.execution": { categories: ["categories"], errorCodes: ["errorCodes"], errorTypes: ["errorTypes"], exitCode: ["exitCode", "exit_code"] },
   "harness.retry": {},
   "harness.attempt": {},
+  "harness.decision": {},
   "engine.retry": { sourceEngine: ["sourceEngine"], sourceType: ["sourceType"], errors: ["errors"] },
   "skill.invoked": { name: ["name"], path: ["path"], source: ["source"], trigger: ["trigger"], model: ["model"], invokedAtTurn: ["invokedAtTurn"] },
   "skill.context_delivered_ref": { interactionId: ["interactionId"], source: ["source"], contentId: ["contentId"] },
   "skill.inventory": { skills: ["skills"] },
   "skill.conflict": { name: ["name"], kind: ["kind"], sources: ["sources"] },
-  "session.init": { sourceEngine: ["sourceEngine"], model: ["model", "selectedModel"], sessionId: ["sessionId", "session_id"], cwd: ["cwd"], reasoningEffort: ["reasoningEffort"] },
+  "session.init": {
+    sourceEngine: ["sourceEngine"],
+    agentVersion: ["agentVersion", "agent_version"],
+    provider: ["provider"],
+    model: ["model", "selectedModel"],
+    sessionId: ["sessionId", "session_id"],
+    cwd: ["cwd"],
+    reasoningEffort: ["reasoningEffort"],
+  },
   "session.shutdown": {
     shutdownType: ["shutdownType"],
     errorReason: ["errorReason"],
@@ -252,6 +287,8 @@ const EVENT_FIELDS = {
     ...TOOL_FIELDS,
     success: ["success"],
     output: ["output"],
+    outputTruncated: ["outputTruncated"],
+    structuredContent: ["structuredContent"],
     result: ["result"],
     error: ["error"],
     fileEdits: ["fileEdits"],
@@ -322,7 +359,7 @@ const EVENT_FIELDS = {
     bytes: ["bytes"],
     durationMs: ["durationMs", "duration_ms"],
   },
-  "firewall.steering": { ...RUNTIME_FIELDS, threshold: ["threshold"] },
+  "firewall.steering": { ...RUNTIME_FIELDS, threshold: ["threshold"], trigger: ["trigger"], conversation: ["conversation"] },
   "firewall.event": RUNTIME_FIELDS,
   "firewall.token_usage": {
     provider: ["provider"],
@@ -339,6 +376,7 @@ const EVENT_FIELDS = {
     premiumRequests: ["premiumRequests", "premium_requests"],
     durationMs: ["durationMs", "duration_ms"],
     steering: ["steering"],
+    steeringDelivery: ["steeringDelivery", "steering_delivery"],
   },
   "firewall.model_routing": {
     schema: ["_schema", "schema"],
@@ -394,8 +432,32 @@ const EVENT_FIELDS = {
   },
   "safe_output.request": SAFE_OUTPUT_FIELDS,
   "safe_output.result": SAFE_OUTPUT_FIELDS,
-  "safe_output.outcome": SAFE_OUTPUT_FIELDS,
+  "safe_output.execution": SAFE_OUTPUT_FIELDS,
   "safe_output.error": SAFE_OUTPUT_FIELDS,
+  "lifecycle.adoption": {
+    sourceRunId: ["sourceRunId"],
+    sourceWorkflow: ["sourceWorkflow"],
+    repository: ["repository"],
+    outputType: ["outputType"],
+    deliveryState: ["deliveryState"],
+    deliverySignal: ["deliverySignal"],
+    deliveryAt: ["deliveryAt"],
+    deliveryObservedAt: ["deliveryObservedAt"],
+    deliverySource: ["deliverySource"],
+    adoptionState: ["adoptionState"],
+    adoptionSignal: ["adoptionSignal"],
+    adoptionAt: ["adoptionAt"],
+    adoptionObservedAt: ["adoptionObservedAt"],
+    adoptionSource: ["adoptionSource"],
+    adoptionRuleVersion: ["adoptionRuleVersion"],
+    acceptanceKind: ["acceptanceKind"],
+    humanVerified: ["humanVerified"],
+    adoptionCoverage: ["adoptionCoverage"],
+    survivalState: ["survivalState"],
+    survivalSignal: ["survivalSignal"],
+    survivalObservedAt: ["survivalObservedAt"],
+    survivalCoverage: ["survivalCoverage"],
+  },
   "experiment.state": { runId: ["runId", "run_id"], assignments: ["assignments"], counts: ["counts"] },
   "grader.manifest": { version: ["version"], customGraders: ["customGraders"] },
   "grader.result": GRADER_FIELDS,
@@ -638,9 +700,10 @@ function normalizeRankedChoices(choices) {
  * Unknown extension data remains opaque for forward compatibility.
  * @param {SessionEvent} event
  * @param {string} [phase]
+ * @param {boolean} [copilotSource] Set by the collector for raw sources; omitted when reprojecting unified data.
  * @returns {SessionEvent}
  */
-function normalizeUnifiedSessionEvent(event, phase) {
+function normalizeUnifiedSessionEvent(event, phase, copilotSource) {
   /** @type {any} */
   const source = event.data;
   if (event.type === "session.result") {
@@ -669,6 +732,28 @@ function normalizeUnifiedSessionEvent(event, phase) {
   }
   const known = Object.hasOwn(EVENT_FIELDS, event.type);
   const data = event.type === "mcp.configuration" ? normalizeMcpConfigurationData(source) : known ? selectFields(source, EVENT_FIELDS[event.type]) : structuredClone(source);
+  if (event.type === "session.shutdown" && (copilotSource === true || (copilotSource === undefined && Object.hasOwn(source, "aiCreditsStatus")))) {
+    const snapshot = copilotSource ? source.accountingSnapshot : source;
+    const status = snapshot?.aiCreditsStatus;
+    const total = snapshot?.totalNanoAiu;
+    if ((status === "complete" || status === "partial") && isTokenCount(total) && (source.totalNanoAiu === undefined || source.totalNanoAiu === total)) {
+      data.aiCreditsStatus = status;
+      data.totalNanoAiu = total;
+    } else {
+      data.aiCreditsStatus = "unavailable";
+      delete data.totalNanoAiu;
+    }
+  }
+  if (event.type === "session.init" || event.type === "session.start") {
+    for (const field of ["agentVersion", "provider"]) {
+      if (typeof data[field] !== "string") delete data[field];
+    }
+  }
+  if (event.type === "harness.decision") {
+    const decision = normalizeHarnessDecisionData(source);
+    if (!decision) throw new Error(`${ERR_VALIDATION}: Harness decision evidence must contain bounded outcomes and latency metadata`);
+    Object.assign(data, decision);
+  }
   if (event.type === "harness.retry" || event.type === "harness.attempt") {
     const retry = event.type === "harness.retry" ? normalizeHarnessRetryRecord(source) : normalizeHarnessAttemptEvent(source);
     if (!retry) throw new Error(`${ERR_VALIDATION}: Harness retry evidence must contain valid bounded attempt metadata`);
@@ -825,6 +910,12 @@ function normalizeUnifiedSessionEvent(event, phase) {
       if (STEERING_TYPES.has(steering.type) && STEERING_THRESHOLDS.has(steering.threshold)) data.steering = steering;
       else delete data.steering;
     }
+    if (Object.hasOwn(data, "steeringDelivery")) {
+      // Keep every AWF notice delivery with its conversation; drop malformed records.
+      const delivery = normalizeSteeringDelivery(data.steeringDelivery);
+      if (delivery) data.steeringDelivery = delivery;
+      else delete data.steeringDelivery;
+    }
   }
   if (event.type === "tool.execution_complete" && (source.is_error === true || source.result?.isError === true || source.result?.is_error === true)) data.isError = true;
   if (event.type === "experiment.assignment") {
@@ -854,9 +945,8 @@ function normalizeUnifiedSessionEvent(event, phase) {
     if (Array.isArray(errors)) data.errors = errors.filter(error => error && typeof error === "object" && !Array.isArray(error)).map(projectSafeOutputData);
   }
   const metadata = selectFields(event, { id: ["id"], parentId: ["parentId"], timestamp: ["timestamp", "ts", "time", "created_at"], agentId: ["agentId"], ephemeral: ["ephemeral"] });
-  /** @type {any} */
-  const nativeMessage = event.message;
-  if (!Object.hasOwn(metadata, "timestamp") && nativeMessage?.timestamp !== undefined) metadata.timestamp = structuredClone(nativeMessage.timestamp);
+  const nativeTimestamp = sessionMessageTimestamp(event);
+  if (!Object.hasOwn(metadata, "timestamp") && nativeTimestamp !== undefined) metadata.timestamp = nativeTimestamp;
   return {
     type: event.type,
     ...metadata,

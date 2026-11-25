@@ -1,5 +1,6 @@
 ---
 title: AI Credits Specification
+spec: true
 description: Formal W3C-style specification for AI Credits (AIC) calculation, model pricing catalog format, and Copilot billing reference requirements.
 sidebar:
   order: 1361
@@ -7,9 +8,9 @@ sidebar:
 
 # AI Credits Specification
 
-**Version**: 1.5.1<br />
+**Version**: 1.5.5<br />
 **Status**: Draft  
-**Publication Date**: 2026-10-12<br />
+**Publication Date**: 2026-11-22<br />
 **Editor**: GitHub Agentic Workflows Team  
 **This Version**: [ai-credits-specification](/gh-aw/specs/ai-credits-specification/)  
 **Latest Published Version**: This document
@@ -32,7 +33,7 @@ This document is governed by the GitHub Agentic Workflows project specifications
 2. [Conformance](#2-conformance)
 3. [AI Credits Accounting Model](#3-ai-credits-accounting-model)
 4. [Pricing Catalog Format (`models.json`)](#4-pricing-catalog-format-modelsjson)
-5. [Catalog Provisioning and Synchronization](#5-catalog-provisioning-and-synchronization)
+5. [AWF Pricing Catalog Ownership](#5-awf-pricing-catalog-ownership)
 6. [Copilot Billing Reference Requirements](#6-copilot-billing-reference-requirements)
 7. [Reporting Requirements](#7-reporting-requirements)
 8. [Compliance Testing](#8-compliance-testing)
@@ -58,7 +59,7 @@ This specification covers:
 - The normative AIC unit definition and conversion rules.
 - The per-invocation and aggregated AIC calculation formulas.
 - Required `models.json` data structure and field semantics.
-- Requirements for how pricing catalog data is provided and mirrored in gh-aw.
+- Requirements for AWF-owned pricing and explicit workflow overrides.
 - Required references to GitHub Copilot model and billing documentation.
 
 This specification does NOT cover:
@@ -73,7 +74,7 @@ The specification is designed to:
 1. Provide a testable and deterministic calculation contract.
 2. Keep pricing inputs explicit and auditable through structured catalog files.
 3. Support model-name drift through normalized lookup and prefix fallback matching.
-4. Maintain compatibility between CLI and setup runtime pricing catalogs.
+4. Consume AWF pricing evidence without maintaining duplicate catalogs.
 
 ---
 
@@ -83,7 +84,7 @@ The specification is designed to:
 
 **Conforming implementation**: Satisfies all MUST/SHALL requirements in Sections 3 through 8.
 
-**Partially conforming implementation**: Computes core AIC from token usage and model pricing (Section 3) but omits one or more optional reporting or synchronization requirements.
+**Partially conforming implementation**: Computes core AIC from token usage and model pricing (Section 3) but omits one or more optional reporting requirements.
 
 ### 2.2 Requirements Notation
 
@@ -93,7 +94,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 - **Level 1 – Calculation**: Implements AIC formulas and provider token handling (Section 3).
 - **Level 2 – Catalog**: Implements required `models.json` structure and lookup semantics (Section 4).
-- **Level 3 – Operational**: Implements catalog provisioning, Copilot reference alignment, and reporting requirements (Sections 5–7).
+- **Level 3 – Operational**: Implements AWF pricing integration, Copilot reference alignment, and reporting requirements (Sections 5–7).
 
 ---
 
@@ -215,7 +216,8 @@ An `InvocationRecord` represents a single LLM API call and its associated token 
 
 ### 4.1 Top-Level Structure
 
-A conforming catalog MUST be valid JSON with this structure:
+Explicit workflow pricing overlays and runtime pricing documents MUST be valid JSON with
+this structure. This format does not require a bundled gh-aw catalog:
 
 ```json
 {
@@ -269,50 +271,25 @@ The `github_models` alias is written by the AWF proxy for Copilot engine runs an
 
 ---
 
-## 5. Catalog Provisioning and Synchronization
+## 5. AWF Pricing Catalog Ownership
 
-### 5.1 Embedded Runtime Catalogs
+### 5.1 Runtime Catalog
 
-gh-aw implementations MUST provide synchronized pricing catalogs at:
+AWF owns the model pricing catalog. gh-aw MUST NOT bundle a pricing catalog or inject
+catalog-derived rates during compilation. Explicit workflow `models.providers` overrides
+MUST continue to be passed to AWF.
 
-- `pkg/cli/data/models.json`
-- `actions/setup/js/models.json`
+### 5.2 Reported Costs
 
-These files SHALL represent the same pricing dataset.
+gh-aw SHOULD use AWF-reported inference costs and runtime pricing evidence. When pricing
+is unavailable, implementations MUST NOT invent rates or fall back to a repository-owned
+catalog. Token usage and available reported costs MUST remain accessible.
 
-### 5.2 Source and Refresh Expectations
+### 5.3 Catalog Maintenance
 
-Catalog refresh processes SHOULD use normalized upstream model inventories and SHOULD validate Copilot entries against authoritative GitHub Copilot model and billing documentation.
-
-### 5.3 Change Control
-
-Catalog updates MUST preserve JSON validity and MUST maintain backward-safe handling for historical model IDs that remain in the catalog but are absent from current live inventories.
-
-### 5.4 Catalog Sync Failure Handling
-
-A conforming implementation MUST define and enforce behavior for catalog synchronization failures. Specifically:
-
-1. **Unreachable catalog source**: When the upstream pricing catalog source is unreachable during a sync operation, the implementation MUST fall back to the last successfully synchronized catalog version. The implementation MUST NOT silently use an empty or zero-cost catalog. The implementation MUST emit a diagnostic warning identifying the sync failure and the fallback version in use.
-
-2. **Malformed catalog**: When a fetched catalog update fails JSON schema validation or contains non-numeric cost fields, the implementation MUST reject the update entirely, retain the previous valid catalog, and emit a validation error identifying the malformed field(s). The implementation MUST NOT partially apply a malformed update.
-
-3. **Missing required fields**: When a catalog entry is missing required fields (`input` or `output` cost values), the implementation MUST treat that entry as invalid and MUST NOT compute AIC using zero or undefined costs for that model. The entry MUST be skipped or flagged, and a diagnostic MUST be emitted.
-
-4. **Catalog version mismatch**: When the two required catalog paths (`pkg/cli/data/models.json` and `actions/setup/js/models.json`) diverge in content after a sync operation, the sync tooling/CI gate MUST treat this as a sync failure. The refresh operation MUST fail until consistency is restored. In the gh-aw repository:
-   - CI MUST run `make validate-models-json-sync` (or an equivalent normalized-content comparison gate).
-   - That gate MUST fail whenever these mirror files cease to represent the same JSON dataset.
-
-### 5.5 Catalog Staleness SLA
-
-A catalog that has not been refreshed from its upstream source within **7 days** is considered stale. Implementations SHOULD track the timestamp of the last successful catalog sync.
-
-When the elapsed time since the last successful sync exceeds 7 days, the implementation SHOULD emit a re-sync warning. The warning MUST include:
-
-- The timestamp of the last successful sync.
-- The number of days elapsed since that sync.
-- A recommendation to run the catalog refresh process.
-
-This is a SHOULD-level norm; catalog staleness does not constitute a hard failure, but implementations MUST NOT suppress the warning if the threshold is exceeded. Implementations that cannot determine the last sync timestamp SHOULD treat the catalog as potentially stale and emit the warning unconditionally.
+Catalog refresh, validation, and historical model coverage are AWF responsibilities.
+gh-aw pricing diagnostics SHOULD identify the runtime evidence used rather than recommend
+refreshing local catalog mirrors.
 
 ---
 
@@ -332,7 +309,7 @@ These references SHOULD be treated as the external billing-alignment sources for
 
 A conforming implementation MUST expose AIC in runtime reporting outputs where cost metrics are emitted.
 
-When AWF token-usage records provide finite, non-negative `ai_credits_this_response` values, reporting MUST prefer those per-request values. The chronologically last valid `ai_credits_total` is the reported run total. If later records omit or contain invalid reported values, reporting MUST surface a warning and extend the last valid total with available per-request values or legacy pricing until another valid cumulative total appears. Implementations MUST recompute AIC from token counts and catalog pricing for legacy records that omit these fields.
+When AWF token-usage records provide finite, non-negative `ai_credits_this_response` values, reporting MUST prefer those per-request values. The chronologically last valid `ai_credits_total` is the reported run total. If later records omit or contain invalid reported values, reporting MUST surface a warning and extend the last valid total with available per-request values until another valid cumulative total appears. Implementations MUST NOT recompute legacy record costs using a bundled pricing catalog; missing cost evidence remains unavailable.
 
 > [!NOTE]
 > Token-usage files are diagnostic artifacts visible to the agent runtime. Their mirrored AIC fields improve usage summaries, but are not sufficient evidence to classify a provider failure as budget enforcement or to change retry, authentication, or safe-output behavior.
@@ -358,7 +335,7 @@ A conformance test suite MUST include at least the following test cases:
 - **T-AIC-004**: Verify fallback pricing when optional cost fields are omitted.
 - **T-AIC-005**: Verify `models.json` rejects missing required fields (`input`, `output`).
 - **T-AIC-006**: Verify provider key normalization and `github`, `copilot`, and `github_models` to `github-copilot` mapping behavior.
-- **T-AIC-007**: Verify catalog mirror consistency between CLI and setup runtime paths.
+- **T-AIC-007**: Verify AWF-reported costs and explicit workflow pricing overrides work without a bundled catalog.
 - **T-AIC-008**: Verify reporting outputs include per-run AIC values.
 
 ### 8.2 Compliance Checklist
@@ -371,7 +348,7 @@ A conformance test suite MUST include at least the following test cases:
 | Optional price fallback behavior | T-AIC-004 | 1 | Required |
 | Catalog schema conformance | T-AIC-005 | 2 | Required |
 | Provider/model normalization behavior | T-AIC-006 | 2 | Required |
-| Mirrored catalog consistency | T-AIC-007 | 3 | Required |
+| AWF pricing evidence and explicit overrides | T-AIC-007 | 3 | Required |
 | AIC reporting visibility | T-AIC-008 | 3 | Required |
 
 ---
@@ -453,12 +430,13 @@ A conforming implementation MUST enforce the following at compile time:
 | T-AIC-DG-019 | Agent, Detection, and Evaluations accounting is validated independently without overlapping-source double counting | §9.11 |
 | T-AIC-DG-020 | Every supported zero-accounting path satisfies its documented evidence conditions | §9.11 |
 | T-AIC-DG-021 | Unresolved historical accounting substitutes the positive configured per-run maximum for the whole run | §9.12 |
-| T-AIC-DG-022 | Transient reads retry at most three times; quota, permission, and retry restrictions stop without estimates | §9.13 |
+| T-AIC-DG-022 | Transient reads retry at most three times; exhausted quota stops remain unverified and block enforced startup without estimates | §9.13, §9.14 |
 | T-AIC-DG-023 | Workflow-history 404 uses repository-history fallback, not zero usage or an incomplete total | §9.9, §9.13 |
 | T-AIC-DG-024 | Estimated credits are reported separately and equality with the threshold is exceeded | §9.14 |
 | T-AIC-DG-025 | Repo-memory trust, timestamp filtering, duplicate selection, and permissive read behavior match the separate backend contract | §9.15 |
 | T-AIC-DG-026 | A cancelled rerun without a verified producer carries usage only from the unique latest earlier executed job with a verified producer; missing accounting, ambiguous prior jobs, and other outcomes fail closed | §9.11 |
 | T-AIC-DG-027 | Run/attempt-bound advisory Decisions failures use the failed-Evaluations accounting policy, preserve other component usage, and replace whole-run estimates on the next scan | §9.11 |
+| T-AIC-DG-028 | Successful Decisions model-unavailable skips require coherent run/selected-attempt evidence and no answer records; other component usage and strict accounting precedence remain intact | §9.11 |
 
 ### 9.8 Guardrail Bypass Conditions
 
@@ -524,7 +502,7 @@ Individually resolved observations are persisted even if a later historical read
 
 The runtime MUST list billable jobs with all attempts, validate completed job metadata, and independently account for Agent, Detection, and Evaluations. It normalizes display names to component IDs, rejects ambiguous same-attempt jobs, and retains the relevant executed job when a failed-only rerun preserves a successful earlier attempt. A complete empty job list or a list containing only skipped billable jobs proves zero for the run without an artifact read.
 
-Otherwise, the runtime selects the latest matching `usage` or invocation-prefixed `*-usage` artifact. Missing identity, expiry, missing creation time, or incomplete component coverage is unresolved accounting, not zero. An aggregate artifact MUST cover each executed component's start/end timestamps. On reruns, unless the cancelled-attempt exception below applies, the original component producer artifact MUST also exist, be unexpired, and have a creation time from the job start through strictly before its completion plus one second. Repacking old data with a new aggregate timestamp MUST NOT establish coverage.
+Otherwise, the runtime MUST list all artifacts, order aggregate and producer artifacts by `createdAt` descending, and select the first matching `usage` or invocation-prefixed `*-usage` artifact. Artifact ID MUST NOT determine artifact selection. Missing identity, expiry, missing creation time, or incomplete component coverage is unresolved accounting, not zero. An aggregate artifact MUST cover each executed component's start/end timestamps. On reruns, unless the cancelled-attempt exception below applies, the original component producer artifact MUST also exist, be unexpired, and have a creation time from the job start through strictly before its completion plus one second. Repacking old data with a new aggregate timestamp MUST NOT establish coverage.
 
 If the selected latest component job is `cancelled` and its attempt has no verifiable producer artifact, the runtime MAY count carried-forward usage only when the latest earlier executed job for that component is unambiguous and has a verifiable, unexpired producer artifact created within that job's start/completion bounds, and the selected aggregate accounting completely covers that attempt. The runtime MUST warn that usage from the cancelled attempt may be unaccounted for. Missing accounting, ambiguous jobs on the latest earlier attempt, or an unverifiable producer for that attempt remains unresolved accounting; it MUST NOT be treated as zero or carried forward from an arbitrary older job. This fallback MUST NOT apply to any outcome other than `cancelled`. A verified producer for the selected attempt takes precedence and does not require older attempts to be unambiguous.
 
@@ -556,10 +534,11 @@ The following additional component zero-accounting fallbacks are supported. Othe
 | Legacy failed Agent before accounting | Verified coverage, no selected accounting, failed conclusion, missing raw file, no execution-evidence file, and no inspected legacy Agent artifact |
 | Failed Evaluations before accounting | Verified coverage, failed conclusion, and no selected accounting |
 | Advisory Decisions failure before accounting | Verified coverage, successful job conclusion, no selected accounting, and `evals/evals_status.json` identifying the same run and selected job attempt with engine `decisions`, status `not_evaluated`, reason `judge_failed`, execution outcome `failure`, and execution state `started` |
+| Unavailable Decisions model before accounting | Verified coverage, successful job conclusion, no selected accounting, and `evals/evals_status.json` identifying the same run and selected job attempt with engine `decisions`, status `not_evaluated`, reason `model_unavailable`, execution outcome `success`, and execution state `model_unavailable`; both `evals.jsonl` and `evals/evals.jsonl` MUST be missing or empty |
 
 Legacy Agent evidence is inspected only when no non-empty Agent accounting candidate exists. The legacy artifact must be unexpired, timestamp-bound to its job, and contain a regular log no larger than 10 MiB. Detection's empty-raw exception is checked before lower-priority candidate selection. The remaining zero fallbacks MUST NOT override a malformed non-empty or higher-priority unreadable source.
 
-These are implemented evidence/compatibility policies, not a proof that a provider never charged a request. In particular, missing-accounting failure heuristics and absent provider-response usage cannot certify external billing. The advisory Decisions fallback applies the existing failed-Evaluations policy to the judge outcome when `continue-on-error` leaves its wrapper job successful. It emits a warning that provider billing remains unverified; it MUST NOT override non-empty or unreadable accounting.
+These are implemented evidence/compatibility policies, not a proof that a provider never charged a request. In particular, missing-accounting failure heuristics and absent provider-response usage cannot certify external billing. The advisory Decisions fallback applies the existing failed-Evaluations policy to the judge outcome when `continue-on-error` leaves its wrapper job successful. The unavailable-model fallback covers a rejected Decisions request with no answers, not arbitrary `not_evaluated` markers or missing usage. Mismatched identity, engine, reason, outcome, or state, and non-empty or unreadable answer files MUST NOT establish that fallback. Both Decisions fallbacks emit a warning that provider billing remains unverified and MUST NOT override non-empty or unreadable accounting.
 
 ### 9.12 Conservative Whole-Run Maximum Fallback
 
@@ -587,7 +566,7 @@ Retry, recovery, and stop diagnostics identify the read using a fixed operation 
 
 After every authoritative candidate has been resolved, sum its selected measured or estimated value exactly once, including confirmed-zero runs in run counts and statistics. `daily_ai_credits_total` is this sum; `daily_ai_credits_estimated` is the sum restricted to estimated runs. Every supplied run value and aggregate total MUST be finite and non-negative; overflow MUST fail accounting before publishing a total or threshold decision, for either backend. For positive threshold `L`, totals strictly below `L` produce `under_budget`; totals at or above `L` produce `exceeded`, set `daily_ai_credits_exceeded: true`, and gracefully skip the agent.
 
-An unresolved scan MUST NOT report `under_budget` from a partial total. It calls `core.setFailed` and reports `structural_error` for missing credentials, HTTP 401/404, or a non-rate-limited 403; other caught accounting failures report `transient_error`. A marked quota/reserve stop takes precedence over the HTTP resource/permission classification and reports `transient_error`. Disabled or bypassed checks report `disabled` or `skipped` without accounting.
+An unresolved scan MUST NOT report `under_budget` from a partial total. It calls `core.setFailed` and reports `structural_error` for missing credentials, HTTP 401/404, or a non-rate-limited 403; other caught accounting failures report `transient_error`. A marked quota/reserve stop takes precedence over the HTTP resource/permission classification and reports `quota_blocked` without calling `core.setFailed`; the total and estimated outputs remain empty and `daily_ai_credits_exceeded` remains `false`. Enforce mode MUST gate agent startup on this status; an explicitly configured fail-open mode MAY continue, but MUST NOT relabel the result as complete, under budget, or exceeded. Disabled or bypassed checks report `disabled` or `skipped` without accounting.
 
 `continue-on-error: true` is an explicit Actions step-level fail-open policy: it may allow continuation despite an unknown total, but MUST NOT relabel the accounting result as complete or under budget. Summary-rendering failures are outside the accounting state machine; they may change step failure reporting after totals were computed.
 
@@ -609,7 +588,9 @@ The writer uses staged usage files and the permissive usage parser, appending ti
 
 ### 9.16 Native Contract Coverage and Validation Boundary
 
-Focused Vitest suites exercise the runtime behavior described in Sections 9.9–9.15, including history completeness, snapshot trust and reinspection, component accounting, fallback decisions, API retries and quota handling, and repo-memory ledger rules. The spec-derived fixed-output contract cases are in `actions/setup/js/daily_aic_spec_conformance.test.cjs`; related implementation suites cover detailed boundaries. These tests are executable conformance examples, not a proof of provider billing or GitHub API behavior.
+Focused Vitest suites exercise the runtime behavior described in Sections 9.9–9.15, including history completeness, snapshot trust and reinspection, component accounting, fallback decisions, API retries and quota handling, and repo-memory ledger rules. The spec-derived fixed-output contract cases are in `actions/setup/js/daily_aic_spec_conformance.test.cjs`; quota-blocked cases verify empty totals, `exceeded: false`, and no activation failure, while compiler tests verify enforced startup gating and configured fail-open behavior. These tests are executable conformance examples, not a proof of provider billing or GitHub API behavior.
+
+The [bounded daily guardrail TLA+ model](https://github.com/github/gh-aw/tree/main/specs/daily-aic) checks history completeness, exact-match snapshot reuse, whole-run estimates, quota deferral, startup decisions, and repo-memory backend selection. A separate model checks the cancelled-rerun evidence rule in §9.11. Neither model verifies provider billing, GitHub API behavior, or the runtime implementation.
 
 ---
 
@@ -649,7 +630,7 @@ This expression MUST be embedded in the compiled YAML (not pre-evaluated at comp
 
 ### 10.5 Disable Sentinel
 
-A `max-ai-credits` frontmatter value of `-1` MUST disable the per-run budget. When this sentinel is present at runtime (via the organization variable resolving to `-1`), a conforming implementation MUST disable AWF budget steering and omit the `maxAiCredits` field from the firewall configuration.
+A `max-ai-credits` frontmatter value of `-1` MUST disable the per-run budget. When this sentinel is present at runtime (via the organization variable resolving to `-1`), a conforming implementation MUST disable the configured AWF budget. It MAY pass `maxAiCredits: -1` directly to AWF, which treats it as an omitted budget ([AWF configuration specification §10.3](https://github.com/github/gh-aw-firewall/blob/main/docs/awf-config-spec.md#103-max-ai-credits-configuration)). AWF's operator-controlled hard cap still applies. With supported AWF versions, frontmatter `-1` disables token steering by default unless `sandbox.agent.token-steering` explicitly overrides it. Runtime `-1` leaves token steering enabled by default; `sandbox.agent.token-steering` controls it separately.
 
 ### 10.6 Value Validation
 
@@ -667,7 +648,7 @@ A conforming implementation MUST enforce the following at compile time when a fr
 |---------|-------------|-------------|
 | T-AIC-PR-001 | Frontmatter value baked into AWF config JSON at compile time | §10.3 (1) |
 | T-AIC-PR-002 | No frontmatter, no imports: emitted expression is `${{ vars.GH_AW_DEFAULT_MAX_AI_CREDITS \|\| '1000' }}` | §10.4 |
-| T-AIC-PR-003 | Org variable `-1` disables budget steering at runtime | §10.5 |
+| T-AIC-PR-003 | Generated runtime setup preserves org variable `-1` for AWF's native disabled-budget handling | §10.5 |
 | T-AIC-PR-004 | `K`/`M` suffix values expanded in compile-time literal | §10.6 |
 | T-AIC-PR-005 | Values below `-1` rejected at compile time | §10.6 |
 | T-AIC-PR-006 | Runtime variable resolved by GitHub Actions runner, not compiler process | §10.3 (3) |
@@ -741,29 +722,38 @@ Pricing catalogs are configuration inputs. Implementations MUST:
 - **[GH-COPILOT-BILLING-MODELS]** GitHub Copilot models and pricing. <https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing>
 - **[GH-COPILOT-BILLING-PLANS]** Subscription plans for GitHub Copilot. <https://docs.github.com/en/copilot/about-github-copilot/subscription-plans-for-github-copilot>
 - **[MODELS-DEV]** models.dev API index. <https://models.dev/api.json>
+- **[GH-AW-COMPONENT-COVERAGE]** Daily AIC component accounting implementation and focused compliance tests. <https://github.com/github/gh-aw/blob/main/actions/setup/js/daily_aic_component_coverage.cjs>, <https://github.com/github/gh-aw/blob/main/actions/setup/js/daily_aic_component_coverage.test.cjs>
 
 ---
 
 <a id="sync-notes"></a>
 ## Sync Notes
 
-The canonical gh-aw mirror files for this specification are:
-
-- `pkg/cli/data/models.json`
-- `actions/setup/js/models.json`
-
-The repository validation target for mirror consistency is `make validate-models-json-sync`.
-
-This specification MUST be revalidated when any of the following occurs:
-
-1. A new model or provider entry is added to either mirror.
-2. A pricing value or billing-related field changes in either mirror.
-3. This specification is incremented to a new minor version.
+This specification MUST be revalidated when the AWF pricing evidence contract,
+explicit workflow pricing overrides, or the specification's minor version changes.
 
 ---
 
 <a id="change-log"></a>
 ## Change Log
+
+### Version 1.5.5 (2026-11-22)
+
+- **Updated**: §9.11 requires artifact selection by descending creation time rather than artifact ID, while preserving timestamp verification and cancelled-rerun fallback behavior.
+
+### Version 1.5.4 (2026-11-13)
+
+- **Updated**: §10.5 and T-AIC-PR-003 specify preservation of the runtime disable sentinel and clarify the token-steering difference between frontmatter and runtime values.
+
+### Version 1.5.3 (2026-11-10)
+
+- **Clarified**: A marked quota/reserve stop reports `quota_blocked` with empty totals and `exceeded: false`; enforced startup is gated without converting the unknown total into a failed or exceeded accounting result.
+- **Updated**: Spec-conformance documentation to identify the quota-blocked output and compiler startup-gating checks, while preserving configured fail-open behavior.
+
+### Version 1.5.2 (2026-11-05)
+
+- **Added**: Section 9.11 and compliance test T-AIC-DG-028 specify the run/selected-attempt-bound Decisions model-unavailable fallback, absence-of-answer evidence, and fail-closed accounting boundaries.
+- **Clarified**: The advisory `judge_failed` failure/started policy remains unchanged; unavailable-model skips do not certify external provider billing.
 
 ### Version 1.5.1 (2026-10-12)
 

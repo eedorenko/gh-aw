@@ -1,0 +1,827 @@
+// @ts-check
+// @safe-outputs-exempt SEC-005: the job writes only its own workflow's history branch in the current repository, taken from the GitHub Actions context.
+"use strict";
+
+/**
+ * The push_routing_history job: records one finished run in its workflow's adaptive-routing history,
+ * state.json and runs.jsonl on memory/adaptive-routing/<workflow> (routing_history.cjs).
+ *
+ * The job runs after the conclusion job has published the run's unified session. It reads the
+ * routing verdict, the pair AWF selected and what the run cost from that session, charges earlier
+ * runs whose own save never landed, and saves through repo-memory's save loop. When another run
+ * moved the branch first, the loop re-applies this run to the newest files, so concurrent runs all
+ * land and none counts twice.
+ */
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { ERR_API, ERR_CONFIG, ERR_SYSTEM, ERR_VALIDATION } = require("./error_codes.cjs");
+const { getErrorMessage } = require("./error_helpers.cjs");
+const { getGitAuthEnv } = require("./git_auth_helpers.cjs");
+const { execGitSync } = require("./git_helpers.cjs");
+const { readJsonlFile } = require("./jsonl_helpers.cjs");
+const { pushRepoMemoryChangesWithRetry } = require("./push_repo_memory.cjs");
+const { attributeRequest, routedRequests } = require("./routing_analytics.cjs");
+const { BOUNDS, applyRun, emptyState, legacyReconciliationFloor, trimRuns } = require("./routing_history.cjs");
+
+/** @typedef {import("./routing_history.cjs").HistoryState} HistoryState */
+
+const BRANCH_PREFIX = "memory/adaptive-routing/";
+const STATE_FILE = "state.json";
+const RUNS_FILE = "runs.jsonl";
+const DEFAULT_SESSION_FILE = "/tmp/gh-aw/usage/aw_session.jsonl";
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+const CLASSIFIER_PURPOSE = "routing_classification";
+// The job that runs this script, as the jobs API names it.
+const WRITER_JOB = "push_routing_history";
+const LIST_RUNS_PER_PAGE = 100;
+const MAX_LIST_PAGES = 8;
+const MAX_DIRECT_UNRESOLVED_LOOKUPS = 10;
+const LEVELS = new Set(["economy", "balanced", "robust"]);
+const MODES = new Set(["observe"]);
+const SAVED_CONCLUSIONS = new Set(["success", "skipped", "neutral"]);
+const OUTCOMES = new Set(["success", "failure", "skip"]);
+const SKIP_REASONS = new Set(["cancelled", "infrastructure", "rate_limited", "pair_mismatch", "unknown_evidence"]);
+// AWF's provider keys, written as contract 1 names them.
+/** @type {Record<string, string>} */
+const PROVIDER_NAMES = { copilot: "github-copilot" };
+const WORKFLOW_ID = /^[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)*$/;
+const SCOPE_PART = /^[a-z0-9][a-z0-9-]*$/;
+const BOT_IDENTITY = ["-c", "user.name=github-actions[bot]", "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com"];
+
+/** @param {unknown} value @returns {value is Record<string, any>} */
+const isRecord = value => value !== null && typeof value === "object" && !Array.isArray(value);
+
+/** Seconds precision, as the history's examples show. */
+const timestamp = () => new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+
+/**
+ * The job's compiled configuration.
+ * @param {Record<string, string | undefined>} env
+ */
+function readConfig(env) {
+  const workflow = env.GH_AW_ROUTING_WORKFLOW || "";
+  if (!WORKFLOW_ID.test(workflow) || workflow.length > 100 || workflow.endsWith(".lock")) throw new Error(`${ERR_CONFIG}: GH_AW_ROUTING_WORKFLOW is not a workflow ID: ${JSON.stringify(workflow)}`);
+  const generation = env.GH_AW_ROUTING_GENERATION || "";
+  if (!/^[0-9a-f]{64}:[0-9a-f]{64}$/.test(generation)) throw new Error(`${ERR_CONFIG}: GH_AW_ROUTING_GENERATION is not a workflow definition hash`);
+  const mode = env.GH_AW_ROUTING_MODE || "";
+  if (!MODES.has(mode)) throw new Error(`${ERR_CONFIG}: GH_AW_ROUTING_MODE must be observe, not ${JSON.stringify(mode)}`);
+  const engine = env.GH_AW_ROUTING_ENGINE || "";
+  const goal = env.GH_AW_ROUTING_GOAL || "";
+  if (!SCOPE_PART.test(engine) || !SCOPE_PART.test(goal)) throw new Error(`${ERR_CONFIG}: GH_AW_ROUTING_ENGINE and GH_AW_ROUTING_GOAL must name the routing scope`);
+  // A level chosen at run time arrives resolved; anything else shares records across levels.
+  const requestedLevel = env.GH_AW_ROUTING_LEVEL || "";
+  const level = LEVELS.has(requestedLevel) ? requestedLevel : "shared";
+  let subAgentModels;
+  if (env.GH_AW_INFO_SUB_AGENT_MODELS) {
+    try {
+      subAgentModels = JSON.parse(env.GH_AW_INFO_SUB_AGENT_MODELS);
+    } catch (error) {
+      throw new Error(`${ERR_CONFIG}: GH_AW_INFO_SUB_AGENT_MODELS is not JSON: ${getErrorMessage(error)}`, { cause: error });
+    }
+    if (!Array.isArray(subAgentModels)) throw new Error(`${ERR_CONFIG}: GH_AW_INFO_SUB_AGENT_MODELS must be an array`);
+  }
+  return { workflow, generation, mode, scope: `${engine}/${goal}/${level}`, branch: BRANCH_PREFIX + workflow, sessionFile: env.GH_AW_ROUTING_SESSION_FILE || DEFAULT_SESSION_FILE, subAgentModels };
+}
+
+/**
+ * Why this run must not update the history, or "" when it may: only first attempts whose workflow
+ * definition comes from the default branch are recorded.
+ * @param {{attempt: number, workflowRef: string, defaultBranch: string}} run
+ */
+function ineligibility({ attempt, workflowRef, defaultBranch }) {
+  if (attempt !== 1) return `attempt ${attempt} is a re-run; only first attempts are recorded`;
+  const ref = workflowRef.slice(workflowRef.lastIndexOf("@") + 1);
+  if (!defaultBranch || ref !== `refs/heads/${defaultBranch}`) return `the workflow definition comes from ${ref || "an unknown ref"}, not the default branch`;
+  return "";
+}
+
+/**
+ * The run's unified session. A missing file means the usage artifact never arrived, which fails the
+ * job, so the next save can charge the run as unsaved.
+ * @param {string} file
+ */
+function readSession(file) {
+  if (!fs.existsSync(file)) throw new Error(`${ERR_SYSTEM}: The run's unified session is missing (${file}); the usage artifact was not published`);
+  return [...readJsonlFile(file, { strict: true })];
+}
+
+/**
+ * What the run's session says about it: the routing verdict (contract 4), the pair AWF selected
+ * (contract 1) and the run's cost from AWF's records. Only agent-phase AWF records count; threat
+ * detection's are not the agent's.
+ * @param {unknown[]} events
+ * @param {unknown} [subAgentModels] the compiled sub-agent model declarations, as aw_info records them
+ */
+function sessionEvidence(events, subAgentModels) {
+  /**
+   * @param {string} type
+   * @returns {Record<string, any>[]}
+   */
+  const agentRecords = type => events.flatMap(event => (isRecord(event) && event.type === type && isRecord(event.data) && event.provenance?.component === "firewall" && event.provenance?.phase === "agent" ? [event.data] : []));
+  // T-UAS-094: only the conclusion job's collector emits the verdict; any other source is dropped.
+  const verdict = events.filter(event => isRecord(event) && event.type === "routing.observation" && isRecord(event.data) && event.provenance?.component === "collector" && event.provenance?.phase === "conclusion").at(-1);
+  // routing_analytics attributes AWF's records by their raw field names.
+  /** @type {Record<string, any>[]} */
+  const routing = agentRecords("firewall.model_routing").map(record => ({ ...record, request_id: record.requestId, requested_model: record.requestedModel }));
+  const usage = agentRecords("firewall.token_usage");
+  const selection = routing.filter(record => record.stage === "selection").at(-1);
+  let observation = isRecord(verdict) ? validObservation(verdict.data) : null;
+  const pair = selection ? pairName(selection) : null;
+  // A verdict on a pair the records do not name cannot count for any pair.
+  if (observation && !pair) observation = { outcome: "skip", reason: "unknown_evidence" };
+  return { observation, pair, cost: runCost(usage, routing, subAgentModels) };
+}
+
+/** @param {unknown} data */
+function validObservation(data) {
+  if (!isRecord(data) || !OUTCOMES.has(data.outcome)) return { outcome: "skip", reason: "unknown_evidence" };
+  if (data.outcome !== "skip") return { outcome: data.outcome };
+  return { outcome: "skip", reason: SKIP_REASONS.has(data.reason) ? data.reason : "unknown_evidence" };
+}
+
+/**
+ * `<provider>/<wire model>@<effort>`, as AWF names the pair it selected.
+ * @param {Record<string, any>} selection
+ */
+function pairName(selection) {
+  const provider = typeof selection.selectedProvider === "string" && selection.selectedProvider ? selection.selectedProvider : selection.provider;
+  const model = selection.wireModel;
+  if (typeof provider !== "string" || !provider || typeof model !== "string" || !model) return null;
+  const effort = typeof selection.selectedEffort === "string" && selection.selectedEffort ? selection.selectedEffort : "none";
+  // Own keys only: an inherited name such as `constructor` is an ordinary provider key.
+  const name = Object.hasOwn(PROVIDER_NAMES, provider) ? PROVIDER_NAMES[provider] : provider;
+  return `${name}/${model}@${effort}`;
+}
+
+/** @param {unknown} value @returns {number | null} */
+const count = value => (typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null);
+
+/**
+ * One main request's counts as contract 4 defines them: input excluding cache, cache read, cache
+ * write and output. AWF's records keep each provider's own input count, which includes cache for
+ * some responses and not others. The record's flag says which when AWF provides it. Otherwise
+ * Anthropic counts exclude cache, OpenAI counts include cache, and for Copilot (or any other
+ * provider) an input count smaller than the cache cannot include it while any other count is taken
+ * to include it, which undercounts only a request whose new input exceeds its cached input.
+ * @param {Record<string, any>} used the record's usage
+ * @param {unknown} [provider] the record's provider
+ * @returns {number[] | null}
+ */
+function requestTokens(used, provider) {
+  const input = count(used.inputTokens);
+  const cacheRead = count(used.cacheReadInputTokens);
+  const cacheWrite = count(used.cacheCreationInputTokens);
+  const output = count(used.outputTokens);
+  if (input === null || cacheRead === null || cacheWrite === null || output === null) return null;
+  const cached = cacheRead + cacheWrite;
+  const includesCache = typeof used.inputTokensIncludeCache === "boolean" ? used.inputTokensIncludeCache : provider === "anthropic" ? false : provider === "openai" ? true : input >= cached;
+  // As AWF's credit meter reads an input count that includes cache.
+  return [includesCache ? Math.max(0, input - cached) : input, cacheRead, cacheWrite, output];
+}
+
+/**
+ * The run's cost from AWF's records (contract 4): `credits` over every agent request except the
+ * router's classifier call, and `model_credits` and token counts over the main conversation's
+ * requests. `credits` is null when any covered request lacks a price, `model_credits` is null
+ * whenever `credits` is null or there are no main requests, and `tokens` is null when a main
+ * request lacks a count.
+ * @param {Record<string, any>[]} usage firewall.token_usage data
+ * @param {Record<string, any>[]} routing firewall.model_routing data with raw request fields
+ * @param {unknown} subAgentModels
+ */
+function runCost(usage, routing, subAgentModels) {
+  const routes = routedRequests(routing);
+  const classifier = new Set([...routes].flatMap(([id, route]) => (route?.purpose === CLASSIFIER_PURPOSE ? [id] : [])));
+  const seen = new Set();
+  /** @type {number | null} */
+  let credits = 0;
+  /** @type {number | null} */
+  let modelCredits = 0;
+  /** @type {number[] | null} */
+  let tokens = [0, 0, 0, 0];
+  /** @type {number | null} */
+  let reasoning = 0;
+  let requests = 0;
+  let main = 0;
+  for (const record of usage) {
+    const id = typeof record.requestId === "string" && record.requestId ? record.requestId : null;
+    if (record.purpose === CLASSIFIER_PURPOSE || (id && classifier.has(id))) continue;
+    // Count each proxy request once, even when it appears in replicated logs.
+    if (id && seen.has(id)) continue;
+    if (id) seen.add(id);
+    requests++;
+    const aic = count(record.aic);
+    credits = credits === null || aic === null ? null : credits + aic;
+    if (!id || attributeRequest(routes.get(id), record.provider, subAgentModels) !== "main") continue;
+    main++;
+    modelCredits = modelCredits === null || aic === null ? null : modelCredits + aic;
+    const used = isRecord(record.usage) ? record.usage : {};
+    const counts = requestTokens(used, record.provider);
+    if (tokens === null || counts === null) {
+      tokens = null;
+      continue;
+    }
+    const totals = tokens;
+    tokens = counts.map((value, index) => totals[index] + value);
+    const reasoned = count(used.reasoningOutputTokens);
+    reasoning = reasoning === null || reasoned === null ? null : reasoning + reasoned;
+  }
+  const round = (/** @type {number | null} */ value) => (value === null ? null : Number(value.toFixed(6)));
+  const totalCredits = requests > 0 ? round(credits) : null;
+  return {
+    credits: totalCredits,
+    model_credits: totalCredits !== null && main > 0 ? round(modelCredits) : null,
+    tokens: main > 0 && tokens !== null ? [...tokens, reasoning] : null,
+  };
+}
+
+/**
+ * A missing branch is an empty history (contract 5).
+ * @param {string} workspaceDir
+ * @param {string} workflow
+ * @returns {{state: HistoryState, runs: any[]}}
+ */
+function readHistory(workspaceDir, workflow) {
+  const statePath = path.join(workspaceDir, STATE_FILE);
+  const runsPath = path.join(workspaceDir, RUNS_FILE);
+  /** @type {HistoryState} */
+  let state = emptyState(workflow);
+  if (fs.existsSync(statePath)) {
+    try {
+      state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    } catch (error) {
+      throw new Error(`${ERR_VALIDATION}: ${STATE_FILE} is not readable JSON: ${getErrorMessage(error)}`, { cause: error });
+    }
+  }
+  if (!isRecord(state) || state.v !== 2 || state.workflow !== workflow || !isRecord(state.scopes)) {
+    throw new Error(`${ERR_VALIDATION}: ${STATE_FILE} is not a version 2 routing history for ${workflow}`);
+  }
+  const runs = fs.existsSync(runsPath) ? [...readJsonlFile(runsPath, { strict: true })] : [];
+  return { state, runs };
+}
+
+/**
+ * @param {string} workspaceDir
+ * @param {HistoryState} state
+ * @param {any[]} runs
+ * @param {string} runId
+ */
+function commitHistory(workspaceDir, state, runs, runId) {
+  try {
+    fs.writeFileSync(path.join(workspaceDir, STATE_FILE), `${JSON.stringify(state)}\n`);
+    fs.writeFileSync(path.join(workspaceDir, RUNS_FILE), runs.map(line => `${JSON.stringify(line)}\n`).join(""));
+  } catch (error) {
+    throw new Error(`${ERR_SYSTEM}: Could not write the routing history: ${getErrorMessage(error)}`, { cause: error });
+  }
+  execGitSync(["add", "--", STATE_FILE, RUNS_FILE], { cwd: workspaceDir, stdio: "pipe" });
+  execGitSync([...BOT_IDENTITY, "commit", "-m", `Record workflow run ${runId} in the routing history`], { cwd: workspaceDir, stdio: "pipe" });
+}
+
+/**
+ * Check out the history branch in a fresh repository, creating it on the first write with a root
+ * commit made through the API, which GitHub signs. If another run creates it first, use theirs.
+ * @param {{githubClient: any, owner: string, repo: string, branch: string, workspaceDir: string, token: string, serverHost: string, remoteUrl?: string}} options
+ * @returns {Promise<string>} the head the save builds on
+ */
+async function checkoutHistoryBranch({ githubClient, owner, repo, branch, workspaceDir, token, serverHost, remoteUrl }) {
+  const env = { ...process.env, ...getGitAuthEnv(token) };
+  execGitSync(["init", "--quiet"], { cwd: workspaceDir, stdio: "pipe" });
+  execGitSync(["remote", "add", "origin", remoteUrl || `https://${serverHost}/${owner}/${repo}.git`], { cwd: workspaceDir, stdio: "pipe" });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      execGitSync(["fetch", "--quiet", "--no-tags", "--depth=1", "origin", `+refs/heads/${branch}:refs/remotes/origin/history`], { cwd: workspaceDir, env, stdio: "pipe", suppressLogs: true });
+      execGitSync(["checkout", "--quiet", "-B", branch, "refs/remotes/origin/history"], { cwd: workspaceDir, stdio: "pipe" });
+      return execGitSync(["rev-parse", "HEAD"], { cwd: workspaceDir, stdio: "pipe" }).trim();
+    } catch (error) {
+      if (attempt > 0 || !/couldn't find remote ref|remote branch .* not found/i.test(getErrorMessage(error))) throw error;
+    }
+    const { data: root } = await githubClient.rest.git.createCommit({ owner, repo, message: `Initialize ${branch}`, tree: EMPTY_TREE, parents: [] });
+    core.info(`Created the history's root commit ${root.sha} (signature verified: ${root.verification?.verified === true})`);
+    try {
+      await githubClient.rest.git.createRef({ owner, repo, ref: `refs/heads/${branch}`, sha: root.sha });
+    } catch (error) {
+      if (!/422|Reference already exists/i.test(getErrorMessage(error))) throw error;
+      core.info(`Another run created ${branch} first; recording on top of it`);
+    }
+  }
+  throw new Error(`${ERR_API}: Could not check out ${branch}`);
+}
+
+/**
+ * Fetch a bounded contiguous window of newest-first workflow-runs pages covering `targetRunNumber`
+ * upward toward `maxRunNumber`. In the common case page 1 reaches `targetRunNumber` (or the start
+ * of the stream) in one call. When `targetRunNumber` lies more than `maxPages` pages back and
+ * `total_count` is reported, binary-searches to the page covering `targetRunNumber` and walks
+ * upward so large gaps advance in verified chunks without stalling.
+ * @param {(page: number) => Promise<any>} fetchPage
+ * @param {number} targetRunNumber lowest run_number we must reach (inclusive)
+ * @param {number} maxRunNumber highest run_number we need to verify (inclusive)
+ * @param {number} [maxPages]
+ */
+async function fetchStreamWindow(fetchPage, targetRunNumber, maxRunNumber, maxPages = MAX_LIST_PAGES) {
+  /** @type {Map<number, { batch: any[], minNum: number, maxNum: number, reachedStart: boolean }>} */
+  const pages = new Map();
+  let calls = 0;
+  /** @type {number | null} */
+  let totalCount = null;
+
+  /** @param {number} pageNum */
+  const load = async pageNum => {
+    const existing = pages.get(pageNum);
+    if (existing) return existing;
+    calls += 1;
+    const response = await fetchPage(pageNum);
+    const batch = response?.data?.workflow_runs || [];
+    if (typeof response?.data?.total_count === "number") totalCount = response.data.total_count;
+    let minNum = Infinity;
+    let maxNum = -Infinity;
+    for (const item of batch) {
+      if (Number.isInteger(item?.run_number)) {
+        if (item.run_number < minNum) minNum = item.run_number;
+        if (item.run_number > maxNum) maxNum = item.run_number;
+      }
+    }
+    const reachedStart = typeof totalCount === "number" ? (pageNum - 1) * LIST_RUNS_PER_PAGE + batch.length >= totalCount : batch.length < LIST_RUNS_PER_PAGE;
+    const entry = { batch, minNum, maxNum, reachedStart };
+    pages.set(pageNum, entry);
+    return entry;
+  };
+
+  const first = await load(1);
+  if (first.reachedStart || (first.batch.length > 0 && first.minNum <= targetRunNumber)) {
+    return { items: first.batch, reachedFloor: true, maxVerified: maxRunNumber };
+  }
+  if (first.batch.length === 0) {
+    return { items: [], reachedFloor: false, maxVerified: targetRunNumber - 1 };
+  }
+
+  const lastPage = typeof totalCount === "number" ? Math.ceil(totalCount / LIST_RUNS_PER_PAGE) : null;
+  if (lastPage === null || lastPage <= maxPages) {
+    const items = [...first.batch];
+    for (let pageNum = 2; pageNum <= maxPages; pageNum++) {
+      const entry = await load(pageNum);
+      items.push(...entry.batch);
+      if (entry.reachedStart || (entry.batch.length > 0 && entry.minNum <= targetRunNumber)) {
+        return { items, reachedFloor: true, maxVerified: maxRunNumber };
+      }
+      if (entry.batch.length === 0) break;
+    }
+    return { items, reachedFloor: false, maxVerified: targetRunNumber - 1 };
+  }
+
+  let lo = 2;
+  let hi = lastPage;
+  /** @type {number | null} */
+  let floorPage = null;
+  /** @type {number | null} */
+  let newestTooOld = null;
+  let oldestTooNew = 1;
+  // Allow enough bounded binary-search probes to locate floorPage before applying the upward chunk budget.
+  const searchBudget = Math.max(maxPages, Math.ceil(Math.log2(lastPage)) + 2);
+
+  while (lo <= hi && calls < searchBudget) {
+    const mid = Math.floor((lo + hi) / 2);
+    const entry = await load(mid);
+    if (entry.batch.length === 0) {
+      return { items: [...pages.values()].flatMap(p => p.batch), reachedFloor: false, maxVerified: targetRunNumber - 1 };
+    }
+    if (entry.minNum <= targetRunNumber && entry.maxNum >= targetRunNumber) {
+      floorPage = mid;
+      break;
+    }
+    if (entry.minNum > targetRunNumber) {
+      oldestTooNew = Math.max(oldestTooNew, mid);
+      if (entry.reachedStart) {
+        floorPage = mid;
+        break;
+      }
+      lo = mid + 1;
+    } else {
+      newestTooOld = newestTooOld === null ? mid : Math.min(newestTooOld, mid);
+      hi = mid - 1;
+    }
+  }
+
+  if (floorPage === null && newestTooOld !== null && newestTooOld === oldestTooNew + 1) {
+    floorPage = oldestTooNew;
+  }
+  if (floorPage === null) {
+    return { items: [...pages.values()].flatMap(p => p.batch), reachedFloor: false, maxVerified: targetRunNumber - 1 };
+  }
+
+  // Reserve at least one upward chunk fetch after binary search locates floorPage so large backlogs keep advancing.
+  const walkBudget = Math.max(maxPages, calls + 1);
+  let newestPage = floorPage;
+  while (newestPage > 1) {
+    const prevPage = newestPage - 1;
+    if (pages.has(prevPage)) {
+      newestPage = prevPage;
+      continue;
+    }
+    if (calls >= walkBudget) break;
+    const entry = await load(prevPage);
+    if (entry.batch.length === 0) break;
+    newestPage = prevPage;
+  }
+
+  const items = [];
+  for (let p = newestPage; p <= floorPage; p++) {
+    const entry = pages.get(p);
+    if (entry) items.push(...entry.batch);
+  }
+  const topEntry = pages.get(newestPage);
+  const maxVerified = newestPage === 1 ? maxRunNumber : Math.min(maxRunNumber, topEntry?.maxNum ?? targetRunNumber - 1);
+  return { items, reachedFloor: true, maxVerified };
+}
+
+/**
+ * Read the compiled `GH_AW_ROUTING_GENERATION` hash from the workflow lock file at `ref` so
+ * failed saves straddling a generation edit on the default branch can be attributed to their true
+ * definition. Never called for `pull_request_target` runs whose REST `head_sha` is the PR head.
+ * Returns `null` when unavailable so the reducer fails closed.
+ * @param {{githubClient: any, owner: string, repo: string, workflowPath: string, ref: string}} options
+ */
+async function readRunGeneration({ githubClient, owner, repo, workflowPath, ref }) {
+  if (!workflowPath || !ref || typeof githubClient?.rest?.repos?.getContent !== "function") return null;
+  try {
+    const { data } = await githubClient.rest.repos.getContent({ owner, repo, path: workflowPath, ref });
+    if (!data || typeof data.content !== "string") return null;
+    const text = Buffer.from(data.content, data.encoding === "base64" ? "base64" : "utf8").toString("utf8");
+    const match = /\bGH_AW_ROUTING_GENERATION:\s*["']?([0-9a-f]{64}:[0-9a-f]{64})["']?/.exec(text);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether a workflow run's definition comes from the default branch (matching AW-3's eligibility
+ * rule): pull_request* except pull_request_target are ineligible; pull_request_target is eligible
+ * regardless of head_branch; every other event is eligible only on defaultBranch.
+ * @param {any} run
+ * @param {string} defaultBranch
+ */
+function isEligibleRun(run, defaultBranch) {
+  if (/^pull_request(?!_target)/.test(run.event || "")) return false;
+  return run.event === "pull_request_target" || run.head_branch === defaultBranch;
+}
+
+/**
+ * Completed runs on the newest pages that the history may need to charge because their own save
+ * never landed (contract 5): first attempts strictly earlier than `runNumber` whose definition
+ * comes from the default branch, judged by their first attempt, not yet reconciled
+ * (`run_number > floor` or in `unresolved_runs`) and not yet written. Runs that
+ * `pull_request_target` started are listed under the pull request's branch, so they come from a
+ * second page. Streams use bounded chunked pagination to reach back to the previous floor without
+ * stalling across large gaps, ambiguous gaps are corroborated against an unfiltered run listing,
+ * and missing tracked `unresolved_runs` with persisted run IDs fall back to direct `getWorkflowRun`
+ * lookups so long-running obligations can always be settled.
+ * @param {{githubClient: any, owner: string, repo: string, workflowFile: string, workflowPath?: string, defaultBranch: string, runId: string, runNumber: number, state: HistoryState, runs: any[], generation: string}} options
+ * @returns {Promise<{listing: any[], reconciliation: import("./routing_history.cjs").ReconciliationCoverage}>}
+ */
+async function listRuns({ githubClient, owner, repo, workflowFile, workflowPath = "", defaultBranch, runId, runNumber, state, runs, generation }) {
+  // A brand-new history has no prior generation to reconcile, and fenced-off runs only record themselves.
+  if (state.generation === null || runNumber <= state.reset_after_run || (state.generation.hash !== generation && runNumber <= state.generation.since_run)) {
+    return { listing: [], reconciliation: { verified: true, unresolved: [], resolved: [] } };
+  }
+
+  const legacyFloor = legacyReconciliationFloor(state, runs);
+  const baseReconciled = typeof state.reconciled_through === "number" ? state.reconciled_through : legacyFloor;
+  const floor = Math.max(baseReconciled, state.reset_after_run || 0);
+  // Leave tracked unresolved runs at or above this writer's number for a later writer to handle.
+  const prevUnresolved = new Set((Array.isArray(state.unresolved_runs) ? state.unresolved_runs : []).filter(n => Number.isInteger(n) && n > state.reset_after_run && n < runNumber));
+  const storedUnresolvedIds = state.unresolved_run_ids && typeof state.unresolved_run_ids === "object" ? state.unresolved_run_ids : {};
+  const written = new Set(runs.map(line => line.run));
+  const writtenNumbers = new Set(runs.map(line => line.number));
+  writtenNumbers.add(runNumber);
+
+  const upperNeeded = Math.max(floor, runNumber - 1);
+  const [defaultStream, prtStream] = await Promise.all([
+    fetchStreamWindow(page => githubClient.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: workflowFile, branch: defaultBranch, per_page: LIST_RUNS_PER_PAGE, page }), floor + 1, upperNeeded),
+    fetchStreamWindow(page => githubClient.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: workflowFile, event: "pull_request_target", per_page: LIST_RUNS_PER_PAGE, page }), floor + 1, upperNeeded),
+  ]);
+
+  let verified = defaultStream.reachedFloor && prtStream.reachedFloor;
+  let verifiedUpper = verified ? Math.min(upperNeeded, defaultStream.maxVerified, prtStream.maxVerified) : floor;
+  if (verified && runNumber > floor + 1 && verifiedUpper <= floor) verified = false;
+
+  /** @type {Map<number, any>} */
+  const eligibleByNumber = new Map();
+  /** @type {Set<number>} */
+  const ineligibleNumbers = new Set();
+  for (const run of [...defaultStream.items, ...prtStream.items]) {
+    const num = run.run_number;
+    if (!Number.isInteger(num) || num <= state.reset_after_run || num >= runNumber) continue;
+    if (!isEligibleRun(run, defaultBranch)) {
+      ineligibleNumbers.add(num);
+      continue;
+    }
+    if (!eligibleByNumber.has(num)) eligibleByNumber.set(num, run);
+  }
+
+  const missingUnresolved = [...prevUnresolved].filter(num => !writtenNumbers.has(num) && !eligibleByNumber.has(num) && !ineligibleNumbers.has(num));
+  const expectedIntervalCount = verified ? Math.max(0, verifiedUpper - floor) : 0;
+  /** @type {Set<number>} */
+  const knownInInterval = new Set();
+  if (verified && expectedIntervalCount > 0) {
+    for (const num of writtenNumbers) if (num > floor && num <= verifiedUpper) knownInInterval.add(num);
+    for (const num of eligibleByNumber.keys()) if (num > floor && num <= verifiedUpper) knownInInterval.add(num);
+    for (const num of ineligibleNumbers) if (num > floor && num <= verifiedUpper) knownInInterval.add(num);
+  }
+  const hasIntervalGap = verified && knownInInterval.size < expectedIntervalCount;
+
+  /** @type {number[]} */
+  const unresolvedGaps = [];
+  if (hasIntervalGap) {
+    const sortedKnown = [...knownInInterval].sort((a, b) => a - b);
+    let earliestGap = floor + 1;
+    for (const num of sortedKnown) {
+      if (num > earliestGap) break;
+      earliestGap = num + 1;
+    }
+    const unfilteredStream = await fetchStreamWindow(page => githubClient.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: workflowFile, per_page: LIST_RUNS_PER_PAGE, page }), earliestGap, verifiedUpper);
+    for (const run of unfilteredStream.items) {
+      const num = run.run_number;
+      if (!Number.isInteger(num) || num <= state.reset_after_run || num >= runNumber) continue;
+      if (!isEligibleRun(run, defaultBranch)) {
+        ineligibleNumbers.add(num);
+        continue;
+      }
+      if (!eligibleByNumber.has(num)) eligibleByNumber.set(num, run);
+    }
+    if (!unfilteredStream.reachedFloor) {
+      verified = false;
+    } else {
+      verifiedUpper = Math.min(verifiedUpper, unfilteredStream.maxVerified);
+      if (runNumber > floor + 1 && verifiedUpper <= floor) {
+        verified = false;
+      } else {
+        const covered = new Set();
+        for (const num of writtenNumbers) if (num > floor && num <= verifiedUpper) covered.add(num);
+        for (const num of eligibleByNumber.keys()) if (num > floor && num <= verifiedUpper) covered.add(num);
+        for (const num of ineligibleNumbers) if (num > floor && num <= verifiedUpper) covered.add(num);
+        const missingCount = Math.max(0, verifiedUpper - floor) - covered.size;
+        if (missingCount > BOUNDS.unresolved_runs) {
+          verified = false;
+        } else if (missingCount > 0) {
+          // Track unexplained gaps as bounded unresolved obligations so transient omissions still
+          // reconcile when they reappear and permanently deleted runs do not halt later failure accounting.
+          for (let num = floor + 1; num <= verifiedUpper; num++) {
+            if (!covered.has(num)) unresolvedGaps.push(num);
+          }
+        }
+      }
+    }
+  }
+
+  /** @type {Set<number>} */
+  const resolved = new Set();
+  // Resolve tracked unresolved runs that fell past the listing windows via bounded direct run-ID lookups,
+  // rotating the starting index across saves so every tracked run receives a turn.
+  const stillMissingUnresolved = missingUnresolved.filter(num => !eligibleByNumber.has(num) && !ineligibleNumbers.has(num));
+  const lookupCandidates = stillMissingUnresolved.filter(num => Boolean(storedUnresolvedIds[String(num)]));
+  if (lookupCandidates.length > 0 && typeof githubClient?.rest?.actions?.getWorkflowRun === "function") {
+    const startOffset = (runNumber * MAX_DIRECT_UNRESOLVED_LOOKUPS) % lookupCandidates.length;
+    const countToCheck = Math.min(MAX_DIRECT_UNRESOLVED_LOOKUPS, lookupCandidates.length);
+    for (let i = 0; i < countToCheck; i++) {
+      const num = lookupCandidates[(startOffset + i) % lookupCandidates.length];
+      const storedId = storedUnresolvedIds[String(num)];
+      try {
+        const { data: run } = await githubClient.rest.actions.getWorkflowRun({ owner, repo, run_id: Number(storedId) || storedId });
+        if (run && Number.isInteger(run.run_number)) {
+          if (!isEligibleRun(run, defaultBranch)) {
+            ineligibleNumbers.add(num);
+          } else {
+            eligibleByNumber.set(num, run);
+          }
+        }
+      } catch (error) {
+        // A confirmed 404 proves the tracked run was deleted; any other error leaves it unresolved.
+        if (/** @type {any} */ error?.status === 404) resolved.add(num);
+      }
+    }
+  }
+
+  // If still missing unresolved runs without stored IDs (for example from a prior state before IDs were recorded),
+  // fall back to an unfiltered window search when we did not already run one.
+  const unindexedMissing = stillMissingUnresolved.filter(num => !eligibleByNumber.has(num) && !ineligibleNumbers.has(num) && !resolved.has(num) && !storedUnresolvedIds[String(num)]);
+  if (unindexedMissing.length > 0 && !hasIntervalGap) {
+    const unfilteredStream = await fetchStreamWindow(page => githubClient.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: workflowFile, per_page: LIST_RUNS_PER_PAGE, page }), Math.min(...unindexedMissing), upperNeeded);
+    for (const run of unfilteredStream.items) {
+      const num = run.run_number;
+      if (!Number.isInteger(num) || num <= state.reset_after_run || num >= runNumber) continue;
+      if (!isEligibleRun(run, defaultBranch)) {
+        ineligibleNumbers.add(num);
+        continue;
+      }
+      if (!eligibleByNumber.has(num)) eligibleByNumber.set(num, run);
+    }
+  }
+
+  const effectiveSinceRun = state.generation.hash === generation ? state.generation.since_run : runNumber;
+  const fullCatchUp = verified && (runNumber <= floor + 1 || verifiedUpper >= runNumber - 1);
+  const reconciliationCeiling = verified ? (fullCatchUp ? runNumber : verifiedUpper) : floor;
+  const listing = [];
+  /** @type {Set<number>} */
+  const unresolved = new Set(verified ? unresolvedGaps : []);
+  /** @type {Record<string, string>} */
+  const unresolvedIds = {};
+
+  for (const num of [...eligibleByNumber.keys()].sort((a, b) => a - b)) {
+    const isTrackedUnresolved = prevUnresolved.has(num);
+    // Defer runs above reconciliationCeiling so no charge lands outside persisted verified coverage.
+    if (!isTrackedUnresolved && (!verified || num <= floor || num > reconciliationCeiling)) continue;
+    const run = eligibleByNumber.get(num);
+    const id = String(run.id);
+    if (id === runId || written.has(id) || writtenNumbers.has(num)) {
+      if (isTrackedUnresolved) resolved.add(num);
+      continue;
+    }
+    if (run.status !== "completed") {
+      unresolved.add(num);
+      unresolvedIds[String(num)] = id;
+      continue;
+    }
+    let conclusion = run.conclusion;
+    // A successful re-run can hide a failed first save.
+    if ((run.run_attempt || 1) > 1)
+      ({
+        data: { conclusion },
+      } = await githubClient.rest.actions.getWorkflowRunAttempt({ owner, repo, run_id: run.id, attempt_number: 1 }));
+    /** @type {{id: string, number: number, conclusion: string, agent_ran?: boolean, generation?: string}} */
+    const listed = { id, number: num, conclusion: conclusion || "unknown" };
+    let include = true;
+    if (!SAVED_CONCLUSIONS.has(listed.conclusion)) {
+      const jobs = await githubClient.paginate(githubClient.rest.actions.listJobsForWorkflowRunAttempt, { owner, repo, run_id: run.id, attempt_number: 1, per_page: 100 });
+      listed.agent_ran = jobs.some((/** @type {any} */ job) => job?.name === "agent" && job.conclusion !== "skipped" && Boolean(job.started_at));
+      const writer = jobs.find((/** @type {any} */ job) => job?.name === WRITER_JOB);
+      // A run that failed before any job was created (jobs.length === 0) is recorded as no_agent.
+      // When jobs exist, nothing is owed by a run compiled while adaptive routing was off or for a
+      // dry run (both omit the history job), or by a run whose history job succeeded: it saved the
+      // run, or declined it, as for a pull request into another branch.
+      if (jobs.length > 0 && (!writer || writer.conclusion === "success")) include = false;
+      // Only trust head_sha for non-pull_request_target runs on the default branch; pull_request_target's
+      // REST head_sha is the PR head rather than the base commit that supplied the workflow definition.
+      if (include && listed.agent_ran && num <= effectiveSinceRun && run.event !== "pull_request_target" && run.head_branch === defaultBranch && typeof run.head_sha === "string" && run.head_sha) {
+        const runGeneration = await readRunGeneration({ githubClient, owner, repo, workflowPath, ref: run.head_sha });
+        if (runGeneration) listed.generation = runGeneration;
+      }
+    }
+    if (include) listing.push(listed);
+    if (isTrackedUnresolved) resolved.add(num);
+  }
+
+  for (const num of prevUnresolved) {
+    if (eligibleByNumber.has(num) || resolved.has(num)) continue;
+    if (writtenNumbers.has(num) || ineligibleNumbers.has(num)) {
+      resolved.add(num);
+    } else {
+      // Never drop a known unresolved run based on absence alone.
+      unresolved.add(num);
+      const storedId = storedUnresolvedIds[String(num)];
+      if (storedId) unresolvedIds[String(num)] = storedId;
+    }
+  }
+
+  return {
+    listing,
+    reconciliation: {
+      verified,
+      ...(verified && !fullCatchUp ? { ceiling: reconciliationCeiling } : {}),
+      unresolved: [...unresolved].sort((a, b) => a - b),
+      ...(Object.keys(unresolvedIds).length > 0 ? { unresolved_ids: unresolvedIds } : {}),
+      resolved: [...resolved].sort((a, b) => a - b),
+    },
+  };
+}
+
+/** @param {string} serverUrl */
+function hostOf(serverUrl) {
+  try {
+    return new URL(serverUrl).host;
+  } catch (error) {
+    throw new Error(`${ERR_CONFIG}: GITHUB_SERVER_URL is not a URL: ${getErrorMessage(error)}`, { cause: error });
+  }
+}
+
+/** @param {string} parent */
+function makeWorkspace(parent) {
+  try {
+    return fs.mkdtempSync(path.join(parent, "gh-aw-routing-history-"));
+  } catch (error) {
+    throw new Error(`${ERR_SYSTEM}: Could not create a directory for the history branch: ${getErrorMessage(error)}`, { cause: error });
+  }
+}
+
+/**
+ * @param {{github?: any, context?: any, env?: Record<string, string | undefined>, workspaceDir?: string, remoteUrl?: string, pushSignedCommitsFn?: any, execGetExecOutput?: any, sleepFn?: (delay: number) => Promise<void>}} [options]
+ *   Tests replace the API client, the remote and the signed push.
+ */
+async function main(options = {}) {
+  const githubClient = options.github || github;
+  const ctx = options.context || context;
+  const env = options.env || process.env;
+  const config = readConfig(env);
+  const { owner, repo } = ctx.repo;
+  const runId = String(ctx.runId);
+  const attempt = Number(env.GITHUB_RUN_ATTEMPT || "1");
+  const workflowRef = env.GITHUB_WORKFLOW_REF || "";
+  const defaultBranch = ctx.payload?.repository?.default_branch || (await githubClient.rest.repos.get({ owner, repo })).data.default_branch;
+  const skipped = ineligibility({ attempt, workflowRef, defaultBranch });
+  if (skipped) {
+    core.info(`Not recording run ${runId} in the routing history: ${skipped}`);
+    return;
+  }
+
+  const evidence = sessionEvidence(readSession(config.sessionFile), config.subAgentModels);
+  const token = env.GH_TOKEN || "";
+  const serverHost = hostOf(env.GITHUB_SERVER_URL || "https://github.com");
+  const workspaceDir = options.workspaceDir || makeWorkspace(env.RUNNER_TEMP || os.tmpdir());
+  const baseRef = await checkoutHistoryBranch({ githubClient, owner, repo, branch: config.branch, workspaceDir, token, serverHost, remoteUrl: options.remoteUrl });
+  const initial = readHistory(workspaceDir, config.workflow);
+  const workflowSpec = workflowRef.slice(0, workflowRef.lastIndexOf("@"));
+  const workflowFile = path.posix.basename(workflowSpec);
+  const repoPrefix = `${owner}/${repo}/`;
+  const workflowPath = workflowSpec.startsWith(repoPrefix) ? workflowSpec.slice(repoPrefix.length) : "";
+  const run = { id: runId, number: Number(ctx.runNumber), attempt };
+  /** @type {any[]} */
+  let recorded = [];
+  /** @param {{state: HistoryState, runs: any[]}} history */
+  const record = async history => {
+    if (history.runs.some(entry => entry.run === runId)) {
+      recorded = [];
+      return false;
+    }
+    /** @type {any[]} */
+    let listing = [];
+    /** @type {import("./routing_history.cjs").ReconciliationCoverage} */
+    let reconciliation = { verified: false };
+    try {
+      ({ listing, reconciliation } = await listRuns({
+        githubClient,
+        owner,
+        repo,
+        workflowFile,
+        workflowPath,
+        defaultBranch,
+        runId,
+        runNumber: run.number,
+        state: history.state,
+        runs: history.runs,
+        generation: config.generation,
+      }));
+    } catch (error) {
+      // Runs this save cannot charge stay unreconciled for the next save.
+      core.warning(`Could not list earlier runs to charge unsaved ones: ${getErrorMessage(error)}`);
+    }
+    const result = applyRun(history.state, history.runs, {
+      workflow: config.workflow,
+      run,
+      at: timestamp(),
+      generation: config.generation,
+      mode: config.mode,
+      scope: config.scope,
+      ...evidence,
+      receipt: null,
+      prepare: null,
+      listing,
+      reconciliation,
+    });
+    recorded = result.lines;
+    if (result.lines.length > 0) commitHistory(workspaceDir, result.state, trimRuns([...history.runs, ...result.lines]), runId);
+    return result.lines.length > 0;
+  };
+  if (!(await record(initial))) {
+    core.info(`Run ${runId} is already in the routing history`);
+    return;
+  }
+  const pushed = await pushRepoMemoryChangesWithRetry({
+    githubClient,
+    targetOwner: owner,
+    targetRepoName: repo,
+    targetRepo: `${owner}/${repo}`,
+    branchName: config.branch,
+    baseRef,
+    workspaceDir,
+    ghToken: token,
+    serverHost,
+    reapply: () => record(readHistory(workspaceDir, config.workflow)),
+    ...(options.remoteUrl ? { originUrlForPush: options.remoteUrl, repoUrlForRetry: options.remoteUrl } : {}),
+    ...(options.pushSignedCommitsFn ? { pushSignedCommitsFn: options.pushSignedCommitsFn } : {}),
+    ...(options.execGetExecOutput ? { execGetExecOutput: options.execGetExecOutput } : {}),
+    ...(options.sleepFn ? { sleepFn: options.sleepFn } : {}),
+  });
+  if (pushed === false) return;
+  if (pushed === undefined) {
+    core.info(`Run ${runId} was already in the routing history when this save re-read it`);
+    return;
+  }
+  const own = recorded.find(line => line.run === runId);
+  const counted = own?.counted ? "counted" : `not counted${own?.note ? ` (${own.note})` : ""}`;
+  core.info(`Recorded run ${runId} in ${config.branch}: ${own?.pair ?? "no pair"}, ${own?.outcome ?? "no outcome"}, ${counted}`);
+  await core.summary.addRaw(`### Routing history\n\nRecorded run ${runId} in \`${config.branch}\` (${config.mode}): ${own?.pair ? `\`${own.pair}\`` : "no pair"}, ${own?.outcome ?? "no outcome"}, ${counted}.\n`).write();
+}
+
+module.exports = { checkoutHistoryBranch, ineligibility, listRuns, main, pairName, readConfig, readHistory, runCost, sessionEvidence };

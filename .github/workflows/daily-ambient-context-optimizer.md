@@ -34,7 +34,7 @@ safe-outputs:
   allowed-github-references: []
   create-issue:
     title-prefix: "[ambient-context] "
-    labels: [automation, report, workflow-optimization, analysis]
+    labels: [automation, report, workflow-optimization, analysis, cookie, "backlog:reports"]
     close-older-issues: true
     expires: 7d
     max: 3
@@ -47,7 +47,7 @@ steps:
   - name: Prepare analysis workspace
     run: |
       mkdir -p /tmp/gh-aw/ambient-context
-  - name: Closed PR deduplication guard
+  - name: Exclude files from recently closed PRs
     uses: actions/github-script@v9.0.0
     with:
       github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -108,7 +108,7 @@ steps:
 
         core.info(`Deduplication guard: ${closedOptimizerPrs.length} closed optimizer PRs, ${blockedFiles.length} blocked files`);
         for (const bf of blockedFiles) core.info(`  BLOCKED: ${bf}`);
-  - name: PR close-rate metric
+  - name: Calculate PR close rate
     uses: actions/github-script@v9.0.0
     with:
       github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -161,6 +161,7 @@ steps:
 imports:
   - shared/mcp-pagination.md
   - shared/otlp.md
+  - shared/reporting.md
 features:
   gh-aw-detection: true
 evals:
@@ -168,6 +169,8 @@ evals:
     question: Did the agent sample recent agentic workflow runs and inspect their ambient context?
   - id: recommendations_produced
     question: Were recommendations produced for prompt, skill, and agent changes to reduce ambient context size?
+  - id: instruction_prefix_audited
+    question: When instruction or skill sources were available, did the analysis measure their first 8000 UTF-8 bytes and identify whether essential constraints, routing, verification and stop rules fit within 7500 bytes? Return UNKNOWN when no such sources were accessible.
 ---
 
 # Daily Ambient Context Optimizer
@@ -295,6 +298,11 @@ The script must compute deterministic metrics for each sampled first request:
 - longest 5 sections by heading
 - top repeated non-trivial lines or paragraphs
 - count of lines mentioning tools, skills, agents, safe outputs, and workflow instructions
+- For accessible instruction/skill sources only (not the whole first request):
+  total UTF-8 bytes, bytes visible under an 8,000-byte query, omitted bytes and
+  execution-contract end byte. Reuse
+  `python3 scripts/check-instruction-prefixes.py --json <source-paths>` for
+  structure/byte counts. Record unavailable sources/checks explicitly.
 
 Aggregate metrics across the sample set:
 
@@ -318,6 +326,15 @@ Assess whether the request size is likely driven by:
 - duplicated guardrails, examples, or formatting rules
 - context that should be moved to deterministic `steps:` or smaller sub-agents
 - large output templates (issue body, discussion body, report formats) embedded inline in the prompt body rather than in `## skill:` blocks
+- Required instruction/skill rules lost after byte 8,000. Review each available
+  exact prefix: objective, constraints, task routes, verification and stop
+  conditions should be actionable by byte 7,500 including metadata. Recommend
+  short grammatical imperatives, early conditional links and later examples;
+  preserve safety, negation, exceptions and exact identifiers. A structural
+  checker cannot establish semantic completeness or response-quality parity.
+
+Keep source-prefix availability separate from actual first-request measurements;
+do not truncate captured DLLM requests or claim the CLI limit applies to them.
 
 Review `prompt.txt` only as a compiler cross-check artifact:
 

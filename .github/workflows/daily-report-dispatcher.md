@@ -5,6 +5,7 @@ on:
   schedule: daily around 12:00
 if: github.run_attempt == 1
 imports:
+  - shared/reporting.md
   - shared/work-queue-staged-plan.md
 permissions:
   contents: read
@@ -82,15 +83,16 @@ additional candidates or admission identities.
 3. The staged dispatch request contains the exact `plan.dispatch`:
    `{"pool":"daily-reports","max_claims":3,"max_dispatches":3}`.
    Do not select winning Work IDs, workflows or revisions from the snapshot.
-   The trusted scheduler selects the eligible fair prefix against fresh state
-   and records its Claims and reservations in `work-queue.jsonl`.
+   The trusted scheduler selects eligible Work in priority, then FIFO order
+   against fresh state and records its Claims and dispatches in
+   `work-queue.jsonl`.
 
 Use only the advertised work-queue MCP tools (or their `work-queue` CLI wrapper).
 Do not call ordinary `dispatch_workflow` or target-specific dispatch tools.
-The allowlist approves routes; the installed Policy pins actual immutable
-revisions, singleton assignments and resource scope. AW handles authorization
-and binds the actual native run to each Claim. Scheduling overrides, including
-the `daily-reports` pool and equal-weight report keys, live in the shared
+The allowlist approves routes; the compiled queue policy pins worker profiles,
+one Claim per dispatch and resource scope. AW handles authorization and binds
+the worker run to each dispatch. Scheduling overrides, including the
+`daily-reports` pool and its per-account limit, live in the shared
 `.github/workflows/aw.json` `work_queue` section.
 
 This workflow runs daily around 12:00 UTC, away from the observed 10:00 UTC
@@ -106,3 +108,13 @@ Do not force-release reservations to make a target count. Three launches are not
 a guarantee of three successfully published discussions. Report only the staged
 request; never label it as a completed report or infer
 that a stale snapshot guarantees no eligible grant.
+
+## Status report format
+
+Use `###` or lower headings for any status report. Start with a visible summary
+of the staged request, then key counts and dispatch status, collapse lengthy
+cohort details in `<details><summary><b>...</b></summary>...</details>`, and end
+with next actions or limitations. Keep staging failures and the distinction
+between staged requests and completed reports visible; never imply that a report
+was published. Format applicable run references as
+`[§12345](https://github.com/${{ github.repository }}/actions/runs/12345)`.

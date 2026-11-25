@@ -14,7 +14,8 @@ permissions:
   contents: read
   pull-requests: read
   issues: read
-model: copilot/gpt-5.6-sol
+  copilot-requests: write
+model: router/economy
 engine:
   id: codex
   model-provider: github

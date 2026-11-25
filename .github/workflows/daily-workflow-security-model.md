@@ -1,8 +1,8 @@
 ---
 name: Daily Workflow Security Model
 engine:
-  id: copilot
-  copilot-sdk: true
+  id: codex
+  model-provider: github
 description: Model-check and refine the compiled-workflow TLA+ security architecture, preserving concrete counterexamples.
 on:
   schedule: daily
@@ -21,18 +21,20 @@ checkout:
   fetch-depth: 0
 imports:
   - shared/tla-plus.md
+  - shared/reporting.md
 env:
   PYTHONDONTWRITEBYTECODE: "1"
 steps:
-  - name: Set up Go for the compiled-profile verifier
+  - name: Setup Go for the compiled-profile verifier
     uses: actions/setup-go@v7.0.0
     with:
       go-version-file: go.mod
       cache: true
-  - name: Build compiled-profile verifier
+  - name: Build compiled-profile verifier and compiler
     run: |
       set -euo pipefail
       go build -o /tmp/gh-aw/agent/tla-tools/verify-lock ./cmd/gh-aw-security-model
+      go build -o /tmp/gh-aw/agent/tla-tools/gh-aw ./cmd/gh-aw
 tools:
   edit:
   bash: ["*"]
@@ -90,8 +92,9 @@ python3 specs/workflow-security/check.py --results /tmp/gh-aw/agent/tla-results 
 /tmp/gh-aw/agent/tla-tools/verify-lock --profile daily .github/workflows/daily-workflow-security-model.lock.yml
 ```
 
-The Java runtime, compiled-profile verifier, and checksum-verified TLC jar are already installed; do not
-download other tools. The results directory must be new. Retain the command,
+The Java runtime, checked-out compiler, compiled-profile verifier, and checksum-verified TLC jar are already installed; do not
+download other tools. Use `/tmp/gh-aw/agent/tla-tools/gh-aw compile` for source
+fixture checks. The results directory must be new. Retain the command,
 exit status, model/config hashes, state counts, and complete reports. A parse
 error, timeout, missing tool, wrong invariant, or unfinished exploration is a
 failed investigation, not a counterexample or security success.
@@ -113,13 +116,17 @@ Compare that boundary against the current security architecture and compiler
 threat specification cited by the README, plus the corresponding compiler and
 runtime code. State precisely which behavior is enforced, merely documented,
 assumed, configurable, or not modeled. Trace every new predicate to source paths
-and symbols. Include failure/cancellation paths and explicitly authorized tool
-credentials; do not assume every token is forbidden in the agent.
+and symbols. Use the prioritized refinement backlog in
+`specs/workflow-security/README.md` as the source of truth for unresolved
+boundaries, keeping the tracking owner and target module aligned with any
+proposed refinement. A backlog item is not by itself a confirmed defect.
+Include failure/cancellation paths and explicitly authorized tool credentials;
+do not assume every token is forbidden in the agent.
 
 Refine one bounded aspect of the model when warranted. Preserve all existing
 secure runs, negative controls, and witness traces. Add a targeted mutation or
 reachability witness for new properties, rerun the entire checker and unit tests,
-and compile any new source fixtures with `gh aw compile --no-emit --json`.
+and compile any new source fixtures with `/tmp/gh-aw/agent/tla-tools/gh-aw compile --no-emit --json`.
 When the model changes, run the checker with `--write-examples` and a new results
 directory before the unit tests so the checked-in examples match the model hash.
 If Go verifier code changes, run its Go tests and rebuild the verifier before
@@ -131,6 +138,15 @@ If the model exhibits a violation with `Fault = "none"`, minimize the trace and
 decide whether it represents an implementation defect, a model error, or an
 architectural gap. Do not file the intentional `Fault != "none"` controls or
 `No*` reachability witnesses as vulnerabilities.
+
+## Report formatting
+
+For any issue or pull request body, use `###` (h3) or lower headers only. Keep the
+summary and decisions visible; put long findings, logs, and evidence in
+`<details><summary><b>...</b></summary>...</details>` blocks. Structure the report
+as overview → key findings/metrics → detailed findings → next actions. Use `- [ ]`
+for follow-up work and format workflow run references as
+`[§12345](https://github.com/github/gh-aw/actions/runs/12345)`.
 
 ## Concretize and report
 

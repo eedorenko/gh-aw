@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "fs";
+import os from "node:os";
+import path from "node:path";
+import { createHash } from "node:crypto";
 
 // Mock the global objects that GitHub Actions provides
 const mockCore = {
@@ -30,26 +33,23 @@ const mockContext = {
 
 const mockGithub = {
   rest: {
+    repos: {
+      getContent: vi.fn(async ({ path }) => ({
+        data: { type: "file", path, encoding: "base64", content: Buffer.from('# gh-aw-metadata: {}\n# gh-aw-manifest: {"version":1,"agent_metadata":{}}\n# compiled fixture\n').toString("base64") },
+      })),
+    },
     actions: {
       getWorkflowRun: vi.fn(),
     },
   },
 };
 
-const queueAssignment = {
-  version: 3,
-  dispatch_id: "d1",
-  request_id: "request1",
-  commit_id: "commit1",
-  policy_epoch: "e1",
-  pool: "default",
-  worker_profile: "worker",
-  claims: [{ handle: "h1", claim_id: "c1", work_id: "w1", work: { task: "test", inputs: { labels: ["bug"] } }, result_refs: [] }],
-};
+const queueAssignment = { version: 4, dispatch_id: "d1" };
 
 describe("generate_aw_info.cjs", () => {
   let main;
   let awInfoPath;
+  let originalGithub;
 
   it("persists declared sub-agent models without configured skills", async () => {
     const models = [{ name: "reader", model: "small", patterns: ["github-copilot/*haiku*"] }];
@@ -77,14 +77,23 @@ describe("generate_aw_info.cjs", () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    originalGithub = global.github;
     // Keep compiler-fixed runner paths in memory; never write to the host's /tmp.
     const files = new Map();
     const realRead = fs.readFileSync.bind(fs);
     const realExists = fs.existsSync.bind(fs);
+    const realStat = fs.lstatSync.bind(fs);
+    const realPath = fs.realpathSync.bind(fs);
     vi.spyOn(fs, "mkdirSync").mockImplementation(() => undefined);
     vi.spyOn(fs, "writeFileSync").mockImplementation((filename, content) => files.set(String(filename), String(content)));
     vi.spyOn(fs, "existsSync").mockImplementation(filename => (String(filename).startsWith("/tmp/gh-aw") ? files.has(String(filename)) : realExists(filename)));
+    vi.spyOn(fs, "lstatSync").mockImplementation(filename => (String(filename).endsWith(".lock.yml") ? { isFile: () => true, size: 128 } : realStat(filename)));
+    vi.spyOn(fs, "realpathSync").mockImplementation(filename => (String(filename).endsWith(".lock.yml") ? String(filename) : realPath(filename)));
     vi.spyOn(fs, "readFileSync").mockImplementation((filename, ...args) => {
+      if (String(filename).endsWith(".lock.yml")) {
+        const header = '# gh-aw-metadata: {}\n# gh-aw-manifest: {"version":1,"agent_metadata":{}}\n# compiled fixture\n';
+        return args[0] === "utf8" ? header : Buffer.from(header);
+      }
       if (files.has(String(filename))) return files.get(String(filename));
       if (String(filename).startsWith("/tmp/gh-aw")) throw Object.assign(new Error("missing fixture"), { code: "ENOENT" });
       return realRead(filename, ...args);
@@ -103,6 +112,8 @@ describe("generate_aw_info.cjs", () => {
     process.env.GH_AW_INFO_CLI_VERSION = "";
     process.env.GH_AW_INFO_WORKFLOW_NAME = "my-workflow";
     process.env.GH_AW_INFO_WORKFLOW_ID = "github/my-repo/.github/workflows/my-workflow.lock.yml@refs/heads/main";
+    process.env.GH_AW_INFO_WORKFLOW_SHA = "a".repeat(40);
+    global.github = mockGithub;
     process.env.GH_AW_INFO_EXPERIMENTAL = "false";
     process.env.GH_AW_INFO_SUPPORTS_TOOLS_ALLOWLIST = "true";
     delete process.env.GH_AW_INFO_CACHE_MEMORY;
@@ -137,6 +148,25 @@ describe("generate_aw_info.cjs", () => {
     }
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
+    global.github = originalGithub;
+  });
+
+  it("records the BYOK GenAI provider only when configured", async () => {
+    const endpoint = new URL("https://gw.azure-api.net:8443/v1?key=private#fragment");
+    endpoint.username = "user";
+    endpoint.password = "placeholder";
+    process.env.GH_AW_INFO_GENAI_ENDPOINT = endpoint.href;
+    await main(mockCore, mockContext);
+    expect(JSON.parse(fs.readFileSync(awInfoPath, "utf8"))).not.toHaveProperty("genai_provider");
+    expect(JSON.parse(fs.readFileSync(awInfoPath, "utf8"))).not.toHaveProperty("genai_server_address");
+
+    process.env.GH_AW_INFO_GENAI_PROVIDER = "azure.ai.openai";
+    await main(mockCore, mockContext);
+    const contents = fs.readFileSync(awInfoPath, "utf8");
+    expect(JSON.parse(contents).genai_provider).toBe("azure.ai.openai");
+    expect(JSON.parse(contents).genai_server_address).toBe("gw.azure-api.net");
+    expect(contents).not.toContain("placeholder");
+    expect(contents).not.toContain("key=private");
   });
 
   it("should write aw_info.json with values from env vars and context", async () => {
@@ -168,6 +198,45 @@ describe("generate_aw_info.cjs", () => {
     expect(awInfo.created_at).toBeTruthy();
   });
 
+  it("keeps compiler metadata in aw_info.json without dumping it to Actions logs", async () => {
+    const agent = { name: "private-agent", description: "confidential-agent-description", model: "private-model", tools: ["confidential-tool"] };
+    const digest = value => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+    const agentDigest = digest(agent);
+    const errorDigest = digest("invalid-agent-source");
+    const manifest = { metadata_errors: { [`artifact:${errorDigest}`]: "confidential-compiler-error" } };
+    process.env.GH_AW_INFO_MARKDOWN_METADATA = JSON.stringify({
+      version: 2,
+      records: [
+        { kind: "artifact", sha256: agentDigest, value: agent },
+        { kind: "artifact", sha256: errorDigest, value: null, error: "confidential-compiler-error" },
+      ],
+    });
+
+    await main(mockCore, mockContext);
+
+    const awInfo = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
+    expect(awInfo).toMatchObject({
+      agent_metadata: { [agentDigest.slice(0, 20)]: agent },
+      metadata_errors: { [`artifact:${errorDigest.slice(0, 20)}`]: "confidential-compiler-error" },
+      engine_id: "copilot",
+      run_id: mockContext.runId,
+    });
+    expect(mockGithub.rest.repos.getContent).not.toHaveBeenCalled();
+    expect(mockCore.setOutput).toHaveBeenCalledWith("model", "gpt-4");
+    expect(mockCore.setOutput).toHaveBeenCalledWith("engine_id", "copilot");
+    expect(mockCore.info).toHaveBeenCalledWith("Generated aw_info.json at: " + awInfoPath);
+    const logs = [mockCore.info, mockCore.debug, mockCore.warning, mockCore.error].flatMap(log => log.mock.calls.flat()).join("\n");
+    for (const value of ["agent_metadata", "model_pins", "metadata_errors", agent.name, agent.description, agent.model, ...agent.tools, ...Object.values(manifest.metadata_errors)]) {
+      expect(logs).not.toContain(value);
+    }
+  });
+
+  it("treats an absent embedded catalog as empty without reading the executing workflow", async () => {
+    await main(mockCore, mockContext, mockGithub);
+    expect(mockGithub.rest.repos.getContent).not.toHaveBeenCalled();
+    expect(JSON.parse(fs.readFileSync(awInfoPath, "utf8")).agent_metadata).toEqual({});
+  });
+
   it("records the executing reusable workflow separately from its caller in the same run", async () => {
     const callerRef = "github/my-repo/.github/workflows/caller.yml@refs/heads/main";
     const executingRef = "org/platform/.github/workflows/worker.lock.yml@refs/tags/v1";
@@ -175,7 +244,7 @@ describe("generate_aw_info.cjs", () => {
     vi.stubEnv("GITHUB_WORKFLOW_REF", callerRef);
     vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
     const caller = { repo: "github/my-repo", run_id: "12345", run_attempt: "2", workflow_id: callerRef, workflow_call_id: `12345-2:${callerRef}` };
-    await main(mockCore, { ...mockContext, payload: { inputs: { aw_context: JSON.stringify(caller) } } });
+    await main(mockCore, { ...mockContext, payload: { inputs: { aw_context: JSON.stringify(caller) } } }, mockGithub);
     const info = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
     expect(info).toMatchObject({
       workflow_id: executingRef,
@@ -191,15 +260,47 @@ describe("generate_aw_info.cjs", () => {
     expect(info.workflow_call_id).not.toBe(info.context.workflow_call_id);
   });
 
+  it.each(["environment", "file"])("generates run info for a private reusable workflow using embedded compiler metadata via %s", async transport => {
+    const source = "model: private-model\ntools: [Read]";
+    const sha256 = createHash("sha256").update(source).digest("hex");
+    const value = { model: "private-model", tools: ["Read"] };
+    process.env.GH_AW_INFO_WORKFLOW_ID = "private/shared/.github/workflows/worker.lock.yml@refs/heads/main";
+    const payload = JSON.stringify({ version: 2, records: [{ kind: "artifact", sha256, value }] });
+    let directory;
+    if (transport === "file") {
+      directory = fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-metadata-"));
+      const file = path.join(directory, "metadata.json");
+      const descriptor = fs.openSync(file, "w");
+      try {
+        fs.writeSync(descriptor, payload);
+      } finally {
+        fs.closeSync(descriptor);
+      }
+      vi.stubEnv("GH_AW_INFO_MARKDOWN_METADATA_FILE", file);
+    } else {
+      process.env.GH_AW_INFO_MARKDOWN_METADATA = payload;
+    }
+    const githubClient = { rest: { repos: { getContent: vi.fn().mockRejectedValue(Object.assign(new Error("Not Found"), { status: 404 })) } } };
+
+    try {
+      await main(mockCore, mockContext, githubClient);
+    } finally {
+      if (directory) fs.rmSync(directory, { recursive: true, force: true });
+    }
+
+    const info = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
+    expect(info.agent_metadata).toEqual({ [sha256.slice(0, 20)]: value });
+    expect(info.workflow_ref).toBe(process.env.GH_AW_INFO_WORKFLOW_ID);
+    expect(info.repository).toBe("github/my-repo");
+    expect(githubClient.rest.repos.getContent).not.toHaveBeenCalled();
+  });
+
   it("does not misidentify the caller as the executing workflow when its reference is unavailable", async () => {
     delete process.env.GH_AW_INFO_WORKFLOW_ID;
     vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
     vi.stubEnv("GITHUB_WORKFLOW_REF", "github/my-repo/.github/workflows/caller.yml@refs/heads/main");
-    await main(mockCore, mockContext);
-    const info = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
-    expect(info.workflow_id).toBe("");
-    expect(info.workflow_call_id).toBe("12345-2");
-    expect(info.caller_workflow_ref).toBe("github/my-repo/.github/workflows/caller.yml@refs/heads/main");
+    await expect(main(mockCore, mockContext)).rejects.toThrow("executing workflow identity");
+    expect(fs.existsSync(awInfoPath)).toBe(false);
   });
 
   it("defaults the workflow call ID to the first attempt when the runner omits it", async () => {
@@ -397,6 +498,90 @@ describe("generate_aw_info.cjs", () => {
     expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("ERR_CONFIG"));
   });
 
+  it.each(["router", "router/economy", "router/balanced", "router/robust", "router/fast", "Router/Economy", "router/economy?effort=high"])(
+    "fails before the agent starts when an unrouted main model resolves to the router value %s",
+    async model => {
+      // For example vars.GH_AW_DEFAULT_MODEL_COPILOT or ${{ vars.MODEL }} resolving to a router value.
+      process.env.GH_AW_INFO_MODEL = model;
+      process.env.GH_AW_INFO_MODEL_CONFIG = '{"routing":{"enabled":false},"models":{"allowed":[],"blocked":[]},"max_ai_credits_source":"default"}';
+      try {
+        await expect(main(mockCore, mockContext)).rejects.toThrow("ERR_CONFIG");
+        expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining(`resolved to the router value ${JSON.stringify(model)} at run time`));
+        expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("router, router/economy, router/balanced, router/robust"));
+        expect(fs.existsSync(awInfoPath)).toBe(false);
+      } finally {
+        delete process.env.GH_AW_INFO_MODEL_CONFIG;
+      }
+    }
+  );
+
+  it("fails on a runtime router value when no model config is compiled", async () => {
+    process.env.GH_AW_INFO_MODEL = "router/economy";
+    delete process.env.GH_AW_INFO_MODEL_CONFIG;
+    await expect(main(mockCore, mockContext)).rejects.toThrow("ERR_CONFIG");
+  });
+
+  it("fails when an empty model expression falls back to a router value from the model variables", async () => {
+    // model: ${{ inputs.model }} resolved empty; the harness would use GH_AW_MODEL_FALLBACK,
+    // here vars.GH_AW_DEFAULT_MODEL_COPILOT=router/economy.
+    process.env.GH_AW_INFO_MODEL = "";
+    process.env.GH_AW_INFO_MODEL_FALLBACK = "router/economy";
+    process.env.GH_AW_INFO_MODEL_CONFIG = '{"routing":{"enabled":false},"models":{"allowed":[],"blocked":[]},"max_ai_credits_source":"default"}';
+    try {
+      await expect(main(mockCore, mockContext)).rejects.toThrow("ERR_CONFIG");
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining('resolved to the router value "router/economy" at run time'));
+      expect(fs.existsSync(awInfoPath)).toBe(false);
+    } finally {
+      delete process.env.GH_AW_INFO_MODEL_FALLBACK;
+      delete process.env.GH_AW_INFO_MODEL_CONFIG;
+    }
+  });
+
+  it("checks the resolved model expression rather than the fallback when the expression is nonempty", async () => {
+    process.env.GH_AW_INFO_MODEL = "gpt-6.1-sol";
+    process.env.GH_AW_INFO_MODEL_FALLBACK = "router/economy";
+    try {
+      await main(mockCore, mockContext);
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.GH_AW_INFO_MODEL_FALLBACK;
+    }
+  });
+
+  it("fails when vars.GH_AW_MODEL_AGENT_<ENGINE> disables implicit routing and resolves to a router value", async () => {
+    // Without a model, GH_AW_INFO_MODEL is vars.GH_AW_MODEL_AGENT_COPILOT || vars.GH_AW_DEFAULT_MODEL_COPILOT || 'auto',
+    // and a nonempty agent variable makes the activation decision disable implicit routing.
+    process.env.GH_AW_INFO_MODEL = "router/robust";
+    process.env.GH_AW_INFO_MODEL_CONFIG = '{"routing":{"enabled":false},"models":{"allowed":[],"blocked":[]},"max_ai_credits_source":"default"}';
+    try {
+      await expect(main(mockCore, mockContext)).rejects.toThrow("ERR_CONFIG");
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining('resolved to the router value "router/robust" at run time'));
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("vars.GH_AW_MODEL_AGENT_<ENGINE>"));
+    } finally {
+      delete process.env.GH_AW_INFO_MODEL_CONFIG;
+    }
+  });
+
+  it("does not fail on a router-like model variable when the compiled config routes the run", async () => {
+    // Explicit routing ignores the model variables, so their value is never passed to the engine.
+    process.env.GH_AW_INFO_MODEL = "router/economy";
+    process.env.GH_AW_INFO_MODEL_CONFIG = '{"routing":{"enabled":true,"goal":"cost","mode":"economy","requested":"router/economy"},"models":{"allowed":[],"blocked":[]},"max_ai_credits_source":"default"}';
+    try {
+      await main(mockCore, mockContext);
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+      const awInfo = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
+      expect(awInfo.model_config.routing).toEqual({ enabled: true, goal: "cost", mode: "economy", requested: "router/economy" });
+    } finally {
+      delete process.env.GH_AW_INFO_MODEL_CONFIG;
+    }
+  });
+
+  it.each(["openrouter/auto", "routerx", "my-router/economy", "gpt-6.1-sol"])("does not treat %s as a router value", async model => {
+    process.env.GH_AW_INFO_MODEL = model;
+    await main(mockCore, mockContext);
+    expect(mockCore.setFailed).not.toHaveBeenCalled();
+  });
+
   it("should not fail when model name does not contain unresolved expressions", async () => {
     const cases = [
       { label: "plain string", model: "gpt-4o" },
@@ -583,7 +768,7 @@ describe("generate_aw_info.cjs", () => {
     }
   });
 
-  it.each([null, [], "claim", { work_id: "", claim_id: "c", work: {} }, { ...queueAssignment, claims: [] }, { ...queueAssignment, claims: [{ ...queueAssignment.claims[0], work: [] }] }, { ...queueAssignment, unexpected: true }])(
+  it.each([null, [], "claim", { work_id: "", claim_id: "c", work: {} }, { ...queueAssignment, claims: [] }, { ...queueAssignment, version: 3 }, { ...queueAssignment, dispatch_id: "" }, { ...queueAssignment, unexpected: true }])(
     "rejects a malformed current assignment without publishing context",
     async work_queue_assignment => {
       vi.stubEnv("GH_AW_WORK_QUEUE_ENABLED", "true");
@@ -649,9 +834,9 @@ describe("generate_aw_info.cjs", () => {
     }
   });
 
-  it("preserves a declared worker's original multi-Claim assignment without injecting authority fields", async () => {
+  it("preserves a declared worker's dispatch reference without injecting authority fields", async () => {
     const previousRole = process.env.GH_AW_WORK_QUEUE_ROLE;
-    const assignment = { ...queueAssignment, claims: [...queueAssignment.claims, { handle: "h2", claim_id: "claim2", work_id: "work2", work: {}, result_refs: [] }] };
+    const assignment = queueAssignment;
     const caller = { repo: "org/repo", run_id: "123", workflow_id: "caller" };
     try {
       vi.stubEnv("GH_AW_WORK_QUEUE_ENABLED", "true");
@@ -699,11 +884,10 @@ describe("generate_aw_info.cjs", () => {
     expect(mockCore.warning).toHaveBeenCalledWith("aw_context contains nested objects for keys: work_queue_assignment. Ignoring aw_context.");
   });
 
-  it.each([1, 2])("validates a standalone %i-Claim activation without fabricating caller provenance", async count => {
+  it("validates a standalone worker activation without fabricating caller provenance", async () => {
     vi.stubEnv("GH_AW_WORK_QUEUE_ENABLED", "true");
     vi.stubEnv("GH_AW_WORK_QUEUE_ROLE", "worker");
-    const assignment = { ...queueAssignment, claims: Array.from({ length: count }, (_, i) => ({ ...queueAssignment.claims[0], handle: `h${i + 1}`, claim_id: `c${i + 1}`, work_id: `w${i + 1}` })) };
-    await main(mockCore, { ...mockContext, payload: { inputs: { work_queue_assignment: JSON.stringify(assignment) } } });
+    await main(mockCore, { ...mockContext, payload: { inputs: { work_queue_assignment: JSON.stringify(queueAssignment) } } });
     expect(JSON.parse(fs.readFileSync(awInfoPath, "utf8"))).not.toHaveProperty("context");
     expect(mockCore.setOutput).toHaveBeenCalledWith("aw_context", "{}");
     expect(mockCore.warning).not.toHaveBeenCalled();

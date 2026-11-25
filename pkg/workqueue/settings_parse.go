@@ -11,8 +11,9 @@ import (
 // IssuesSettings describes optional Issues projection, not queue authority.
 // Nil Settings.Issues means disabled; true or {} uses the default label and title prefix.
 type IssuesSettings struct {
-	Label       string `json:"label"`
-	TitlePrefix string `json:"title_prefix"`
+	Label             string `json:"label"`
+	TitlePrefix       string `json:"title_prefix"`
+	OrphanedAfterDays int    `json:"orphaned_after_days"`
 }
 
 func parseIssuesSettings(data []byte) (*IssuesSettings, error) {
@@ -20,13 +21,13 @@ func parseIssuesSettings(data []byte) (*IssuesSettings, error) {
 	case "false":
 		return nil, nil
 	case "true":
-		return &IssuesSettings{Label: "work", TitlePrefix: "[work queue]"}, nil
+		return &IssuesSettings{Label: "work", TitlePrefix: "[work queue]", OrphanedAfterDays: 30}, nil
 	}
-	fields, err := settingsObject(data, "work_queue.issues", []string{"label", "title_prefix"})
+	fields, err := settingsObject(data, "work_queue.issues", []string{"label", "title_prefix", "orphaned_after_days"})
 	if err != nil {
-		return nil, fmt.Errorf("work_queue.issues: use true, false, or an object with optional literal label and title_prefix: %w", err)
+		return nil, fmt.Errorf("work_queue.issues: use true, false, or an object with optional literal label, title_prefix, and orphaned_after_days: %w", err)
 	}
-	issues := &IssuesSettings{Label: "work", TitlePrefix: "[work queue]"}
+	issues := &IssuesSettings{Label: "work", TitlePrefix: "[work queue]", OrphanedAfterDays: 30}
 	if data, exists := fields["label"]; exists {
 		var label string
 		if json.Unmarshal(data, &label) != nil || strings.TrimSpace(label) == "" || len(label) > 33 ||
@@ -43,18 +44,17 @@ func parseIssuesSettings(data []byte) (*IssuesSettings, error) {
 		}
 		issues.TitlePrefix = prefix
 	}
+	if data, exists := fields["orphaned_after_days"]; exists {
+		days, err := settingsInteger(data, "work_queue.issues.orphaned_after_days", 3650)
+		if err != nil {
+			return nil, err
+		}
+		issues.OrphanedAfterDays = days
+	}
 	return issues, nil
 }
 
 func decodeSettingsScalars(fields map[string]json.RawMessage, settings *Settings) error {
-	if value, ok := fields["mode"]; ok {
-		var mode string
-		if json.Unmarshal(value, &mode) != nil ||
-			(mode != "weighted-priority" && mode != "strict-priority") {
-			return settingsError("work_queue.mode", "must be weighted-priority or strict-priority")
-		}
-		settings.Mode = mode
-	}
 	for _, field := range []string{"concurrency", "pending_limit"} {
 		if value, ok := fields[field]; ok {
 			target := &settings.Concurrency
@@ -69,51 +69,6 @@ func decodeSettingsScalars(fields map[string]json.RawMessage, settings *Settings
 		}
 	}
 	return nil
-}
-
-func parseSettingsClassWeights(data []byte) ([]int, error) {
-	var values []json.RawMessage
-	if json.Unmarshal(data, &values) != nil || len(values) != 5 {
-		return nil, settingsError("work_queue.class_weights", "must contain exactly five integer weights in 1..1000")
-	}
-	weights := make([]int, 0, len(values))
-	for index, raw := range values {
-		weight, err := settingsInteger(raw, fmt.Sprintf("work_queue.class_weights[%d]", index), 1000)
-		if err != nil {
-			return nil, err
-		}
-		weights = append(weights, weight)
-	}
-	return weights, nil
-}
-
-func parseSettingsAccountingWeights(data []byte) (map[string]int, error) {
-	values, err := settingsObject(data, "work_queue.accounting_weights", nil)
-	if err != nil {
-		return nil, err
-	}
-	if len(values) > 1024 {
-		return nil, settingsError("work_queue.accounting_weights", "must contain at most 1024 keys")
-	}
-	weights := map[string]int{"": 1}
-	for _, key := range sortedSettingsKeys(values) {
-		property := "work_queue.accounting_weights." + key
-		if !validKey(key) {
-			return nil, settingsError(property, "must be an accounting key of at most 128 UTF-8 bytes without control characters")
-		}
-		weight, err := settingsInteger(values[key], property, 1000)
-		if err != nil {
-			return nil, err
-		}
-		if key == "" && weight != 1 {
-			return nil, settingsError(property, "the default accounting key must have weight 1")
-		}
-		weights[key] = weight
-	}
-	if len(weights) > 1024 {
-		return nil, settingsError("work_queue.accounting_weights", "must contain at most 1024 keys including the default key")
-	}
-	return weights, nil
 }
 
 func parseSettingsPools(data []byte, settings Settings) (map[string]PoolSettings, error) {

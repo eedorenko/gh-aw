@@ -12,6 +12,7 @@ permissions:
   contents: read
   issues: read
   pull-requests: read
+  copilot-requests: write
 
 
 network:
@@ -55,10 +56,10 @@ experiments:
     weight: [50, 50]
     start_date: "2026-05-24"
 
+model: router/economy
 engine:
   id: codex
-  model-provider: openai
-model: openai/gpt-6.1-sol
+  model-provider: github
 strict: false
 
 imports:

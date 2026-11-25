@@ -8,7 +8,116 @@ This action runs in all workflow jobs to provide scripts that can be used instea
 
 The action copies runtime `.cjs` JavaScript files (excluding tests) from the `js/` directory and `.sh` shell scripts from the `sh/` directory.
 
+### Sandboxed threat detector
+
+`detect_threats.cjs` is the sandbox-side producer for `conclude_threat_detection.cjs`.
+It is bundled but not yet selected by the workflow compiler. The host passes a
+trusted launch descriptor separately from the agent's staged artifacts:
+
+```sh
+node detect_threats.cjs --launch-config launch.json \
+  --output detection_result.json artifacts/
+```
+
+For a gh-aw harness, the descriptor supplies `command` and an `args` prefix
+(for example, `node` and `["/opt/gh-aw/copilot_harness.cjs", "copilot"]`).
+`convention` (`copilot`, `claude`, or `codex`) selects the argument and prompt
+transport independently of the executable name. Optional `model`, `provider`,
+`env`, and `cwd` are host-resolved values. Set `mode` to `direct` for a bare
+CLI that reads its prompt on stdin instead of a harness that takes `--prompt-file`.
+Never load this descriptor from model-authored artifacts.
+
+The detector converts supported Git bundles to diff text offline, in a
+disposable object store. Incremental bundles need their prerequisite objects
+in the local `$GITHUB_WORKSPACE` checkout; the detector never fetches them.
+An unreadable or over-limit bundle is an inspection warning, not evidence of
+a clean patch or a threat.
+
+On Linux the supervisor uses Python 3 and `/proc` to reap descendants owned
+by the attempt, including tools that start a separate process group.
+Engine output is not forwarded to Actions logs: it can contain private evidence.
+Codex runs with the private output directory as its writable workspace, not
+the repository; the general temporary directories are not granted for writing.
+
+Only `detection_result.json` is publishable. The adjacent
+`detection_result_full.json` contains private reasons and must stay local.
+Both destinations are invalidated at the start of each assessment, so a
+failed rerun cannot publish an earlier verdict.
+The detector checks each attempt's private sink against the original artifact
+eligibility, even when the reporting command accepted it. Exit codes are 0
+(clean), 1 (finding), and 2 (no usable verdict); stderr ends with a
+`THREAT_DETECTION_STATUS:` line for the host conclusion.
+
+JavaScript reads compiled lock metadata and manifests through the bounded JSON
+header helper, without parsing the workflow body. The runtime lives entirely in
+this action and consumes compiler-produced JSON metadata. Setup does not compile
+or install Go code, provision a native metadata helper, or install a parser
+package.
+
+The lock manifest stores a compact top-level `agent_metadata` map, keyed by
+unique normalized frontmatter SHA-256 prefixes. Prefixes start at 20 hexadecimal
+characters and extend as needed to avoid collisions; lookup supports full
+digests and abbreviated keys. Agent values contain only `name`, `model`, and
+`tools`. There is no `markdown_metadata` wrapper or per-entry `sha256`, `kind`,
+or `value` envelope, and no JSON-encoded strings. Information already present in
+`gh-aw-metadata` or the rest of `gh-aw-manifest` is omitted and reused through
+`metadata_refs`, mapping destination JSON pointers to existing header pointers.
+Compiler rejections are stored separately in `metadata_errors`.
+Empty per-source projections are omitted; `agent_metadata: {}` marks a compiled
+manifest with no agent records. No per-source `{}`, `null`, or
+`{"empty":true}` entries are stored. Missing source metadata is treated as an
+empty object, without parsing the uncompiled source or adopting any of its
+declared fields.
+Reference-only and rejected sources need no value entry: their reference/error
+maps carry the source key. There is no `metadata_empty` field or opaque hash
+encoding.
+The runtime resolves these references from the same immutable lock before
+installing records; missing, recursive, overlapping, or conflicting references
+are rejected. The existing header fields remain the source of truth.
+Matching values are referenced regardless of JSON type, including booleans,
+numbers, and empty containers. Skill descriptions and IDs are not added to
+these maps:
+repository skill files are installed unchanged, inline skill frontmatter is
+discarded without parsing, and inventory records only directory-derived names,
+sources, scopes, and content digests. The existing `skills` field remains the
+safe-update inventory of explicitly declared installation references.
+Authored agent descriptions are not stored in these maps. Pi advertises agent
+names only; Codex and Claude use the agent name for required native descriptions.
+
+The compiler interprets authored frontmatter;
+the runtime matches the normalized source SHA-256 digest to the catalog and
+reads JSON. JSON frontmatter also requires catalog provenance; valid JSON alone
+is not trusted. Run `gh aw compile` after changing repository or imported
+agent frontmatter to regenerate these maps. Missing or stale source
+records yield no declared configuration; explicit compiler rejections still
+fail rather than falling back to runtime parsing.
+
+Engine copies use canonical JSON authorized by compiler artifact values.
+Trusted scalar, name, and model edits retain exact derived digests in the
+existing `aw_info.json` metadata cache for downstream processes. Arbitrary
+generated JSON without provenance contributes no metadata. Author source files
+are not rewritten. Model inventory workflows inspect workflow source files on demand through
+agentic-workflows MCP tooling; model configuration is not copied into lock
+manifests.
+
+Header delimiters accept BOM prefixes and surrounding whitespace, stop at the
+first closing fence, and reject unterminated headers.
+
 All files are copied to the destination directory (default: `${{ runner.temp }}/gh-aw/actions`). These files are generated by running `make actions-build` and are committed to the repository.
+
+## Engine harnesses
+
+Claude, Codex, and Copilot share the retry state machine in
+`js/harness_retry_runner.cjs`: attempt telemetry, backoff, cancellation, runtime
+guard exit normalization, and Retry-After limits. Shared operational helpers
+handle safe-output observation and fresh AWF invocation-budget evidence.
+Engine adapters retain native error classification, authentication rules,
+and session resume/restart decisions.
+
+Post-result watchdogs and late-exit success checks observe only terminal
+safe-output written during the current attempt. Previously staged output
+remains available to whole-run budget enforcement, but cannot arm a new
+attempt's watchdog or turn an unrelated failure into late-exit success.
 
 ## Usage
 
@@ -64,8 +173,8 @@ This action copies files from `actions/setup/`, including:
   and deferred agent-job passes, while prompt and inline instruction files remain
   fully rendered. Only compiler-declared deferred bindings are interpreted again;
   placeholder-like text inside evaluated context stays literal. Inline metadata
-  is parsed before context restoration, and evaluated values are serialized as
-  YAML scalars rather than YAML structure.
+  is read from compiler records before context restoration, and evaluated
+  values are serialized as JSON scalar values rather than executable structure.
   Interpolation and renderer diagnostics report counts and branch outcomes, not
   prompt previews, variable names, values, or opaque tokens. Provenance debug
   logs report retained/discarded value counts and fixed rejection reasons.
@@ -81,6 +190,18 @@ This action copies files from `actions/setup/`, including:
 - `validate_multi_secret.sh` - Validates that at least one secret from a list is configured
 
 All files are copied from the committed `js/` and `sh/` directories which contain the source of truth for all JavaScript and shell scripts.
+
+### Agent step summary publication
+
+The compiler publishes the agent's step summary only after every built-in and
+custom secret-masking step succeeds. Unreadable directories fail redaction rather
+than silently bypassing its coverage. `append_agent_step_summary.sh` delegates to
+the Node.js publisher, which reuses the shared guarded-file reader's Linux
+directory-relative descriptors and no-follow opens for every path component.
+Only isolated regular files up to 10 MiB are accepted; source and ancestor
+symlinks cannot redirect publication. Missing or empty summaries remain a no-op;
+unsafe inputs fail with a diagnostic without publishing their content. As with
+other guarded asset readers, unsupported platforms fail closed.
 
 ## AWF release downloads
 
@@ -117,7 +238,7 @@ values; the runner-mask policy does not reduce that redaction.
 ### Decisions client
 
 `js/decisions_client.cjs` exports
-`invokeDecisions({ baseURL, apiKey?, model, input, questions, timeoutMs?, fetchImpl?, onUsage? })`.
+`invokeDecisions({ baseURL, apiKey?, integrationId?, model, input, questions, timeoutMs?, fetchImpl?, onUsage? })`.
 It sends the whole question array in one `POST` to `<baseURL>/decisions` and
 returns the response, including its named answers, model, and token usage.
 The helper supports `predicate`, `choice`, and `score` questions, string or
@@ -130,10 +251,17 @@ HTTP failures, and redirects without retrying or logging provider bodies.
 Refusals remain typed answers for the caller to handle. It requires no SDK,
 Actions globals, or agentic engine.
 
+The optional `integrationId` adds the `Copilot-Integration-Id` request header.
+Copilot evals set it to `agentic-workflows`, matching the firewall's default
+integration identity. OpenAI evals omit it.
+
 The optional `onUsage(usage, model)` callback runs after receiving JSON, before
 answer validation, so callers can collect costs even when the answer batch is
 invalid. Evals use it to save response token usage and catalog-derived AIC and
 USD costs to the accounting artifact.
+
+Live Decisions API coverage is provided by Copilot evals rather than a separate
+integration smoke test.
 
 ### Synthetic message previews
 
@@ -166,9 +294,8 @@ to reuse its rendered content for publication and retries. Changing its title or
 body, or copying the object, requires validation and rendering again.
 Changing a prepared request's owner, repo, or headers is rejected before any API
 write; build and render a fresh complete report for the intended target instead.
-Linear uses the Markdown renderer. Jira uses text-preserving normalization before
-converting its literal description to ADF, without replacing ordinary language
-characters with visually similar Latin letters.
+Linear uses the Markdown renderer. Jira requests use the shared Go connector
+runtime's literal text-to-ADF encoder, not JavaScript provider handlers.
 
 `js/report_ast.cjs` defines the typed inline and block nodes, normalization, and
 GitHub Markdown renderer. The renderer owns escaping, HTTPS link validation,

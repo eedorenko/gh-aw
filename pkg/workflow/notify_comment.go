@@ -21,7 +21,7 @@ var notifyCommentLog = logger.New("workflow:notify_comment")
 // - Recording missing tools
 // This job runs when:
 // 1. always() - runs even if agent fails
-// 2. Agent job was not skipped
+// 2. Agent job was not skipped, activation failed, or a custom prerequisite failed
 // 3. NO add_comment output was produced, or detection produced no verdict
 // This job depends on all safe output jobs to ensure it runs last
 func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, safeOutputJobNames []string) (*Job, error) {
@@ -51,6 +51,10 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 	}
 	notifyCommentLog.Printf("Job built successfully: dependencies_count=%d", len(needs))
 	conclusionPerms := computeConclusionJobPermissions(data)
+	if usesTokenBrokerSafeOutputs(data) {
+		conclusionPerms.Set(PermissionIdToken, PermissionWrite)
+		steps = append(steps, c.buildBrokerInvalidationStep(data)...)
+	}
 	return &Job{
 		Name:        "conclusion",
 		If:          RenderCondition(c.buildConclusionJobCondition(data, mainJobName, safeOutputJobNames)),
@@ -61,17 +65,17 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 		Steps:       steps,
 		Needs:       needs,
 		Outputs:     buildConclusionJobOutputs(data),
-		Env:         buildConclusionMemorySaveEnv(data),
+		Env:         c.addIssueLabelEnv(buildConclusionMemorySaveEnv(data)),
 	}, nil
 }
 
 // buildConclusionJobSteps assembles the ordered step list for the conclusion job: setup and
 // usage-artifact steps, noop/missing-tool/incomplete reporting, agent-failure and
-// failed-jobs reporting, the optional status-comment update, and the steering-issue step.
+// failed-jobs reporting, the optional status-comment update, steering-issue step, and
+// trigger-reaction cleanup.
 func (c *Compiler) buildConclusionJobSteps(data *WorkflowData, mainJobName string, safeOutputJobNames []string) ([]string, error) {
 	steps := c.buildConclusionSetupSteps(data)
 	steps = append(steps, c.buildWorkQueueTerminationStep(data)...)
-	steps = append(steps, c.buildWorkQueueIssuesStep(data)...)
 	steps = append(steps, c.buildConclusionWorkQueueSummaryStep(data)...)
 	if isWorkQueueParticipant(data) {
 		// Queue outputs and failure reports are settled only in their trusted Claim pass.
@@ -79,6 +83,7 @@ func (c *Compiler) buildConclusionJobSteps(data *WorkflowData, mainJobName strin
 		steps = append(steps, c.buildConclusionDetectionRunsStep(data, mainJobName)...)
 		return c.appendConclusionUsageSteps(steps, data)
 	}
+	steps = append(steps, c.buildConclusionRequestContinuationStep(data, mainJobName)...)
 	steps = append(steps, c.buildConclusionNoOpStep(data, mainJobName)...)
 	steps = append(steps, c.buildConclusionDetectionRunsStep(data, mainJobName)...)
 	steps = append(steps, c.buildConclusionMissingToolStep(data, mainJobName)...)
@@ -99,22 +104,27 @@ func (c *Compiler) buildConclusionJobSteps(data *WorkflowData, mainJobName strin
 	// Only add the conclusion update step if status comments are explicitly enabled
 	if data.StatusComment != nil && *data.StatusComment {
 		var token string
-		var stepCondition string
+		stepCondition := "always()"
 		if data.SafeOutputs != nil && data.SafeOutputs.AddComments != nil {
 			token = data.SafeOutputs.AddComments.GitHubToken
 		}
 		if slices.Contains(safeOutputJobNames, "add_comment") {
 			stepCondition = "always() && !(needs.add_comment.outputs.comment_id)"
 		}
+		envVars := c.buildConclusionScriptEnvVars(data, mainJobName, safeOutputJobNames, messagesJSON)
+		if err := c.addSafeOutputDomainEnvVars(&envVars, data); err != nil {
+			return nil, err
+		}
 		steps = append(steps, c.buildGitHubScriptStepWithoutDownload(data, GitHubScriptStepConfig{
-			StepName:      "Update reaction comment with completion status",
-			StepID:        "conclusion",
-			MainJobName:   mainJobName,
-			CustomEnvVars: c.buildConclusionScriptEnvVars(data, mainJobName, safeOutputJobNames, messagesJSON),
-			Script:        getNotifyCommentErrorScript(),
-			ScriptFile:    "notify_comment_error.cjs",
-			CustomToken:   token,
-			StepCondition: stepCondition,
+			StepName:             "Update reaction comment with completion status",
+			StepID:               "conclusion",
+			MainJobName:          mainJobName,
+			CustomEnvVars:        envVars,
+			ProtectCustomEnvVars: true,
+			Script:               getNotifyCommentErrorScript(),
+			ScriptFile:           "notify_comment_error.cjs",
+			CustomToken:          token,
+			StepCondition:        stepCondition,
 		})...)
 	}
 	steps = append(steps, c.buildConclusionSteeringIssueStep(data, mainJobName, steeringToken)...)
@@ -139,13 +149,17 @@ func (c *Compiler) appendConclusionUsageSteps(steps []string, data *WorkflowData
 	// Admission still runs in dry-run mode; record its decision without applying
 	// its budget to agent, detection, or evals execution.
 	steps = append(steps, buildUsageActivityGenerationStep(data.AdmissionEnabled, hasMaxDailyAICGuardrail(data), !isWorkQueueParticipant(data) && conclusionReportFailedJobsEnabled(data), c.getActionPin, usageEnv...)...)
+	steps = append(steps, buildUsageArtifactUploadStep(artifactPrefixExprForDownstreamJob(data), usesExperimentsBroker(data), c.getActionPin)...)
 	if data.AdmissionEnabled {
-		steps = append(steps, c.buildConclusionAdmissionMetadataStep(data)...)
+		if err := validateAdmissionWorkflowHashes(data); err != nil {
+			return nil, err
+		}
+		steps = append(steps, c.buildConclusionAdmissionStep(data)...)
 	}
-	steps = append(steps, buildUsageArtifactUploadStep(artifactPrefixExprForDownstreamJob(data), c.getActionPin)...)
 	if c.actionMode.IsScript() {
-		steps = append(steps, c.generateScriptModeCleanupStep())
+		steps = append(steps, c.generateScriptModeCleanupStep(data))
 	}
+	steps = append(steps, c.buildReactionCleanupSteps(data)...)
 	return steps, nil
 }
 
@@ -162,10 +176,11 @@ func configuredUsageSafeJobNames(data *WorkflowData) []string {
 }
 
 // computeConclusionJobPermissions resolves the GITHUB_TOKEN permissions for the conclusion
-// job: safe-outputs permissions plus the scopes required by configured OTLP OIDC,
+// job: safe-outputs permissions plus its stable OIDC capability,
 // session job-duration collection, and any issue-creating conclusion mechanism.
 func computeConclusionJobPermissions(data *WorkflowData) *Permissions {
 	conclusionPerms := ComputePermissionsForSafeOutputs(data.SafeOutputs)
+	addReactionCleanupJobPermissions(data, conclusionPerms)
 	// Session job-duration collection is always enabled, independently of failure
 	// reporting, and reads the current run attempt's Actions jobs.
 	if level, ok := conclusionPerms.Get(PermissionActions); !ok || level == PermissionNone {
@@ -177,19 +192,18 @@ func computeConclusionJobPermissions(data *WorkflowData) *Permissions {
 		conclusionPerms.Set(PermissionActions, PermissionRead)
 		if workQueueRequiresAssignment(data) {
 			conclusionPerms.Set(PermissionContents, PermissionWrite)
+			if workQueueIssuesConfig(data) != nil {
+				conclusionPerms.Set(PermissionIssues, PermissionWrite)
+			}
 		}
-		if workQueueIssuesConfig(data) != nil {
-			conclusionPerms.Set(PermissionContents, PermissionWrite)
+		if conclusionDetectionMayCreateIssue(data) {
 			conclusionPerms.Set(PermissionIssues, PermissionWrite)
 		}
-		if hasOTLPGitHubOIDCAuth(data.ParsedFrontmatter, data.RawFrontmatter) {
-			conclusionPerms.Set(PermissionIdToken, PermissionWrite)
-		}
+		conclusionPerms.Set(PermissionIdToken, PermissionWrite)
+		addReactionCleanupJobPermissions(data, conclusionPerms)
 		return conclusionPerms
 	}
-	if hasOTLPGitHubOIDCAuth(data.ParsedFrontmatter, data.RawFrontmatter) {
-		conclusionPerms.Set(PermissionIdToken, PermissionWrite)
-	}
+	conclusionPerms.Set(PermissionIdToken, PermissionWrite)
 	if isWorkQueueEnabled(data) {
 		if level, ok := conclusionPerms.Get(PermissionContents); !ok || level == PermissionNone {
 			conclusionPerms.Set(PermissionContents, PermissionRead)
@@ -206,7 +220,7 @@ func computeConclusionJobPermissions(data *WorkflowData) *Permissions {
 	// Only request issues: write when at least one conclusion-job mechanism can actually
 	// create/update an issue and that path is not already covered by
 	// ComputePermissionsForSafeOutputs (report-failed-jobs, agent-failure reporting,
-	// noop reporting, or missing-tool issue reporting). This keeps the permission grant
+	// noop, detection, or missing-tool issue reporting). This keeps the permission grant
 	// derived from the resolved configuration instead of being emitted unconditionally.
 	if conclusionMayCreateIssue(data) {
 		if level, ok := conclusionPerms.Get(PermissionIssues); !ok || level != PermissionWrite {
@@ -252,9 +266,13 @@ func issueReportingCreateIssueEnabled(config *IssueReportingConfig) bool {
 	return config != nil && (config.CreateIssue == nil || !strings.EqualFold(strings.TrimSpace(*config.CreateIssue), "false"))
 }
 
+func conclusionDetectionMayCreateIssue(data *WorkflowData) bool {
+	return IsDetectionJobEnabled(data.SafeOutputs) && data.SafeOutputs.ThreatDetection.IsReportAsIssueEnabled()
+}
+
 // conclusionMayCreateIssue returns true if at least one conclusion-job mechanism can create or
 // update an issue: report-failed-jobs, agent-failure reporting (report-failure-as-issue), noop
-// reporting (noop.report-as-issue), or missing-tool issue reporting. This mirrors the resolved
+// reporting (noop.report-as-issue), detection runs, or missing-tool issue reporting. This mirrors the resolved
 // configuration so that disabling every issue-creating path removes issues: write from the
 // compiled conclusion job's permissions.
 func conclusionMayCreateIssue(data *WorkflowData) bool {
@@ -268,6 +286,9 @@ func conclusionMayCreateIssue(data *WorkflowData) bool {
 		return true
 	}
 	if conclusionMissingToolCreateIssueEnabled(data) {
+		return true
+	}
+	if conclusionDetectionMayCreateIssue(data) {
 		return true
 	}
 	return false
@@ -338,44 +359,13 @@ func buildUsageArtifactUploadSteps(prefix string, hasEvals bool, experimentArtif
 func buildUsageArtifactPublishSteps(prefix string, hasDetection, hasDailyAICGuardrail, reuseJobDurations bool, pinAction func(string) string, gradersEnv ...string) []string {
 	steps := buildUsageArtifactCollectionStep(hasDetection)
 	steps = append(steps, buildUsageActivityGenerationStep(false, hasDailyAICGuardrail, reuseJobDurations, pinAction, gradersEnv...)...)
-	return append(steps, buildUsageArtifactUploadStep(prefix, pinAction)...)
+	return append(steps, buildUsageArtifactUploadStep(prefix, false, pinAction)...)
 }
 
-func buildUsageArtifactUploadStep(prefix string, pinAction func(string) string) []string {
-	usageArtifactName := prefix + "usage"
+func buildUsageArtifactUploadStep(prefix string, broker bool, pinAction func(string) string) []string {
 	var steps []string
 	usageArtifactUploadAction := pinAction("actions/upload-artifact")
-	usageArtifactUploadWithLines := []string{
-		"        with:\n",
-		fmt.Sprintf("          name: %s\n", usageArtifactName),
-		"          path: |\n",
-		"            /tmp/gh-aw/usage/aw_session.jsonl\n",
-		"            /tmp/gh-aw/usage/aw_info.json\n",
-		"            /tmp/gh-aw/usage/aw-info.jsonl\n",
-		"            /tmp/gh-aw/usage/agent_usage.json\n",
-		"            /tmp/gh-aw/usage/agent_usage.jsonl\n",
-		"            /tmp/gh-aw/usage/detection_usage.jsonl\n",
-		"            /tmp/gh-aw/usage/evals.jsonl\n",
-		"            /tmp/gh-aw/usage/graders/grader_manifest.json\n",
-		"            /tmp/gh-aw/usage/graders/grader_results.json\n",
-		"            /tmp/gh-aw/usage/github_rate_limits.jsonl\n",
-		"            /tmp/gh-aw/usage/agent/token_usage.jsonl\n",
-		"            /tmp/gh-aw/usage/agent/model-routing.jsonl\n",
-		"            /tmp/gh-aw/usage/agent/execution.json\n",
-		"            /tmp/gh-aw/usage/agent/harness_retry.json\n",
-		"            /tmp/gh-aw/usage/detection/token_usage.jsonl\n",
-		"            /tmp/gh-aw/usage/detection/execution.json\n",
-		"            /tmp/gh-aw/usage/detection/harness_retry.json\n",
-		"            /tmp/gh-aw/usage/detection/detection_result.json\n",
-		"            /tmp/gh-aw/usage/evals/token_usage.jsonl\n",
-		"            /tmp/gh-aw/usage/evals/execution.json\n",
-		"            /tmp/gh-aw/usage/evals/evals_status.json\n",
-		"            /tmp/gh-aw/usage/experiment/state.jsonl\n",
-		"            /tmp/gh-aw/usage/experiment/state.json\n",
-		"            /tmp/gh-aw/usage/experiment/assignments.json\n",
-		"            /tmp/gh-aw/usage/activity/summary.json\n",
-		"          if-no-files-found: ignore\n",
-	}
+	usageArtifactUploadWithLines := buildUsageArtifactUploadPathLines(prefix, broker)
 	retryUsageArtifactUploadWithLines := append([]string{}, usageArtifactUploadWithLines...)
 	retryUsageArtifactUploadWithLines = append(retryUsageArtifactUploadWithLines, "          overwrite: true\n")
 	steps = append(steps,
@@ -402,6 +392,44 @@ func buildUsageArtifactUploadStep(prefix string, pinAction func(string) string) 
 	)
 	steps = append(steps, retryUsageArtifactUploadWithLines...)
 	return steps
+}
+
+func buildUsageArtifactUploadPathLines(prefix string, broker bool) []string {
+	lines := []string{
+		"        with:\n",
+		fmt.Sprintf("          name: %susage\n", prefix),
+		"          path: |\n",
+		"            /tmp/gh-aw/usage/aw_session.jsonl\n",
+		"            /tmp/gh-aw/usage/aw_info.json\n",
+		"            /tmp/gh-aw/usage/aw-info.jsonl\n",
+		"            /tmp/gh-aw/usage/agent_usage.json\n",
+		"            /tmp/gh-aw/usage/agent_usage.jsonl\n",
+		"            /tmp/gh-aw/usage/detection_usage.jsonl\n",
+		"            /tmp/gh-aw/usage/evals.jsonl\n",
+		"            /tmp/gh-aw/usage/graders/grader_manifest.json\n",
+		"            /tmp/gh-aw/usage/graders/grader_results.json\n",
+		"            /tmp/gh-aw/usage/github_rate_limits.jsonl\n",
+		"            /tmp/gh-aw/usage/agent/token_usage.jsonl\n",
+		"            /tmp/gh-aw/usage/agent/model-routing.jsonl\n",
+		"            /tmp/gh-aw/usage/agent/execution.json\n",
+		"            /tmp/gh-aw/usage/agent/harness_retry.json\n",
+		"            /tmp/gh-aw/usage/agent/durable-session.jsonl\n",
+		"            /tmp/gh-aw/usage/detection/token_usage.jsonl\n",
+		"            /tmp/gh-aw/usage/detection/execution.json\n",
+		"            /tmp/gh-aw/usage/detection/harness_retry.json\n",
+		"            /tmp/gh-aw/usage/detection/detection_result.json\n",
+		"            /tmp/gh-aw/usage/evals/token_usage.jsonl\n",
+		"            /tmp/gh-aw/usage/evals/execution.json\n",
+		"            /tmp/gh-aw/usage/evals/evals_status.json\n",
+		"            /tmp/gh-aw/usage/experiment/state.jsonl\n",
+		"            /tmp/gh-aw/usage/experiment/state.json\n",
+		"            /tmp/gh-aw/usage/experiment/assignments.json\n",
+		"            /tmp/gh-aw/usage/activity/summary.json\n",
+	}
+	if broker {
+		lines = append(lines, "            /tmp/gh-aw/usage/activity/experiment-results.json\n")
+	}
+	return append(lines, "          if-no-files-found: ignore\n")
 }
 
 func buildUsageArtifactCollectionStep(hasDetection bool) []string {

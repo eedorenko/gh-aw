@@ -22,8 +22,15 @@ type PromptImportEntry struct {
 	Markdown   string // Non-empty when this import should be inlined into the prompt at compile time
 }
 
+// ConnectorImport retains registrations after normal import-schema/with substitution.
+type ConnectorImport struct {
+	Source        string
+	Registrations map[string]any
+}
+
 // ImportsResult holds the result of processing imports from frontmatter
 type ImportsResult struct {
+	Connectors                    []ConnectorImport
 	MergedTools                   string                // Merged tools configuration from all imports
 	MergedMCPServers              string                // Merged mcp-servers configuration from all imports
 	MergedEngines                 []string              // Merged engine configurations from all imports
@@ -31,7 +38,7 @@ type ImportsResult struct {
 	MergedPluginObjects           []map[string]any      // Object-form Agent Plugin references from all imports
 	MergedSafeOutputs             []string              // Merged safe-outputs configurations from all imports
 	MergedGraders                 string                // Merged graders configuration from all imports (JSON objects, one per line)
-	GraderRunSources              map[string]string     // Declaring files for imported grader run paths.
+	MergedExperiments             string                // Experiment configuration from imports (JSON objects, one per line)
 	MergedMCPScripts              []string              // Merged mcp-scripts configurations from all imports
 	MergedMarkdown                string                // Only contains imports WITH inputs (for compile-time substitution)
 	ImportPaths                   []string              // List of import file paths for runtime-import macro generation (replaces MergedMarkdown)
@@ -41,6 +48,7 @@ type ImportsResult struct {
 	MergedPreSteps                string                // Merged pre-steps configuration from all imports (prepended in order)
 	MergedPreAgentSteps           string                // Merged pre-agent-steps configuration from all imports (prepended in order)
 	MergedRuntimes                string                // Merged runtimes configuration from all imports
+	MergedRunsOn                  any                   // First imported top-level runner specification
 	MergedRunInstallScripts       bool                  // true if any imported workflow sets runtimes.node.run-install-scripts: true
 	MergedServices                string                // Merged services configuration from all imports
 	MergedNetwork                 string                // Merged network configuration from all imports
@@ -74,6 +82,9 @@ type ImportsResult struct {
 	MergedEngineMCPToolTimeout    string                // First engine.mcp.tool-timeout found across all imports (Go duration string, e.g. "10m")
 	MergedEngineMCPSessionTimeout string                // First engine.mcp.session-timeout found across all imports (Go duration string, e.g. "4h")
 	MergedEngineModel             string                // First engine.model found in imports that have no engine.id (model preference without engine selection)
+	RouterShortlists              [][]string            // Top-level main-agent shortlists, kept separate to detect conflicting declarations.
+	RouterDisabled                bool                  // An import opts out of default routing without selecting an engine or model.
+	EngineModelChoiceDeclared     bool                  // An import declares a top-level model, or a preference-only engine object declares model, model-routing, or fallback-models (including empty values)
 	MergedMaxTurns                string                // First max-turns value found across all imports (JSON-encoded, first-wins)
 	MergedMaxToolDenials          string                // First max-tool-denials value found across all imports (JSON-encoded, first-wins)
 	MergedMaxToolCalls            string                // First max-tool-calls value found across all imports (JSON-encoded, first-wins)
@@ -81,10 +92,12 @@ type ImportsResult struct {
 	MergedMaxTurnCacheMisses      string                // First max-turn-cache-misses value found across all imports (JSON-encoded, first-wins)
 	MergedMaxAICredits            string                // First max-ai-credits value found across all imports (JSON-encoded, first-wins)
 	MergedMaxDailyAICredits       string                // First max-daily-ai-credits value found across all imports (JSON-encoded, first-wins)
+	MergedAdaptiveRouting         string                // First adaptive-routing value found across all imports (JSON-encoded, first-wins)
 	MergedConcurrency             string                // First import-safe concurrency.group value found across all imports (JSON-encoded, first-wins)
 	MergedJobDiscriminator        string                // First concurrency.job-discriminator found across all imports (first-wins)
 	MergedExcludedEnv             []string              // Union of excluded-env lists from all imports (deduplicated, used to extend the main workflow's excluded-env)
 	ImportedFiles                 []string              // List of imported file paths (for manifest)
+	MetadataDocuments             map[string]string     // Raw selected Markdown imports, keyed by compiler-resolved path
 	AgentFile                     string                // Path to custom agent file (if imported)
 	SubAgentModels                []SubAgentModel       // models declared by imported inline agents and agent files
 	SubAgents                     []InlineSubAgent      // imported inline definitions for engine-specific validation

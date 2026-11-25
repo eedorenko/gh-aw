@@ -8,6 +8,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/stringutil"
+	"github.com/goccy/go-yaml"
 )
 
 // compiler_activation_outputs contains activation outputs, artifact upload wiring, and environment assembly.
@@ -50,6 +51,7 @@ func (c *Compiler) addActivationCommandAndLabelOutputs(ctx *activationJobBuildCo
 		compilerActivationJobLog.Print("Adding remove-trigger-label step for label-command workflow")
 		ctx.steps = append(ctx.steps, "      - name: Remove trigger label\n")
 		ctx.steps = append(ctx.steps, fmt.Sprintf("        id: %s\n", constants.RemoveTriggerLabelStepID))
+		ctx.steps = appendDailyAICQuotaStepIf(ctx.steps, data)
 		ctx.steps = append(ctx.steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)))
 		ctx.steps = append(ctx.steps, "        env:\n")
 		labelNamesJSON, err := json.Marshal(data.LabelCommand)
@@ -238,8 +240,9 @@ func (c *Compiler) addWorkQueueSnapshotStep(ctx *activationJobBuildContext) {
 	}
 
 	compilerActivationJobLog.Print("Adding activation-time work queue snapshot")
-	if workQueueIssuesConfig(ctx.data) != nil && isWorkQueueParticipant(ctx.data) {
-		ctx.steps = append(ctx.steps, c.workQueueProjectorTokenSteps(ctx.data, "activation")...)
+	broker := usesTokenBrokerSafeOutputs(ctx.data)
+	if broker {
+		ctx.steps = append(ctx.steps, c.buildGitHubBrokerTokenStep(ctx.data, "work-queue-activation-broker-token")...)
 	}
 	ctx.steps = append(ctx.steps,
 		"      - name: Snapshot work queue state\n",
@@ -247,7 +250,7 @@ func (c *Compiler) addWorkQueueSnapshotStep(ctx *activationJobBuildContext) {
 		fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", ctx.data)),
 	)
 	ctx.steps = append(ctx.steps, workQueuePolicyEnvironment(ctx.data)...)
-	if workQueueIssuesConfig(ctx.data) != nil {
+	if workQueueRequiresAssignment(ctx.data) {
 		var staged *TemplatableBool
 		if ctx.data.SafeOutputs != nil {
 			staged = ctx.data.SafeOutputs.Staged
@@ -259,14 +262,28 @@ func (c *Compiler) addWorkQueueSnapshotStep(ctx *activationJobBuildContext) {
 	ctx.steps = append(ctx.steps,
 		"        with:\n",
 	)
-	if workQueueIssuesConfig(ctx.data) != nil && isWorkQueueParticipant(ctx.data) {
-		c.addWorkQueueProjectorToken(&ctx.steps, ctx.data)
+	if broker {
+		c.addWorkQueueProjectorToken(&ctx.steps, ctx.data, "activation")
 	}
 	ctx.steps = append(ctx.steps,
 		"          script: |\n",
 		generateGitHubScriptWithRequire("write_work_queue_snapshot.cjs"),
 	)
-	ctx.outputs["work_queue_origin"] = "${{ steps.work_queue_snapshot.outputs.work_queue_origin }}"
+	if broker {
+		ctx.steps = append(ctx.steps, c.buildBrokerInvalidationStep(ctx.data)...)
+	}
+	if workQueueRequiresAssignment(ctx.data) {
+		ctx.outputs[workQueueAssignmentSettledOutput] = "${{ steps.work_queue_snapshot.outputs." + workQueueAssignmentSettledOutput + " }}"
+	}
+}
+
+// workQueueAssignmentSettledOutput is set by the worker snapshot when the
+// dispatched assignment has no open Claim left; agent and safe-output jobs skip.
+const workQueueAssignmentSettledOutput = "work_queue_assignment_settled"
+
+// workQueueAssignmentOpenCondition gates worker jobs that must not run for a settled assignment.
+func workQueueAssignmentOpenCondition() ConditionNode {
+	return BuildNotEquals(BuildPropertyAccess("needs."+string(constants.ActivationJobName)+".outputs."+workQueueAssignmentSettledOutput), BuildStringLiteral("true"))
 }
 
 func isWorkQueueEnabled(data *WorkflowData) bool {
@@ -338,7 +355,17 @@ func (c *Compiler) addActivationInfoArtifactUploadStep(ctx *activationJobBuildCo
 func (c *Compiler) buildActivationEnvironment(ctx *activationJobBuildContext) string {
 	if ctx.data.ManualApproval != "" {
 		compilerActivationJobLog.Print("Activation job uses manual-approval environment gate")
-		return "environment: " + stringutil.StripANSI(ctx.data.ManualApproval)
+		manualApproval := stringutil.StripANSI(ctx.data.ManualApproval)
+		var environmentConfig map[string]any
+		if err := yaml.Unmarshal([]byte(ctx.data.Environment), &environmentConfig); err == nil {
+			if environment, ok := environmentConfig["environment"].(map[string]any); ok {
+				environment["name"] = manualApproval
+				if updatedConfig, err := yaml.Marshal(environmentConfig); err == nil {
+					return c.indentYAMLLines(string(updatedConfig), "    ")
+				}
+			}
+		}
+		return "environment: " + manualApproval
 	}
 	return c.indentYAMLLines(ctx.data.Environment, "    ")
 }

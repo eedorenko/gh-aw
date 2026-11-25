@@ -1,5 +1,6 @@
 ---
 title: Safe Outputs MCP Gateway Specification
+spec: true
 description: Formal W3C-style specification defining the Safe Outputs Model Context Protocol Gateway for secure AI-to-GitHub operation translation
 sidebar:
   order: 1360
@@ -7,9 +8,9 @@ sidebar:
 
 # Safe Outputs MCP Gateway Specification
 
-**Version**: 1.29.15<br>
+**Version**: 1.32.0<br>
 **Status**: Working Draft<br>
-**Publication Date**: 2026-11-02<br>
+**Publication Date**: 2026-11-24<br>
 **Editor**: GitHub Agentic Workflows Team<br>
 **This Version**: [safe-outputs-specification](/gh-aw/specs/safe-outputs-specification/)<br>
 **Latest Published Version**: This document
@@ -36,6 +37,7 @@ This specification follows World Wide Web Consortium (W3C) formatting convention
 6. [Universal Feature Interpretation](#6-universal-feature-interpretation)
 7. [Safe Output Type Definitions](#7-safe-output-type-definitions)
 8. [Protocol Exchange Patterns](#8-protocol-exchange-patterns)
+   - [Request-Continuation Routes](#85-request-continuation-routes)
 9. [Content Integrity Mechanisms](#9-content-integrity-mechanisms)
 10. [Execution Guarantees](#10-execution-guarantees)
 11. [Cache Memory Integrity](#11-cache-memory-integrity)
@@ -65,7 +67,7 @@ This specification uses the following terms with precise definitions:
 
 **Staged Mode**: Preview execution mode where operations are simulated without creating permanent GitHub resources.
 
-**Temporary ID**: A placeholder identifier (format: `aw_<id>`) used to reference not-yet-created resources. Resolved to actual resource numbers during processing.
+**Temporary ID**: A workflow-scoped placeholder identifier using the form `aw_<id>` for a not-yet-created resource. A reference MAY appear in ordinary Markdown form or with a Markdown escape immediately before `#`, `_`, or both (for example, `#aw_track1`, `\#aw_track1`, `#aw\_track1`, or `\#aw\_track1`). Implementations MUST remove only those backslash escapes immediately preceding `#` or `_` when normalizing a reference for lookup or emitted replacement. They MUST preserve unrelated backslash escapes. A valid temporary-ID candidate MUST match the complete identifier form; implementations MUST NOT match a valid prefix of a longer or malformed identifier.
 
 **Provenance**: Metadata identifying the workflow and run that created a GitHub resource. Included in footers or API metadata fields.
 
@@ -174,7 +176,7 @@ This specification uses the following terms with precise meanings:
 
 **Footer**: An AI attribution message appended to created content, identifying the workflow source, providing provenance via run URL, and optionally including installation instructions.
 
-**Temporary ID**: A workflow-scoped identifier (format: `aw_<alphanumeric>`) allowing agents to reference not-yet-created issues in subsequent operations. Resolved to actual issue numbers during execution.
+**Temporary ID**: A workflow-scoped placeholder identifier using the form `aw_<id>`; references may use ordinary Markdown or escaped forms as defined above.
 
 ---
 
@@ -782,7 +784,7 @@ Implementations MUST execute validation steps in this exact sequence for all saf
 **Stage 6: Dependency Resolution (CONDITIONAL)**
 
 - Input: Temporary IDs, parent references
-- Check: Resolve references to actual GitHub resource numbers
+- Check: Resolve references to actual GitHub resource numbers, recognizing ordinary and Markdown-escaped or partially escaped forms. Remove only backslash escapes immediately preceding `#` or `_` for lookup and replacement, preserve unrelated escapes, and require a complete valid identifier without matching a valid prefix.
 - On failure: Reject with E005 (MISSING_PARENT)
 - Output: Fully-resolved operation data
 
@@ -1078,7 +1080,7 @@ When `tools.comment-memory` is enabled, implementations MUST support this additi
 2. **Local files → agent**: The prompt MUST include instructions that memory files are edited directly in `/tmp/gh-aw/comment-memory/`.
 3. **Agent → artifact**: The unified agent artifact MUST include `/tmp/gh-aw/comment-memory/` when comment memory is enabled.
 4. **Artifact → threat detection**: Threat-detection prompt setup MUST include discovered comment-memory files in analysis context.
-5. **Artifact/files → safe output processor**: The processor MUST load edited `*.md` files, synthesize `comment_memory` operations, and execute them through the `comment_memory` handler.
+5. **Artifact/files → safe output processor**: The processor MUST load edited `*.md` files, synthesize `comment_memory` operations, and execute them through the `comment_memory` handler. When resolving temporary IDs, it MUST recognize ordinary and Markdown-escaped or partially escaped references, remove only escapes immediately preceding `#` or `_` for lookup and output, preserve unrelated escapes, and require a complete valid identifier without matching a valid prefix.
 6. **Safe output processor → GitHub comment**: The handler MUST upsert the managed comment using the `gh-aw-comment-memory` marker and preserve only user content within the managed XML block.
 
 This round-trip path ensures memory edits remain file-based for the agent while keeping GitHub as the authoritative persistent store.
@@ -1316,6 +1318,8 @@ MUST NOT:
 **Semantics**: When `true`, activation MUST create a workflow-repository issue before agent execution and expose its number and URL to the agent prompt. The agent MAY read user-authored issue comments containing the `steer` keyword. The conclusion phase MUST update the validated issue with the failure title and body when failure reporting is active, rather than creating a separate failure issue; on successful completion, it SHOULD close the issue and link a created pull request when available.
 
 This mode requires top-level `issues: read` permission for comment reads. The activation and conclusion jobs require `issues: write` through the global safe-output credential (`safe-outputs.github-token` or `safe-outputs.github-app`); a GitHub App token MUST be minted with `issues: write`.
+
+The effective value of `safe-outputs.steer` is resolved after imported workflow configuration is applied. An explicit local value MUST take precedence over an imported value. An imported `steer: true` therefore enables steering only when the local workflow omits the setting; an explicit local `steer: false` MUST disable it. The built-in default remains `false` when neither local nor imported configuration supplies a value.
 
 **Constraints**:
 
@@ -1574,6 +1578,31 @@ For example, `dispatch-workflow` configured with `github-token: ${{ secrets.DISP
 
 **Conformance**: Tests MUST verify the generated global App mints and job permissions with and without a handler token, including dispatch-repository tools. Tests MUST also cover mixed configurations where another handler keeps the global App mint enabled while credential-overridden handlers perform finalization, autofix, or cleanup.
 
+#### GP5c: Persisted PR Checkout Credentials
+
+The trusted `safe_outputs` job MUST retain credentials for PR fetch/push operations with `persist-credentials: true`. When PR handlers use the global App for the host repository, the default workspace checkout MUST persist the resolved PR token, including `${{ steps.safe-outputs-app-token.outputs.token }}`, unless explicit checkout authentication takes precedence. Unsigned Git pushes MUST NOT silently use the checkout's default `GITHUB_TOKEN` instead of that selected App token.
+
+The global-App override MUST apply only when no PR handler has its own App or token, no distinct PR target/head repository is selected, and the global App mint is emitted. A global App serving only other handlers MUST NOT replace the default checkout credential: its permissions can exclude `contents`. Additional static checkouts MUST retain their existing static/per-entry credentials rather than inherit the default workspace's App-token override. Runtime repository-list checkouts retain the separate credential rules in [Section 9.6.1](#961-runtime-repository-list-checkouts).
+
+Token minting MUST precede any checkout that references its output. Work-queue jobs MUST order artifact downloads, claim reconciliation, global App minting, then shared PR checkout. With `ignore-if-missing`, the persisted expression MUST preserve the configured safe-output token fallback, then `secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN`.
+
+Persistence MUST NOT widen App repository scope or permission aggregation under GP5–GP5b, override explicit per-checkout authentication, change static code-scanning upload token selection, or expose these privileged credentials to the agent job or safe-outputs MCP server. Retained credentials authorize trusted publication, not agent-generated code.
+
+**Conformance**: Generated-step tests MUST cover the host App token, missing-key fallback, mixed global/per-handler Apps, additional static checkouts, a distinct cross-organization target, and work-queue reconciliation/mint/checkout ordering. These tests establish compiler wiring, not live installation access or downstream workflow execution. Existing locks require recompilation to adopt the changed token selection and ordering.
+
+#### GP5d: Authenticated Author and Bot Validation
+
+Automatic comment selection for `add_comment` with `replace-older-comments: true` and for privileged `comment_memory` upserts MUST validate GitHub API author metadata in addition to each handler's required body markers. Body markers alone MUST NOT establish ownership. These rules do not replace the trusted comment-ID authorization paths for explicit or status-comment reuse.
+
+1. **Effective Credential**: Implementations MUST resolve the authenticated login through the same GitHub client and effective credential used by the handler. `github.actor`, `context.actor`, and event authors identify triggering users, not necessarily the publishing identity, and MUST NOT substitute for credential identity.
+2. **Lazy, Scoped Lookup**: The authenticated-user lookup MUST occur only when matching comment candidates exist and MUST NOT occur in staged mode. Implementations MUST share concurrent lookups and cache both resolved and unavailable identities within the resolver's lifetime; cached identity MUST NOT be shared across clients with different credentials.
+3. **Resolved Identity**: When a non-empty authenticated login is available, a candidate MUST have a non-empty `user.login` from GitHub API metadata that exactly matches that login. This includes PAT-authored comments; bot type alone MUST NOT override a known login mismatch.
+4. **Unavailable Identity**: When the authenticated-user endpoint fails or supplies no login, a candidate MUST have a non-empty API-provided `user.login` and `user.type` equal to `Bot`. Missing author metadata and human accounts MUST be rejected; a `[bot]` login suffix alone MUST NOT establish bot status. Lookup failures MUST log that selection is falling back to bot-authored comments.
+
+GitHub App installation tokens can lack access to the authenticated-user endpoint. The fallback intentionally supports API-identified bots without hard-coding `github-actions[bot]`, so configured App publishers remain supported. It establishes bot type, not ownership by a specific App installation. Bot-authored content MUST still undergo the applicable sanitization and metadata validation; bot status MUST NOT make body text trusted.
+
+**Conformance**: Tests MUST cover exact authenticated-author matching, a mismatching bot, PAT-authored comments, unavailable identity, a human account with a `[bot]` suffix, missing author metadata, lazy/concurrent lookup caching, and client isolation.
+
 #### GP6: data
 
 **Syntax**: `safe-outputs.data: false | true | <schema-object> | <github-expression>`
@@ -1617,6 +1646,242 @@ Compile-time validation SHOULD be applied when schema content is statically avai
 **Data Validation Errors**
 
 When `data` validation fails, implementations MUST return actionable field-path errors that identify the failing location (for example, `data.extra` or `data.required[0]`).
+
+#### Safe-output invocation authorization
+
+`safe-outputs.authorization` requires external authorization for every enabled
+non-builtin output. The same object on an individual output, including
+`scripts.<name>`, `actions.<name>` and `jobs.<name>`, protects that output only.
+Authorization is opt-in; absence preserves existing execution behavior.
+
+For independently protected enforcement of enrollment, literal authority bindings,
+and source-to-lock integrity, see [How to protect an authorization baseline](/gh-aw/guides/authorization-policy/).
+
+```yaml
+safe-outputs:
+  authorization:
+    endpoint: https://authority.example.org/api/safe-output-authorization
+    audience: https://authority.example.org/gh-aw-safe-outputs
+  create-issue:
+    max: 1
+```
+
+Both `endpoint` and `audience` are required strings. The endpoint MUST be HTTPS
+without embedded credentials or a fragment. Presence means required
+authorization; `false`, warning-only and fail-open configurations are not
+supported. A local authority identical to the global authority produces one
+requirement. Conflicting authorities MUST fail compilation, including conflicts
+introduced through imports. Agent-provided fields MUST NOT change this trusted
+configuration. `authorization` is reserved metadata, not a tool name.
+
+**Repository defaults:** `.github/workflows/aw.json` MAY set
+`safe_output_authorization` to the same endpoint/audience object, or to `true`
+to require the runtime Actions variables
+`GH_AW_DEFAULT_SAFE_OUTPUT_AUTHORIZATION_URL` and
+`GH_AW_DEFAULT_SAFE_OUTPUT_AUTHORIZATION_AUDIENCE`. The latter are managed with
+`gh aw env` keys `default_safe_output_authorization_url` and
+`default_safe_output_authorization_audience`. Both variables MUST be valid and
+nonempty for live execution; missing values MUST block, not disable the gate.
+The compiler MUST apply the repository requirement after merging imports and
+MUST reject conflicting global or local authorities. An environment-backed
+requirement cannot be proven identical to a literal authority at compile time,
+so combining them MUST fail compilation. Repository policy MUST NOT enable
+otherwise-disabled outputs. Changes to the repository setting require
+recompilation; changes to its runtime variables do not.
+
+**Shared workflow imports:** Shared agentic workflows MAY declare global or
+per-output authorization, including a policy-only `safe-outputs` block with no
+output declarations. The compiler MUST preserve these requirements through
+direct and nested `imports`, then resolve inheritance against the merged
+outputs. Imported global authorization therefore applies to eligible outputs
+declared by the importing workflow or another import, not only outputs in the
+policy file.
+
+```aw title=".github/workflows/shared/output-authorization.md"
+safe-outputs:
+  authorization:
+    endpoint: https://authority.example.org/api/safe-output-authorization
+    audience: https://authority.example.org/gh-aw-safe-outputs
+```
+
+```aw title=".github/workflows/triage.md"
+on: workflow_dispatch
+imports:
+  - ./shared/output-authorization.md
+safe-outputs:
+  create-issue:
+    max: 1
+```
+
+The same rules apply to imported native outputs, scripts, actions and jobs.
+Ordinary output configuration overrides MUST NOT discard an imported local
+requirement. Identical authorities MAY be shared across imports; conflicting
+authorities and invalid disabling declarations MUST fail compilation.
+
+Global inheritance excludes only descriptors classified by the compiler as
+builtin diagnostics: `noop`, `report-missing-tool`, `report-missing-data` and
+`report-incomplete`, including aliases. Explicit local authorization on these
+diagnostics still applies. Ordinary native outputs such as `create-issue` and
+`add-comment` are not exempt, including when compiler-enabled or carrying
+diagnostic-looking text. Custom names MUST NOT acquire builtin classification.
+
+**Staging:** Effective global or per-output staged mode, including resolved
+expressions, MUST branch before OIDC acquisition, authority requests or execution
+claims. Its authorization state is `skipped_staged`, never `allowed`.
+Configuration validation still applies, but unavailable OIDC credentials or
+authority service MUST NOT prevent a valid preview. Custom module evaluation,
+factory initialization, action hooks and job steps MUST NOT run to produce a
+staged preview. All-statically-staged outputs MUST NOT add OIDC permission solely
+for this feature.
+
+**Execution boundary:** The authorized unit is a prepared invocation of a
+reviewed implementation, not necessarily one network write. Implementations MUST
+bind normalized inputs, resolved defaults and temporary IDs, the executor and its
+implementation revision, execution identity, policy and independently resolved
+targets or artifacts where available. Arbitrary custom code uses invocation-level
+binding with declared scope; it MUST NOT be represented as an independently
+verified exact effect. Changing approved inputs or expanding scope requires a new
+decision.
+
+Native handlers without a separate effect-preparation adapter also advertise
+`binding: invocation`. Their handler-specific sanitization and dynamic API
+lookups remain inside the reviewed implementation; the approval does not attest
+to an independently resolved final network request.
+
+**Semantic consistency:** The workflow hash (`caller.workflow_hash`,
+frontmatter and body), `input_digest` and `context.policy_digest` together
+bind the declaration, the normalized invocation inputs and the effective handler
+policy. In the manager, `input_digest` covers the frozen prepared message, the
+temporary-ID resolution snapshot and resolved defaults such as the pinned target
+repository. The authorization input snapshot remains deep-frozen. The manager
+passes the handler an independent, initially data-equivalent mutable copy of the
+bound message, the bound resolution snapshot and the frozen policy captured when
+handlers were loaded;
+mutating the source message, live temporary-ID entries, configuration objects
+or environment-backed defaults during the authority wait MUST NOT redirect or
+expand execution. Every temporary-ID view a protected executor receives,
+including the shared map argument, MUST read resolutions from the bound
+snapshot; temporary IDs the executor creates are still published to the shared
+map for later invocations. Handlers that cache resolutions across invocations
+MUST let each invocation's snapshot replace cached entries. Targets that are
+still unresolved temporary IDs in the supported issue/PR number fields defer
+before an authority request or decision consumption. Recognition uses the
+issue-target resolver's accepted forms: case-insensitive `aw_` prefixes, optional
+`#`, surrounding whitespace and matching single or double quotes. Regression
+coverage exercises `item_number`, `issue_number`, `pr_number` and `pull_number`
+for `remove-labels`. Output-producing IDs and unrelated identity fields do not
+trigger this guard. Semantic consistency is not byte equality:
+deterministic derivations from bound values are permitted after authorization,
+including alias normalization, the configured `target` selector and its
+triggering-event fallback within the same run, label trimming and sanitization,
+deduplication, `allowed`/`blocked` filtering and `max` truncation. These can
+only narrow the bound operation; a writable message copy is not permission to
+redirect or expand it beyond the bound declaration, inputs, policy and reviewed
+implementation. Live reads such as `required-labels` or
+`required-title-prefix` checks MAY reject execution; they do not establish
+atomic target state, exact-once delivery or label identity. Invalid input or
+filtering that yields no operation performs no write. The manager path is
+covered by regression tests for `remove-labels`; other native handlers share
+the same boundary, but handler-specific transformations, values read from the
+live temporary-ID map argument, queue/Claim adapters and custom executors have
+not been exhaustively assessed.
+
+Compiler diagnostics use `DEBUG=workflow:safe_outputs_authorization`.
+Runtime diagnostics use the GitHub Actions debug log and report preparation,
+OIDC acquisition, decision requests, release and fixed failure reason codes.
+Debug messages MUST NOT contain authority endpoints, audiences, tokens,
+response bodies, or normalized input bodies.
+
+When a workflow trace is configured, authorization emits correlated
+`safe_output.authorization.{oidc,authority,decision}.run` OpenTelemetry spans.
+Attributes under `gh-aw.safe_output.gate.*` include only the phase,
+state, fixed reason code and validated executor, binding and requirement source.
+Spans MUST NOT contain authority URLs, audiences, credentials, invocation IDs,
+policy revisions, decision IDs, request/response bodies or output names.
+Staged and unconfigured paths MUST NOT initialize authorization telemetry.
+Export is best-effort and MUST NOT delay execution of a live grant, bypass
+freshness checks, change a decision or cause authorization replay.
+
+All existing validation, target restrictions, limits, threat detection, protected
+file checks, review requirements and queue Claim checks continue to apply with
+AND semantics. The actual executor MUST gate native, deferred, standalone,
+custom script, action, job, fan-out and queue paths. A payload-export handler
+alone is not the action's execution boundary. Batch executors require a decision
+per logical record and MUST NOT start any author code unless all required
+decisions remain usable. Unconditional pre-output hooks cannot remain an
+unclassified write path when authorization is enabled.
+
+Reusable-workflow fan-out obtains a fresh launch-release decision in a separate
+gate job after payload preparation, retaining the selected record's original
+batch ordinal. This approves submitting the launch to Actions, not when
+downstream execution starts or what the called workflow writes.
+
+**Authority protocol:** The client sends a bounded, versioned HTTPS POST
+authenticated using GitHub OIDC with the configured audience. The request binds
+the host, repository ID, workflow identity and revision, compiled configuration,
+run and attempt, logical invocation identity, implementation and input digests,
+binding level and relevant evidence references. Private bodies, patches, prompts,
+secret-valued inputs and tokens MUST NOT be transmitted or logged; bind digests
+and reviewed secret references instead. The authority independently verifies any
+evidence required by its policy. The [companion TypeSpec definition](https://github.com/github/gh-aw/blob/main/docs/src/content/docs/specs/safe-output-authorization.tsp)
+describes the decision endpoint and its request and response bodies.
+
+The request object contains `version`, `request_digest`, and `invocation`, plus
+top-level `job_id` whenever nonempty `GITHUB_JOB` is available. `job_id` preserves
+the original job name using JSON string encoding; callers without job context
+omit it. It is diagnostic metadata outside the canonical invocation and its
+`request_digest`, not a signed job identity, policy selector or execution claim.
+Adding it MUST NOT change the digest or logical invocation identity. Authorities
+with closed request schemas MUST allow this member; response schemas are unchanged.
+
+The decision POST MUST carry W3C `traceparent` when the current
+`GITHUB_AW_OTEL_TRACE_ID` and `GITHUB_AW_OTEL_PARENT_SPAN_ID` form a valid context;
+invalid or incomplete context is omitted. When job context is available, it also
+carries W3C `baggage: cicd.pipeline.task.name=<encoded-job-id>`, using
+OpenTelemetry's CI/CD task-name key. Sanitize the header value with UTF-8
+percent-encoding (`encodeURIComponent`), including whitespace, CR/LF, Unicode,
+baggage delimiters and literal percent signs. Do not percent-encode JSON `job_id`.
+Neither carrier authorizes execution or replaces verified GitHub identity.
+Arbitrary inherited trace headers, baggage and exporter credentials MUST NOT be
+forwarded, and these correlation headers MUST NOT be sent to the OIDC issuer.
+Propagation MUST NOT enable telemetry export or change the fail-closed gate.
+
+The authority MUST atomically claim the logical invocation before allowing it.
+An executable response binds the request digest, invocation, current attempt,
+decision ID, policy revision and validity window. Denial, missing or malformed
+responses, redirects, expired decisions, binding mismatches and unavailability
+MUST block the executor. Limits are 64 KiB per request, 8 KiB per response,
+10 seconds per HTTP request and 20 seconds total for credential acquisition and
+authorization. Permission lifetime is at most 30 seconds, with at least
+2 seconds remaining when released to the executor. Deadlines use monotonic
+elapsed time and validated UTC timestamps. These limits govern starting an
+invocation, not its execution duration.
+
+Consuming requests MUST NOT be automatically retried after transmission. A lost
+response blocks execution even if the authority recorded the claim. Logical
+identity distinguishes separate identical-input records but survives redispatch
+of the same batch. Reruns MUST reconcile unresolved prior execution; a changed
+attempt alone is not permission to repeat an uncertain effect. Existing
+operation-specific safe retry and reconciliation rules remain applicable.
+
+**Evidence:** Authorization state is separate from execution outcome:
+`not_configured`, `exempt_builtin`, `skipped_staged`, `allowed`, `denied`, `error`
+or `not_requested`. Evidence records minimized output and executor identity,
+binding level, requirement source, request digest, decision ID, policy revision,
+timestamps and fixed reason codes. `allowed` means permission to start, not
+successful completion or verified downstream effect. Minimal decision evidence
+MUST be persisted before execution; persistence failure blocks the invocation.
+Post-effect audit failures MUST preserve confirmed, partial or indeterminate
+outcomes and MUST NOT trigger operation replay. Denial blocks dependents without
+preventing independent diagnostics or rolling back completed effects.
+
+This client-side mechanism protects participating trusted workflows. It does not
+provide a production authority, approval UI, credential brokerage or mandatory
+organization-wide enforcement. Protect workflow configuration, runtime pins and
+credentials separately. A workflow author with independent broad credentials can
+bypass a client gate. Final target readback reduces but cannot eliminate races;
+stronger atomicity and revocation require target-side enforcement. Authorization
+of a reusable-workflow launch covers only that launch, not its downstream writes.
 
 ### 5.3 Type-Specific Common Parameters
 
@@ -1803,6 +2068,8 @@ create-issue:
   target-repo: owner/repo        # Cross-repository target
   allowed-repos: [owner/repo1]   # Cross-repo allowlist
   allowed-labels: [bug, feature] # Agent label restrictions
+  max-issue-artifacts: 3         # Per-issue attachments (default: 10; <=0 disables)
+  max-issue-artifact-size: 1mb    # Per-artifact UTF-8 body size (default: 1 MB)
 ```
 
 **Comment Extensions**:
@@ -1833,10 +2100,13 @@ submit-pull-request-review:
 
 **Pull Request Extensions**:
 
+Imported safe-output configuration participates in effective configuration resolution. For `create-pull-request`, imported `expires` and `draft` values apply only when the local handler omits those fields. A local handler value MUST take precedence over the imported value. These workflow-level defaults do not change the handler defaults documented below.
+
 ```yaml
 create-pull-request:
   base-branch: main              # Target branch (default: repo default)
-  draft: true                    # Create as draft (default: true)
+  expires: 2d                    # Expiration for the created pull request
+  draft: true                    # Create as draft (handler default: true)
   commit-changes: true           # Auto-commit workspace changes
   reviewers: [user1, copilot]    # Auto-request reviewers
   labels: [automated]            # Auto-apply labels
@@ -2404,6 +2674,10 @@ Test Case 4: Mention Filtering
 
 This section provides complete normative definitions for all safe output types. Each definition includes tool schema, operational semantics, configuration parameters, and security requirements.
 
+:::caution[Experimental]
+Issue-intent metadata (`rationale`, `confidence`, `suggest`) and the per-type `issue-intent` configuration toggle are experimental and disabled by default. Set `issue-intent: true` on a supported safe output to opt in; the compiler emits an experimental-feature warning. Their schema and runtime behavior may change without notice.
+:::
+
 ### 7.0 Schema and Agent Sync Requirements
 
 When a safe-output MCP tool schema changes (new required field, removed field, renamed field, or semantic contract change), the same pull request **MUST** update:
@@ -2488,6 +2762,18 @@ If an optional advisory or enrichment field is declared with `x-strip-on-error: 
 
 Fields used for privileged transport metadata, including patch anchoring and upload asset file metadata, MUST be derived by trusted workflow steps or privileged processors rather than accepted from agent-controlled NDJSON.
 
+### 7.0.4 Dependency and Batch Processing Semantics
+
+**Requirement DSB1 (Eligible Review Prerequisites):** Implementations MUST permit `submit_pull_request_review` and `create_pull_request_review_comment` outputs to serve as `depends-on` prerequisites.
+
+**Requirement DSB2 (Review Buffer Drain):** Implementations MUST drain and finalize the applicable buffered review batch before releasing outputs that depend on it, except for the review submission that publishes its own buffered comments.
+
+**Requirement DSB3 (Publication-Based Success):** Buffering MUST NOT establish prerequisite success; success requires confirmed publication. A review submission MAY include its own buffered comment prerequisites in the same publication, but MUST NOT treat them as published before that publication succeeds. Failed, skipped, staged, queued, or otherwise unconfirmed outputs MUST NOT establish prerequisite success. Unsupported or delegated outputs, including custom jobs and standalone steps, MUST NOT establish prerequisite success.
+
+**Requirement DSB4 (Deferred-Dependent Retry):** Newly eligible deferred dependents MUST be retried without replaying completed handlers. Implementations MUST finalize newly buffered batches, including batches created by in-place retries, before releasing their dependents. Retries MUST be bounded and contingent on resolution progress; unresolved prerequisites MUST fail closed.
+
+**Requirement DSB5 (Single Explicit Review Submission):** Implementations MUST preserve at most one explicit `submit_pull_request_review` per pull request per run across drained batches.
+
 ### 7.1 Core Issue Operations
 
 #### Type: create_issue
@@ -2511,6 +2797,25 @@ Fields used for privileged transport metadata, including patch anchoring and upl
       "title": {"type": "string", "description": "Issue title"},
       "body": {"type": "string", "description": "Issue description in Markdown"},
       "labels": {"type": ["array", "string"], "items": {"type": "string"}},
+      "artifacts": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["name"],
+          "oneOf": [{"required": ["body"]}, {"required": ["path"]}],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["generic", "link", "plan", "embedded_html"],
+              "default": "generic"
+            },
+            "name": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+            "body": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+            "path": {"type": "string", "minLength": 1, "pattern": "^/", "description": "Absolute literal path to a UTF-8 text file within the workspace or /tmp/gh-aw/agent, excluding sensitive publication sources; the MCP backend reads its content into body"}
+          },
+          "additionalProperties": false
+        }
+      },
       "fields": {
         "type": "array",
         "items": {
@@ -2543,8 +2848,8 @@ Fields used for privileged transport metadata, including patch anchoring and upl
 
 **Operational Semantics**:
 
-1. **Atomicity**: Validation failure prevents issue creation. Dependency attachment after creation is best-effort and MUST NOT report the created issue as uncreated.
-2. **Temporary ID Resolution**: References to `#aw_<id>` in bodies replaced with actual numbers post-creation.
+1. **Atomicity**: Pre-creation validation failure prevents issue creation. Dependency attachment after creation is best-effort and MUST NOT report the created issue as uncreated. Issue artifact failures after creation MUST retain the created issue's identity as specified below.
+2. **Temporary ID Resolution**: References to temporary IDs in issue bodies MUST be recognized in ordinary Markdown form and in Markdown-escaped or partially escaped forms, including `#aw_track1`, `\#aw_track1`, `#aw\_track1`, and `\#aw\_track1`. Implementations MUST remove only backslash escapes immediately preceding `#` or `_` for lookup and replacement, then replace resolved references with the actual resource numbers. Unresolved references and malformed identifiers MUST remain unchanged. Implementations MUST require a complete valid identifier and MUST NOT replace a valid prefix within a longer or malformed identifier.
 3. **Parent Linking**: When `parent` specified, tasklist entry added to parent issue.
 4. **Label Validation**: Labels must exist in repository; non-existent labels cause failure.
 5. **Issue Field Validation**: Field names/values must match configured repository issue fields; invalid values return actionable errors.
@@ -2553,10 +2858,13 @@ Fields used for privileged transport metadata, including patch anchoring and upl
 8. **Blocked-By Resolution**: `blocked_by` accepts a single reference or an array. Numeric references (optionally prefixed with `#`) use the new issue's repository; qualified references, GitHub issue URLs, and temporary IDs retain the referenced repository. Duplicate references are removed using a case-folded repository/number key; this deduplication MUST NOT change case-sensitive authorization. Unresolved temporary IDs defer creation, except in staged mode where they are preview-only.
 9. **Blocked-By Authorization**: All resolved blocker repositories MUST pass the handler repository policy before per-item mention lookups, issue creation, blocker reads, or dependency mutation. A disallowed blocker MUST reject the entire item without creating an issue or attaching any dependencies, including when mixed with permitted blockers.
 10. **Blocked-By Attachment**: After issue creation, the handler reads each authorized blocker to obtain its issue ID and uses GitHub's native blocked-by dependency API on the newly created issue. Attachment failures MUST produce warnings and `blocked_by_errors` while retaining the successful creation result.
+11. **Issue Artifacts**: Optional artifact requests MUST follow the schema, limits, sanitization, and partial-failure requirements below. They are distinct from blocked-by dependencies and GitHub Actions artifacts.
 
 **Configuration Parameters**:
 
 - `max`: Operation limit (default: 1)
+- `max-issue-artifacts`: Integer attachment limit per issue (default: 10); non-positive values disable attachments
+- `max-issue-artifact-size`: Positive integer bytes or human-friendly size per artifact body (default: `1mb`, 1048576 UTF-8 bytes)
 - `title-prefix`: Prepend to titles
 - `labels`: Auto-apply labels
 - `assignees`: Auto-assign users/agents
@@ -2591,6 +2899,38 @@ Fields used for privileged transport metadata, including patch anchoring and upl
 
 - Both permission modes require the same write scopes
 - GitHub App permissions provide access but MUST NOT bypass the handler repository policy
+
+##### Issue Artifact Requirements
+
+1. **Input contract**: MCP `artifacts` MUST be an array of objects containing only `type`, `name`, `body`, and `path`. Each item MUST provide a non-empty name and exactly one of inline `body` or a non-empty absolute `path`. Inline bodies and loaded file content MUST be non-empty strings after trimming. Omitted `type` MUST normalize to `generic`; the other accepted formats are `plan`, `link`, and `embedded_html`. A `link` body contains a URL; an `embedded_html` body contains HTML source, not a binary upload. Recorded requests and the privileged `createIssue` helper MUST accept body-only artifacts.
+2. **Count limit**: The compiler MUST emit `max_issue_artifacts` as an integer. The handler MUST reject arrays exceeding the configured per-issue limit before issue creation, including in staged mode. Zero or negative counts MUST disable attachments without disabling requests that omit artifacts or provide an empty array. The misspelled triple-s option MUST NOT be accepted as an alias.
+3. **Body-size limit**: The compiler MUST normalize `max-issue-artifact-size` to integer bytes in `max_issue_artifact_size`. Human-friendly units `B`, `K`/`KB`/`KiB`, `M`/`MB`/`MiB`, `G`/`GB`/`GiB`, and `T`/`TB`/`TiB` MUST be case-insensitive and use multiples of 1024. Decimal quantities and whitespace around the quantity or unit MAY be used, but the result MUST be a positive whole-byte count within native-integer and JavaScript-safe-integer bounds.
+4. **Content processing**: The handler MUST measure each body independently in UTF-8 bytes, not characters or combined upload size. Raw bodies and sanitized bodies with known temporary references resolved MUST fit before issue creation. The handler MUST sanitize artifact names and content and reject oversized content rather than silently truncate it. HTML artifacts MUST use the existing safe-output tag and attribute sanitizers across their entire content, preserving supported tags and converting unsupported tags to visible text. Their URL protocol and domain filtering MUST use `allowed-only` semantics regardless of workflow URL policy or backtick regions in HTML. It MUST check the final body again before attachment, including expansion of the new issue's temporary ID.
+5. **Publication**: The handler MUST attach artifacts after issue creation with `POST /repos/{owner}/{repo}/issues/{issue_number}/artifacts`, API version `2026-03-10`, and the same authenticated client and authorized repository used for the issue. Artifact input MUST NOT be forwarded to the issue-creation endpoint. Artifact requests MUST bypass same-day comment grouping without bypassing issue deduplication. `issues: write` is sufficient; attachment MUST NOT introduce a separate credential.
+6. **Preview and failure**: Staged mode MUST preview normalized artifacts without API writes. A post-creation attachment or final-size failure MUST retain the artifact error while continuing normal issue assignment and parent linking before reporting the existing issue's number and URL and the number of artifacts successfully attached. It MUST NOT delete the issue, recreate it, or imply that issue creation did not occur. Applied artifact metadata MUST contain a positive safe-integer `number` and a string `url` or `undefined`; malformed API metadata MUST fail explicitly.
+7. **Custom jobs and types**: The custom-job `createIssue` helper MUST use its fixed defaults of 10 artifacts and 1048576 bytes per body, not inherit built-in frontmatter limits. Custom jobs remain responsible for sanitizing content and authorizing destinations. Shared types MUST distinguish path-capable MCP `IssueArtifactInput`, body-only `IssueArtifactBodyInput` for recorded requests and the privileged helper, normalized `IssueArtifact` with required format, and `CreatedIssueArtifact` metadata. The helper's `staged` result discriminator MUST distinguish preview requests from created resources.
+
+##### Files and Paths
+
+An issue artifact is a content record. The unprivileged safeoutputs MCP backend MUST support `artifacts[].path` and read the file into `body` before appending a request or changing issue deduplication state. It MUST validate artifact count and all input shapes before reading any file. Reads MUST resolve literal absolute paths within the workspace or `/tmp/gh-aw/agent`, reject symbolic links (including directory links), hard links, and non-regular files, and use bounded, descriptor-verified snapshots on the Linux workflow runtime. The shared file-upload source denylist MUST reject any `.git` path component, system directories, and HOME credential/config subtrees before reading, including when those locations overlap an allowed root. General temporary runtime files MUST NOT be accepted. Other platforms MUST fail closed. Raw bytes MUST fit `max-issue-artifact-size`; decoding MUST reject invalid UTF-8 and empty content. A failure MUST record no issue request.
+
+The backend MUST replace `path` with the complete file `body` in the recorded request and MUST NOT echo file content in its tool response. The privileged issue processor MUST NOT open agent-supplied paths and MUST reject unresolved `path` properties. The agent does not need to load the file, separately upload it, or declare custom-job artifact transport. A pathname supplied as `body` MUST remain text; no shell variables or globs are expanded.
+
+Example MCP arguments after the agent writes the file:
+
+```json
+{
+  "title": "Implement parser caching",
+  "body": "The implementation plan is attached.",
+  "artifacts": [
+    {"type": "plan", "name": "Implementation plan", "path": "/tmp/gh-aw/agent/issue-plan.md"}
+  ]
+}
+```
+
+A trusted custom safe-output job MAY instead read a fixed declared file from its downloaded agent artifact and pass sanitized content to the body-only `createIssue` helper. Such custom-job source files MUST use the existing declared, redacted file transport and be addressed relative to the download root. See [attaching a text file from a custom job](/gh-aw/reference/custom-safe-outputs/#attaching-a-text-file-as-an-issue-artifact).
+
+For binary files or downloadable originals, use a path-based file-upload operation instead. `upload_artifact` creates a run-scoped GitHub Actions artifact with configured retention and access controls; `upload_asset` publishes a persistent repository-branch asset. A published URL MAY be referenced in an issue body or a `link` issue artifact, but an upload operation and an issue artifact remain separate resources.
 
 ---
 
@@ -2650,7 +2990,7 @@ These extensions apply to safe-output processor messages for `add_comment` (incl
 5. When an agent supplies `comment_id`, implementations MUST reject the operation unless `safe-outputs.add-comment.allows-comment-ids` is configured and contains that exact positive integer ID. The allowlist is trusted workflow state and MAY be computed by earlier workflow steps.
 6. Agent-supplied `comment_id` MUST NOT be honored for discussion comments and MUST NOT be treated as a substitute for the trusted status comment ID used by `target: "status"`.
 7. When updating an existing comment through either controlled reuse path, implementations SHOULD skip hide-older-comments behavior for that operation.
-8. With `replace-older-comments: true`, implementations MUST update the newest issue/PR comment on the target item authored by the authenticated workflow identity whose `gh-aw-workflow-call-id` marker matches the current caller workflow, or create a new comment if none matches. If the authenticated identity cannot be resolved, only bot-authored comments are eligible. When no caller ID is available, implementations MAY use the workflow ID marker instead. The replacement MUST include the newly generated body, footer, and markers; staged mode MUST NOT perform the lookup or update. Explicit trusted comment reuse takes precedence.
+8. With `replace-older-comments: true`, implementations MUST update the newest issue/PR comment on the target item authored by the authenticated workflow identity whose `gh-aw-workflow-call-id` marker matches the current caller workflow, or create a new comment if none matches. Author eligibility and unavailable-identity bot fallback MUST follow [GP5d](#gp5d-authenticated-author-and-bot-validation). When no caller ID is available, implementations MAY use the workflow ID marker instead. The replacement MUST include the newly generated body, footer, and markers; staged mode MUST NOT perform the lookup or update. Explicit trusted comment reuse takes precedence.
 
 **Enforced Constraints**:
 
@@ -2797,6 +3137,7 @@ safe-outputs:
 13. **Signed Commit Delivery**: Branch delivery MUST satisfy the [signed commit delivery requirements](#signed-commit-delivery-requirements), shared with `push_to_pull_request_branch`.
 14. **Transport Integrity**: Patch/bundle application and publication MUST satisfy the shared [transport integrity requirements](#patch-and-bundle-transport-integrity-requirements).
 15. **Bundle Git Operations**: Bundle inspection and prerequisite recovery MUST satisfy [BGO-001–003 and BGO-008](#bundle-git-operations-and-validation-baselines). Optional unsigned push baselines (BGO-004–007) apply only to `push_to_pull_request_branch`.
+16. **Review-First Merge Gate**: Auto-merge MUST satisfy [WTD4](#105-warn-mode-threat-detection-failure-policy) for both detection caution and protected-files `request-review` requirements, regardless of whether `REQUEST_CHANGES` succeeds. A failed required `REQUEST_CHANGES` review, including rejection because the authenticated bot authored the pull request, MUST leave auto-merge disabled and emit guidance requiring an independent reviewer. Implementations MUST NOT downgrade the only blocking review to `COMMENT` and continue into auto-merge.
 
 **Configuration Parameters**:
 
@@ -2808,6 +3149,7 @@ safe-outputs:
 - `allowed-branches`: Allowed source branch patterns for `branch` tool input
 - `allowed-base-branches`: Allowed base-branch override patterns for per-run `base` tool input
 - `draft`: Draft status
+- `auto-merge`: `false` (default), `true` (squash), or `squash`, `merge`, `rebase`. Detection caution, protected-files `request-review`, or a failed required `REQUEST_CHANGES` review overrides enablement; see WTD4.
 - `commit-changes`: Auto-commit workspace
 - `reviewers`: Auto-request reviewers
 - `labels`: Auto-apply labels
@@ -3062,7 +3404,7 @@ Paths in this table are under `actions/setup/js/`. The bounded [Git-operation mo
 
 ### 7.2 System Types
 
-System types are always available in every workflow. The types `noop`, `report-missing-tool`, and `report-missing-data` are unconditionally enabled, while `create-issue` is conditionally auto-injected when no other safe output types are explicitly configured (see Section 4.3 for auto-injection rules).
+System types are always available in every workflow. The types `noop`, `report-missing-tool`, `report-missing-data`, and `report-incomplete` are unconditionally enabled, while `create-issue` is conditionally auto-injected when no other safe output types are explicitly configured (see Section 4.3 for auto-injection rules). `noop` records completion when the agent has completed its assigned task without requiring another safe-output action. `report-incomplete` is reserved for cases in which the agent cannot complete or publish its assigned task because of a tool, authentication, permission, safe-output, essential-input/data, timeout, or other external blocker.
 
 #### Type: noop
 
@@ -3094,6 +3436,62 @@ System types are always available in every workflow. The types `noop`, `report-m
 2. **Execution Order**: Always executes last for summary generation.
 3. **No Side Effects**: Creates no GitHub resources.
 4. **Transparency**: Provides clear indication of normal completion vs. error states.
+
+**Invocation Decision Skips**:
+
+For a top-level `skip-if-decision` aggregate of `deny`, the harness inside AWF
+MUST suppress the otherwise eligible proposed agent invocation without counting
+it as an executed attempt or retry. When safe-output recording is configured
+and no terminal output exists, it MUST attempt to append a `noop` describing
+the skipped invocation. It MUST NOT append a duplicate no-op when a terminal
+output already exists, discard earlier task outputs, or remove incomplete
+diagnostics. An append failure MUST be diagnosed without changing the advisory
+decision into an agent invocation or independently failing the workflow.
+
+An `allow`, all `unknown`, or an absent/empty question list MUST preserve the
+deterministic execution path. API errors, timeouts, malformed responses, and
+unavailable file evidence MUST NOT independently generate `noop` or
+`report_incomplete`, trigger a decision retry, or suppress invocation.
+Previously recorded failures and normal threat-detection and publication
+policies MUST remain effective regardless of the decision recommendation.
+
+`skip-if-decision` is experimental; nonempty lists emit a compiler warning,
+and configuration and behavior may change without deprecation.
+
+File imports MUST remain confined to the workspace or `/tmp/gh-aw/agent` and
+use remaining byte budgets that include evidence metadata and escaping.
+The complete serialized Decisions request MUST NOT exceed 400,000 UTF-8 bytes,
+approximately 100,000 tokens at four bytes per token, not an exact token count.
+Questions that exceed the remaining budget MUST abstain without transmission.
+
+Before transmitting a question or its fresh, confined, size-limited `@file`
+evidence, the evaluator MUST screen for configured secret values and common
+credential patterns, including private keys, GitHub/AWS credentials, bearer
+tokens, and sensitive key/value assignments. A match MUST withhold the entire
+question and its evidence, record `unknown` with `sensitive_content_blocked`,
+and preserve batching of other safe questions. If all questions are withheld,
+neither proxy reflection nor a Decisions request is made. Question text,
+reference names, and matched values MUST NOT appear in decision telemetry.
+
+File evidence is supplied as JSON-escaped records containing a reference name,
+byte count, and contents, preceded by a data-only directive outside the record.
+Escaping prevents file text from structurally closing the record, but model
+instructions are not a deterministic prompt-injection boundary: semantic
+injection can still influence advisory decisions. Secret screening is also
+heuristic; unknown or encoded secrets can evade detection, and benign examples
+or sensitive-looking assignments can be withheld. These controls do not prove
+that arbitrary files are safe to transmit or authorize publishing their data.
+
+Decision outcomes, sanitized errors, latency, and avoided invocations MUST be
+recorded separately as `harness.decision` unified-session evidence and audit
+decision history. A decision-generated no-op is not a publication
+authorization, independent proof of completed work, or proof of zero model
+usage; decision requests remain subject to normal proxy usage accounting.
+
+Regression evidence: `actions/setup/js/skip_if_decision.test.cjs`,
+`harness_retry_runner.test.cjs`, and `shell_harness.test.cjs` cover abstention,
+denied invocations, and no-op preservation; `unified_session.test.cjs` and
+`pkg/cli/audit_decision_test.go` cover separate decision accounting.
 
 **Configuration Parameters**:
 
@@ -3136,6 +3534,10 @@ This section provides complete definitions for all remaining safe output types. 
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
 
+**MCP Tool Schema**:
+
+None. `comment_memory` MUST NOT be exposed as an agent-callable MCP tool when file-based comment-memory synchronization is active; see **Tool Exposure Model** and **Logical Operation Schema** below for the processor-side operation shape.
+
 **Tool Exposure Model**:
 
 - `comment_memory` is a safe output processor type.
@@ -3158,7 +3560,7 @@ This section provides complete definitions for all remaining safe output types. 
 2. **Setup Extraction**: Pre-agent setup extracts marker content from GitHub comments into `/tmp/gh-aw/comment-memory/<memory_id>.md`.
 3. **File-Based Editing**: Agent updates memory by editing files only; no direct `comment_memory` tool call is required.
 4. **Automatic Sync**: Processor reads `*.md` files and upserts corresponding managed comments after agent execution.
-5. **Temporary ID Rewrite**: If temporary IDs (workflow-run-scoped placeholders prefixed with `aw_`, such as `aw_abc123`) are resolved during processing, comment-memory content MUST be rewritten using the resolved IDs before final upsert.
+5. **Temporary ID Rewrite**: If temporary IDs are resolved during processing, comment-memory content MUST recognize ordinary and Markdown-escaped or partially escaped references, remove only escapes immediately preceding `#` or `_` for lookup and output, and rewrite resolved references before final upsert. Unresolved references, malformed identifiers, and unrelated backslash escapes MUST remain unchanged; valid prefixes MUST NOT be rewritten.
 6. **Precedence Rule**: If both an explicit `comment_memory` operation and a file-backed entry exist for the same `memory_id`, the explicit operation takes precedence.
 
 **Configuration Parameters**:
@@ -3175,6 +3577,8 @@ This section provides complete definitions for all remaining safe output types. 
 
 - `memory_id` MUST be validated as `[A-Za-z0-9_-]+` with path traversal patterns rejected.
 - Managed comment scan MUST be bounded by a maximum page limit.
+- Privileged upsert selection MUST require a matching memory marker, a framework provenance marker outside editable memory, and an eligible author under [GP5d](#gp5d-authenticated-author-and-bot-validation). If no eligible comment exists, the handler MUST create a new managed comment without updating or importing History from an ineligible candidate.
+- Framework history/provenance discovery MUST exclude tagged fenced memory and legacy XML memory payloads. Imported history links MUST match the execution server and repository's Actions run URL prefix with a positive numeric run ID; labels MUST be rebuilt from validated run IDs rather than copied from comment text.
 - Materialized comment-memory files MUST enforce a per-file cap of 16 KiB and an aggregate cap of 48 KiB during setup.
 - Body content MUST undergo sanitization and comment size/mention/link limit validation before upsert.
 - Cross-repository targets MUST be validated against `allowed-repos`.
@@ -3195,7 +3599,7 @@ This section provides complete definitions for all remaining safe output types. 
 
 #### Type: update_issue
 
-**Purpose**: Modify existing issue properties (title, body, state, labels, assignees, milestone).
+**Purpose**: Modify existing issue properties (title, body, state, labels, assignees, milestone) or upsert issue artifacts.
 
 **Default Max**: 1  
 **Cross-Repository Support**: Yes  
@@ -3217,11 +3621,27 @@ This section provides complete definitions for all remaining safe output types. 
       "operation": {
         "type": "string",
         "enum": ["replace", "append", "prepend", "replace-island"],
-        "description": "Body update mode (default: append)"
+        "description": "Body update mode (defaults to the workflow-configured operation, or append)"
       },
       "labels": {"type": "array", "items": {"type": "string"}, "description": "Replacement label list"},
       "assignees": {"type": "array", "items": {"type": "string"}, "description": "Replacement assignee list"},
-      "milestone": {"type": ["number", "string"], "description": "Milestone number (null to clear)"}
+      "milestone": {"type": ["number", "string"], "description": "Milestone number (null to clear)"},
+      "artifacts": {
+        "type": "array",
+        "description": "Create or update artifacts by exact sanitized name",
+        "items": {
+          "type": "object",
+          "required": ["name"],
+          "oneOf": [{"required": ["body"]}, {"required": ["path"]}],
+          "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "type": {"type": "string", "enum": ["generic", "link", "plan", "embedded_html"], "default": "generic"},
+            "body": {"type": "string", "minLength": 1},
+            "path": {"type": "string", "minLength": 1, "pattern": "^/"}
+          },
+          "additionalProperties": false
+        }
+      }
     },
     "additionalProperties": false
   }
@@ -3231,10 +3651,24 @@ This section provides complete definitions for all remaining safe output types. 
 **Operational Semantics**:
 
 1. **Partial Updates**: Only fields explicitly provided are modified; omitted fields are unchanged.
-2. **Body Operation Modes**: `replace` overwrites the entire body; `append`/`prepend` add content with separator; `replace-island` updates a run-specific section.
+2. **Body Operation Modes**: The effective body operation MUST be selected in this order:
+   1. the agent-supplied `operation`, when present;
+   2. the workflow-configured `safe-outputs.update-issue.operation`, when present;
+   3. `append`, when neither value is present.
+
+   The permitted values are `replace`, `append`, `prepend`, and
+   `replace-island`. `replace` overwrites the entire body; `append` and
+   `prepend` add content with a separator; `replace-island` updates a
+   run-specific section. The selected operation applies only when body updates
+   are enabled and the request includes `body`. If body updates are disabled or
+   no body is supplied, the implementation MUST leave the existing body
+   unchanged and MUST NOT perform a body operation.
 3. **Label Validation**: Provided labels must exist in the repository; non-existent labels cause failure.
 4. **Assignee Resolution**: Assignees must have repository access; invalid usernames cause failure.
 5. **Cross-Repository**: When `target-repo` is configured, operates on that repository (must be in `allowed-repos`).
+6. **Artifact Inputs**: `artifacts` alone MUST be sufficient for an update. Artifact shape validation, unprivileged path resolution, sanitization, and pre- and post-sanitization byte limits MUST follow the `create_issue` artifact requirements. Artifact limits apply per call, not to the total artifacts already on the issue. Invalid input MUST fail before any issue or artifact writes.
+7. **Artifact Upserts**: The processor MUST list all artifact pages on the authorized target issue, using explicit page numbers until a short page is returned because this API does not provide Link headers. It MUST match exact, case-sensitive sanitized names, PATCH the lowest-numbered matching artifact to add a version, or POST for a new name. Names created earlier in the same call MUST participate in matching. PATCH MUST send only name and body; an existing artifact's type MUST NOT be changed. Type mismatches MUST fail before any artifact writes, preventing Markdown-sanitized content from entering an existing HTML artifact.
+8. **Artifact Failures**: Failed attachment or update MUST report failure with the target issue number, URL, and completed artifact count. Earlier writes MUST NOT be rolled back or cause the whole issue update to be retried. Staged mode MUST validate inputs without invoking artifact APIs.
 
 **Configuration Parameters**:
 
@@ -3242,7 +3676,12 @@ This section provides complete definitions for all remaining safe output types. 
 - `target`: `"triggering"` (default), `"*"`, or a fixed issue number
 - `target-repo`: Cross-repository target
 - `allowed-repos`: Cross-repo allowlist
+- `operation`: Default body update mode. MUST be one of `replace`, `append`,
+  `prepend`, or `replace-island`; invalid values MUST be rejected during
+  workflow configuration validation.
 - `staged`: Staged mode override
+
+Artifact limits use the same parsing and defaults as `create-issue`: `max-issue-artifacts` is an integer (default: 10; non-positive disables artifacts), and `max-issue-artifact-size` is positive integer bytes or a human-friendly size (default: `1mb`, 1048576 UTF-8 bytes). The compiler MUST emit `max_issue_artifacts` and normalized integer `max_issue_artifact_size`.
 
 **Security Requirements**:
 
@@ -3281,73 +3720,13 @@ This section provides complete definitions for all remaining safe output types. 
 
 ---
 
-#### Type: linear_create_issue
+#### Linear connector effects
 
-**Purpose**: Create an issue in one trusted Linear team using Linear's public GraphQL API.
-
-**Experimental**: Yes. Compiling a workflow with any Linear Safe Output emits: `Using experimental feature: Linear safe outputs`.
-
-**Configuration**:
-
-- `linear-token`: REQUIRED trusted secret expression containing a Linear personal API key
-- `linear-create-issue.team-id`: OPTIONAL Linear team model UUID, key, name, or GitHub Actions expression, falling back to `LINEAR_TEAM_ID`
-- `linear-create-issue.project-id`: OPTIONAL trusted Linear project URL identifier or model UUID, falling back to `LINEAR_PROJECT_ID`
-- `linear-create-issue.max`: Operation limit (default: 1)
-- `linear-create-issue.staged`: Staged mode override
-
-**MCP Tool**: `linear_create_issue`
-
-The MCP input object MUST require `title` and `body`, MUST reject additional properties, and MUST limit them to 128 and 65,000 characters respectively. The body MUST contain at least 20 characters. The trusted team identifier, optional project identifier, and credential MUST NOT be MCP inputs. Team UUIDs MUST be passed directly to `issueCreate`; other identifiers MUST be resolved case-insensitively against available team keys, then names, before issue creation.
-
-**Operational Semantics**:
-
-1. The processor MUST POST to the fixed `https://api.linear.app/graphql` endpoint using `Content-Type: application/json` and the API key as the raw `Authorization` header value.
-2. The implementation-defined `issueCreate(input: IssueCreateInput!)` document MUST use GraphQL variables for `teamId`, `title`, and `description`.
-3. `title` and `body` MUST undergo standard Safe Outputs title and content sanitization before `body` is mapped to Linear's `description`.
-4. The processor MUST fail on HTTP errors, malformed JSON, a non-empty top-level GraphQL `errors` array, `success: false`, or a missing issue object.
-5. Staged mode MUST validate and sanitize the request but MUST NOT perform a network mutation.
-
-The configured team ID MUST be a canonical UUID. Input exceeding a configured limit MUST be rejected, not silently truncated.
-
-#### Type: linear_add_comment
-
-**Purpose**: Add a comment to one trusted Linear issue.
-
-**Experimental**: Yes.
-
-**Configuration**:
-
-- `linear-token`: REQUIRED trusted secret expression containing a Linear personal API key
-- `linear-add-comment.target`: REQUIRED fixed issue UUID or shorthand identifier such as `ENG-123`
-- `linear-add-comment.max`: Operation limit (default: 1)
-- `linear-add-comment.staged`: Staged mode override
-
-**MCP Tool**: `linear_add_comment`
-
-The MCP input object MUST require only `body`, MUST reject additional properties, and MUST limit the body to 65,000 characters. The target and credential MUST NOT be MCP inputs.
-
-The processor MUST use the fixed `commentCreate(input: CommentCreateInput!)` GraphQL document and pass the configured target as `issueId` through variables. The body MUST undergo standard Safe Outputs content sanitization. HTTP, parsing, GraphQL, unsuccessful-payload, and staged-mode behavior MUST match `linear_create_issue`.
-
-#### Type: linear_update_issue
-
-**Purpose**: Replace explicitly enabled basic fields on one trusted Linear issue.
-
-**Experimental**: Yes.
-
-**Configuration**:
-
-- `linear-token`: REQUIRED trusted secret expression containing a Linear personal API key
-- `linear-update-issue.target`: REQUIRED fixed issue UUID or shorthand identifier such as `ENG-123`
-- `linear-update-issue.title`: Set to `true` to enable title replacement
-- `linear-update-issue.body`: Set to `true` to enable description replacement
-- `linear-update-issue.max`: Operation limit (default: 1)
-- `linear-update-issue.staged`: Staged mode override
-
-At least one of `title` or `body` MUST be enabled. The MCP tool name is `linear_update_issue`; its schema MUST expose only enabled fields, require at least one exposed field, reject additional properties, and apply the same field limits and sanitization as `linear_create_issue`. The target and credential MUST NOT be MCP inputs.
-
-The processor MUST use the fixed `issueUpdate(id: String!, input: IssueUpdateInput!)` GraphQL document. The configured target and update values MUST be GraphQL variables. `body` maps to Linear's `description`. Omitted fields MUST remain unchanged. HTTP, parsing, GraphQL, unsuccessful-payload, and staged-mode behavior MUST match `linear_create_issue`.
-
-For all Linear types, GraphQL source, endpoint, protocol, and host are implementation-defined and MUST NOT be agent-controlled. Linear API keys and GitHub App installation tokens are separate credentials for separate services. Enabling only Linear handlers MUST NOT request GitHub API write permissions or mint GitHub App tokens. Linear credentials MUST exist only in the trusted execution path and MUST NOT appear in handler configuration visible to the agent.
+The former `linear_create_issue`, `linear_add_comment`, and
+`linear_update_issue` handlers are removed. Linear operations are declarations
+in an imported, editable Markdown connector and run through the shared
+connector runtime. See [Connectors](/gh-aw/reference/connectors/#linear) for the
+authoritative credential, resource, typed-input, staging, and migration contract.
 
 ---
 
@@ -3756,6 +4135,58 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
 
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "update_pull_request",
+  "description": "Update an existing GitHub pull request's title or body, or update its branch. At least one of title, body, or update_branch=true is required.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "title": {"type": "string", "description": "New pull request title (always replaced)"},
+      "body": {"type": "string", "maxLength": 65536, "description": "Pull request body in Markdown"},
+      "operation": {"type": "string", "enum": ["replace", "append", "prepend", "replace-island"], "description": "How to apply body (default: replace)"},
+      "update_branch": {"type": "boolean", "description": "Update the PR branch with the latest base branch changes; only true is meaningful"},
+      "draft": {"type": "boolean", "description": "Draft state of the pull request"},
+      "pull_request_number": {"type": ["number", "string"], "description": "Canonical target pull request number"},
+      "pr_number": {"type": ["number", "string"], "description": "Alias for pull_request_number"},
+      "pr": {"type": ["number", "string"], "description": "Alias for pull_request_number"}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+**Operational Semantics**:
+
+1. **Required Change**: The MCP server MUST reject (error code -32602) an operation that provides none of a non-empty `title`, a `body`, or `update_branch: true`. `update_branch: false` is equivalent to omission.
+2. **Target Resolution**: The target pull request is resolved from `target` configuration (`"triggering"` by default, `"*"`, or a fixed number). With `target: "*"`, requests MUST include one of `pull_request_number`, `pr_number`, or `pr`.
+3. **Body Operations**: `replace` (default) overwrites the body; `append` and `prepend` add content with a separator; `replace-island` replaces only the run-specific section. The processor reads the current body before applying any operation other than `replace`. `title` is always replaced.
+4. **Branch Update**: When `update_branch` is true (agent-supplied or configured), the processor updates the pull request branch with the latest base branch changes before applying other updates. If the endpoint reports that updating a stacked pull request branch is unsupported, the processor falls back to a stack sync unless `sync-stack: false`.
+5. **Field Gating**: `title: false` or `body: false` configuration disables updating that field.
+6. **Staged Mode**: In staged mode, the processor previews the update without calling the GitHub API.
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 1)
+- `target`: `"triggering"` (default), `"*"`, or a fixed pull request number
+- `target-repo`: Cross-repository target
+- `allowed-repos`: Cross-repo allowlist
+- `title`: Allow title updates (default: `true`)
+- `body`: Allow body updates (default: `true`)
+- `operation`: Default body operation (default: `replace`)
+- `update-branch`: Update the PR branch before other updates (default: `false`)
+- `sync-stack`: Allow the stacked-PR stack-sync fallback (default: `true`)
+- `required-labels`, `required-title-prefix`: Only update pull requests matching all required labels and the title prefix
+
+**Security Requirements**:
+
+- `title` and `body` undergo full sanitization and length limits (title 256 characters, body 65536 characters)
+- Target authorization is enforced at runtime; agent-supplied pull request numbers are ignored unless `target` is `"*"`
+- Required-label and title-prefix filters are evaluated against the live pull request before any mutation
+- Cross-repo validation against `allowed-repos`
+
 **Required Permissions**:
 
 *GitHub Actions Token*:
@@ -3783,12 +4214,41 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
 
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "close_pull_request",
+  "description": "Close a pull request WITHOUT merging, adding a closing comment.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["body"],
+    "properties": {
+      "body": {"type": "string", "maxLength": 65536, "description": "Closing comment explaining why the PR is closed"},
+      "pull_request_number": {"type": ["number", "string"], "description": "Pull request to close; required when target is \"*\""}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+**Operational Semantics**:
+
+1. **Target Resolution**: The target pull request is resolved from `target` configuration (see Target Authorization).
+2. **Filters**: The processor fetches the pull request and skips it when `required-labels` or `required-title-prefix` do not match.
+3. **Comment**: The processor posts the sanitized closing comment, using the agent `body` or the configured `comment` default. When `allow-body: false`, any agent `body` is discarded with a warning and the pull request is closed without a comment.
+4. **Close**: The processor sets the pull request state to `closed` without merging. An already-closed pull request still receives the comment and is reported as `alreadyClosed`.
+5. **Staged Mode**: In staged mode, the processor previews the close without mutating GitHub state.
+
 **Configuration Parameters**:
 
 - `max`: Operation limit (default: 10)
 - `target`: `"triggering"` (default), `"*"`, or a fixed pull request number
 - `target-repo`: Cross-repository target
 - `allowed-repos`: Cross-repo allowlist
+- `required-labels`, `required-title-prefix`: Only close pull requests matching all required labels and the title prefix
+- `comment`: Default closing comment when the agent supplies no `body`
+- `allow-body`: When `false`, discard agent-supplied `body` and close without a comment
 
 **Target Authorization**:
 
@@ -3801,6 +4261,14 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **CPR-004**: Only `target: "*"` MAY select a pull request from the agent-supplied `pull_request_number`.
 
 **CPR-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
+
+**Security Requirements**:
+
+- The closing comment undergoes full sanitization before posting
+- Target authorization (CPR-001 through CPR-005) is enforced at runtime before any mutation
+- Label and title-prefix filters are evaluated against the live pull request
+- Cross-repo validation against `allowed-repos`
+- The operation MUST NOT merge the pull request
 
 **Required Permissions**:
 
@@ -3943,6 +4411,13 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 7. **Revision Binding**: The merge API MUST receive the evaluated head SHA as `sha`. A mismatch MUST fail without retrying the merge; another request requires fresh evaluation.
 8. **Complete Review Evidence**: Missing PR/thread data, invalid review decisions, missing thread resolution flags, malformed pagination, repeated continuation cursors, or a head revision different from the evaluated SHA MUST block merging. Individual reviews MUST be evaluated even without an approver allowlist; any reviewer's latest effective `CHANGES_REQUESTED` review MUST block merging. A null aggregate review decision MUST NOT override an individual objection and is not affirmative approval.
 9. **Final Revalidation**: Before either execution or a staged preview, re-read PR policy fields, target branch policy, the open upstream PR, reviews, configured approvals, and required checks. Changed policy evidence or non-passing checks MUST block the operation. Only the head SHA is enforced atomically by GitHub; other mutable policy state retains a race window after these reads.
+10. **Independent-Review Caution Veto**: Current-run threat warnings or failures, or a missing successful conclusion when detection is required, MUST block merging. Live PR bodies and labels and every individual review body MUST be inspected for threat-detected, detector-engine-error, protected-files-review, and caution notices. Retained notices MUST block both execution and staged success, regardless of affirmative approval, passing checks, or whether a review is advisory, dismissed, or superseded. Missing or malformed relevant evidence MUST fail closed; an API body of `null` represents valid empty content. PR body and review caution evidence MUST be revalidated before execution. Flagged changes require independent review and the repository's normal manual merge process; removing a notice is not evidence that its underlying risk was resolved.
+11. **Protected Changed Files**: Unless trusted configuration sets `protected-files: allowed`, the handler MUST inspect the complete live changed-file list for the target PR, including deleted paths and both old and new rename paths. It MUST use the same protected set, engine-specific files, top-level dot-folder rules, default `CHANGELOG.md` exclusion, handler exclusions, and repository-wide exclusions as `create-pull-request`. Protected changes MUST block both execution and staged success, independently of notice markers or approvals. Missing, malformed, duplicate, or incomplete file evidence, or a changed-file count exceeding GitHub's 3000-file listing limit, MUST block merging. File protection MUST be checked again during final revalidation. Only the evaluated head SHA is atomically enforced; these reads do not eliminate the documented mutable-policy race.
+
+The notice-based veto is independent of live changed-file protection and is
+not an immutable history of removed metadata. Ordinary unmarked
+PRs retain the configured approval policy. Caution evidence MUST NOT add raw PR
+or review bodies to returned or persisted decision evidence.
 
 **Configuration Parameters**:
 
@@ -3951,14 +4426,33 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 - `required-labels`: Labels that must ALL be present on the pull request
 - `required-title-prefix`: Title prefix the pull request must start with
 - `allowed-branches`: Source branch glob patterns; the PR's branch must match at least one
+- `allowed-base-branches`: REQUIRED non-empty list of static destination branch patterns declared by the owner as non-consequential automated integration targets. Only `*` and `**` glob operators are supported. Expressions, negation, character classes, braces, extglobs, `?`, `+`, and backslash escapes MUST be rejected by the schema, compiler, and runtime. Patterns consisting only of `*` and `/`, such as `"*"`, `"**"`, `"*/*"`, and `"**/*"`, MUST be rejected. The live base branch MUST match at evaluation and final revalidation, including staged and cross-repository operations. Matching MUST be case-sensitive, with `*` restricted to one path segment and `**` spanning `/`. This policy MUST NOT override any other gate. Null/default-only merge configuration MUST be rejected; destination scope MUST NOT be inferred from `allowed-branches`.
 - `required-checks`: Exact check-run names, unioned with branch-policy requirements. Each MUST complete with `success` on the evaluated head SHA. Missing, pending, skipped, neutral, failed, or wrong-revision checks block merging. Missing app identities or multiple apps publishing the same required name also block merging; this does not authenticate an expected producer. The compiler rejects overlap with the workflow's resolved agent-controlled `create-check-run` name. Legacy commit-status contexts are not supported. An empty or omitted list adds no workflow-owned CI requirement; if the union is empty, CI is not queried.
 - `required-check-apps`: Optional map from names in `required-checks` to positive GitHub App IDs. For mapped names, every observed non-deployment check run MUST have the configured app ID, including during final revalidation. Unknown names and invalid IDs MUST fail compilation. App identity does not establish which workflow produced a check; CI workflow definitions still require independent protection.
 - `required-approvers`: Human GitHub logins (case-insensitive). When non-empty, at least one allowlisted human MUST have a current `APPROVED` review on the evaluated head SHA. Later decisive review state supersedes earlier approval by validated submission time, not review ID; invalid/missing timestamps or ambiguous same-reviewer ordering block merging. Dismissed approvals and active changes requested block merging. The PR author, bot accounts, and authenticated merge identity cannot authorize. Empty or omitted requires no affirmative approval.
+- `protected-files`: `blocked` (default) or `allowed`, a GitHub Actions expression, or an object with optional `policy` and `exclude`. Exclusions MUST use the same basename, directory-prefix, and rooted path-glob semantics as `create-pull-request`. Only an exact resolved `allowed` disables the changed-file gate; it MUST NOT override caution vetoes or other merge gates. Creation-specific review and issue fallback policies are unsupported.
 - `target-repo`: Cross-repository target
 - `allowed-repos`: Cross-repository allowlist
 - `staged`: Staged mode override
 
-**Decision Audit**: The handler manager MUST expose only summary-safe merge failure diagnostics and persist successful, blocked, and staged decisions in `merge-pull-request-decisions.jsonl`, uploaded with the safe-output items artifact. Records MUST retain the untrusted-data marker and redact known secrets. Persisted decision evidence MUST be limited to validated repository, pull request number, head/base revisions, evaluation/revalidation timestamps, and optional producer rejections containing fixed phase/code and positive safe-integer check-run and expected/observed app IDs. Early request rejections MUST include a fixed failure code and retain only valid attempted-target identity when known. Titles, labels, branches, check names, reviewer identities, approval details, raw API errors, and review bodies MUST NOT be persisted. Each record MUST be bounded to 64 KiB. Before uploading, standard tracked-secret redaction and any configured custom masking MUST succeed; tracked inputs are uppercase `secrets.NAME` references collected from preceding generated steps. Persistence failures MUST be surfaced separately and MUST NOT be reported as audit success. An already-completed merge MUST retain its successful operation outcome, merged revision, URL, and internal evidence even if auditing fails; an audit failure MUST NOT trigger a merge retry.
+**Security Requirements**:
+
+- Merge policy (labels, title prefix, branches, checks, approvers) MUST be workflow-owned configuration; the agent MUST NOT be able to supply or relax it through tool-call arguments.
+- The merge API call MUST be bound to the evaluated head SHA; a mismatch MUST fail without retrying the merge.
+- Review, thread, and check evidence MUST be complete and well-formed; missing or malformed evidence MUST block merging.
+- Any individual reviewer's latest effective `CHANGES_REQUESTED` review MUST block merging, regardless of the aggregate review decision.
+- The PR author, bot accounts, and the authenticated merge identity MUST NOT satisfy `required-approvers`.
+- Merges into protected branches or the repository default branch MUST be refused, and the base branch MUST have an associated open upstream pull request.
+- The base branch MUST match the mandatory `allowed-base-branches` policy independently of the source branch filter. Owners MUST assess downstream effects and protect the declaration from agent edits; a configured declaration does not prove harmless downstream effects or per-merge human approval.
+- Policy state MUST be revalidated immediately before execution or staged preview.
+- Target selection MUST follow MPR-001 through MPR-005, and cross-repository targets MUST be validated against `allowed-repos`.
+- Results and decision audit records MUST be treated as untrusted data and MUST NOT persist secrets or the fields excluded by the Decision Audit requirements.
+
+**Decision Audit**: The handler manager MUST expose only summary-safe merge failure diagnostics and persist successful, blocked, staged, and indeterminate decisions in `merge-pull-request-decisions.jsonl`, uploaded with the safe-output items artifact. Returned failures and thrown exceptions, including deferred processing, MUST use fixed processing error messages rather than raw handler/API errors. Records MUST retain the untrusted-data marker and redact known secrets. Persisted decision evidence MUST be limited to validated repository, pull request number, head/base revisions, evaluation/revalidation/reconciliation timestamps, bounded authorization evidence, and optional producer rejections containing fixed phase/code and positive safe-integer check-run and expected/observed app IDs. Early request rejections MUST include a fixed failure code and retain only valid attempted-target identity when known. Titles, labels, branches, check names, reviewer identities, approval details, raw API errors, and review bodies MUST NOT be persisted. Each record MUST be bounded to 64 KiB. Before uploading, standard tracked-secret redaction and any configured custom masking MUST succeed; tracked inputs are uppercase `secrets.NAME` references collected from preceding generated steps. Persistence failures MUST be surfaced separately and MUST NOT be reported as audit success. An already-completed merge MUST retain its successful operation outcome, merged revision, URL, and internal evidence even if auditing fails; an audit failure MUST NOT trigger a merge retry.
+
+**Authorization Evidence**: Evaluated decisions and early target rejections MUST include `decision_evidence.authorization` with `policy_version: 1`, a 64-character lowercase hexadecimal SHA-256 `policy_sha256`, and fixed `required_checks`, `independent_approval`, `protected_files`, and `final_revalidation` outcomes. Each outcome MUST be one of `passed`, `failed`, `not_required`, or `not_evaluated`. Optional CI and approval MUST NOT be represented as verified checks or human approval. The first three outcomes describe initial evaluation; `final_revalidation` MUST be `passed` only after all final policy checks pass. The fingerprint MUST cover resolved target/repository scope, merge budget, configured labels/title/source/destination filters, the effective required-check union when discovered, expected app IDs, approvers, protected-file rules/exclusions, and detection-required state. Fingerprinting MUST sort collections, lowercase approvers, and hash fixed-order JSON including the policy version; it MUST exclude credentials, staged mode, agent merge options, and PR content. The version MUST change with the fingerprint contract or implicit merge gates. The fingerprint is correlation evidence, not proof of authorization or policy integrity. Already-merged idempotent results MUST NOT claim fresh evaluation.
+
+**Uncertain Merge Outcomes**: HTTP 405, 409, and 422 rejections from the merge API MUST return `success: false`, `merged: false`, and the fixed `merge_not_completed` failure code without reconciliation or retry, and MUST NOT expose raw API errors. After any other merge exception (including timeouts and server errors) or a response without a boolean `merged`, the handler MUST NOT retry the mutation. It MUST attempt one read-only PR lookup. Only `merged: true`, the evaluated head SHA, and a valid merge revision together MAY establish reconciled success, marked `reconciled: true` without attributing the merge to this run. An unavailable, malformed, negative, or different-head read MUST leave the outcome indeterminate. The handler MUST return `success: false`, `merged: null`, `operation_outcome: "indeterminate"`, and the fixed `merge_outcome_indeterminate` failure code. `operation_outcome` is a shared safe-output marker, not a merge-specific field; serializers and unified sessions MUST preserve its allowlisted `indeterminate` value for any safe-output type. It describes uncertainty about side effects independently of processing status. Processing MUST fail to block dependent outputs without claiming that the mutation did not happen. Decision audits MUST preserve the null merge state and indeterminate marker; application-outcome records MUST retain the marker alongside failed processing status. Summaries MUST explain the uncertainty and direct operators to inspect the live PR before further action, without exposing raw transport or reconciliation errors.
 
 **Target Authorization**:
 
@@ -4012,12 +4506,41 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
 
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "mark_pull_request_as_ready_for_review",
+  "description": "Mark a draft pull request as ready for review and add an explanatory comment.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["reason"],
+    "properties": {
+      "reason": {"type": "string", "maxLength": 65536, "description": "Comment explaining why the PR is ready for review"},
+      "pull_request_number": {"type": ["number", "string"], "description": "Pull request to mark ready; defaults to the triggering pull request"}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+**Operational Semantics**:
+
+1. **Target Resolution**: The target pull request is resolved from `target` configuration (see Target Authorization).
+2. **Filters**: The processor skips the pull request when `required-labels` or `required-title-prefix` do not match.
+3. **Validation**: `reason` MUST be a non-empty string; otherwise the operation fails.
+4. **Idempotence**: If the pull request is not a draft, the processor MUST succeed without mutation and report `alreadyReady`.
+5. **Transition**: The processor marks the pull request ready with the GraphQL `markPullRequestReadyForReview` mutation (the REST API ignores `draft: false`) and fails if the pull request is still a draft afterwards.
+6. **Comment**: After the transition, the processor posts the sanitized `reason` as a comment with the workflow footer.
+7. **Staged Mode**: In staged mode, the processor previews the transition without mutating GitHub state.
+
 **Configuration Parameters**:
 
 - `max`: Operation limit (default: 1)
 - `target`: `"triggering"` (default), `"*"`, or a fixed pull request number
 - `target-repo`: Cross-repository target
 - `allowed-repos`: Cross-repo allowlist
+- `required-labels`, `required-title-prefix`: Only mark pull requests matching all required labels and the title prefix
 
 **Target Authorization**:
 
@@ -4030,6 +4553,13 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **MRR-004**: Only `target: "*"` MAY select a pull request from the agent-supplied `pull_request_number`.
 
 **MRR-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
+
+**Security Requirements**:
+
+- The `reason` comment undergoes full sanitization before posting
+- Target authorization (MRR-001 through MRR-005) is enforced at runtime before any mutation
+- Label and title-prefix filters are evaluated against the live pull request
+- Cross-repo validation against `allowed-repos`
 
 **Required Permissions**:
 
@@ -4051,6 +4581,47 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Default Max**: 1  
 **Cross-Repository Support**: Yes (restricted)  
 **Mandatory**: No
+
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "push_to_pull_request_branch",
+  "description": "Push committed changes to a pull request's branch. Append-only: force-push is not supported.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["message"],
+    "properties": {
+      "message": {"type": "string", "maxLength": 65536},
+      "branch": {"type": "string"},
+      "pull_request_number": {"type": ["number", "string"]},
+      "repo": {"type": "string"}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Required Message**: `message` is required on every call and is not read from git. Existing local commits keep their own commit messages.
+2. **Branch Selection**: `branch` names the local branch holding the commits. When omitted, the branch is inferred from the current git `HEAD`.
+3. **Target Resolution**: The target pull request is resolved from `target`, with `pull_request_number` and `repo` honored only where the target configuration permits.
+4. **Filter Evaluation**: When `title-prefix` or `required-labels` is configured, the target pull request MUST satisfy them before any push.
+5. **Append-Only Push**: Local commits are applied on top of the existing pull request head. Force-push and history rewriting MUST be rejected.
+6. **Size Limit**: A patch or bundle larger than `max-patch-size` (default 4096 KB) MUST fail the item.
+7. **No Changes**: When there is nothing to push, the outcome follows `if-no-changes` (`warn` by default, `error`, or `ignore`).
+8. **Staged Mode**: In staged mode the handler previews the push and performs no mutation.
+
+**Security Requirements**:
+
+- The privileged handler MUST NOT accept concurrency-control or head-pinning parameters from the agent; the pull request head is pinned by the handler.
+- Patch or bundle size MUST be validated against `max-patch-size` before it is applied.
+- A pull request title that does not start with the configured `title-prefix` MUST be rejected.
+- Cross-repository pushes MUST be restricted to repositories permitted by the configured target-repo settings.
+- Protected-file and signed-commit policies defined elsewhere in this specification apply to pushed changes.
 
 **Required Permissions**:
 
@@ -4083,10 +4654,14 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 - `head-github-token`: Optional credential for `head-repo` branch writes
 - `head-github-app`: Optional GitHub App configuration to mint an ephemeral credential for `head-repo` branch writes at runtime; takes precedence over `head-github-token` when both are specified
 - `allow-full-history-fetch`: Literal boolean, default `false`, independently scoped to this handler. Permits potentially unbounded bundle prerequisite recovery; does not enable downloads for optional validation baselines.
+- `check-branch-protection`: Literal boolean, default `true`; when `false`, skips the branch-protection pre-flight check but does not bypass GitHub's enforcement during push.
 
 **Notes**:
 
 - Requires `contents: write` for git push operations
+- The handler MUST reject the repository's default branch when identified, regardless of the value of `check-branch-protection`.
+- When branch metadata marks a branch as protected, the handler MUST inspect its active rules before considering an exception. When confirming classic branch protection, implementations MUST query the branch's GraphQL `Ref.refUpdateRule`, not the REST classic-protection endpoint that requires `Administration: read`.
+- An implementation MAY allow a non-default branch that is marked protected only when its metadata explicitly disables classic protection, its complete active-rule list contains only non-blocking types, and GraphQL `Ref.refUpdateRule` is explicitly `null`. Non-blocking types are `copilot_code_review`, `branch_name_pattern`, `commit_message_pattern`, `commit_author_email_pattern`, `committer_email_pattern`, `file_path_restriction`, `file_extension_restriction`, `max_file_path_length`, and `max_file_size`; `required_signatures` MAY also be treated as non-blocking only when signed commits are enabled. These rules remain enforced by GitHub during push. A missing field, incomplete or unknown active-rule data, or failed rules/GraphQL query MUST leave the push blocked. An object returned by `refUpdateRule` MUST NOT be treated as absence of classic protection.
 - Enforces maximum patch size limit (default: 10 KB, range: 1–100 KB)
 - Validates changes don't exceed size limits before pushing
 - The handler MUST ignore agent-supplied `diff_size` values and validate patch size from the generated patch artifact.
@@ -4111,6 +4686,70 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
 
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "create_pull_request_review_comment",
+  "description": "Create a review comment on a specific line of code in a pull request.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["path", "line", "body"],
+    "properties": {
+      "path": {"type": "string", "description": "File path relative to the repository root. Must be a file changed in the PR."},
+      "line": {"type": ["number", "string"], "description": "Target line, or the ending line for multi-line comments."},
+      "body": {"type": "string", "maxLength": 524288, "description": "Review comment content in Markdown."},
+      "pull_request_number": {"type": ["number", "string"], "description": "Pull request number. Required when the configured target is \"*\"."},
+      "start_line": {"type": ["number", "string"], "description": "Starting line for multi-line comments."},
+      "side": {"type": "string", "enum": ["LEFT", "RIGHT"], "description": "Diff side. Defaults to RIGHT."},
+      "repo": {"type": "string", "description": "Target repository in owner/repo format. Must be permitted by allowed-repos when set."}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Repository Resolution**: The target repository MUST be resolved from `repo` or `target-repo` and validated against `allowed-repos` before any API call.
+2. **Context Check**: With `target: "triggering"`, the handler MUST skip the item (without error) when the invocation context is not a pull request or a pull-request comment.
+3. **Field Validation**: `path`, `line`, and `body` MUST be present. `line` MUST be a positive integer. `start_line`, when present, MUST be a positive integer not greater than `line`. `side` MUST be `LEFT` or `RIGHT` and defaults to the configured `side` (default `RIGHT`).
+4. **Target Resolution**: The pull request number is resolved per the Target Authorization rules. The handler MUST obtain the pull request head SHA, fetching the pull request when the payload does not carry it, and MUST fail the item if no head SHA is available.
+5. **Filter Evaluation**: When `required-labels` or `required-title-prefix` is configured, the handler MUST skip the item (without error) if the pull request does not satisfy them.
+6. **Buffering**: The handler MUST NOT post the comment directly. It MUST sanitize and size-fit the body, append any configured footer blocks, and add the comment to the per-pull-request review buffer. The buffered comments are published as one review per [§7.0.4](#704-dependency-and-batch-processing-semantics).
+7. **Per-Run Limit**: Items beyond `max` MUST fail with a max-count error and MUST NOT be buffered.
+8. **Commit Pinning**: When `commit-id` is configured, the buffered review MUST be attributed to that commit instead of the current pull request head.
+9. **Staged Mode**: In staged mode the review buffer MUST preview the review and MUST NOT submit it.
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 10)
+- `side`: Default diff side, `"LEFT"` or `"RIGHT"` (default: `"RIGHT"`)
+- `target`: `"triggering"` (default), `"*"` (request MUST include `pull_request_number`), or a fixed pull request number
+- `target-repo`: Cross-repository target
+- `allowed-repos`: Cross-repo allowlist
+- `required-labels`: Labels that must ALL be present on the pull request for the comment to be processed
+- `required-title-prefix`: Title prefix that the pull request MUST have for the comment to be processed
+- `commit-id`: Commit SHA to which the review is attributed
+- `mentions`: Mention-resolution policy applied to the body
+- `staged`: Staged mode override
+
+**Security Requirements**:
+
+- The comment body MUST be sanitized, and agent-supplied mentions MUST be limited to the resolved allowed aliases
+- Cross-repository targets MUST be validated against `allowed-repos` before any API call
+- The pull request MUST be selected only according to the Target Authorization rules, enforced at runtime
+- Comments within one review MUST be bound to a single repository and pull request; in the legacy single-buffer mode a comment for a different pull request MUST be rejected
+
+**Target Authorization**:
+
+- **CRC-001**: An omitted `target` configuration MUST be interpreted as `target: "triggering"`.
+- **CRC-002**: With `target: "triggering"`, the handler MUST use only the pull request from trusted invocation context and MUST ignore any agent-supplied `pull_request_number`.
+- **CRC-003**: With a fixed numeric `target`, the handler MUST use the configured pull request number and MUST ignore any conflicting agent-supplied `pull_request_number`.
+- **CRC-004**: Only `target: "*"` MAY select a pull request from the agent-supplied `pull_request_number`; omitting it with `target: "*"` MUST fail the item.
+
 **Required Permissions**:
 
 *GitHub Actions Token*:
@@ -4125,6 +4764,7 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Notes**:
 
 - Comments buffered via PR review buffer for batch submission
+- Publication and dependent-output release MUST follow [§7.0.4](#704-dependency-and-batch-processing-semantics).
 - Higher default max (10) enables comprehensive code review
 - When `safe-outputs.create-pull-request-review-comment.target` is `"*"`, requests MUST include `pull_request_number`.
 
@@ -4137,6 +4777,69 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Default Max**: 1  
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
+
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "submit_pull_request_review",
+  "description": "Submit a pull request review with a status decision. Buffered inline comments are attached automatically.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "body": {"type": "string", "maxLength": 524288, "description": "Overall review summary in Markdown. Required for REQUEST_CHANGES."},
+      "event": {"type": "string", "enum": ["APPROVE", "REQUEST_CHANGES", "COMMENT"], "description": "Review decision. Defaults to COMMENT."},
+      "pull_request_number": {"type": ["number", "string"], "description": "Pull request number. Required when the configured target is \"*\"."},
+      "repo": {"type": "string", "description": "Target repository in owner/repo format. Must be permitted by allowed-repos when set."}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Event Validation**: `event` MUST be one of `APPROVE`, `REQUEST_CHANGES`, or `COMMENT` (case-insensitive) and defaults to `COMMENT`.
+2. **Allowed Events**: When `allowed-events` is configured, the handler MUST reject any event outside that set with an error.
+3. **Body Requirement**: A `REQUEST_CHANGES` review MUST carry a non-empty `body`. A review with no `body` and no buffered inline comments MUST be rejected rather than published empty.
+4. **Target and Filter Resolution**: The pull request and repository are resolved per the Target Authorization rules and validated against `allowed-repos`. When `required-labels` or `required-title-prefix` is configured, the handler MUST skip the item (without error) if the pull request does not satisfy them.
+5. **Buffering**: The handler MUST NOT submit the review directly. It records the body and event in the per-pull-request review buffer, which publishes all buffered inline comments and the review together at finalization per [§7.0.4](#704-dependency-and-batch-processing-semantics).
+6. **Single Submission**: A second submission for the same repository and pull request within one run MUST fail with an error.
+7. **Per-Run Limit**: Items beyond `max` MUST fail with a max-count error.
+8. **Commit Attribution**: The review MUST be attributed to `commit-id` when configured, otherwise to the trigger-time head SHA, otherwise to the current pull request head SHA.
+9. **Own-Pull-Request Fallback**: When GitHub rejects an `APPROVE` or `REQUEST_CHANGES` review because the reviewer authored the pull request, publication retries the review as `COMMENT`.
+10. **Supersede**: When `supersede-older-reviews` is enabled, publication of a `COMMENT` review with no inline comments MAY dismiss older `REQUEST_CHANGES` reviews from the same workflow. This step is best-effort and failures MUST NOT fail the review.
+11. **Staged Mode**: In staged mode the review MUST be previewed and MUST NOT be submitted.
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 1)
+- `target`: `"triggering"` (default), `"*"` (request MUST include `pull_request_number`), or a fixed pull request number
+- `target-repo`: Cross-repository target
+- `allowed-repos`: Cross-repo allowlist
+- `allowed-events`: Restrict permitted review events (empty or omitted permits all)
+- `supersede-older-reviews`: Best-effort dismissal of older same-workflow `REQUEST_CHANGES` reviews (default: `false`)
+- `required-labels`: Labels that must ALL be present on the pull request for the review to be processed
+- `required-title-prefix`: Title prefix that the pull request MUST have for the review to be processed
+- `commit-id`: Commit SHA to which the review is attributed
+- `footer`: `"always"` (default), `"none"`, or `"if-body"`
+- `staged`: Staged mode override
+
+**Security Requirements**:
+
+- `allowed-events` MUST be enforced by the privileged handler; prompt instructions MUST NOT replace it
+- Cross-repository targets MUST be validated against `allowed-repos` before any API call
+- The pull request MUST be selected only according to the Target Authorization rules, enforced at runtime
+- The review body MUST be sanitized and size-fitted before publication
+
+**Target Authorization**:
+
+- **SPR-001**: An omitted `target` configuration MUST be interpreted as `target: "triggering"`.
+- **SPR-002**: With `target: "triggering"`, the handler MUST use only the pull request from trusted triggering-event context and MUST ignore any agent-supplied `pull_request_number`.
+- **SPR-003**: With a fixed numeric `target`, the handler MUST use the configured pull request number and MUST ignore any conflicting agent-supplied `pull_request_number`.
+- **SPR-004**: Only `target: "*"` MAY select a pull request from the agent-supplied `pull_request_number`.
 
 **Required Permissions**:
 
@@ -4152,6 +4855,7 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Notes**:
 
 - Submits all buffered review comments from `create_pull_request_review_comment`
+- Publication, dependent-output release, and the per-run explicit-review limit MUST follow [§7.0.4](#704-dependency-and-batch-processing-semantics).
 - Review status affects PR merge requirements
 - **Target**: `target` accepts `"triggering"` (default), `"*"` (request MUST include `pull_request_number`), or an explicit PR number (e.g. `${{ github.event.inputs.pr_number }}`). Required when the workflow is not triggered by a pull request (e.g. `workflow_dispatch`).
 - **Cross-Repository**: `target-repo` specifies a repository in `owner/repo` format to submit reviews on PRs in another repo. Use `allowed-repos` to permit additional repositories.
@@ -4166,6 +4870,25 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Default Max**: 10  
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
+
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "resolve_pull_request_review_thread",
+  "description": "Resolve a review thread on a pull request after the feedback has been addressed.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["thread_id"],
+    "properties": {
+      "thread_id": {"type": "string", "description": "GraphQL node ID of the review thread (e.g., PRRT_kwDO...)."}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
 
 **Configuration Parameters**:
 
@@ -4183,6 +4906,13 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 3. **Resolution**: The processor MUST use GitHub's `resolveReviewThread` GraphQL mutation only for a verified, unresolved thread. Already-resolved threads and stale or missing thread IDs are successful no-ops; staged mode MUST preview without calling the mutation.
 4. **Comment-ID Lookup**: When `thread_id` contains a review-comment ID, the processor MUST search the parent pull request's review threads and comments, following GraphQL cursors until the comment is found or all pages are exhausted. If no containing thread is found, the operation MUST fail without mutation.
 5. **Permission Failure**: If GitHub rejects the mutation because the integration token cannot access the thread, the processor MUST report a skipped operation with guidance to configure a suitable `github-token`; unrelated API errors MUST remain failures.
+
+**Security Requirements**:
+
+- The thread's pull request and repository MUST be derived from GitHub's response, never from agent-supplied metadata
+- Repository allowlists, the configured `target`, and `required-labels`/`required-title-prefix` MUST be enforced before the resolve mutation
+- Node IDs that do not identify a review thread or review comment MUST be rejected without mutation
+- The pull request MUST be selected only according to the Target Authorization rules, enforced at runtime
 
 **Target Authorization**:
 
@@ -4225,6 +4955,37 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
 
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "reply_to_pull_request_review_comment",
+  "description": "Reply to an existing review comment on a pull request.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["comment_id", "body"],
+    "properties": {
+      "comment_id": {"type": ["number", "string"], "description": "Numeric ID of the review comment to reply to."},
+      "body": {"type": "string", "maxLength": 524288, "description": "Reply text in Markdown."},
+      "pull_request_number": {"type": ["number", "string"], "description": "Pull request number. Required when the configured target is \"*\"."}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Field Validation**: `comment_id` MUST be a positive integer (number or numeric string) and `body` MUST be a non-empty string; invalid items fail before counting against `max`.
+2. **Repository Resolution**: The target repository MUST be resolved from `target-repo` and validated against `allowed-repos` before any API call.
+3. **Target Resolution**: The pull request is resolved per the Target Authorization rules. With `target: "triggering"` outside a pull request context the item MUST be skipped without error.
+4. **Filter Evaluation**: When `required-labels` or `required-title-prefix` is configured, the handler MUST skip the item (without error) if the pull request does not satisfy them.
+5. **Per-Run Limit**: Items beyond `max` MUST fail with a max-count error.
+6. **Staged Mode**: In staged mode the handler MUST preview the reply and MUST NOT call the reply API.
+7. **Publication**: The body is sanitized and size-fitted, a detection caution is prepended when threat detection raised a warning, and the footer is appended unless `footer` is `false`. The reply is created through the REST `createReplyForReviewComment` endpoint on the resolved pull request.
+
 **Required Permissions**:
 
 *GitHub Actions Token*:
@@ -4246,6 +5007,19 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 - `required-title-prefix`: Title prefix that the pull request MUST have for the reply to be processed
 - `footer`: Whether to append footer attribution (default: `true`)
 
+**Security Requirements**:
+
+- The reply body MUST be sanitized, and agent-supplied mentions MUST be limited to the resolved allowed aliases
+- Cross-repository targets MUST be validated against `allowed-repos` before any API call
+- The pull request MUST be selected only according to the Target Authorization rules, enforced at runtime
+
+**Target Authorization**:
+
+- **RRC-001**: An omitted `target` configuration MUST be interpreted as `target: "triggering"`.
+- **RRC-002**: With `target: "triggering"`, the handler MUST use only the pull request from trusted triggering-event context and MUST ignore any agent-supplied `pull_request_number`.
+- **RRC-003**: With a fixed numeric `target`, the handler MUST use the configured pull request number and MUST ignore any conflicting agent-supplied `pull_request_number`.
+- **RRC-004**: Only `target: "*"` MAY select a pull request from the agent-supplied `pull_request_number`; omitting it with `target: "*"` MUST fail the item.
+
 **Notes**:
 
 - Higher default max (10) enables responding to multiple review comments per cycle
@@ -4258,9 +5032,89 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 
 **Purpose**: Add labels to issues or pull requests.
 
-**Default Max**: 3  
+**Default Max**: 5  
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
+
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "add_labels",
+  "description": "Add labels to an existing GitHub issue or pull request for categorization and filtering. Labels must already exist in the repository.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["labels"],
+    "properties": {
+      "labels": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "oneOf": [
+            {"type": "string", "maxLength": 50},
+            {
+              "type": "object",
+              "required": ["name"],
+              "properties": {
+                "name": {"type": "string", "maxLength": 50},
+                "rationale": {"type": "string", "maxLength": 280},
+                "confidence": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+                "suggest": {"type": "boolean"}
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "description": "Labels to add. Each entry is a label name string or an object with a name plus optional issue-intent metadata."
+      },
+      "item_number": {
+        "type": ["number", "string"],
+        "pattern": "^(\\d+|#?aw_[A-Za-z0-9_]{3,12})$",
+        "description": "Issue or pull request number, or a temporary ID from the same run. If omitted, the triggering item is used."
+      }
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Target Resolution**: The target issue or pull request is resolved per the Target Authorization rules below. When no item number can be resolved, the item fails without calling the GitHub API.
+2. **Filter Evaluation**: When `required-labels` or `required-title-prefix` is configured, the handler MUST fetch the target and skip the operation (without error) if the target lacks any required label or its title does not start with the required prefix.
+3. **Empty Input**: An empty `labels` list is skipped with a warning rather than failing the job.
+4. **Per-Call Limit**: The number of requested labels MUST NOT exceed `max-labels` (default: 10). Exceeding it fails the item; labels are never silently dropped.
+5. **Validation**: Labels are sanitized, de-duplicated, checked against `allowed` and `blocked`, and the item succeeds with no labels added when none remain valid.
+6. **Staged Mode**: In staged mode the handler previews the labels it would add and performs no mutation.
+7. **Additive Application**: Labels are added through the REST add-labels endpoint and existing labels on the target MUST be preserved.
+8. **Missing Labels**: When `create-if-missing` is `true`, labels absent from the target repository are created (with a deterministic color) before they are applied. Otherwise, labels that do not exist produce an API error or warning.
+9. **Issue-Intent Metadata**: When a label object carries `rationale`, `confidence`, or `suggest` and `issue-intent: true` is set, the handler applies it through the GraphQL `updateIssue` mutation, merging the existing labels so that add-only semantics hold and restoring any pre-existing label the mutation removed. Pull requests have no intent-aware mutation and fall back to the REST endpoint without metadata.
+10. **Strict Intent Mode**: When `issue-intent` is explicitly `true`, plain-string labels MUST be rejected and every label object MUST include both `rationale` and `confidence`.
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 5)
+- `max-labels`: Maximum labels per call (default: 10; MUST be a positive integer)
+- `allowed`: Allowlist of label names that MAY be added
+- `blocked`: Glob patterns for label names that MUST NOT be added
+- `target`: `"triggering"` (default), `"*"`, or a fixed issue or pull request number
+- `target-repo`: Cross-repository target
+- `allowed-repos`: Cross-repo allowlist
+- `required-labels`: Labels that must ALL be present on the target for the operation to proceed
+- `required-title-prefix`: Title prefix the target MUST have for the operation to proceed
+- `create-if-missing`: Create labels that do not exist in the target repository (default: `false`)
+- `issues` / `pull-requests`: Set to `false` to drop the corresponding write permission (at least one MUST remain enabled)
+- `issue-intent`: Experimental, disabled by default. `true` enables issue-intent metadata and makes it mandatory
+- `staged`: Staged mode override
+
+**Security Requirements**:
+
+- Label names MUST undergo sanitization and be validated against `allowed` and `blocked` before any API call
+- Cross-repository targets MUST be validated against the `allowed-repos` allowlist
+- The target MUST be selected only according to the Target Authorization rules, enforced at runtime
+- The `rationale` of a label object MUST NOT exceed 280 characters
 
 **Required Permissions**:
 
@@ -4294,9 +5148,84 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 
 **Purpose**: Remove labels from issues or pull requests.
 
-**Default Max**: 3  
+**Default Max**: 5  
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
+
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "remove_labels",
+  "description": "Remove labels from an existing GitHub issue or pull request. Silently skips labels that don't exist on the item.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["labels"],
+    "properties": {
+      "labels": {
+        "type": "array",
+        "items": {
+          "oneOf": [
+            {"type": "string", "maxLength": 50},
+            {
+              "type": "object",
+              "required": ["name"],
+              "properties": {
+                "name": {"type": "string", "maxLength": 50},
+                "rationale": {"type": "string", "maxLength": 280},
+                "confidence": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+                "suggest": {"type": "boolean"}
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "description": "Labels to remove. Each entry is a label name string or an object with a name plus optional issue-intent metadata."
+      },
+      "item_number": {
+        "type": ["number", "string"],
+        "pattern": "^(\\d+|#?aw_[A-Za-z0-9_]{3,12})$",
+        "description": "Issue or pull request number, or a temporary ID from the same run. If omitted, the triggering item is used."
+      }
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Target Resolution**: The target issue or pull request is resolved per the Target Authorization rules below. When no item number can be resolved, the item fails without calling the GitHub API.
+2. **Filter Evaluation**: When `required-labels` or `required-title-prefix` is configured, the handler MUST fetch the target and skip the operation if the target lacks any required label or its title does not start with the required prefix.
+3. **Empty Input**: An empty `labels` list fails the item with a message listing the allowed labels when an allowlist is configured.
+4. **Validation**: Labels are sanitized, de-duplicated, and checked against `allowed` and `blocked`; the number of labels MUST NOT exceed the configured `max`. The item succeeds with no labels removed when none remain valid.
+5. **Staged Mode**: In staged mode the handler previews the labels it would remove and performs no mutation.
+6. **Per-Label Removal**: Labels are removed one at a time because the GitHub API has no bulk-removal endpoint.
+7. **Missing Labels**: A label that is not present on the target (HTTP 404 or "Label does not exist") is skipped silently and is not a failure.
+8. **Partial Failure**: Any other per-label failure is logged and reported in `failedLabels` while the remaining labels are still processed.
+9. **Intent Metadata**: Issue-intent metadata on label objects is accepted by the schema, but only the label names are used for removal.
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 5)
+- `allowed`: Allowlist of label names that MAY be removed
+- `blocked`: Glob patterns for label names that MUST NOT be removed
+- `target`: `"triggering"` (default), `"*"`, or a fixed issue or pull request number
+- `target-repo`: Cross-repository target
+- `allowed-repos`: Cross-repo allowlist
+- `required-labels`: Labels that must ALL be present on the target for the operation to proceed
+- `required-title-prefix`: Title prefix the target MUST have for the operation to proceed
+- `issues` / `pull-requests`: Set to `false` to drop the corresponding write permission (at least one MUST remain enabled)
+- `staged`: Staged mode override
+
+**Security Requirements**:
+
+- Label names MUST undergo sanitization and be validated against `allowed` and `blocked` before any API call
+- Cross-repository targets MUST be validated against the `allowed-repos` allowlist
+- The target MUST be selected only according to the Target Authorization rules, enforced at runtime
+- A configuration that cannot be parsed MUST fail closed by granting neither `issues: write` nor `pull-requests: write`
 
 **Required Permissions**:
 
@@ -4334,9 +5263,46 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
 
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "add_reviewer",
+  "description": "Add reviewers (users or teams) to a GitHub pull request. Use 'copilot' as a reviewer name to request the Copilot PR review bot. Provide at least one of 'reviewers' or 'team_reviewers'.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "reviewers": {"type": "array", "items": {"type": "string"}},
+      "team_reviewers": {"type": "array", "items": {"type": "string"}},
+      "pull_request_number": {"type": ["number", "string"]}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Per-Run Limit**: Once `max` items have been processed the handler MUST fail further items with a `Max count` error without calling the GitHub API.
+2. **Target Resolution**: The pull request is resolved per the Target Authorization rules below. A target that cannot be resolved fails the item before any API call.
+3. **Repository Validation**: The target repository MUST be the configured `target-repo` (or the current repository) or appear in `allowed-repos`; otherwise the item fails.
+4. **Filter Evaluation**: When `required-labels` or `required-title-prefix` is configured, the handler MUST fetch the pull request and skip the operation (without error) when it does not satisfy every filter.
+5. **Reviewer Selection**: Requested `reviewers` and `team_reviewers` are sanitized, de-duplicated, and checked against `allowed-reviewers` and `allowed-team-reviewers` respectively. The combined number of reviewers and team reviewers MUST NOT exceed `max`; team reviewers only use the slots left after user reviewers.
+6. **Empty Result**: When no reviewer remains after selection, the item succeeds as skipped with no API mutation.
+7. **Staged Mode**: In staged mode the handler previews the selected reviewers and performs no mutation.
+8. **Reviewer Request**: User and team reviewers are requested with a single REST `requestReviewers` call.
+9. **Copilot Reviewer**: The reviewer name `copilot` is separated from other reviewers and requested through the GraphQL `requestReviews` mutation using the Copilot bot node ID (resolved at runtime with a built-in fallback). A failure to request Copilot MUST be logged as a warning and MUST NOT fail the item.
+10. **Execution Metadata**: The review state of the pull request is captured before and after the mutation and attached to the result.
+
 **Configuration Parameters**:
 
 - `max`: Operation limit (default: 3)
+- `allowed-reviewers`: Allowlist of reviewer logins that MAY be requested
+- `allowed-team-reviewers`: Allowlist of team slugs that MAY be requested
+- `required-labels`: Labels that must ALL be present on the pull request for the operation to proceed
+- `required-title-prefix`: Title prefix the pull request MUST have for the operation to proceed
 - `target`: `"triggering"` (default), `"*"`, or a fixed pull request number
 - `target-repo`: Cross-repository target
 - `allowed-repos`: Cross-repo allowlist
@@ -4352,6 +5318,14 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **ARV-004**: Only `target: "*"` MAY select a pull request from the agent-supplied `pull_request_number`.
 
 **ARV-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
+
+**Security Requirements**:
+
+- The pull request number MUST be derived only as described in Target Authorization (ARV-001 to ARV-005); agent-supplied numbers MUST NOT override `triggering` or fixed targets.
+- Reviewer logins and team slugs MUST be sanitized and, when an allowlist is configured, MUST be rejected if absent from it.
+- The reviewer count limit MUST be enforced before any API call and MUST NOT be exceeded by silently combining user and team reviewers.
+- The target repository MUST be validated against `target-repo` and `allowed-repos` before any API call.
+- Mutations MUST NOT be performed in staged mode.
 
 **Required Permissions**:
 
@@ -4379,6 +5353,46 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
 
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "assign_milestone",
+  "description": "Assign an issue to a milestone for release planning and progress tracking. Milestones can be specified by number or title.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["issue_number"],
+    "properties": {
+      "issue_number": {"type": ["number", "string"]},
+      "milestone_number": {"type": ["number", "string"]},
+      "milestone_title": {"type": "string"}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Per-Run Limit**: Once `max` items have been processed the handler MUST fail further items with a `Max count` error without calling the GitHub API.
+2. **Repository Validation**: The target repository MUST be the configured `target-repo` (or the current repository) or appear in `allowed-repos`; otherwise the item fails.
+3. **Target Resolution**: With `target: "*"`, an agent-supplied `issue_number` that is a temporary ID is resolved from the run's temporary-ID map; an unresolved temporary ID defers the item. The issue is then resolved per the Target Authorization rules below.
+4. **Filter Evaluation**: When `required-labels` or `required-title-prefix` is configured, the handler MUST fetch the issue and skip the operation (without error) when it does not satisfy every filter.
+5. **Milestone Identification**: At least one of a positive `milestone_number` or a `milestone_title` MUST be provided; otherwise the item fails. When `milestone_number` is valid it takes precedence over `milestone_title`.
+6. **Title Resolution**: A `milestone_title` is resolved by a paginated, per-repository cached search over open and closed milestones. When no milestone matches and `auto_create` is `true`, the milestone is created; otherwise the item fails.
+7. **Allowlist Check**: When `allowed` is configured, the resolved milestone MUST be fetched and its title or number MUST appear in `allowed`; otherwise the item fails. This check applies to auto-created and number-identified milestones alike.
+8. **Staged Mode**: In staged mode the handler previews the assignment and performs no mutation.
+9. **Assignment**: The milestone is applied with the REST issue update endpoint.
+
+**Security Requirements**:
+
+- The issue number MUST be derived only as described in Target Authorization; agent-supplied identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
+- The `allowed` list MUST be enforced against the resolved milestone before any assignment, regardless of whether it was identified by number or title.
+- Milestones MUST be created only when `auto_create` is `true`, and never in staged mode.
+- The target repository MUST be validated against `target-repo` and `allowed-repos` before any API call, and milestone lookup caches MUST be scoped per repository.
+
 **Required Permissions**:
 
 *GitHub Actions Token*:
@@ -4390,7 +5404,7 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 - `issues: write` - Milestone assignment operations
 - `metadata: read` - Repository metadata (automatically granted)
 
-**Configuration Options**:
+**Configuration Parameters**:
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
@@ -4439,6 +5453,46 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Default Max**: 1  
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
+
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "assign_to_agent",
+  "description": "Assign the GitHub Copilot coding agent to an issue or pull request.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "issue_number": {"type": ["number", "string"]},
+      "pull_number": {"type": ["number", "string"]},
+      "agent": {"type": "string"},
+      "rationale": {"type": "string", "maxLength": 280},
+      "confidence": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+      "suggest": {"type": "boolean"},
+      "pull_request_repo": {"type": "string"}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Per-Run Limit**: Once `max` items have been processed, further items MUST be skipped without assigning the agent.
+2. **Target Resolution**: The issue or pull request is resolved per the Target Authorization rules below. `issue_number` and `pull_number` are mutually exclusive when `target` is `"*"`.
+3. **Filter Evaluation**: When `required-labels` is configured, the current labels of the resolved target MUST be checked immediately before assignment (see ATA-006).
+4. **Agent Selection**: `agent` defaults to `copilot`. When `allowed` is configured, an agent outside the allowlist MUST be rejected.
+5. **Pull Request Repository**: `pull_request_repo` selects where the resulting pull request is created. The global `pull-request-repo` is implicitly allowed; any other repository MUST appear in `allowed-pull-request-repos`.
+6. **Staged Mode**: In staged mode the handler previews the assignment and performs no mutation.
+
+**Security Requirements**:
+
+- Target selection MUST follow the Target Authorization rules, enforced at runtime.
+- Agent names and pull request repositories MUST be validated against `allowed` and `allowed-pull-request-repos` before any API call.
+- The `rationale` of an assignment MUST NOT exceed 280 characters.
+- Handler-level token overrides (`github-token`) MUST NOT be exposed to the agent.
 
 **Configuration Parameters**:
 
@@ -4490,8 +5544,52 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
 
-**Configuration Options**:
+**MCP Tool Schema**:
 
+```json
+{
+  "name": "assign_to_user",
+  "description": "Assign one or more GitHub users to an issue. Users must have access to the repository.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["issue_number"],
+    "properties": {
+      "issue_number": {"type": ["number", "string"]},
+      "assignees": {"type": "array", "items": {"type": "string"}},
+      "assignee": {"type": "string"},
+      "rationale": {"type": "string", "maxLength": 280},
+      "confidence": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+      "suggest": {"type": "boolean"}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Per-Run Limit**: Once `max` items have been processed the handler MUST fail further items with a `Max count` error without calling the GitHub API.
+2. **Repository Validation**: The target repository MUST be the configured `target-repo` (or the current repository) or appear in `allowed-repos`; otherwise the item fails.
+3. **Target Resolution**: The issue or pull request is resolved per the Target Authorization rules below. Temporary IDs are not accepted for this type.
+4. **Filter Evaluation**: When `required-labels` or `required-title-prefix` is configured, the handler MUST fetch the target and skip the operation (without error) when it does not satisfy every filter.
+5. **Assignee Selection**: Assignees come from `assignees` and `assignee`. They are sanitized, de-duplicated, checked against `allowed` and `blocked`, and limited to `max`.
+6. **Empty Result**: When no assignee remains after selection, the item succeeds with no assignees added and no API mutation.
+7. **Staged Mode**: In staged mode the handler previews the assignment (and the `unassign-first` step when enabled) and performs no mutation.
+8. **Unassign First**: When `unassign-first` is `true`, the current assignees are fetched and removed before the new assignees are added.
+9. **Assignment**: Assignees are added with the REST add-assignees endpoint. When `issue-intent: true` is set, normalized `rationale`, `confidence`, and `suggest` metadata are forwarded with the request.
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 1)
+- `allowed`: Allowlist of logins that MAY be assigned
+- `blocked`: Glob patterns of logins that MUST NOT be assigned
+- `required-labels`: Labels that must ALL be present on the target for the operation to proceed
+- `required-title-prefix`: Title prefix the target MUST have for the operation to proceed
+- `target-repo`: Cross-repository target
+- `allowed-repos`: Cross-repository allowlist
+- `issue-intent`: Controls whether intent metadata is forwarded (default: enabled)
 - `unassign-first` (boolean, default: false): If true, unassigns all current assignees before assigning new ones. Useful for reassigning issues from one user to another.
 - `target`: `"triggering"` (default), `"*"`, or a fixed issue/pull request number
 
@@ -4506,6 +5604,14 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **ATU-004**: Only `target: "*"` MAY select an issue or pull request from the agent-supplied identifier.
 
 **ATU-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
+
+**Security Requirements**:
+
+- The target number MUST be derived only as described in Target Authorization (ATU-001 to ATU-005).
+- Assignee logins MUST be sanitized and checked against `allowed` and `blocked` before any API call; `blocked` entries MUST take precedence.
+- The assignee count MUST NOT exceed `max`.
+- The target repository MUST be validated against `target-repo` and `allowed-repos` before any API call.
+- When `unassign-first` is enabled, current assignees MUST NOT be removed in staged mode or when no valid new assignee remains.
 
 **Required Permissions**:
 
@@ -4535,9 +5641,45 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
 
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "unassign_from_user",
+  "description": "Remove one or more assignees from an issue.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "issue_number": {"type": ["number", "string"]},
+      "assignees": {"type": "array", "items": {"type": "string"}},
+      "assignee": {"type": "string"},
+      "repo": {"type": "string"}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Per-Run Limit**: Once `max` items have been processed the handler MUST fail further items with a `Max count` error without calling the GitHub API.
+2. **Target Resolution**: The issue or pull request is resolved per the Target Authorization rules below.
+3. **Assignee Selection**: Assignees come from `assignees` and `assignee`. They are sanitized, de-duplicated, checked against `allowed` and `blocked`, and limited to `max`.
+4. **Empty Result**: When no assignee remains after selection, the item succeeds with no assignees removed and no API mutation.
+5. **Repository Validation**: The target repository MUST be the configured `target-repo` (or the current repository) or appear in `allowed-repos`; otherwise the item fails.
+6. **Filter Evaluation**: When `required-labels` or `required-title-prefix` is configured, the handler MUST fetch the target and skip the operation (without error) when it does not satisfy every filter.
+7. **Staged Mode**: In staged mode the handler previews the removal and performs no mutation.
+8. **Removal**: Assignees are removed with the REST remove-assignees endpoint.
+
 **Configuration Parameters**:
 
 - `max`: Operation limit (default: 1)
+- `allowed`: Allowlist of logins that MAY be unassigned
+- `blocked`: Glob patterns of logins that MUST NOT be unassigned
+- `required-labels`: Labels that must ALL be present on the target for the operation to proceed
+- `required-title-prefix`: Title prefix the target MUST have for the operation to proceed
 - `target`: `"triggering"` (default), `"*"`, or a fixed issue/pull request number
 - `target-repo`: Cross-repository target
 - `allowed-repos`: Cross-repo allowlist
@@ -4553,6 +5695,14 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **UFU-004**: Only `target: "*"` MAY select an issue or pull request from the agent-supplied identifier.
 
 **UFU-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
+
+**Security Requirements**:
+
+- The target number MUST be derived only as described in Target Authorization (UFU-001 to UFU-005).
+- Assignee logins MUST be sanitized and checked against `allowed` and `blocked` before any API call; `blocked` entries MUST take precedence.
+- The assignee count MUST NOT exceed `max`.
+- The target repository MUST be validated against `target-repo` and `allowed-repos` before any API call.
+- Mutations MUST NOT be performed in staged mode.
 
 **Required Permissions**:
 
@@ -4575,9 +5725,46 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Cross-Repository Support**: Yes
 **Mandatory**: No
 
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "set_issue_type",
+  "description": "Set the type of a GitHub issue. Pass an empty string to clear the issue type.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["issue_type"],
+    "properties": {
+      "issue_number": {"type": ["number", "string"]},
+      "issue_type": {"type": "string"},
+      "rationale": {"type": "string", "maxLength": 280},
+      "confidence": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+      "suggest": {"type": "boolean"}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Per-Run Limit**: Once `max` items have been processed the handler MUST fail further items with a `Max count` error without calling the GitHub API.
+2. **Repository Validation**: The target repository MUST be the configured `target-repo` (or the current repository) or appear in `allowed-repos`; otherwise the item fails.
+3. **Target Resolution**: With `target: "*"`, an agent-supplied `issue_number` (including a temporary ID resolved from the run) selects the issue. The issue is resolved per the Target Authorization rules below.
+4. **Filter Evaluation**: When `required-labels` or `required-title-prefix` is configured, the handler MUST fetch the issue and skip the operation (without error) when it does not satisfy every filter.
+5. **Clearing**: An empty `issue_type` clears the issue type and bypasses the `allowed` list.
+6. **Allowlist Check**: When `allowed` is configured, a non-empty `issue_type` MUST match an entry case-insensitively; otherwise the item fails. The configured spelling is used for the mutation.
+7. **Staged Mode**: In staged mode the handler previews the change and performs no mutation.
+8. **Issue-Intent Path**: When `issue-intent: true` is set, the handler resolves the issue node ID and the repository issue type by case-insensitive name, then applies the type with the GraphQL `updateIssue` mutation together with normalized `rationale`, `confidence`, and `suggest` metadata. An unknown type fails with the list of available types.
+9. **REST Path**: When issue intent is not enabled, or when clearing, the type is applied with the REST issue update endpoint.
+10. **Error Mapping**: A 422 response for a non-empty type is mapped to an actionable error naming the type and, when reported, the available types.
+
 **Configuration Parameters**:
 
 - `max`: Operation limit (default: 5)
+- `issue-intent`: Controls whether intent metadata is forwarded (default: enabled)
 - `allowed`: Optional allowlist of issue type names
 - `target`: `"triggering"` (default), `"*"`, or a fixed issue number
 - `required-labels`: Labels that must all be present on the issue
@@ -4596,6 +5783,13 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **SIT-004**: Only `target: "*"` MAY select an issue from the agent-supplied `issue_number`.
 
 **SIT-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
+
+**Security Requirements**:
+
+- The issue number MUST be derived only as described in Target Authorization (SIT-001 to SIT-005).
+- When `allowed` is configured, a non-empty issue type MUST be rejected before any mutation unless it matches an entry.
+- The target repository MUST be validated against `target-repo` and `allowed-repos` before any API call.
+- Mutations MUST NOT be performed in staged mode.
 
 **Required Permissions**:
 
@@ -4618,9 +5812,48 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Cross-Repository Support**: Yes
 **Mandatory**: No
 
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "set_issue_field",
+  "description": "Set a single GitHub issue custom field by name and value. Use field_name for discovery by field label, or provide field_node_id to skip discovery. Does NOT support builtin issue fields such as title, body, or state.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["value"],
+    "properties": {
+      "issue_number": {"type": ["number", "string"]},
+      "field_name": {"type": "string"},
+      "field_node_id": {"type": "string"},
+      "value": {"type": "string"},
+      "rationale": {"type": "string", "maxLength": 280},
+      "confidence": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+      "suggest": {"type": "boolean"}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Per-Run Limit**: Once `max` items have been processed the handler MUST fail further items with a `Max count` error without calling the GitHub API.
+2. **Repository Validation**: The target repository MUST be the configured `target-repo` (or the current repository) or appear in `allowed-repos`; otherwise the item fails.
+3. **Target Resolution**: With `target: "*"`, an agent-supplied `issue_number` (including a temporary ID resolved from the run) selects the issue. The issue is resolved per the Target Authorization rules below.
+4. **Filter Evaluation**: When `required-labels` or `required-title-prefix` is configured, the handler MUST fetch the issue and skip the operation (without error) when it does not satisfy every filter.
+5. **Input Validation**: `value` MUST be present and at least one of `field_name` or `field_node_id` MUST be provided. A `field_name` naming a builtin issue field (for example `title`, `body`, or `state`) MUST be rejected with guidance to use `update_issue`.
+6. **Staged Mode**: In staged mode the handler previews the change and performs no mutation.
+7. **Field Discovery**: The handler fetches the repository issue fields. When none are visible, the item is skipped with a warning. A `field_name` is matched case-insensitively; a `field_node_id` MUST match a discovered field. When both are supplied they MUST resolve to the same field.
+8. **Allowlist Check**: The resolved field name MUST satisfy `allowed-fields` (when configured and not `["*"]`) before any mutation.
+9. **Value Typing**: The value is converted according to the field type: single-select values MUST match an option name (case-insensitive), number values MUST be finite numbers, date values MUST use `YYYY-MM-DD`, and other fields are set as text.
+10. **Mutation**: The value is applied with the GraphQL `setIssueFieldValue` mutation together with normalized `rationale`, `confidence`, and `suggest` metadata when `issue-intent: true` is set.
+
 **Configuration Parameters**:
 
 - `max`: Operation limit (default: 5)
+- `issue-intent`: Controls whether intent metadata is forwarded (default: enabled)
 - `allowed-fields`: Optional allowlist of custom issue field names
 - `target`: `"triggering"` (default), `"*"`, or a fixed issue number
 - `required-labels`: Labels that must all be present on the issue
@@ -4639,6 +5872,14 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **SIF-004**: Only `target: "*"` MAY select an issue from the agent-supplied `issue_number`.
 
 **SIF-005**: Schema shaping, prompt instructions, and temporary-ID resolution MUST NOT replace or precede runtime target authorization. Agent-supplied target identifiers, including unresolved temporary IDs, MUST be ignored unless `target` is `"*"`.
+
+**Security Requirements**:
+
+- The issue number MUST be derived only as described in Target Authorization (SIF-001 to SIF-005).
+- The resolved field name MUST be checked against `allowed-fields` before any mutation, including when the field is identified by `field_node_id`.
+- Builtin issue fields MUST NOT be writable through this type.
+- The target repository MUST be validated against `target-repo` and `allowed-repos` before any API call.
+- Mutations MUST NOT be performed in staged mode.
 
 **Required Permissions**:
 
@@ -4660,6 +5901,40 @@ For all Linear types, GraphQL source, endpoint, protocol, and host are implement
 **Default Max**: 5  
 **Cross-Repository Support**: Yes  
 **Mandatory**: No
+
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "hide_comment",
+  "description": "Hide a comment on a GitHub issue, pull request, or discussion.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["comment_id"],
+    "properties": {
+      "comment_id": {"type": "string"},
+      "reason": {"type": "string", "enum": ["SPAM", "ABUSE", "OFF_TOPIC", "OUTDATED", "RESOLVED", "LOW_QUALITY"]}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Comment Resolution**: `comment_id` is a GraphQL node ID, or a positive numeric REST comment ID that the handler resolves to a node ID. A missing or unresolvable ID fails the item.
+2. **Parent Resolution**: The handler MUST resolve the comment's parent issue, pull request, or discussion, and apply the Target Authorization rules below before mutating.
+3. **Reason Normalization**: `reason` is upper-cased and defaults to `SPAM`. When `allowed-reasons` is configured, a reason outside the list MUST cause the comment to be skipped.
+4. **Hiding**: The comment is minimized through the GraphQL `minimizeComment` mutation using the normalized reason as the classifier.
+5. **Staged Mode**: In staged mode the handler previews the action and performs no mutation.
+
+**Security Requirements**:
+
+- The comment's parent item MUST be authorized per HC-001 through HC-005 before the mutation is issued.
+- `reason` MUST be one of the enumerated classifiers and MUST satisfy `allowed-reasons` when configured.
+- Cross-repository targets MUST be validated against `target-repo` and `allowed-repos`.
 
 **Configuration Parameters**:
 
@@ -4736,6 +6011,52 @@ safe-outputs:
 **Cross-Repository Support**: Yes (organization or user projects)  
 **Mandatory**: No
 
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "create_project",
+  "description": "Create a new GitHub Project board.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "title": {"type": "string"},
+      "owner": {"type": "string"},
+      "owner_type": {"type": "string", "enum": ["org", "user"]},
+      "item_url": {"type": "string"},
+      "temporary_id": {"type": "string", "pattern": "^#?aw_[A-Za-z0-9_]{3,12}$"}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Per-Run Limit**: Once `max` projects have been created, further items MUST fail with a `Max count` error.
+2. **Title Resolution**: When `title` is omitted, it is generated from `title-prefix` (default `Project`) and the triggering issue context. When no title can be resolved the item fails.
+3. **Owner Resolution**: `owner` falls back to the configured `target-owner`. When neither is available the item fails. `owner_type` defaults to `org`.
+4. **Initial Item**: When `item_url` is supplied it MUST be a GitHub issue URL or a temporary ID; a temporary ID that has not been resolved fails the item.
+5. **Temporary ID**: The created project is registered under `temporary_id` (generated when omitted) so later `update_project` and `create_project_status_update` items can reference it.
+6. **Configured Views**: Views declared in configuration are created after the project exists.
+7. **Staged Mode**: In staged mode the handler previews the project and performs no mutation.
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 1)
+- `target-owner`: Default organization or user that owns created projects
+- `title-prefix`: Prefix for generated project titles (default: `Project`)
+- `views`: Views to create on each new project
+- `staged`: Staged mode override
+
+**Security Requirements**:
+
+- The owner MUST be resolved from the message or configuration; creation without an owner MUST fail.
+- Temporary IDs MUST match `aw_` followed by 3 to 12 alphanumeric or underscore characters.
+- Project creation requires a GitHub App token; see Required Permissions.
+
 **Required Permissions**:
 
 *GitHub Actions Token*:
@@ -4764,6 +6085,62 @@ safe-outputs:
 **Default Max**: 10  
 **Cross-Repository Support**: Yes (via `target_repo` field in agent output; requires `allowed-repos` configuration)  
 **Mandatory**: No
+
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "update_project",
+  "description": "Add or update project items, create fields, or create views on a GitHub Project.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["project"],
+    "properties": {
+      "project": {"type": "string"},
+      "operation": {"type": "string", "enum": ["create_fields", "create_view"]},
+      "content_type": {"type": "string", "enum": ["issue", "pull_request", "draft_issue"]},
+      "content_number": {"type": ["number", "string"]},
+      "target_repo": {"type": "string"},
+      "draft_title": {"type": "string"},
+      "draft_body": {"type": "string", "maxLength": 65536},
+      "draft_issue_id": {"type": "string"},
+      "temporary_id": {"type": "string"},
+      "fields": {"type": "object"},
+      "field_definitions": {"type": "array"},
+      "view": {"type": "object"},
+      "create_if_missing": {"type": "boolean"}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Project Resolution**: `project` is a full project URL or a temporary project ID from `create_project`. An unresolved temporary ID or malformed URL fails the item.
+2. **Mode Selection**: With no `operation`, the item adds or updates a project item. `create_fields` creates the custom fields in `field_definitions`; `create_view` creates the view in `view`.
+3. **Item Resolution**: For `issue` and `pull_request`, `content_number` is a positive integer or a resolved temporary ID, looked up in `target_repo` or the current repository. For `draft_issue`, `draft_title` is required unless a known `draft_issue_id` is supplied.
+4. **Field Updates**: `fields` values are applied to the project item after it is added.
+5. **Configured Fields and Views**: `field_definitions` and `views` from configuration are created even when the agent does not request them, and configured field definitions fill in when `create_fields` omits its own.
+6. **View Validation**: A view MUST have a non-empty `name` and a `layout` of `table`, `board`, or `roadmap`.
+7. **Staged Mode**: In staged mode the handler previews the update and performs no mutation.
+
+**Configuration Parameters**:
+
+- `max`: Operation limit
+- `project`: Default project URL
+- `views`: Views to create on the project
+- `field-definitions`: Custom fields to create on the project
+- `staged`: Staged mode override
+
+**Security Requirements**:
+
+- The project MUST be resolved to a concrete owner and number before any mutation.
+- `target_repo` MUST use `owner/repo` format.
+- Referenced issues and pull requests MUST exist; missing content fails the item.
+- Project permissions are available only to GitHub App tokens; see Required Permissions.
 
 **Required Permissions**:
 
@@ -4794,6 +6171,51 @@ safe-outputs:
 **Cross-Repository Support**: No (same repository only)  
 **Mandatory**: No
 
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "create_project_status_update",
+  "description": "Post a status update to a GitHub Project.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["project", "body"],
+    "properties": {
+      "project": {"type": "string"},
+      "status": {"type": "string", "enum": ["ON_TRACK", "AT_RISK", "OFF_TRACK", "COMPLETE", "INACTIVE"]},
+      "start_date": {"type": "string"},
+      "target_date": {"type": "string"},
+      "body": {"type": "string", "maxLength": 65536}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Per-Run Limit**: Once `max` updates have been posted, further items MUST fail with a `Max count` error.
+2. **Project Resolution**: `project` MUST be a full GitHub project URL or a temporary project ID from `create_project`. Invalid or unresolved values fail the item.
+3. **Status Normalization**: `status` is upper-cased and defaults to `ON_TRACK`. An invalid value falls back to `ON_TRACK` with a warning.
+4. **Date Handling**: `start_date` and `target_date` use `YYYY-MM-DD`; an invalid date falls back to the current date with a warning.
+5. **Body Sanitization**: `body` is sanitized, mention-limited per `mentions` configuration, and receives the configured body footer.
+6. **Staged Mode**: In staged mode the handler previews the update and performs no mutation.
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 10)
+- `body-footer`: Deterministic footer appended to each update
+- `mentions`: Mention policy applied to the body
+- `staged`: Staged mode override
+
+**Security Requirements**:
+
+- The project MUST be resolved to an accessible owner and number before posting.
+- Body content MUST be sanitized, with mentions limited by the configured mention policy, before it is sent.
+- Project permissions are available only to GitHub App tokens; see Required Permissions.
+
 **Required Permissions**:
 
 *GitHub Actions Token*:
@@ -4818,6 +6240,50 @@ safe-outputs:
 **Default Max**: 1  
 **Cross-Repository Support**: No (same repository only)  
 **Mandatory**: No
+
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "update_release",
+  "description": "Update an existing GitHub Release description.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["tag", "operation", "body"],
+    "properties": {
+      "tag": {"type": "string"},
+      "operation": {"type": "string", "enum": ["replace", "append", "prepend"]},
+      "body": {"type": "string", "minLength": 20, "maxLength": 65536}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Tag Resolution**: The tag is taken from `tag`. When absent, it MAY be inferred from a `release` event payload or `release_url` / `release_id` workflow-dispatch inputs; if no tag can be resolved the item fails.
+2. **Release Lookup**: The release is fetched by tag. When that lookup returns not-found, draft releases are searched before the item fails, because the tag endpoint does not return drafts.
+3. **Missing Release**: A Git tag without a GitHub Release MUST fail with a validation error that explains the release must be created first.
+4. **Body Update**: `replace` overwrites the body; `append` and `prepend` add `body` with a separator. The default operation is `append`.
+5. **Footer**: A generated footer is added unless `footer` is `false`, and `body-footer` is applied when configured.
+6. **Staged Mode**: In staged mode the handler previews the update and performs no mutation.
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 1)
+- `footer`: Controls the generated footer (default: `true`)
+- `body-footer`: Deterministic body footer template
+- `github-token`: Handler-level token override
+- `staged`: Staged mode override
+
+**Security Requirements**:
+
+- Release body content MUST be sanitized before it is written.
+- The handler MUST update only the body of an existing release; it MUST NOT create releases or modify release assets.
+- Only the current repository's releases MAY be updated.
 
 **Required Permissions**:
 
@@ -4845,6 +6311,47 @@ safe-outputs:
 **Cross-Repository Support**: No (same repository only)  
 **Mandatory**: No
 
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "upload_asset",
+  "description": "Upload a file as a URL-addressable asset stored on an orphaned git branch.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["path"],
+    "properties": {
+      "path": {"type": "string"}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Staging**: The MCP backend stages the file at `path` using guarded reads; the agent job uploads the staged files as an artifact.
+2. **Validation**: `path` MUST be an absolute path under the workspace or `/tmp`. Only image files (`.png`, `.jpg`, `.jpeg`) are accepted unless other extensions are configured, and files over the size limit are rejected.
+3. **Publication**: The privileged `upload_assets` job downloads the artifact, commits the files to the orphaned asset branch, and computes URLs from trusted context.
+4. **Result Reporting**: Tool acceptance alone MUST NOT be reported as successful publication.
+5. **Staged Mode**: In staged mode the publication step previews the upload and performs no mutation.
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 10)
+- `max-size`: Maximum file size in KB (default: 10240)
+- `allowed-exts`: Allowed file extensions (default: `.png`, `.jpg`, `.jpeg`)
+- `branch`: Orphaned branch that stores assets
+- `staged`: Staged mode override
+
+**Security Requirements**:
+
+- Source paths MUST be contained within the workspace or `/tmp` and MUST NOT be symbolic links, hard links, or non-regular files.
+- Size, SHA-256 digest, target filename, and URL MUST be derived from staged content, never from agent-supplied metadata.
+- Staged files MUST use mode `0600` and private directories mode `0700`, as detailed in Asset Staging Ownership and Transport below.
+
 **Required Permissions**:
 
 *GitHub Actions Token*:
@@ -4865,11 +6372,23 @@ safe-outputs:
 - The privileged upload job MUST validate that staged asset paths remain contained within the staged-assets directory and that the expected staged filename matches the declared source path.
 - The privileged upload job MUST compute asset size, SHA-256 digest, target filename, and published URL from staged file contents and trusted runtime context. It MUST NOT trust agent-supplied `size`, `sha`, `path`, `targetFileName`, or URL metadata for privileged decisions.
 
+**Path-Based Invocation**:
+
+The agent supplies a literal absolute source path under the workspace or `/tmp`, subject to the configured extension and size limits:
+
+```json
+{"path": "/tmp/gh-aw/agent/chart.png"}
+```
+
+These are MCP arguments to `upload_asset`, not an `artifacts` entry on `create_issue`. The path identifies a source to stage; it is not the final artifact name or URL. The backend MUST perform guarded staging, and the privileged upload job MUST publish the staged bytes according to the transport requirements below. Tool acceptance alone MUST NOT be reported as successful publication.
+
 ##### Asset Staging Ownership and Transport
 
 The `upload_asset` MCP handler stages files inside a backend container; the agent job's host-side `Upload Safe Outputs Assets` action reads them to create the `safe-outputs-assets` artifact. The downstream `upload_assets` job downloads that artifact before publishing to the asset branch. A shared mount or a successful MCP tool result MUST NOT be treated as evidence that the host can read the staged bytes or that publication completed.
 
-Unless an explicit container user is configured, gateway startup MUST run the built-in `safeoutputs` backend with the host runner's numeric UID and GID before serializing or publishing its configuration. The backend MUST NOT rely on inheriting the outer gateway container's Docker user. Missing or invalid runner identity MUST fail startup rather than silently fall back to root. This default identity MUST include a writable, container-local `HOME` at `/tmp` unless `HOME` is already configured, so local Git configuration does not require `/root` access or exposure of the host's home directory. Explicit container-user settings and configured `HOME` values MUST remain effective; deployments using these overrides are responsible for compatible host access. Other MCP backends, mounts, credentials, and network policies MUST remain unchanged by this ownership policy.
+Unless an explicit container user is configured, gateway startup MUST run the built-in `safeoutputs` backend with the host runner's effective numeric UID and primary GID before serializing or publishing its configuration. The backend MUST NOT rely on inheriting the outer gateway container's Docker user. Missing or invalid runner identity MUST fail startup rather than silently fall back to root. This default identity MUST include a writable, container-local `HOME` at `/tmp` unless `HOME` is already configured, so local Git configuration does not require `/root` access or exposure of the host's home directory. Explicit container-user settings and configured `HOME` values MUST remain effective; deployments using these overrides are responsible for compatible host access. Configured supplementary container groups MUST be preserved, but runner supplementary groups MUST NOT be added automatically. Other MCP backends, mounts, credentials, and network policies MUST remain unchanged by this ownership policy.
+
+The generated safeoutputs `config.json`, `tools.json`, `tools_meta.json`, `validation.json`, and output files MUST use mode `0600` both when created and when replacing or appending to existing files. Writes MUST reject symbolic links and MUST NOT broaden permissions to compensate for mismatched ownership.
 
 Guarded staging MUST exclusively create regular files with mode `0600`; private subdirectories created by the guard, including Claim-specific directories, MUST use mode `0700`. The ownership contract MUST keep those files and directories readable and traversable by the host uploader without broadening their modes. Source and destination symlink rejection, hard-link and nonregular-source rejection, descriptor-relative path checks, bounded reads, and content-derived metadata MUST remain enforced. Implementations MUST NOT repair ownership by following agent-controlled links, recursively changing arbitrary trees, or disabling these guards.
 
@@ -4886,6 +6405,44 @@ Implementation and regression mappings are maintained in the [compiler threat sp
 **Default Max**: 1  
 **Cross-Repository Support**: Yes (via `target-repo`)  
 **Mandatory**: No
+
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "dispatch_workflow",
+  "description": "Dispatch an allowed workflow via workflow_dispatch.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["workflow_name"],
+    "properties": {
+      "workflow_name": {"type": "string"},
+      "inputs": {"type": "object"},
+      "ref": {"type": "string"}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Per-Run Limit**: Once `max` dispatches have been made, further items MUST be rejected.
+2. **Workflow Allowlist**: `workflow_name` MUST appear in `workflows`; otherwise the item fails with an error that lists the allowed workflows.
+3. **Repository and Ref Validation**: Cross-repository targets MUST satisfy `target-repo` and `allowed-repos`. A per-call `ref` MUST match `allowed-refs`, or the default branch when `allowed-refs` is omitted.
+4. **Input Conversion**: `inputs` values are converted to strings as required by `workflow_dispatch`.
+5. **Compiler-Managed Context**: Workflows that accept `aw_context` receive compiler-managed context; agent-supplied work-queue and claim inputs for protected queues MUST be rejected.
+6. **Dispatch**: The workflow is dispatched with the resolved file, ref, and inputs.
+7. **Staged Mode**: In staged mode the handler previews the dispatch and performs no mutation.
+
+**Security Requirements**:
+
+- Only workflows in the configured allowlist MAY be dispatched.
+- Refs MUST be validated against `allowed-refs` patterns before dispatch.
+- Cross-repository dispatch MUST be validated against `allowed-repos` before any API call.
+- Compiler-managed inputs MUST NOT be forgeable by the agent.
 
 **Required Permissions**:
 
@@ -4926,6 +6483,51 @@ Implementation and regression mappings are maintained in the [compiler threat sp
 **Cross-Repository Support**: No (same repository only)  
 **Mandatory**: No
 
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "create_code_scanning_alert",
+  "description": "Create a code scanning alert for a finding.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["file", "line", "severity", "message"],
+    "properties": {
+      "file": {"type": "string"},
+      "line": {"type": ["number", "string"]},
+      "severity": {"type": "string", "enum": ["error", "warning", "info", "note"]},
+      "message": {"type": "string"},
+      "column": {"type": ["number", "string"]},
+      "ruleIdSuffix": {"type": "string"}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Per-Run Limit**: When `max` is greater than zero and has been reached, further findings MUST be rejected. A `max` of zero means unlimited.
+2. **Required Fields**: `file`, `line`, `severity`, and `message` MUST be present. `line` MUST parse to a positive integer.
+3. **Column**: `column` defaults to 1 and MUST be a number or numeric string.
+4. **Rule Identifier**: The SARIF rule ID is `<workflow-filename>-<ruleIdSuffix>`, or a numbered `security-finding` ID when no suffix is given. A suffix MUST contain only alphanumeric characters, hyphens, and underscores.
+5. **Severity Mapping**: `severity` is case-insensitive and MUST be `error`, `warning`, `info`, or `note`; it is mapped to a SARIF level.
+6. **SARIF Output**: Accepted findings are written to `code-scanning-alert.sarif` for later upload to code scanning.
+7. **Staged Mode**: In staged mode the handler previews the finding and does not write the SARIF file.
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: unlimited)
+- `staged`: Staged mode override
+
+**Security Requirements**:
+
+- Findings MUST be validated before inclusion in the SARIF file; invalid findings MUST be rejected individually.
+- Rule ID suffixes MUST be restricted to a safe character set.
+- SARIF upload requires `security-events: write`; see Required Permissions.
+
 **Required Permissions**:
 
 *GitHub Actions Token*:
@@ -4952,6 +6554,46 @@ Implementation and regression mappings are maintained in the [compiler threat sp
 **Default Max**: 10  
 **Cross-Repository Support**: No (same repository only)  
 **Mandatory**: No
+
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "autofix_code_scanning_alert",
+  "description": "Create an autofix for a code scanning alert.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["alert_number", "fix_description", "fix_code"],
+    "properties": {
+      "alert_number": {"type": ["number", "string"]},
+      "fix_description": {"type": "string", "maxLength": 65536},
+      "fix_code": {"type": "string", "maxLength": 65536}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Per-Run Limit**: Once `max` autofixes have been processed (default 10), further items MUST be rejected.
+2. **Required Fields**: `alert_number`, `fix_description`, and `fix_code` MUST be present, and `alert_number` MUST parse to a positive integer.
+3. **Autofix Creation**: The autofix is created with `POST /repos/{owner}/{repo}/code-scanning/alerts/{alert_number}/fixes` in the current repository.
+4. **Failure Diagnostics**: 404, 403, and 422 API responses produce specific diagnostics for a missing alert, missing `security-events: write` permission, and an invalid fix.
+5. **Staged Mode**: In staged mode the handler previews the autofix and performs no mutation.
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 10)
+- `staged`: Staged mode override
+
+**Security Requirements**:
+
+- Required fields MUST be validated before any API call.
+- Autofixes MUST target only alerts in the current repository.
+- The agent-supplied fix is a proposal to the code scanning API and MUST NOT be applied to repository files by this handler.
 
 **Required Permissions**:
 
@@ -5038,6 +6680,16 @@ Implementation and regression mappings are maintained in the [compiler threat sp
 | `output.title` | `string` | — | Static fallback title when the agent does not provide one. |
 | `output.summary` | `string` | — | Static fallback summary when the agent does not provide one. |
 
+**Security Requirements**:
+
+- The check run name MUST come only from workflow frontmatter configuration; the handler MUST NOT accept a name from the agent.
+- `title`, `summary`, and `text` MUST be sanitized before the Checks API call. `title` MUST be limited to 256 characters; `summary` and `text` MUST each be limited to 65535 characters.
+- Config-level `output.title` and `output.summary` fallbacks MUST be sanitized and bounded identically to agent-supplied values.
+- The check run MUST be created only in the current repository; cross-repository targets are not supported.
+- Pull request targeting MUST follow the standard target rules. Agent-supplied `pull_request_number` (and its aliases) MUST be honored only when `target` is `"*"`.
+- When `target` is configured, the head SHA MUST be fetched from the Pulls API at execution time rather than trusted from the event payload.
+- In staged mode the handler MUST NOT call the Checks API or the Pulls API.
+
 **Required Permissions**:
 
 *GitHub Actions Token* (when `target` is NOT configured):
@@ -5095,6 +6747,50 @@ safe-outputs:
 **Cross-Repository Support**: No (same repository only)  
 **Mandatory**: No
 
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "create_agent_session",
+  "description": "Create a GitHub Copilot coding agent session to delegate coding work.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["body"],
+    "properties": {
+      "body": {"type": "string", "maxLength": 65536}
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+> **Note**: The schema above is abbreviated; the compiled tool definition also carries the `secrecy` and `integrity` provenance fields used by all safe output tools.
+
+**Operational Semantics**:
+
+1. **Empty Task**: An empty or whitespace-only `body` MUST fail the item without calling the API.
+2. **Repository Validation**: The target repository MUST be the configured `target-repo` (or the current repository) or appear in `allowed-repos`; otherwise the item fails.
+3. **Base Branch**: `base` from configuration is used when set; otherwise the repository default branch is resolved.
+4. **Footer**: `body-footer` is appended to the task description when configured.
+5. **Session Creation**: The session is created with `POST /agents/repos/{owner}/{repo}/tasks`, passing the prompt and base ref. The session ID and URL are recorded for outputs and the step summary.
+6. **Staged Mode**: In staged mode the handler previews the session and performs no mutation.
+
+**Configuration Parameters**:
+
+- `max`: Operation limit (default: 1)
+- `base`: Base branch for the session
+- `target-repo`: Cross-repository target
+- `allowed-repos`: Cross-repo allowlist
+- `body-footer`: Deterministic footer appended to the task description
+- `github-token`: Dedicated token for session creation
+- `staged`: Staged mode override
+
+**Security Requirements**:
+
+- The target repository MUST be validated against `target-repo` and `allowed-repos` before any API call.
+- Session creation MUST use a token authorized for agent sessions; a dedicated `github-token` or the broker-issued token takes precedence over the default token.
+- Handler token overrides MUST NOT be exposed to the agent.
+
 **Required Permissions**:
 
 *GitHub Actions Token*:
@@ -5122,6 +6818,59 @@ The YAML configuration key is `report-missing-tool`. The legacy tool/output type
 **Default Max**: unlimited  
 **Cross-Repository Support**: N/A (logging only)  
 **Mandatory**: Yes (always enabled, cannot be disabled)
+
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "report_missing_tool",
+  "description": "Report that a tool or capability needed to complete the task is not available, or share any information you deem important about missing functionality or limitations.",
+  "inputSchema": {
+    "type": "object",
+    "required": [
+      "reason"
+    ],
+    "properties": {
+      "tool": {
+        "type": "string",
+        "description": "Optional: Name or description of the missing tool or capability (max 128 characters). Be specific about what functionality is needed."
+      },
+      "reason": {
+        "type": "string",
+        "description": "Explanation of why this tool is needed or what information you want to share about the limitation (max 256 characters)."
+      },
+      "alternatives": {
+        "type": "string",
+        "description": "Any workarounds, manual steps, or alternative approaches the user could take (max 256 characters)."
+      }
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+**Operational Semantics**:
+
+1. **Required Field**: The handler MUST reject a message without `reason` and return a failure result (`Missing required field: reason`).
+2. **Recording**: The handler records `tool` (or `null`), `reason`, `alternatives` (or `null`) and an ISO-8601 `timestamp`, logs them, and returns them in a success result.
+3. **Max Limit**: When `max` is set and already reached, further messages are skipped with a warning and a failure result.
+4. **No Terminal Output**: This type alone does not count as terminal output when determining whether the agent produced any safe output.
+5. **Issue Creation**: When `create-issue: true`, a separate step creates or updates a tracking issue from the collected reports.
+
+**Configuration Parameters**:
+
+- `create-issue`: When `true`, creates/updates a GitHub tracking issue for reported items (default: `false`)
+- `report-as-failure`: When `true`, the conclusion job surfaces the signal as an agent failure (default: `true`)
+- `title-prefix`: Prefix for tracking issue titles (default: `"[missing tool]"`)
+- `labels`: Labels to add to created issues (array of strings)
+- `max`: Maximum number of `report_missing_tool` signals processed per run (default: unlimited)
+- Setting the YAML key to `false` is accepted and disables the optional behavior
+
+**Security Requirements**:
+
+- All string fields MUST be sanitized by the standard safe-output content sanitization pipeline before processing
+- The handler MUST NOT make any GitHub API calls; GitHub writes occur only in the optional issue-creation step
+- The handler MUST NOT execute or interpret reported values; they are treated as untrusted text
 
 **Required Permissions**:
 
@@ -5153,6 +6902,61 @@ The YAML configuration key is `report-missing-data`. The legacy tool/output type
 **Cross-Repository Support**: N/A (logging only)  
 **Mandatory**: Yes (always enabled, cannot be disabled)
 
+**MCP Tool Schema**:
+
+```json
+{
+  "name": "report_missing_data",
+  "description": "Report that data or information needed to complete the task is not available.",
+  "inputSchema": {
+    "type": "object",
+    "required": [],
+    "properties": {
+      "data_type": {
+        "type": "string",
+        "description": "Type or description of the missing data or information (max 128 characters). Be specific about what data is needed."
+      },
+      "reason": {
+        "type": "string",
+        "description": "Explanation of why this data is needed to complete the task (max 256 characters)."
+      },
+      "context": {
+        "type": "string",
+        "description": "Additional context about the missing data or where it should come from (max 256 characters)."
+      },
+      "alternatives": {
+        "type": "string",
+        "description": "Any workarounds, manual steps, or alternative approaches the user could take (max 256 characters)."
+      }
+    },
+    "additionalProperties": false
+  }
+}
+```
+
+**Operational Semantics**:
+
+1. **No Required Fields**: All fields are optional; the agent MAY emit the message with no fields.
+2. **Recording**: The handler records `data_type`, `reason`, `context`, `alternatives` (each `null` when absent) and an ISO-8601 `timestamp`, logs them, and returns them in a success result.
+3. **Max Limit**: When `max` is set and already reached, further messages are skipped with a warning and a failure result.
+4. **No Terminal Output**: This type alone does not count as terminal output when determining whether the agent produced any safe output.
+5. **Issue Creation**: When `create-issue: true`, a separate step creates or updates a tracking issue from the collected reports.
+
+**Configuration Parameters**:
+
+- `create-issue`: When `true`, creates/updates a GitHub tracking issue for reported items (default: `false`)
+- `report-as-failure`: When `true`, the conclusion job surfaces the signal as an agent failure (default: `true`)
+- `title-prefix`: Prefix for tracking issue titles (default: `"[missing data]"`)
+- `labels`: Labels to add to created issues (array of strings)
+- `max`: Maximum number of `report_missing_data` signals processed per run (default: unlimited)
+- Setting the YAML key to `false` is accepted and disables the optional behavior
+
+**Security Requirements**:
+
+- All string fields MUST be sanitized by the standard safe-output content sanitization pipeline before processing
+- The handler MUST NOT make any GitHub API calls; GitHub writes occur only in the optional issue-creation step
+- The handler MUST NOT execute or interpret reported values; they are treated as untrusted text
+
 **Required Permissions**:
 
 *GitHub Actions Token*:
@@ -5175,7 +6979,7 @@ The YAML configuration key is `report-missing-data`. The legacy tool/output type
 
 #### Type: report_incomplete
 
-**Purpose**: Signal that the task could not be completed due to an infrastructure or tool failure (e.g., MCP server crash, missing authentication, inaccessible repository). This is distinct from `noop` (no action needed) — it indicates an active failure that prevented the task from running. The workflow framework treats this as a failure signal even when the agent exits successfully.
+**Purpose**: Signal that the agent could not complete or publish its assigned task because of a tool, authentication, permission, safe-output, essential-input/data, timeout, or other external blocker. Completion is judged against the agent's assigned task, not against the state of the subject examined. Negative or unresolved findings—including a review requesting changes, bugs found during triage, failing checks, or follow-up work left for humans—are completed outcomes and MUST NOT result in `report_incomplete` solely because the subject remains unresolved. This is distinct from `noop` (no additional action was needed) and remains a failure signal even when the agent exits successfully.
 
 **Default Max**: 5  
 **Cross-Repository Support**: N/A (logging only)  
@@ -5186,7 +6990,7 @@ The YAML configuration key is `report-missing-data`. The legacy tool/output type
 ```json
 {
   "name": "report_incomplete",
-  "description": "Signal that the task could not be completed due to an infrastructure or tool failure (e.g., MCP server crash, missing authentication, inaccessible repository). Use this when required tools or data are unavailable and the task cannot be meaningfully performed. This is distinct from noop (no action needed) — it indicates an active failure that prevented the task from running. The workflow framework will treat this as a failure signal even when the agent exits successfully.",
+  "description": "Signal that the agent could not complete or publish its assigned task because of a tool, authentication, permission, safe-output, essential-input/data, timeout, or other external blocker. Judge completion by the assigned task, not by whether the subject examined was resolved. Do not use it for negative or unresolved findings, including a review requesting changes, bugs found during triage, failing checks, or follow-up left for humans; those are completed outcomes. Provide a specific reason and optional details so downstream issue aggregation can preserve complete incomplete-signal context. The workflow framework will treat this as a failure signal even when the agent exits successfully.",
   "inputSchema": {
     "type": "object",
     "required": ["reason"],
@@ -5250,6 +7054,8 @@ The YAML configuration key is `report-missing-data`. The legacy tool/output type
 ---
 
 ## 8. Protocol Exchange Patterns
+
+The bounded [compiled workflow model](https://github.com/github/gh-aw/blob/main/specs/workflow-security/CompiledWorkflow.tla) abstracts the handoff from agent requests through artifact provenance, detection, authorization, and privileged effects. It does not model JSON-RPC framing or the NDJSON encoding.
 
 ### 8.1 Stdio Container Transport Layer
 
@@ -5430,6 +7236,8 @@ the same stage violate the specification.
 | `create_issue` | Title length | 256 chars | E009 |
 | `create_issue` | Input body length | 524288 chars | Schema validation |
 | `create_issue` | Body length (complete body with footer) | 65536 chars | E006 |
+| `create_issue`, `update_issue` | Issue artifacts per call | Configured `max-issue-artifacts`, default 10 | Handler validation |
+| `create_issue`, `update_issue` | Each issue artifact body | Configured `max-issue-artifact-size`, default 1048576 UTF-8 bytes | Handler validation |
 | `create_pull_request` | Title length | 256 chars | E009 |
 | `create_pull_request` | Body length (complete body with footer) | 65536 chars | E006 |
 
@@ -5457,6 +7265,59 @@ output types retain their declared input and publication constraints.
 - Parse each line independently
 - Ignore empty lines
 - Validate `type` field presence
+
+### 8.5 Request-Continuation Routes
+
+A workflow MAY opt in to routed `request_continuation` handling by configuring
+`safe-outputs.request-continuation.route` as `workqueue`, `issue`, or
+`dispatch`. An advisory `request-continuation` request without a route remains
+advisory and MUST retain its existing behavior.
+
+A routed request MUST produce at most one continuation per producing run
+attempt. Publication MUST be authorized only when `continuation_evidence` is
+bound to the producing artifact and run attempt, and the required evidence
+collection is clean. Missing, ambiguous, or non-clean evidence MUST prevent
+routed publication.
+
+The continuation message MUST be valid UTF-8 and no more than 16,384 UTF-8
+bytes. For `workqueue` and `dispatch`, `max-depth` MUST be an integer from 1
+through 16; when omitted, it defaults to 1. A route MUST NOT create a
+continuation beyond the configured depth. The `issue` route MUST NOT accept
+`max-depth`; each approval releases one successor without an automatic hop
+budget.
+
+#### 8.5.1 Workqueue route
+
+For `route: workqueue`, the request MUST target an assignment-bound queue
+worker. The worker's finish commit MUST record the parent's `Completion` and
+one dependent successor Work in the same ledger commit. The successor MUST
+inherit the parent's graph, pool, priority, fairness key, worker profile, and
+payload, and MUST receive the continuation message as
+`assignment.claims[i].continuation`.
+
+The route MUST NOT admit more than one successor for the routed request.
+
+#### 8.5.2 Issue route
+
+For `route: issue`, the request MUST target a queue worker. The publisher MUST
+open exactly one approval Issue in the queue repository for the successor. The
+successor MUST remain unschedulable until that exact approval Issue is closed
+with completed status by a user authorized to write, maintain, or administer
+the repository. Each approval MUST release exactly one successor.
+
+#### 8.5.3 Dispatch route
+
+For `route: dispatch`, the processor MUST dispatch the named compiled local
+workflow on the repository's default branch. The dispatch MUST carry the
+bounded `gh_aw_continuation` input, and the receiving workflow MUST declare
+that string input. The processor MUST NOT dispatch a pull-request head or any
+other uncompiled PR-head workflow.
+
+If the dispatch POST outcome is uncertain, the processor MUST report the
+outcome as unknown and MUST NOT resend the dispatch automatically.
+
+Inbound continuation data MUST be treated as untrusted and MUST be sanitized
+before exposure to prompts or tools.
 
 ---
 
@@ -5557,6 +7418,11 @@ Implementations MUST apply these transformations in order:
   - `on*` attributes in HTML tags (onclick, onerror, etc.)
 - Preserve safe GitHub Flavored Markdown tags:
   - `<details>`, `<summary>`, `<sub>`, `<sup>`, `<kbd>`
+  - `<details>` and `<details open>` are the only accepted details openings; their
+    summaries may appear inline or on the following line. Plain `<details>` MUST
+    remain collapsed, and the boolean `open` attribute on `<details open>` MUST be
+    preserved and rendered. Valued, duplicate, event-handler, and other unsupported
+    details attributes MUST be rejected or escaped.
 
 **S5: Command Injection Prevention**
 
@@ -5808,6 +7674,9 @@ When threat detection executes in `warn` mode and reports a threat signal for a 
 
 2. A visible threat label string: `agentic threat detected`.
 3. An XML comment marker in emitted markdown content: `<!-- gh-aw-threat-detected -->`.
+4. Detector-defined threat types from the boolean verdict fields: `prompt_injection`, `secret_leak`, and `malicious_patch`. Public warnings, failure notifications, tracking comments, and review messages MUST describe only the fields set to `true`, using framework-authored labels. They MUST NOT publish detector-generated explanations or agent text as threat details. If the types are unavailable, the message MUST say they were not reported rather than infer a finding. Tooling failures MUST remain distinct from threat findings.
+
+The configurable `detection-failure` template can use `{reason_text}` for a framework-authored description and `{threat_kinds}` for the comma-separated category identifiers (`unknown` when unavailable). Warn-mode detection warnings use framework-provided templates and are not configurable through the safe-outputs messages setting.
 
 **Requirement WTD1a (Threat Engine Error Annotation)**: When warn-mode threat detection produces a tooling-failure reason (`agent_failure` or `parse_error`) instead of a real threat verdict, including when the detection execution step itself failed, implementations MUST emit a review-first artifact with all of the following. A warn-mode detection conclusion of `failure` with a tooling-failure reason MUST be handled as `warning` and MUST NOT be treated as a passed detection:
 
@@ -5824,6 +7693,12 @@ When threat detection executes in `warn` mode and reports a threat signal for a 
 **Requirement WTD2 (Convertible Fallback)**: For safe output types classified as **Convertible**, implementations MUST transform the operation into the mapped Reviewable type before execution. For this specification, `push_to_pull_request_branch` (also referred to as `update-pull-request-branch`) MUST fall back to `create_pull_request` with the WTD1 or WTD1a review annotation that matches the detection reason.
 
 **Requirement WTD3 (Non-Reviewable Abort)**: For safe output types classified as **Abort**, implementations MUST NOT apply the original safe output. Implementations MUST activate a threat-detected code path, emit an explicit failure summary, and return a machine-readable threat-detected error outcome.
+
+**Requirement WTD4 (Enforceable Pull Request Merge Gate)**: When `create_pull_request` has a nonempty `detectionCaution`, including WTD1a detection engine errors and WTD2 conversions, or protected-files `request-review` requires independent review, implementations MUST NOT enable auto-merge unless trusted, live evidence establishes an enforceable human approval or blocking review policy for the target pull request. The policy MUST prevent merging until an independent human reviews the affected changes and MUST apply to the automation identity without bypass. Missing, inaccessible, or inconclusive policy evidence MUST leave auto-merge disabled.
+
+A caution annotation, threat label, requested reviewer, or successful `REQUEST_CHANGES` API response alone MUST NOT count as evidence of an enforceable policy. If the required review fails because the bot authored the pull request, or for any other reason, implementations MUST fail closed or require an independent reviewer; a `COMMENT` fallback MUST NOT replace the only security gate while allowing auto-merge. The created pull request MAY remain available for manual review, but the handler MUST explicitly report that auto-merge was withheld and that independent review is required.
+
+The current `create_pull_request` handler does not verify repository review-policy enforcement and therefore conservatively withholds auto-merge whenever detection caution or protected-files `request-review` requires independent review, even if a reviewer was requested or `REQUEST_CHANGES` succeeded. It also withholds auto-merge after any required `REQUEST_CHANGES` failure and does not retry that review as `COMMENT`.
 
 **Table WTD-A: Warn-Mode Threat Detection Failure Policy by Safe Output Type**
 
@@ -5876,6 +7751,9 @@ When threat detection executes in `warn` mode and reports a threat signal for a 
 - **T-WTD-001**: Reviewable outputs include the threat-appropriate annotation: WTD1 CAUTION block/label/marker for `threat_detected`, or WTD1a WARNING block/label/marker for `agent_failure` and `parse_error`.
 - **T-WTD-002**: `push_to_pull_request_branch` in warn-mode threat failure is converted to `create_pull_request`.
 - **T-WTD-003**: Abort-class outputs are not applied and produce threat-detected error outcomes.
+- **T-WTD-004**: Detection caution prevents auto-merge without verified enforceable policy, including when reviewer requests and `REQUEST_CHANGES` succeed, for every enabled merge strategy and for threat verdicts and detection engine errors.
+- **T-WTD-005**: Own-PR and other required-review failures leave auto-merge disabled, never downgrade the only security gate to `COMMENT` and merge, and emit independent-review guidance. Ordinary pull requests without any independent-review requirement or review failure retain configured auto-merge behavior. Regression evidence: `actions/setup/js/create_pull_request.test.cjs`.
+- **T-WTD-006**: Protected-files `request-review` prevents auto-merge even when `REQUEST_CHANGES` succeeds and emits independent-review guidance; ordinary pull requests without any independent-review requirement retain configured auto-merge behavior.
 
 ### 10.6 Edge Case Behavior
 
@@ -6621,6 +8499,91 @@ This specification revision aligns with directly relevant `CHANGELOG.md` entries
 - **v0.40.1**: append-only status comment behavior was documented for smoke workflow execution.
 - **Earlier changelog entry**: status comments were decoupled from default AI reaction behavior; explicit `on.status-comment` configuration is required when status comments are desired.
 - **Earlier changelog entry**: `command` trigger was renamed to `slash_command` with deprecation compatibility.
+
+**Version 1.32.0** (2026-11-24):
+
+- **Added**: Section 8.5, "Request-Continuation Routes," defining opt-in
+  `workqueue`, `issue`, and `dispatch` routing, evidence binding, depth and
+  message bounds, approval gating, default-branch dispatch, untrusted-input
+  sanitization, and unknown-outcome handling.
+
+**Version 1.31.1** (2026-11-23):
+
+- **Clarified**: `report_incomplete` is based on inability to complete or publish the agent's assigned task, rather than the unresolved state of the subject examined.
+- **Clarified**: Negative findings and human follow-up outcomes do not require `report_incomplete`; tool, authentication, permission, safe-output, essential-input/data, timeout, and external blockers remain incomplete outcomes.
+
+**Version 1.31.0** (2026-11-19):
+
+- **Specified**: JSON `job_id`, current-context W3C `traceparent`, and header-safe job baggage on authorization requests, without changing invocation digests or execution identity.
+- **Clarified**: Job metadata is diagnostic only; authorities must allow the new request member, while OIDC issuance and response schemas remain unchanged.
+
+**Version 1.30.0** (2026-11-18):
+
+- **Added**: Opt-in, fail-closed safe-output invocation authorization through an external HTTPS authority authenticated with GitHub OIDC, with global, local, shared-import and repository-default requirements.
+- **Specified**: Executor-bound authorization, staged-mode isolation, bounded consuming requests without automatic retries, durable pre-execution decision evidence and redacted OpenTelemetry spans.
+- **Clarified**: Existing restrictions remain required; authorization covers a prepared invocation or reusable-workflow launch, not verified downstream effects or mandatory organization-wide enforcement.
+- **Updated**: Publication metadata to 1.30.0.
+
+**Version 1.29.26** (2026-11-13):
+
+- **Specified**: `safe-outputs.update-issue.operation` workflow configuration with `append`, `prepend`, `replace`, and `replace-island` values.
+- **Specified**: Body-operation precedence: explicit agent operation, workflow default, then `append`; body-disabled and no-body behavior is unchanged.
+- **Updated**: Publication metadata to 1.29.26.
+
+**Version 1.29.25** (2026-11-12):
+
+- **Specified**: Shared authenticated-author validation for automatic comment replacement and managed comment-memory upserts, including effective-credential identity, lazy scoped lookup caching, and the API-identified bot fallback when identity is unavailable.
+- **Clarified**: Bot type does not establish a specific App's ownership or make comment content trusted; managed memory payloads are excluded from framework metadata discovery and imported history values are validated independently.
+
+**Version 1.29.24** (2026-11-12):
+
+- **Clarified**: Imported safe-output configuration precedence for `steer` and `create-pull-request` fields; explicit local values take precedence and imported values apply only when local fields are omitted.
+- **Added**: `create-pull-request.expires` to the type-specific extension documentation without changing the handler default.
+
+**Version 1.29.23** (2026-11-11):
+
+- **Specified**: `merge_pull_request` blocks protected-file changes by default using the shared creation rules and exclusions, complete live file evidence, and final revalidation for both live and staged execution.
+- **Clarified**: Explicit `protected-files: allowed` disables only the changed-file gate; caution vetoes and other merge requirements remain enforced. Creation-only review and issue fallback policies are unsupported.
+
+**Version 1.29.22** (2026-11-09):
+
+- **Specified**: `push_to_pull_request_branch` classic-protection confirmation through GraphQL `Ref.refUpdateRule`, requiring explicit absence and fail-closed behavior without `Administration: read`.
+
+**Version 1.29.21** (2026-11-08):
+
+- **Specified**: AWF-resident invocation decision skips, conditional no-op recording, preservation of prior outputs and incomplete diagnostics, and failure abstention without decision retries.
+- **Clarified**: Decision evidence is separate from executed attempts and does not authorize publication, prove completed work, or imply zero model usage.
+
+**Version 1.29.20** (2026-11-07):
+
+- **Specified**: Temporary-ID resolution recognizes Markdown-escaped and partially escaped hashes and underscores across dependency extraction, unresolved detection, replacement, supported URL patch handling, and artifact/project URL replacement.
+- **Specified**: Implementations remove only escapes immediately preceding `#` or `_` for lookup and output, preserve unrelated escapes, leave unresolved or malformed references unchanged, and reject valid-prefix matching.
+- **Clarified**: Issue-body and comment-memory rewrites apply the same normalization and complete-identifier requirements before replacement or comment upsert.
+- **Updated**: Publication metadata to 1.29.20.
+
+**Version 1.29.19** (2026-11-06):
+
+- **Specified**: Effective runner UID and primary GID defaults for the built-in `safeoutputs` backend, preserving explicit users, configured HOME, and supplementary group arguments.
+- **Required**: Owner-only (`0600`) no-follow writes for generated safeoutputs config, tools, metadata, validation, and output files, including replacements.
+- **Added**: §7.0.4 specifies review prerequisites, publication-confirmed dependency success, bounded batch finalization and deferred retries without replay, and one explicit review per PR per run.
+- **Preserved**: Fail-closed dependency handling and rejection of unsupported, delegated, staged, queued, or otherwise unconfirmed prerequisites.
+
+**Version 1.29.18** (2026-11-06):
+
+- **Added**: Issue artifact schemas, count and human-friendly UTF-8 size limits, sanitization, authenticated publication, staged previews, typed contracts, and partial-failure requirements for `create_issue`.
+- **Added**: `artifacts[].path` is read into UTF-8 content by the unprivileged MCP backend before recording a body-only request, with guarded, bounded reads. The agent need not load or separately transfer the file; the privileged issue processor never reads agent-supplied paths.
+
+**Version 1.29.17** (2026-11-06):
+
+- **Required**: WTD4 and `create_pull_request` item 16 withhold auto-merge for detection caution, protected-files independent-review requirements, and required-review failures without verified enforceable approval policy.
+- **Prohibited**: Downgrading the only required `REQUEST_CHANGES` security gate to `COMMENT` while continuing into auto-merge, including when the bot authored the PR.
+- **Added**: T-WTD-004–006 regression requirements and user-facing auto-merge configuration caveats.
+- **Required**: `merge_pull_request` item 10 vetoes retained detection and protected-file review notices, including historical advisory/dismissed reviews, without treating approvals or passing checks as resolution. Complete caution evidence and final revalidation apply to live, staged, and cross-repository merges; audit diagnostics remain minimized.
+
+**Version 1.29.16** (2026-11-03):
+
+- **Specified**: GP5c for resolved global-App token persistence on the default host PR checkout, preserving explicit checkout credentials, optional-App fallback, static additional checkouts, and agent-job isolation.
+- **Required**: Work-queue reconciliation and App minting before shared PR checkout, without expanding App permissions or repository scope. Existing locks require recompilation.
 
 **Version 1.29.15** (2026-11-02):
 

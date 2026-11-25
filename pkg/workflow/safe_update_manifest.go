@@ -4,10 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
@@ -69,6 +70,11 @@ type GHAWManifestDetectionPolicy struct {
 	Condition string `json:"condition,omitempty"`
 }
 
+// GHAWManifestWorkQueue records compiler-derived work-queue worker metadata.
+type GHAWManifestWorkQueue struct {
+	Worker bool `json:"worker"`
+}
+
 // GHAWManifest is the single-line JSON payload embedded as a "# gh-aw-manifest: ..."
 // comment in generated lock files. It records the secrets, external actions, and
 // container images that were detected at the time the lock file was last compiled
@@ -77,6 +83,7 @@ type GHAWManifestDetectionPolicy struct {
 type GHAWManifest struct {
 	Version                     int                                  `json:"version"`
 	Secrets                     []string                             `json:"secrets"`
+	DynamicSecretReferences     []string                             `json:"dynamic_secret_references,omitempty"`
 	Actions                     []GHAWManifestAction                 `json:"actions"`
 	Skills                      []string                             `json:"skills,omitempty"`                    // frontmatter skill specs (owner/repo@sha or owner/repo/skill/path@sha), sorted
 	Plugins                     []string                             `json:"plugins,omitempty"`                   // frontmatter plugin specs (owner/repository[/path]@sha), sorted
@@ -90,7 +97,13 @@ type GHAWManifest struct {
 	ThreatDetectionSuppressions []ThreatDetectionSuppression         `json:"threat_detection_suppressions,omitempty"`
 	ThreatDetection             *GHAWManifestDetectionPolicy         `json:"threat_detection,omitempty"`
 	Admission                   bool                                 `json:"admission"`
+	SafeOutputAuthorization     map[string]string                    `json:"safe_output_authorization,omitempty"`
 	WebhookSubscriptions        []WebhookSubscription                `json:"webhook_subscriptions,omitempty"`
+	WorkQueue                   *GHAWManifestWorkQueue               `json:"work_queue,omitempty"`
+	MarkdownMetadata            *GHAWMarkdownMetadata                `json:"-"`
+	AgentMetadata               map[string]json.RawMessage           `json:"agent_metadata"`
+	MetadataRefs                map[string]map[string]string         `json:"metadata_refs,omitempty"`
+	MetadataErrors              map[string]string                    `json:"metadata_errors,omitempty"`
 }
 
 // NewGHAWManifest builds a GHAWManifest from the raw secret names, action reference
@@ -119,7 +132,7 @@ func NewGHAWManifest(secretNames []string, actionRefs []string, failures []GHAWM
 			secrets = append(secrets, full)
 		}
 	}
-	sort.Strings(secrets)
+	slices.Sort(secrets)
 
 	actions := parseActionRefs(actionRefs)
 	resolutionFailures := normalizeResolutionFailures(failures)
@@ -132,7 +145,7 @@ func NewGHAWManifest(secretNames []string, actionRefs []string, failures []GHAWM
 	sortedSkills := normalizeManifestSpecs(skillSpecs)
 	sortedPlugins := normalizeManifestSpecs(pluginSpecs)
 
-	hasPR, hasPRTarget := detectPullRequestEvents(onField)
+	hasPR, hasPRTarget := extractPullRequestEventPresenceFromOnField(onField)
 
 	return &GHAWManifest{
 		Version:              currentGHAWManifestVersion,
@@ -145,7 +158,21 @@ func NewGHAWManifest(secretNames []string, actionRefs []string, failures []GHAWM
 		Redirect:             strings.TrimSpace(redirect),
 		HasPullRequest:       hasPR,
 		HasPullRequestTarget: hasPRTarget,
+		AgentMetadata:        map[string]json.RawMessage{},
 	}
+}
+
+func normalizeDynamicSecretReferences(references []string) []string {
+	hashed := make([]string, 0, len(references))
+	for _, reference := range references {
+		reference = strings.TrimSpace(reference)
+		if reference == "" {
+			continue
+		}
+		hash := sha256.Sum256([]byte(reference))
+		hashed = append(hashed, "sha256:"+hex.EncodeToString(hash[:]))
+	}
+	return normalizeManifestSpecs(hashed)
 }
 
 func normalizeManifestSpecs(specs []string) []string {
@@ -157,7 +184,7 @@ func normalizeManifestSpecs(specs []string) []string {
 			sorted = append(sorted, spec)
 		}
 	}
-	sort.Strings(sorted)
+	slices.Sort(sorted)
 	return sorted
 }
 
@@ -181,30 +208,6 @@ func normalizeManifestContainers(containers []GHAWManifestContainer) []GHAWManif
 		}
 	})
 	return sorted
-}
-
-func detectPullRequestEvents(onField any) (hasPR bool, hasPRTarget bool) {
-	switch v := onField.(type) {
-	case string:
-		return v == "pull_request", v == "pull_request_target"
-	case []any:
-		for _, item := range v {
-			event, ok := item.(string)
-			if !ok {
-				continue
-			}
-			if event == "pull_request" {
-				hasPR = true
-			}
-			if event == "pull_request_target" {
-				hasPRTarget = true
-			}
-		}
-	case map[string]any:
-		_, hasPR = v["pull_request"]
-		_, hasPRTarget = v["pull_request_target"]
-	}
-	return hasPR, hasPRTarget
 }
 
 func collectMemoryValidationScripts(data *WorkflowData) []GHAWManifestMemoryValidationScript {
@@ -394,7 +397,14 @@ func ExtractGHAWManifestFromLockFile(content string) (*GHAWManifest, error) {
 	match := ghawManifestPattern.FindString(content)
 	if _, payload, found := strings.Cut(match, ":"); found {
 		var m GHAWManifest
-		if err := json.Unmarshal([]byte(payload), &m); err != nil {
+		decoder := json.NewDecoder(strings.NewReader(payload))
+		if err := decoder.Decode(&m); err != nil {
+			return nil, fmt.Errorf("gh-aw-manifest JSON is not recognized, expected the JSON emitted by ToJSON in the lock file header: %w", err)
+		}
+		if err := decoder.Decode(new(any)); err != io.EOF {
+			if err == nil {
+				return nil, errors.New("gh-aw-manifest JSON is not recognized, expected the JSON emitted by ToJSON in the lock file header: unexpected trailing JSON value")
+			}
 			return nil, fmt.Errorf("gh-aw-manifest JSON is not recognized, expected the JSON emitted by ToJSON in the lock file header: %w", err)
 		}
 		safeUpdateManifestLog.Printf("Extracted gh-aw-manifest: version=%d secrets=%d actions=%d",

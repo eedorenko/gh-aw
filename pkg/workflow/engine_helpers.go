@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"maps"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/workflow/compilerenv"
@@ -107,6 +108,7 @@ func engineEnvHasNonEmptyValue(workflowData *WorkflowData, key string) bool {
 // process_runner.cjs) and by shell-based engine command prefixes so the engine spawns in
 // the user-specified working directory rather than the default GITHUB_WORKSPACE.
 func applyEngineCwdEnv(env map[string]string, workflowData *WorkflowData) {
+	applySkipIfDecisionEnv(env, workflowData)
 	if workflowData == nil || workflowData.EngineConfig == nil || workflowData.EngineConfig.Cwd == "" {
 		return
 	}
@@ -156,8 +158,19 @@ func applyEngineHarnessRetryEnv(env map[string]string, workflowData *WorkflowDat
 		return
 	}
 
-	cfg := workflowData.EngineConfig
 	applyFallbackProviderEnv(env, workflowData)
+	applyHarnessRetryPolicyEnv(env, workflowData)
+}
+
+// applyHarnessRetryPolicyEnv injects only the GH_AW_HARNESS_* retry policy fields.
+// Engines that run through the generic shell harness use it without inheriting
+// fallback-provider credential wiring. Call it before engine.env overrides.
+func applyHarnessRetryPolicyEnv(env map[string]string, workflowData *WorkflowData) {
+	if workflowData == nil || workflowData.EngineConfig == nil {
+		return
+	}
+
+	cfg := workflowData.EngineConfig
 	if cfg.HarnessMaxRetries != "" {
 		env["GH_AW_HARNESS_MAX_RETRIES"] = cfg.HarnessMaxRetries
 	}
@@ -204,7 +217,7 @@ func applyEngineAndAgentEnv(env map[string]string, workflowData *WorkflowData, l
 			log.Printf("Added %d custom env vars from agent config", len(agentConfig.Env))
 		}
 	}
-
+	applySkipIfDecisionEnv(env, workflowData)
 }
 
 func applyPlaywrightBrowserEnv(env map[string]string, workflowData *WorkflowData) {
@@ -432,6 +445,13 @@ func yamlStringValue(value string) string {
 	if quoted := quoteYAMLValueContainingColonSpace(value); quoted != value {
 		return quoted
 	}
+	// Values that are YAML boolean/null keywords (e.g. "True", "yes", "off", "~")
+	// would otherwise be parsed as a non-string scalar, silently changing the
+	// value GitHub Actions exposes to the step (and tripping yamllint's truthy
+	// rule). Quote them so they round-trip as the literal string.
+	if isYAMLAmbiguousPlainScalar(value) {
+		return strconv.Quote(value)
+	}
 	// Values starting with YAML flow indicators need quoting to be treated as strings.
 	// '{' would be parsed as a YAML flow mapping, '[' as a YAML flow sequence.
 	if !strings.HasPrefix(value, "{") && !strings.HasPrefix(value, "[") {
@@ -439,6 +459,31 @@ func yamlStringValue(value string) string {
 	}
 	// Single-quote the value, escaping any embedded single quotes by doubling them.
 	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+// yamlAmbiguousPlainScalars lists case-insensitive plain scalars that YAML
+// parsers (including go-yaml, used by this project's test harness, and
+// GitHub Actions' own YAML parser) resolve to a boolean or null value rather
+// than a string.
+var yamlAmbiguousPlainScalars = map[string]bool{
+	"true": true, "false": true,
+	"yes": true, "no": true,
+	"on": true, "off": true,
+	"y": true, "n": true,
+	"null": true, "~": true,
+}
+
+// isYAMLAmbiguousPlainScalar reports whether value, if emitted unquoted,
+// would be resolved by a YAML parser as something other than the literal string.
+// Canonical lowercase "true"/"false" are excluded: they already round-trip
+// correctly unquoted and are the only values this project's yamllint config
+// allows for the truthy rule, so quoting them would only add unnecessary diff
+// noise without fixing anything.
+func isYAMLAmbiguousPlainScalar(value string) bool {
+	if value == "true" || value == "false" {
+		return false
+	}
+	return yamlAmbiguousPlainScalars[strings.ToLower(value)]
 }
 
 // FilterEnvForSecrets filters environment variables to only include allowed secrets.

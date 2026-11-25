@@ -8,7 +8,8 @@ description: Agentic workflow specific frontmatter fields for GitHub Agentic Wor
 
 - **`description:`** - Human-readable workflow description (string)
 - **`emoji:`** - Optional single emoji used to represent the workflow visually; recommended for quicker recognition in workflow lists and status output (string)
-- **`source:`** - Workflow origin tracking in format `owner/repo/path@ref` (string)
+- **`source:`** - Workflow origin tracking in format `owner/repo/path@ref` (string). Explicit refs are preserved, so updates follow the requested branch or compatible releases.
+- **`source-sha:`** - Installed 40-character source commit SHA, managed by `gh aw add`/`gh aw update` as the three-way merge base; it does not change the tracking ref. Do not hand-edit (string)
 - **`labels:`** - Array of labels to categorize and organize workflows (array)
   - Labels filter workflows in status/list commands
   - Example: `labels: [automation, security, daily]`
@@ -21,11 +22,12 @@ description: Agentic workflow specific frontmatter fields for GitHub Agentic Wor
 - **`on.bots:`** - Bot identifiers allowed to trigger workflow regardless of role permissions (array; e.g. `[dependabot[bot], renovate[bot], github-actions[bot]]`). The bot must be active (installed) on the repository to trigger.
 - **`strict:`** - Enable enhanced validation for production workflows (boolean, defaults to `true`; strongly recommended)
   - Prefer `strict: true`; `strict: false` is dangerous, should be extremely rare, and must be carefully security reviewed before use
-- **`model:`** - Default LLM model for the agentic engine (string). A nested `engine.model` takes precedence for that engine instance. Accepts full model IDs (e.g. `claude-3-5-sonnet-20241022`, `gpt-5.4`) and aliases (e.g. `small`, `large`).
+- **`model:`** - Default LLM model for the agentic engine (string). A nested `engine.model` takes precedence for that engine instance. Accepts full model IDs (e.g. `claude-3-5-sonnet-20241022`, `gpt-5.4`), aliases (e.g. `small`, `large`), and the router values `router`, `router/economy`, `router/balanced`, and `router/robust` (gh-aw per-task model routing; see [syntax-engine.md](syntax-engine.md) for requirements and details). **Unless the task needs a specific model, use `model: router` or a `router/` level.** Eligible workflows with no model already route the same way; see the [default routing eligibility rules](https://github.github.com/gh-aw/reference/model-routing/#default-routing-for-workflows-without-a-model).
 - **`max-turns:`** - AWF turn cap applied consistently across all agentic engines (integer or expression, e.g. `${{ inputs.max-turns }}`). The engine-level `engine.max-turns` is a deprecated alias kept for backward compatibility — prefer this top-level field.
 - **`max-runs:`** - Deprecated legacy alias for the AWF invocation cap (`apiProxy.maxRuns`, defaults to `500` when omitted). Use `max-turns` instead; run `gh aw fix` to migrate.
-- **`max-ai-credits:`** - Per-run AI Credits (AIC) budget enforced by the AWF firewall (integer or `K`/`M` short-form string like `100M`; default `1000`). Set a negative value to disable enforcement and token steering. See [token-optimization.md](token-optimization.md).
+- **`max-ai-credits:`** - Per-run AI Credits (AIC) budget enforced by the AWF firewall (integer or `K`/`M` short-form string like `100M`; default `1000`). Set a negative value to disable enforcement; with AWF releases after v0.29.11, budget notices continue unless `sandbox.agent.token-steering: false`. See [token-optimization.md](token-optimization.md).
 - **`max-turn-cache-misses:`** - Maximum consecutive AWF cache misses allowed before the API proxy blocks further requests (integer, default `5`). Maps to `apiProxy.maxCacheMisses`; precedence is frontmatter → `GH_AW_DEFAULT_MAX_TURN_CACHE_MISSES` env override → built-in default.
+- **`max-tool-calls:`** - Run-wide cap on tool dispatches, including nested/subagent calls (positive integer or expression). Reserved before execution, so failed and denied calls count. Enforced only by the built-in Copilot SDK driver (CLI mode and custom drivers/harnesses reject it) and Pi drivers. Distinct from per-tool `tools.github.allowed[].max-calls` and from `max-tool-denials`.
 - **`models:`** - Model policy and optional pricing (object). Experimental policy fields `allowed` / `blocked` (lists of model names or patterns) restrict which models the workflow may use; they map to AWF `apiProxy.allowedModels` / `disallowedModels` and merge as unions across imports. Environment-variable overrides are supported. The separate `providers` field supplies custom pricing, and `default-ai-credits-pricing` (`input`/`output` in $/1M tokens) is a fallback rate for models absent from the built-in table — required to avoid HTTP 400 rejections for self-hosted/BYOK models (set both to `0` for free/local models). See [token-optimization.md](token-optimization.md).
 
   ```yaml
@@ -54,7 +56,6 @@ description: Agentic workflow specific frontmatter fields for GitHub Agentic Wor
 - **`features:`** - Feature flags for experimental or optional features (object)
   - Each flag is a key-value pair; boolean flags (`true`/`false`) or string values are accepted
   - Known feature flags:
-    - `copilot-requests: true` - Use GitHub Actions token for Copilot authentication instead of `COPILOT_GITHUB_TOKEN` secret
     - `disable-xpia-prompt: true` - Disable the built-in cross-prompt injection attack (XPIA) system prompt
     - `action-tag: "v0"` - Pin compiled action references to a specific version of the `gh-aw-actions` repository. Accepts version tags (e.g., `"v0"`, `"v1"`, `"v1.0.0"`) or a full 40-character commit SHA. When set, overrides the compiler's default action mode and resolves all action references from the external `github/gh-aw-actions` repository at the specified tag.
     - `action-mode: "script"` - Control how the compiler generates action references: `"dev"` (local paths, default), `"release"` (SHA-pinned remote), `"action"` (gh-aw-actions repo), `"script"` (direct shell calls). Can also be overridden via `--action-mode` CLI flag.
@@ -62,6 +63,7 @@ description: Agentic workflow specific frontmatter fields for GitHub Agentic Wor
     - `cli-proxy: true` - Enable AWF CLI proxy sidecar for secure read-only `gh` CLI access without exposing `GITHUB_TOKEN` (requires AWF v0.26.0+). Prerequisite for `integrity-reactions`; the compiler enables it automatically when `integrity-reactions: true` is set.
     - `integrity-reactions: true` - Enable reaction-based integrity promotion/demotion. Maintainers can use 👍/❤️ reactions to promote content to `approved` and 👎/😕 to demote it to `none`. Compiler automatically enables `cli-proxy`. Requires `tools.github.min-integrity` to be set and MCPG >= v0.2.18. Defaults: endorsement reactions THUMBS_UP/HEART, disapproval reactions THUMBS_DOWN/CONFUSED, endorser-min-integrity: approved, disapproval-integrity: none.
     - `dangerously-disable-sandbox-agent: true` - Required when `sandbox.agent: false` is set. This opt-out is rejected in strict mode.
+    - `dangerously-allow-pull-request-target-forks-all: true` - Lets strict mode accept `on.pull_request_target.forks: ["*"]`; the warning remains. Must be in the main workflow's top-level `features:` (imported features do not count). See [triggers.md](triggers.md).
 
 - **`experiments:`** - A/B testing experiments for balanced variant selection (object)
   - Maps experiment names to variant lists (bare array) or full config objects
@@ -158,24 +160,29 @@ description: Agentic workflow specific frontmatter fields for GitHub Agentic Wor
 
 - **`observability:`** - Workflow observability and telemetry configuration (object)
   - **`otlp:`** - Export OpenTelemetry spans to any OTLP-compatible backend (Honeycomb, Grafana Tempo, Sentry, etc.) (object)
-    - `endpoint:` - OTLP collector endpoint URL. When a static URL is provided, its hostname is added to the AWF firewall allowlist automatically. Supports GitHub Actions expressions.
+    - `endpoint:` - OTLP collector URL string, a `{url, headers}` object, or an array of them for concurrent multi-endpoint export. Static hostnames are added to the AWF firewall allowlist automatically. Supports GitHub Actions expressions.
     - `github-app:` - Optional runtime auth configuration.
       - Preferred: provide GitHub App credentials (`app-id`/`client-id` + `private-key`) to mint a token with `actions/create-github-app-token` before `actions/setup`.
       - OIDC mode is used when `github-app` is configured without credentials (`app-id`/`client-id` + `private-key`).
       - OIDC mode requires `permissions.id-token: write` on the workflow/job.
     - `workload-identity:` - Exchange a GitHub Actions OIDC token for a cloud access token before OTLP export. Only `provider: google` is currently supported; requires `audience:` (Google Workload Identity Provider resource name) and accepts optional `service-account:` to impersonate after STS token exchange.
-    - `headers:` - Comma-separated `key=value` HTTP headers included in every OTLP export request (e.g. `Authorization=Bearer <token>`). Injected as `OTEL_EXPORTER_OTLP_HEADERS`. Supports GitHub Actions expressions.
+    - `headers:` - Map of HTTP header names to values (e.g. `Authorization: ${{ secrets.OTLP_AUTH }}`) for the string `endpoint:` form; object/array endpoints carry their own `headers:`. Injected as `OTEL_EXPORTER_OTLP_HEADERS`. The comma-separated `key=value` string form is deprecated.
+    - `if-missing:` - `error` (default), `warn`, or `ignore` when endpoint/header values resolve empty at runtime (affects MCP gateway OTLP setup only).
+    - `attributes:` - Optional map of custom span attributes; values are static strings or `{{ <span-attribute> }}` templates. Exported to backends and masked in runner logs.
     - `resource-attributes:` - Optional map of additional OTEL resource attributes appended to gh-aw/GitHub defaults. Values may be static strings or GitHub Actions expressions. Do not use `secrets.*` or `vars.*` here because resource attributes are exported to external observability backends and are not treated as secret values.
+  - Runtime controls (Actions variables, not frontmatter; recompile once to add the lookup): `OTEL_EXPORTER_OTLP_PROTOCOL` selects `http/json` (default) or `http/protobuf` (gRPC unsupported; per-signal `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`/`OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` override it); `GH_AW_OTLP_LOGS_ENABLED=true` opts in to compact unified-session OTLP logs posted to `<endpoint>/v1/logs`, capped by `GH_AW_OTLP_LOGS_MAX_BYTES` (default `65536`). Manage the protocol with `gh aw env` key `default_otlp_protocol`.
   - Example:
 
     ```yaml
     observability:
       otlp:
-        endpoint: ${{ secrets.GH_AW_OTEL_ENDPOINT }}
+        endpoint:
+          - url: ${{ secrets.GH_AW_OTEL_ENDPOINT }}
+            headers:
+              Authorization: ${{ secrets.GH_AW_OTEL_AUTHORIZATION }}
         github-app:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
-        headers: ${{ secrets.GH_AW_OTEL_HEADERS }}
     ```
 
     Every job emits setup and conclusion spans with rich attributes (`gh-aw.job.name`, `gh-aw.workflow.name`, `gh-aw.engine.id`, token usage). All jobs in a run share one trace ID. Dispatched child workflows inherit the parent's trace context via `aw_context`.
@@ -213,7 +220,7 @@ description: Agentic workflow specific frontmatter fields for GitHub Agentic Wor
     ```
 
 - **`runtimes.node.run-install-scripts:`** - Allow npm pre/post install scripts to execute during package installation for the Node.js runtime (boolean, default: `false`)
-  - By default, `--ignore-scripts` is added to all generated npm install commands to prevent supply chain attacks via malicious install hooks
+  - By default, generated Node.js runtime and engine npm installs disable scripts using `NPM_CONFIG_IGNORE_SCRIPTS: 'true'` for global installs or `--ignore-scripts` for local installs to prevent supply chain attacks via malicious install hooks
   - Set `run-install-scripts: true` under `runtimes.node` to allow scripts for Node.js installs
   - A supply chain security warning is emitted at compile time; in strict mode this is an error
 
@@ -224,6 +231,7 @@ description: Agentic workflow specific frontmatter fields for GitHub Agentic Wor
   - Each job can have: `name`, `runs-on`, `steps`, `needs`, `if`, `env`, `permissions`, `timeout-minutes`, etc.
   - For most agentic workflows, jobs are auto-generated; only specify this for advanced multi-job workflows
   - **Security Notice**: Custom jobs run OUTSIDE the firewall sandbox. Execute with standard GitHub Actions security but NO network egress controls. Use only for deterministic preprocessing, data fetching, or static analysis—not agentic compute or untrusted AI execution.
+  - **Detection gate**: custom jobs that depend (directly or transitively) on `agent`/`detection` get a direct `detection` dependency and a non-overridable success guard; failed, cancelled, skipped, or warn-flagged detection blocks them even with `if: always()`. Custom jobs cannot run between `agent` and `detection`. For leaf status reporters only, set `detection-gate: status-only` (compiler-only key) to run anyway: they may read outputs of compiler-owned jobs (e.g. `safe_outputs`) and of pre-agent custom jobs listed directly in `needs` (pass via `env`, never interpolate into `run`/script code). The compiler rejects them if they download artifacts, call opaque reusable workflows, read other job outputs, or reference agent/safe-output files; no job may depend on them.
   - **`setup-steps:`** - Steps injected at the earliest point in a custom or built-in job, before framework GitHub App token minting and before checkout (array). Use this for OIDC login, secret fetch, and credential bootstrap that must happen before framework token/checkout steps. Imported `setup-steps` run before main workflow `setup-steps`.
   - **`pre-steps:`** - Steps injected after framework setup scaffolding and before the job's main `steps:` in a custom or built-in job (array). For built-in jobs, this is after the `id: setup` step (which includes framework token minting/checkout setup) and before the first checkout. Imported `pre-steps` run before main workflow `pre-steps`.
   - **`setup-steps` vs `pre-steps`** - Use `setup-steps` for work that must run before framework GitHub App token minting and checkout (e.g., OIDC/secret bootstrap). Use `pre-steps` for work that should run later, after setup scaffolding and before the job's main `steps:`.
@@ -279,7 +287,7 @@ description: Agentic workflow specific frontmatter fields for GitHub Agentic Wor
         id: awf                     # Required in strict mode
         version: "v0.25.29"         # Optional: pin AWF version
         model-fallback: false       # Optional: disable model fallback (default true); set false for BYOK Azure OpenAI to prevent deployment-name rewriting
-        token-steering: false       # Optional: disable API proxy token steering to preserve the configured provider and model
+        token-steering: false       # Optional: turn off AWF budget notices (on by default; steering never changes the provider or model)
     ```
 
   - When `engine.env` sets `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` (custom provider endpoints, e.g. OpenRouter), `model-fallback` is disabled automatically so provider-specific model slugs pass through verbatim; set it explicitly to override.
@@ -304,7 +312,7 @@ description: Agentic workflow specific frontmatter fields for GitHub Agentic Wor
 
 - **`safe-outputs:`** - Safe output processing configuration. See [safe-outputs.md](safe-outputs.md) for complete documentation of all output types: `create-issue`, `create-discussion`, `add-comment`, `create-pull-request`, `push-to-pull-request-branch`, `close-issue`, `close-discussion`, `update-issue`, `update-pull-request`, `add-labels`, `remove-labels`, `replace-label`, `dispatch-workflow`, `call-workflow`, `create-code-scanning-alert`, `upload-asset`, `upload-artifact`, `assign-to-agent`, `assign-to-user`, `approve-workflow-run`, and more.
 
-  **Key safe-outputs global fields** (detail in [safe-outputs-runtime.md](safe-outputs-runtime.md)): `github-token`, `github-app`, `staged` (preview mode, no API calls), `footer`, `threat-detection`, `runs-on` (default `ubuntu-slim`), `messages`, `env`, `max-patch-size` (KB, default `4096`).
+  **Key safe-outputs global fields** (detail in [safe-outputs-runtime.md](safe-outputs-runtime.md)): `github-token`, `github-app`, `token-broker`, `staged` (preview mode, no API calls), `footer`, `threat-detection`, `runs-on` (default `ubuntu-slim`), `messages`, `env`, `max-patch-size` (KB, default `4096`). Experimental `safe-outputs.token-broker: true` (or an empty value) exchanges GitHub Actions OIDC for a broker-policy-scoped GitHub App token for each consuming job; `false` disables it. Do not combine an enabled broker with `safe-outputs.github-token` or `safe-outputs.github-app`. `safe-outputs.jobs` do not inherit it, and work-queue dispatch requires an explicit `dispatch-workflow.github-app` or `dispatch-workflow.github-token`. See [token broker configuration](https://github.github.com/gh-aw/reference/frontmatter/#token-broker-token-broker).
 
 
 - **`mcp-scripts:`** - Define custom lightweight MCP tools as JavaScript, shell, Python, or Go scripts (object)

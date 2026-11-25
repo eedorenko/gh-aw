@@ -327,14 +327,25 @@ func buildAgenticAssessments(processedRun ProcessedRun, metrics MetricsData, too
 
 	assessments := make([]AgenticAssessment, 0, 4)
 	toolTypes := len(toolUsage)
-	frictionEvents := len(processedRun.MissingTools) + len(processedRun.MCPFailures) + len(processedRun.MissingData)
+	reportedControlSignals := len(processedRun.MissingTools) + len(processedRun.MCPFailures) + len(processedRun.MissingData)
+	controlEvents := reportedControlSignals
+	frictionEvidence := fmt.Sprintf("control_events=%d reported_control_signals=%d friction_counted_occurrences=unavailable", controlEvents, reportedControlSignals)
+	if processedRun.Friction != nil {
+		frictionOccurrences := processedRun.Friction.CountedOccurrences
+		// The sources may overlap; max avoids double-counting but can undercount distinct signals.
+		controlEvents = max(controlEvents, frictionOccurrences)
+		frictionEvidence = fmt.Sprintf("control_events=max(reported_control_signals=%d, friction_counted_occurrences=%d)=%d", reportedControlSignals, frictionOccurrences, controlEvents)
+		if processedRun.Friction.Derived {
+			frictionEvidence += " friction_scope=derived_from_logs"
+		}
+	}
 	writeCount := len(createdItems) + processedRun.Run.SafeItemsCount
 
 	assessments = appendResourceHeavyAssessment(assessments, processedRun, metrics, domain, fingerprint, toolTypes, writeCount)
 	assessments = appendOverkillAssessment(assessments, metrics, domain, fingerprint, toolTypes)
-	assessments = appendPoorControlAssessment(assessments, domain, fingerprint, frictionEvents, writeCount)
+	assessments = appendPoorControlAssessment(assessments, domain, fingerprint, controlEvents, frictionEvidence, writeCount)
 	assessments = appendPartiallyReducibleAssessment(assessments, metrics, fingerprint)
-	assessments = appendModelDowngradeAssessment(assessments, domain, fingerprint)
+	assessments = appendModelDowngradeAssessment(assessments, domain, fingerprint, processedRun.ModelRouting)
 	assessments = appendDelegatedContextAssessment(assessments, awContext)
 
 	auditAgenticLog.Printf("Built %d agentic assessments", len(assessments))
@@ -359,6 +370,10 @@ func appendResourceHeavyAssessment(assessments []AgenticAssessment, processedRun
 }
 
 func appendOverkillAssessment(assessments []AgenticAssessment, metrics MetricsData, domain *TaskDomainInfo, fingerprint *BehaviorFingerprint, toolTypes int) []AgenticAssessment {
+	if metrics.Turns == 0 {
+		auditAgenticLog.Print("Skipping overkill assessment: no agent turns recorded")
+		return assessments
+	}
 	if (domain.Name == "triage" || domain.Name == "repo_maintenance" || domain.Name == "issue_response") && fingerprint.ResourceProfile == "lean" && fingerprint.ExecutionStyle == "directed" && fingerprint.ToolBreadth == "narrow" {
 		assessments = append(assessments, AgenticAssessment{
 			Kind:           "overkill_for_agentic",
@@ -371,17 +386,17 @@ func appendOverkillAssessment(assessments []AgenticAssessment, metrics MetricsDa
 	return assessments
 }
 
-func appendPoorControlAssessment(assessments []AgenticAssessment, domain *TaskDomainInfo, fingerprint *BehaviorFingerprint, frictionEvents, writeCount int) []AgenticAssessment {
-	if frictionEvents >= 3 || (frictionEvents > 0 && writeCount >= 3) || ((domain.Name == "triage" || domain.Name == "repo_maintenance" || domain.Name == "issue_response") && fingerprint.ExecutionStyle == "exploratory") {
+func appendPoorControlAssessment(assessments []AgenticAssessment, domain *TaskDomainInfo, fingerprint *BehaviorFingerprint, controlEvents int, frictionEvidence string, writeCount int) []AgenticAssessment {
+	if controlEvents >= 3 || (controlEvents > 0 && writeCount >= 3) || ((domain.Name == "triage" || domain.Name == "repo_maintenance" || domain.Name == "issue_response") && fingerprint.ExecutionStyle == "exploratory") {
 		severity := "medium"
-		if frictionEvents >= 4 || (frictionEvents > 0 && fingerprint.ActuationStyle == "write_heavy") {
+		if controlEvents >= 4 || (controlEvents > 0 && fingerprint.ActuationStyle == "write_heavy") {
 			severity = "high"
 		}
 		assessments = append(assessments, AgenticAssessment{
 			Kind:           "poor_agentic_control",
 			Severity:       severity,
 			Summary:        "The run showed signs of broad or weakly controlled agentic behavior.",
-			Evidence:       fmt.Sprintf("friction=%d execution=%s actuation=%s", frictionEvents, fingerprint.ExecutionStyle, fingerprint.ActuationStyle),
+			Evidence:       fmt.Sprintf("%s execution=%s actuation=%s", frictionEvidence, fingerprint.ExecutionStyle, fingerprint.ActuationStyle),
 			Recommendation: "Tighten instructions, reduce unnecessary tools, or delay write actions until the workflow has stronger evidence.",
 		})
 	}
@@ -411,21 +426,68 @@ func appendPartiallyReducibleAssessment(assessments []AgenticAssessment, metrics
 	return assessments
 }
 
-func appendModelDowngradeAssessment(assessments []AgenticAssessment, domain *TaskDomainInfo, fingerprint *BehaviorFingerprint) []AgenticAssessment {
-	// Model downgrade suggestion: the run uses a heavy resource profile but
-	// the task domain is simple enough that a smaller model would likely suffice.
-	if fingerprint.ResourceProfile != "lean" &&
-		(domain.Name == "triage" || domain.Name == "repo_maintenance" || domain.Name == "issue_response") &&
-		fingerprint.ActuationStyle != "write_heavy" {
-		assessments = append(assessments, AgenticAssessment{
+const modelRoutingDocsURL = "https://github.github.com/gh-aw/reference/model-routing/"
+
+// perTaskRoutingChange covers each way a workflow can set its model because
+// audit cannot tell which form the workflow uses.
+const perTaskRoutingChange = "change engine.model (if set) or the top-level model to router; with an engine.model-routing block, set its mode: auto instead. To cap routing at the lowest level, use router/economy (mode: economy) instead."
+
+func appendModelDowngradeAssessment(assessments []AgenticAssessment, domain *TaskDomainInfo, fingerprint *BehaviorFingerprint, routing *ModelRoutingSummary) []AgenticAssessment {
+	// Per-task routing suggestion: the run uses a non-lean resource profile but
+	// the task domain is routine enough that the router's classifier would
+	// likely pick the economy level for it.
+	if fingerprint.ResourceProfile == "lean" ||
+		(domain.Name != "triage" && domain.Name != "repo_maintenance" && domain.Name != "issue_response") ||
+		fingerprint.ActuationStyle == "write_heavy" {
+		return assessments
+	}
+	evidence := fmt.Sprintf("domain=%s resource_profile=%s actuation=%s", domain.Name, fingerprint.ResourceProfile, fingerprint.ActuationStyle)
+	level := confirmedModelRoutingLevel(routing)
+	switch {
+	case level == "economy":
+		auditAgenticLog.Print("Skipping model downgrade assessment: run was already routed at economy")
+		return assessments
+	case level != "" && routing.ObjectiveMode == "auto":
+		// The classifier chose this level for the task; the domain heuristic
+		// is weaker evidence and must not overrule it.
+		auditAgenticLog.Printf("Skipping model downgrade assessment: auto routing selected %s for this task", level)
+		return assessments
+	case level != "" && (routing.ObjectiveMode == "balanced" || routing.ObjectiveMode == "robust"):
+		return append(assessments, AgenticAssessment{
 			Kind:           "model_downgrade_available",
 			Severity:       "low",
-			Summary:        fmt.Sprintf("This %s run may not need a frontier model. A smaller model (e.g. gpt-4.1-mini, claude-haiku-4-5) could handle the task at lower cost.", domain.Label),
-			Evidence:       fmt.Sprintf("domain=%s resource_profile=%s actuation=%s", domain.Name, fingerprint.ResourceProfile, fingerprint.ActuationStyle),
-			Recommendation: "Try engine.model: gpt-4.1-mini or claude-haiku-4-5 in the workflow frontmatter.",
+			Summary:        fmt.Sprintf("This %s run was routed at a fixed %s level; when the router's classifier picks the level per task, routine work like this usually runs at the economy level for lower cost.", domain.Label, routing.ObjectiveMode),
+			Evidence:       fmt.Sprintf("%s routing_objective_mode=%s routing_mode=%s", evidence, routing.ObjectiveMode, level),
+			Recommendation: "Let the router pick the level for each task: " + perTaskRoutingChange + " See " + modelRoutingDocsURL,
+		})
+	default:
+		return append(assessments, AgenticAssessment{
+			Kind:           "model_downgrade_available",
+			Severity:       "low",
+			Summary:        fmt.Sprintf("This %s run may not need a high-capability model. Per-task model routing lets the router's classifier pick the level for each task, usually economy for routine work like this, at lower cost.", domain.Label),
+			Evidence:       evidence,
+			Recommendation: "Route each task with model: router: " + perTaskRoutingChange + " Workflows eligible for default routing can instead omit the model. See " + modelRoutingDocsURL,
 		})
 	}
-	return assessments
+}
+
+// confirmedModelRoutingLevel returns the routing level recorded by a successful
+// selection, or "" when the evidence is missing, incomplete, or ambiguous. The
+// level comes only from the selection mode; requested modes such as auto, model
+// names, and outcome-only records are never treated as a selected level.
+func confirmedModelRoutingLevel(routing *ModelRoutingSummary) string {
+	if routing == nil || routing.Status != "selected" || routing.Failure != nil {
+		return ""
+	}
+	if routing.SelectedModel == "" && routing.SelectedID == "" {
+		return ""
+	}
+	switch routing.Mode {
+	case "economy", "balanced", "robust":
+		return routing.Mode
+	default:
+		return ""
+	}
 }
 
 func appendDelegatedContextAssessment(assessments []AgenticAssessment, awContext *AwContext) []AgenticAssessment {
@@ -467,7 +529,7 @@ func generateAgenticAssessmentFindings(assessments []AgenticAssessment) []AuditF
 		case "model_downgrade_available":
 			code = AuditFindingAgenticModelDowngrade
 			category = "optimization"
-			impact = "A smaller model could reduce per-run cost significantly for this task domain"
+			impact = "Per-task model routing could reduce per-run cost for this task domain"
 		case "delegated_context_present":
 			code = AuditFindingAgenticDelegatedContext
 			category = "coordination"

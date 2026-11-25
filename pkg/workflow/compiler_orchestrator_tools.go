@@ -28,6 +28,7 @@ type toolsProcessingResult struct {
 	importPaths             []string // Import paths for runtime-import macro generation (imports without inputs)
 	promptImports           []parser.PromptImportEntry
 	mainWorkflowMarkdown    string // main workflow markdown without imports (for runtime-import)
+	promptMarkdown          string // expanded main body preserving inline definitions for embedding
 	rawMainMarkdown         string // raw main markdown before include expansion, without inline sub-agent sections
 	allIncludedFiles        []string
 	workflowName            string
@@ -133,6 +134,7 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 		importPaths:             markdownData.importPaths,
 		promptImports:           markdownData.promptImports,
 		mainWorkflowMarkdown:    markdownData.mainWorkflowMarkdown,
+		promptMarkdown:          markdownData.promptMarkdown,
 		rawMainMarkdown:         config.effectiveMarkdown,
 		allIncludedFiles:        markdownData.allIncludedFiles,
 		workflowName:            markdownData.workflowName,
@@ -171,6 +173,7 @@ type markdownArtifacts struct {
 	importPaths          []string
 	promptImports        []parser.PromptImportEntry
 	mainWorkflowMarkdown string
+	promptMarkdown       string
 	allIncludedFiles     []string
 	workflowName         string
 	frontmatterName      string
@@ -239,9 +242,6 @@ func (c *Compiler) resolveToolsConfiguration(
 		orchestratorToolsLog.Printf("Tools merge failed: %v", err)
 		return nil, fmt.Errorf("failed to merge tools: %w", err)
 	}
-	if err := expandLinearTool(tools); err != nil {
-		return nil, err
-	}
 	githubToolExplicit := hasExplicitGitHubTool(tools, topTools)
 	toolsTimeout, toolsStartupTimeout, err := c.extractToolTimeouts(tools)
 	if err != nil {
@@ -261,12 +261,13 @@ func (c *Compiler) resolveToolsConfiguration(
 	if err != nil {
 		return nil, err
 	}
+	// Validate authored restrictions before capability normalization can discard them.
+	if err := c.validateEngineToolRequirements(result.Frontmatter, agenticEngine, tools); err != nil {
+		return nil, err
+	}
 	tools = c.adjustToolsForEngineCapabilities(result.Frontmatter, agenticEngine, tools)
 	tools, err = enforceMCPProxyTools(agenticEngine, tools)
 	if err != nil {
-		return nil, err
-	}
-	if err := c.validateEngineToolRequirements(result.Frontmatter, agenticEngine, tools); err != nil {
 		return nil, err
 	}
 	return &mergedToolsData{
@@ -414,6 +415,9 @@ func (c *Compiler) adjustToolsForEngineCapabilities(frontmatter map[string]any, 
 	// Queue assignment and CLI transport are framework controls, not native
 	// engine tool allow-list entries. Preserve them for dispatch-only workers.
 	fallback := map[string]any{"github": map[string]any{}}
+	if github, ok := tools["github"]; ok {
+		fallback["github"] = github
+	}
 	if queue, ok := tools["work-queue"]; ok {
 		fallback["work-queue"] = queue
 	}
@@ -466,13 +470,25 @@ func (c *Compiler) resolveMarkdownArtifacts(
 		return nil, fmt.Errorf("failed to expand includes in markdown: %w", err)
 	}
 	mainWorkflowMarkdown := markdownContent
+	promptMarkdown := ""
+	if c.inlinePrompt || resolveInlinedImports(result.Frontmatter) {
+		var promptIncludedFiles []string
+		promptMarkdown, promptIncludedFiles, err = parser.ExpandIncludesWithManifest(result.Markdown, markdownDir, false, c.getSharedImportCache())
+		if err != nil {
+			return nil, fmt.Errorf("failed to expand includes in main workflow prompt: %w", err)
+		}
+		includedMarkdownFiles = append(includedMarkdownFiles, promptIncludedFiles...)
+	}
 	orchestratorToolsLog.Printf("Main workflow markdown: %d bytes", len(mainWorkflowMarkdown))
 	importPaths := append([]string{}, importsResult.ImportPaths...)
 	promptImports := append([]parser.PromptImportEntry(nil), importsResult.PromptImports...)
 	if len(importPaths) > 0 {
 		orchestratorToolsLog.Printf("Found %d import paths for runtime-import macros", len(importPaths))
 	}
-	bodyImports := parser.ExtractBodyLevelImportPaths(effectiveMarkdown, markdownDir)
+	bodyImports, err := parser.ExtractBodyLevelImportPaths(effectiveMarkdown, markdownDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan body-level runtime imports: %w", err)
+	}
 	if len(bodyImports) > 0 {
 		orchestratorToolsLog.Printf("Found %d body-level {{#runtime-import}} directive(s) to promote to lock-file macros", len(bodyImports))
 		for _, bodyImport := range bodyImports {
@@ -505,6 +521,7 @@ func (c *Compiler) resolveMarkdownArtifacts(
 		importPaths:          importPaths,
 		promptImports:        promptImports,
 		mainWorkflowMarkdown: mainWorkflowMarkdown,
+		promptMarkdown:       promptMarkdown,
 		allIncludedFiles:     mergeAndSortIncludedFiles(includedToolFiles, includedMarkdownFiles),
 		workflowName:         workflowName,
 		frontmatterName:      frontmatterName,
@@ -643,6 +660,10 @@ func (c *Compiler) hasContentContext(frontmatter map[string]any) bool {
 // The schema's x-deprecation-message (falling back to description) is used as
 // the warning text so deprecations self-document without per-field plumbing.
 func (c *Compiler) warnDeprecatedFrontmatterFields(frontmatter map[string]any) {
+	if warning := parser.LegacyModelRoutingWarning(frontmatter); warning != "" {
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(warning))
+		c.IncrementWarningCount()
+	}
 	deprecatedFields, err := parser.GetMainWorkflowDeprecatedFieldsDeep()
 	if err != nil {
 		orchestratorToolsLog.Printf("Failed to load deprecated fields from schema: %v", err)

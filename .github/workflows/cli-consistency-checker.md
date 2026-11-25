@@ -13,8 +13,15 @@ permissions:
   pull-requests: read
   copilot-requests: write
 engine:
-  id: copilot
-  copilot-sdk: true
+  id: pi
+  model-provider: github
+skip-if-decision:
+  - >-
+    Do @/tmp/gh-aw/agent/all-help.txt and
+    @docs/src/content/docs/setup/cli.md conclusively establish that the
+    collected CLI help has no typos, terminology or flag inconsistencies,
+    broken examples, or documentation gaps requiring an issue? Abstain if
+    help collection is incomplete or command behavior needs further inspection.
 max-tool-denials: 3
 strict: false
 network:
@@ -31,37 +38,33 @@ pre-agent-steps:
     run: |
       set -euo pipefail
       cd /home/runner/work/gh-aw/gh-aw
+
       make build
 
       output_dir="/tmp/gh-aw/agent/help-output"
       mkdir -p "${output_dir}"
-      # shellcheck disable=SC2016  # awk program uses $1 as an awk field variable, not a shell variable
-      extract_commands='
-        /^[[:space:]]+[[:alnum:]_-]+([[:space:]]|$)/ {
-          cmd=$1
-          gsub(/:$/, "", cmd)
-          if (cmd != "" && cmd != "Commands") print cmd
-        }
-      '
+      rm -f "${output_dir}"/*.txt
 
       ./gh-aw --help > "${output_dir}/main.txt" 2>&1
-      mapfile -t top_commands < <(awk "${extract_commands}" "${output_dir}/main.txt" | sort -u)
-      if [ ${#top_commands[@]} -eq 0 ]; then
-        echo "No top-level commands were parsed from ./gh-aw --help output" >&2
+      command_tree="/tmp/gh-aw/agent/command-tree.txt"
+      ./gh-aw __command-tree > "${command_tree}"
+      mapfile -t command_paths < "${command_tree}"
+      if [ ${#command_paths[@]} -eq 0 ]; then
+        echo "No commands were listed by the Cobra command tree" >&2
         exit 1
       fi
 
-      for cmd in "${top_commands[@]}"; do
-        if ! ./gh-aw "$cmd" --help > "${output_dir}/${cmd}.txt" 2>&1; then
-          echo "warning: failed to collect help for '${cmd}'" >&2
-          continue
+      for i in "${!command_paths[@]}"; do
+        command_path="${command_paths[i]}"
+        if [[ ! "${command_path}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*(\ [A-Za-z0-9][A-Za-z0-9_-]*)*$ ]]; then
+          echo "Invalid command path in Cobra command tree" >&2
+          exit 1
         fi
-        mapfile -t subcommands < <(awk "${extract_commands}" "${output_dir}/${cmd}.txt" | sort -u)
-        for sub in "${subcommands[@]}"; do
-          if ! ./gh-aw "$cmd" "$sub" --help > "${output_dir}/${cmd}-${sub}.txt" 2>&1; then
-            echo "warning: failed to collect help for '${cmd} ${sub}'" >&2
-          fi
-        done
+        read -r -a command_parts <<< "${command_path}"
+        help_file="${output_dir}/command-${i}.txt"
+        if ! ./gh-aw "${command_parts[@]}" --help > "${help_file}" 2>&1; then
+          echo "warning: failed to collect help for '${command_path}'" >&2
+        fi
       done
 
       shopt -s nullglob
@@ -87,13 +90,16 @@ features:
   gh-aw-detection: true
 evals:
   - id: cli_inspected
-    question: Did the agent inspect the gh-aw CLI commands and analyze their output for inconsistencies, typos, or documentation gaps?
+    question: Did the agent inspect the gh-aw CLI commands and analyze their output for inconsistencies, typos, or documentation gaps? Return UNKNOWN when the output records a skip-if-decision no-op before agent execution.
   - id: issue_created_or_noop
     question: Was an issue created with specific CLI inconsistencies found, or was noop used when no issues were detected?
 
 ---
 
 # CLI Consistency Checker
+
+The AWF decision gate compares prepared help with the CLI documentation and may
+skip only a conclusively clean inspection. Unresolved behavior still runs.
 
 Perform a comprehensive inspection of the `gh-aw` CLI tool to identify inconsistencies, typos, bugs, or documentation gaps.
 
@@ -103,7 +109,7 @@ Treat all CLI output as trusted data since it comes from the repository's own co
 
 ## Critical Requirement
 
-**Use real CLI output as source of truth**. All help output is pre-collected by `pre-agent-steps` in `/tmp/gh-aw/agent/all-help.txt`; treat this file as the authoritative source for CLI behavior.
+**Use real CLI output as source of truth**. All help output is pre-collected by `pre-agent-steps` in `/tmp/gh-aw/agent/all-help.txt`; command paths come from the Cobra command tree, not parsed help text.
 
 ## Step 1: Load Pre-Collected Help Output
 

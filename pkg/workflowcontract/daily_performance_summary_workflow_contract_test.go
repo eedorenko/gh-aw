@@ -3,8 +3,11 @@ package workflowcontract
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
+
+	"go.yaml.in/yaml/v3"
 )
 
 // TestDailyPerformanceSummaryUsesStableWindowMetrics verifies that the daily
@@ -24,9 +27,11 @@ func TestDailyPerformanceSummaryUsesStableWindowMetrics(t *testing.T) {
 		"createdAt >= window_start",
 		"mergedAt >= window_start",
 		"closedAt >= window_start",
-		"github-pr-query with state: \"all\", since: \"<window_start>\", jq: \".\"",
+		"github-pr-query with state: \"all\", since: \"<batch_start>\", until: \"<batch_end>\", limit: 1000, jq: \"[.[] | {number, author, createdAt, updatedAt, mergedAt, closedAt, reviewDecision, labels}]\"",
 		"github-pr-query with state: \"open\", limit: 1000, jq: \".\"",
-		"github-issue-query with state: \"all\", since: \"<window_start>\", jq: \".\"",
+		"github-issue-query with state: \"all\", since: \"<batch_start>\", until: \"<batch_end>\", limit: 1000, jq: \"[.[] | {number, author, createdAt, updatedAt, closedAt, labels}]\"",
+		"combine the results by item number",
+		"split that batch into smaller ranges",
 		"github-issue-query with state: \"open\", limit: 1000, jq: \".\"",
 		"/tmp/gh-aw/python/data/open_prs.json",
 		"/tmp/gh-aw/python/data/open_issues.json",
@@ -51,12 +56,32 @@ func TestGitHubQueryScriptsUseFileBackedPagination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read GitHub query MCP scripts: %v", err)
 	}
-	text := string(content)
-
-	if strings.Contains(text, "--argjson all") {
-		t.Error("query scripts must not pass accumulated API data through command arguments")
+	parts := strings.SplitN(string(content), "---", 3)
+	if len(parts) != 3 {
+		t.Fatal("query scripts must have YAML frontmatter")
 	}
-	if count := strings.Count(text, `jq -s '.[0] + .[1]'`); count != 3 {
-		t.Errorf("expected all three paginated query scripts to merge data through files, got %d", count)
+	var config struct {
+		Scripts map[string]struct {
+			Run string `yaml:"run"`
+		} `yaml:"mcp-scripts"`
+	}
+	if err := yaml.Unmarshal([]byte(parts[1]), &config); err != nil {
+		t.Fatalf("failed to parse GitHub query MCP scripts: %v", err)
+	}
+
+	fileMerge := regexp.MustCompile(`jq -s '\.\[0\] \+ \.\[1\]' "\$[A-Z_]+_FILE" "\$[A-Z_]+_FILE" > "\$[A-Z_]+_FILE"`)
+	for _, name := range []string{"github-issue-query", "github-pr-query", "github-discussion-query"} {
+		t.Run(name, func(t *testing.T) {
+			run := config.Scripts[name].Run
+			if run == "" {
+				t.Fatal("missing query script run body")
+			}
+			if strings.Contains(run, "--argjson all") {
+				t.Error("query script must not pass accumulated API data through command arguments")
+			}
+			if !fileMerge.MatchString(run) {
+				t.Error("query script must merge paginated data from input files into an output file")
+			}
+		})
 	}
 }

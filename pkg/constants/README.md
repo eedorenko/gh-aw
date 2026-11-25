@@ -39,6 +39,9 @@ The package also acts as the authoritative source for the generated workflow con
 | `GetAllEngineSecretNames` | `func GetAllEngineSecretNames() []string` | Returns the deduplicated union of engine primary secrets, alternative secrets, and system secrets. |
 | `GetEngineOption` | `func GetEngineOption(engineValue string) *EngineOption` | Returns the configured engine option for an engine value, or `nil` when none exists. |
 | `GetWorkflowDir` | `func GetWorkflowDir() string` | Returns the workflow directory, honoring `GH_AW_WORKFLOWS_DIR` and normalizing path separators to `/`. |
+| `EngineExecutionStepName` | `func EngineExecutionStepName(name string) string` | Returns `name` unchanged when it follows the engine execution-step naming contract; otherwise adds the required prefix. |
+| `IsCompilerOwnedJobName` | `func IsCompilerOwnedJobName(name string) bool` | Reports whether a job name is owned by the compiler, including generated maintenance jobs. |
+| `IsEngineExecutionStepName` | `func IsEngineExecutionStepName(name string) bool` | Reports whether a name follows the evals or detection engine execution-step naming contract. |
 
 ### Constants
 
@@ -48,6 +51,7 @@ The package also acts as the authoritative source for the generated workflow con
 | `ExpressionBreakThreshold` | `LineLength` | `100` | Preferred break point for wrapping long expressions. |
 | `MaxExpressionLineLength` | `LineLength` | `120` | Maximum single-line expression length before wrapping. |
 | `DefaultEngine` | `EngineName` | `CopilotEngine` | Default engine when workflows do not specify one. |
+| `DefaultCopilotVersion` | `Version` | `"1.0.103"` | Default pinned version of the GitHub Copilot CLI. |
 | `CopilotEngine` | `EngineName` | `"copilot"` | GitHub Copilot engine identifier. |
 | `ClaudeEngine` | `EngineName` | `"claude"` | Claude engine identifier. |
 | `CodexEngine` | `EngineName` | `"codex"` | Codex engine identifier. |
@@ -63,11 +67,13 @@ The package also acts as the authoritative source for the generated workflow con
 | `GroupConcurrencyQueueFeatureFlag` | `FeatureFlag` | `"group-concurrency-queue"` | Controls whether generated group concurrency uses `queue: max`. |
 | `DangerouslyDisableSandboxAgentFeatureFlag` | `FeatureFlag` | `"dangerously-disable-sandbox-agent"` | Required to allow `sandbox.agent: false`. |
 | `DangerouslyAllowRolesReadAndPullRequestTargetFeatureFlag` | `FeatureFlag` | `"dangerously-allow-roles-read-and-pull-request-target"` | Suppresses the non-strict warning for `pull_request_target` with `on.roles` containing `read` or `all`. |
+| `DangerouslyAllowPullRequestTargetForksAllFeatureFlag` | `FeatureFlag` | `"dangerously-allow-pull-request-target-forks-all"` | Allows unrestricted `pull_request_target` fork admission in strict mode; the warning remains. |
 | `GHAWDetectionFeatureFlag` | `FeatureFlag` | `"gh-aw-detection"` | Enables the external threat-detection binary path by default; set to `false` for the legacy inline path. |
 | `AgentJobName` | `JobName` | `"agent"` | Built-in agent job identifier. |
 | `ActivationJobName` | `JobName` | `"activation"` | Built-in activation job identifier. |
 | `PreActivationJobName` | `JobName` | `"pre_activation"` | Built-in pre-activation job identifier. |
 | `PreActivationHyphenJobName` | `JobName` | `"pre-activation"` | Hyphenated compatibility alias for the pre-activation job. |
+| `CheckMembershipStepID` | `StepID` | `"check_membership"` | Step identifier for checking workflow membership during pre-activation. |
 | `DetectionJobName` | `JobName` | `"detection"` | Built-in detection job identifier. |
 | `EvalsJobName` | `JobName` | `"evals"` | Built-in evals job identifier. |
 | `SafeOutputsJobName` | `JobName` | `"safe_outputs"` | Built-in safe-outputs job identifier. |
@@ -86,12 +92,172 @@ The package also acts as the authoritative source for the generated workflow con
 | `DefaultMCPRegistryURL` | `URL` | `"https://api.mcp.github.com/v0.1"` | Default MCP registry endpoint. |
 | `PublicGitHubHost` | `URL` | `"https://github.com"` | Canonical public GitHub host. |
 | `GitHubCopilotMCPDomain` | untyped `string` | `"api.githubcopilot.com"` | Hosted GitHub MCP server domain used by remote mode. |
+| `OtelMetricsJsonlFilename` | `Filename` | `"otel-metrics.jsonl"` | Filename of the OTLP metrics mirror written to `/tmp/gh-aw/`. |
 | `DocsEnginesURL` | `DocURL` | `"https://github.com/github/gh-aw/blob/main/docs/src/content/docs/reference/engines.md"` | Engines reference documentation URL. |
 | `DocsToolsURL` | `DocURL` | `"https://github.com/github/gh-aw/blob/main/docs/src/content/docs/reference/tools.md"` | Tools reference documentation URL. |
 | `DocsGitHubToolsURL` | `DocURL` | `"https://github.com/github/gh-aw/blob/main/docs/src/content/docs/reference/tools.md#github-tools-github"` | GitHub tools subsection URL. |
 | `DocsPermissionsURL` | `DocURL` | `"https://github.com/github/gh-aw/blob/main/docs/src/content/docs/reference/permissions.md"` | Permissions reference URL. |
 | `DocsNetworkURL` | `DocURL` | `"https://github.com/github/gh-aw/blob/main/docs/src/content/docs/reference/network.md"` | Network reference URL. |
 | `DocsSandboxURL` | `DocURL` | `"https://github.com/github/gh-aw/blob/main/docs/src/content/docs/reference/sandbox.md"` | Sandbox reference URL. |
+
+### Additional exported constant families
+
+The `AWF*` constants define the AWF runtime contract: version gates, runtime
+commands, and paths or expressions for configuration, audit, prompts, proxy
+logs, and reflected resources. The family is kept here as a compatibility
+surface; consumers should use the named values rather than duplicate paths.
+
+`AWFAPIProxyCACertMinVersion`, `AWFAPIProxyContainerIP`, `AWFAPIProxyHostname`,
+`AWFAPIProxyProvidersMinVersion`, `AWFAgentTimeoutSteeringMinVersion`,
+`AWFAllowHostPortsMinVersion`, `AWFArcDindMinVersion`, `AWFAuditDir`,
+`AWFAuditDirExpr`, `AWFAuditDirShell`, `AWFChrootConfigMinVersion`,
+`AWFCliProxyGHListMinVersion`, `AWFCliProxyMinVersion`,
+`AWFCloudHypervisorCommand`, `AWFCloudHypervisorFilesystemAllowWriteMinVersion`,
+`AWFCloudHypervisorMinVersion`, `AWFCloudHypervisorModelRoutingMinVersion`,
+`AWFCloudHypervisorPrimaryEnclaveMinVersion`, `AWFCostOnlyModelRoutingMinVersion`,
+`AWFConfigFilePath`,
+`AWFConfigFilePathExpr`, `AWFContainerImagesMinVersion`,
+`AWFDefaultAiCreditsPricingMinVersion`, `AWFDefaultCommand`,
+`AWFDefaultLogLevel`, `AWFDockerEnclaveSetupMinVersion`,
+`AWFDockerHostPathPrefixMinVersion`, `AWFDynamicRepositoryEnclaveMinVersion`,
+`AWFEnclaveAgentToolsMinVersion`, `AWFEnclaveCloudHypervisorMinVersion`,
+`AWFEnclaveGitHubIssuesMinVersion`, `AWFEnclaveTrustedSensitivityMinVersion`,
+`AWFExcludeEnvMinVersion`, `AWFFallbackModelsMinVersion`,
+`AWFFilesystemAllowWriteMinVersion`, `AWFHTTPAPITargetMinVersion`,
+`AWFHostedWebMinVersion`, `AWFLegacySecurityCommand`,
+`AWFLegacySecurityMinVersion`, `AWFModelRoutingMinVersion`, `AWFNVXCommand`,
+`AWFNVXMinVersion`, `AWFNoProxyHosts`, `AWFOpenAIWIFMinVersion`,
+`AWFPrivilegedCommand`, `AWFProtectedCommandOutputMinVersion`,
+`AWFProxyLogsDir`, `AWFProxyLogsDirExpr`, `AWFProxyLogsDirShell`,
+`AWFReflectFilePath`, `AWFReflectFilePathExpr`, `AWFResolvedConfigFilePath`,
+`AWFResolvedConfigFilePathExpr`, `AWFRouterImageRoleMinVersion`,
+`AWFRouterReleaseImageMinVersion`, `AWFRoutingCandidateModelsMinVersion`,
+`AWFSessionStateDirMinVersion`, and `AWFTokenSteeringMinVersion`.
+
+The `Default*` constants supply compiler and runtime defaults for engines,
+images, dependency pins, timeouts, MCP and router settings, resource limits,
+and workspace mounts:
+
+`DefaultActivationJobRunnerImage`, `DefaultAgentJobTimeout`,
+`DefaultAgenticWorkflowTimeout`, `DefaultAgyVersion`, `DefaultAlpineImage`,
+`DefaultBunVersion`, `DefaultClaudeCodeVersion`, `DefaultCopilotVersion`,
+`DefaultCloudHypervisorMemoryMiB`, `DefaultCloudHypervisorVCPUs`,
+`DefaultCodexVersion`, `DefaultCopilotChecksumsSHA256`,
+`DefaultCopilotSDKPort`, `DefaultCopilotSDKVersion`, `DefaultDenoVersion`,
+`DefaultDetectionJobTimeout`, `DefaultDetectionMaxAICredits`,
+`DefaultDotNetVersion`, `DefaultElixirVersion`, `DefaultFirewallRegistry`,
+`DefaultFirewallVersion`, `DefaultGeminiVersion`, `DefaultGhAwMount`,
+`DefaultGhAwNodeImage`, `DefaultGhBinaryMount`, `DefaultGitHubLockdown`,
+`DefaultGitHubMCPServerVersion`, `DefaultGitHubScriptVersion`,
+`DefaultGoVersion`, `DefaultHTTPClientTimeout`, `DefaultHaskellVersion`,
+`DefaultJavaVersion`, `DefaultMCPGatewayContainer`, `DefaultMCPGatewayPayloadDir`,
+`DefaultMCPGatewayPayloadSizeThreshold`, `DefaultMCPGatewayPort`,
+`DefaultMCPGatewayVersion`, `DefaultMCPInspectorPort`, `DefaultMCPSDKVersion`,
+`DefaultMCPServerPort`, `DefaultMCPStartupTimeout`, `DefaultMaxAICredits`,
+`DefaultMaxDailyAICredits`, `DefaultMaxRuns`, `DefaultMaxToolDenials`,
+`DefaultMaxTurnCacheMisses`, `DefaultNVXMemoryMaxBytes`, `DefaultNVXMemoryMiB`,
+`DefaultNVXPidsMax`, `DefaultNodeAlpineLTSImage`, `DefaultNodeVersion`,
+`DefaultPiVersion`, `DefaultPlaywrightCLIVersion`, `DefaultPythonAlpineLTSImage`,
+`DefaultPythonVersion`, `DefaultRateLimitMax`, `DefaultRateLimitWindow`,
+`DefaultRouterRegistry`, `DefaultRouterVersion`, `DefaultRubyVersion`,
+`DefaultSafeOutputsMount`, `DefaultThreatDetectArtifactBaseURL`,
+`DefaultThreatDetectVersion`, `DefaultTmpGhAwMount`, `DefaultToolTimeout`,
+and `DefaultWorkspaceMount`.
+
+The `EnvVar*` constants name runtime settings and model selections; the
+remaining groups identify engine credentials and provider configuration,
+workflow paths, artifacts, built-in jobs and steps, output markers, file
+permissions, and temporary runtime locations. These names are shared workflow
+contract values and should remain stable:
+
+`ActivatedOutput`, `ActivationArtifactName`, `ActivationStageAmbientFoldersStepName`,
+`ActivationUploadArtifactStepName`, `AdmissionJobName`, `AgentArtifactName`, `AgentDefaultModel`,
+`AgentFailureStepName`, `AgentOutputArtifactName`, `AgentOutputFallbackArtifactName`,
+`AgentOutputFilename`, `AgentStdioLogPath`, `AgentsDir`, `AgyDefaultModel`,
+`AgyEngine`,
+`AnthropicAPIKey`, `ArtifactPrefixOutputName`, `AwPromptsFile`,
+`AwPromptsFileExpr`, `AwPromptsFileShell`, `AwPromptsUserFile`,
+`AwPromptsUserFileExpr`, `BashCompletionDir`, `BashCompletionGhAwPath`,
+`CheckCommandPositionStepID`, `CheckCooldownStepID`, `CheckMembershipStepID`,
+`CheckRateLimitStepID`,
+`CheckSkipBotsStepID`, `CheckSkipIfCheckFailingStepID`, `CheckSkipIfMatchStepID`,
+`CheckSkipIfNoMatchStepID`, `CheckSkipRolesStepID`, `CheckStopTimeStepID`,
+`ClaudeCLIModelEnvVar`, `ClaudeLLMGatewayPort`, `CodexAPIKey`, `CodexDefaultModel`,
+`CodexLLMGatewayPort`, `CodexMcpConfigTomlPath`, `CommandPositionOkOutput`,
+`CooldownOkOutput`, `CopilotBYOKDefaultModel`, `CopilotBYOKDummyAPIKey`,
+`CopilotBYOKDummyAPIKeyEnvVar`, `CopilotBinaryPath`, `CopilotCLIIntegrationIDEnvVar`,
+`CopilotCLIIntegrationIDValue`, `CopilotCLIModelEnvVar`, `CopilotGitHubToken`,
+`CopilotLLMGatewayPort`, `CopilotNoAskUserMinVersion`, `CopilotProviderAPIKey`,
+`CopilotProviderBaseURL`, `CopilotProviderBearerToken`, `CopilotProviderWireAPI`,
+`CopilotSDKDriverEnvVar`, `CopilotSDKServerArgsEnvVar`, `CopilotSDKToolConfigEnvVar`,
+`CopilotSDKURIEnvVar`, `CopilotSessionIDMinVersion`, `DetectionArtifactName`,
+`DeferredPromptStepID`, `DeferredPromptStepName`, `DetectAgentErrorsStepID`,
+`DevModeGhAwImage`, `DirPermOwnerOnly`, `DirPermPublic`, `DirPermSensitive`,
+`EngineExecutionStepNamePrefix`, `EnvVarGitHubApprovalLabels`,
+`EnvVarGitHubBlockedUsers`, `EnvVarGitHubMCPServerToken`, `EnvVarGitHubToken`,
+`EnvVarGitHubTrustedUsers`, `EnvVarMCPConfig`, `EnvVarMaxToolDenials`,
+`EnvVarMaxTurns`, `EnvVarModelAgentClaude`, `EnvVarModelAgentCodex`,
+`EnvVarModelAgentCopilot`, `EnvVarModelAgentCustom`, `EnvVarModelAgentGemini`,
+`EnvVarModelAgentPi`, `EnvVarModelDetectionClaude`, `EnvVarModelDetectionCodex`,
+`EnvVarModelDetectionCopilot`, `EnvVarModelDetectionGemini`,
+`EnvVarModelEvalsClaude`, `EnvVarModelEvalsCodex`, `EnvVarModelEvalsCopilot`,
+`EnvVarModelEvalsGemini`, `EnvVarModelEvalsPi`, `EnvVarModelFallback`,
+`EnvVarPrompt`, `EnvVarSafeOutputs`, `EnvVarStartupTimeout`, `EnvVarToolTimeout`,
+`EvalsArtifactName`, `EvalsBranchPrefix`, `EvalsResultFilename`,
+`EvalsStatusFilename`, `ExperimentArtifactName`, `FilePermExecutable`,
+`FilePermOwnerReadOnly`,
+`FilePermPublic`, `FilePermSensitive`, `FirewallAuditArtifactName`,
+`GeminiAPIKey`, `GeminiCLIModelEnvVar`, `GeminiLLMGatewayPort`,
+`GetTriggerLabelStepID`, `GhAwRootDir`, `GhAwRootDirShell`,
+`GhAwRootDirShellSlash`, `GhAwRootDirSlash`, `GhCLIPath`, `GhSkillsMinVersion`,
+`GithubDir`, `GithubRateLimitsFilename`, `GraderManifestFilename`,
+`GraderResultsFilename`, `GradersArtifactName`, `GradersDir`, `GradersDirName`,
+`GradersDirSlash`, `GradersJobName`, `HomebrewPrefix`, `InfoArtifactName`,
+`IsTeamMemberOutput`, `LegacyDetectionArtifactName`,
+`MCPGDynamicRepositoryDelegationMinVersion`, `MCPGEnclaveAgentToolsMinVersion`,
+`MCPGEnclaveGitHubIssuesMinVersion`, `MCPGIntegrityReactionsMinVersion`,
+`MCPSessionTimeoutMin`, `MCPToolTimeoutMax`, `MCPToolTimeoutMin`,
+`MatchedCommandOutput`, `MaxNetworkPort`, `MaxSymlinkDepth`,
+`McpServersJsonPathExpr`, `MinNetworkPort`, `OTELSentryEndpointSecretName`,
+`OpenAIAPIKey`, `OtelJsonlFilename`, `OtlpExportErrorsFilename`,
+`ParseMCPGatewayStepID`, `ParseTokenUsageStepID`, `PiCLIModelEnvVar`,
+`PreActivationAppTokenStepID`, `PreAgentAuditFilePath`,
+`PushEvalsStateJobName`, `PushExperimentsStateJobName`, `ReportExperimentsJobName`,
+`PushLedgerChangesJobName`,
+`PushRepoMemoryJobName`, `RateLimitOkOutput`, `RemoveTriggerLabelStepID`,
+`SafeOutputArtifactName`, `SafeOutputErrorsFilename`, `SafeOutputItemsArtifactName`,
+`SafeOutputsFilename`, `SarifArtifactDownloadPath`, `SarifArtifactName`,
+`SarifFileName`, `ShellMcpConfigDir`, `ShellMcpServersJsonPath`,
+`SkipBotsOkOutput`, `SkipCheckOkOutput`, `SkipIfCheckFailingOkOutput`,
+`SkipNoMatchCheckOkOutput`, `SkipRolesOkOutput`, `SonnetDefaultModel`,
+`StopTimeOkOutput`, `TemporaryIdMapFilename`, `ThreatDetectionDir`,
+`ThreatDetectionExecutionStepName`, `ThreatDetectionInputDir`,
+`ThreatDetectionLogPath`, `ThreatDetectionResultPath`,
+`ThreatDetectionStepSummaryPath`, `TmpAwBundleGlob`, `TmpAwMcpLogsDir`,
+`TmpAwPatchGlob`, `TmpCommentMemoryDir`, `TmpDIFCProxyTLSCACert`,
+`TmpGeminiClientErrorGlob`, `TmpGhAwAgentDir`, `TmpGhAwAssetsDir`,
+`TmpGhAwAssetsDirSlash`, `TmpGhAwDir`, `TmpGhAwDirSlash`, `TmpMcpConfigDir`,
+`TmpMcpConfigLogsDir`, `TmpMcpLogsDir`, `TmpMcpLogsMount`,
+`TmpMcpLogsSafeOutputsDir`, `TmpMcpScriptsLogsDir`, `TmpMcpServersJsonPath`,
+`TmpPiAgentDir`, `TmpProxyLogsDir`, `TmpProxyTLSCACert`, `TmpProxyTLSDir`,
+`TmpRepoMemoryDir`, `TmpSandboxAgentLogsDir`, `TokenUsageFilename`,
+`UpdateCacheMemoryJobName`, `UpdateDriveMemoryJobName`, `UsageArtifactName`,
+`UsrLocalPrefix`, `WorkQueueClaimArtifactsPath`, `WorkQueueEffectsPath`,
+`WorkQueueFinishIntentDir`,
+`WorkQueueFinishIntentMount`, `WorkQueueFinishIntentPath`, `WorkQueueIntentPath`,
+`WorkQueueSnapshotMount`, `WorkQueueSnapshotPath`, `WorkflowsDir`,
+`WorkflowsDirSlash`, `WorkflowsLockYmlGitAttributesEntry`,
+`WorkflowsLockYmlGitAttributesEntryLegacy`, and `WorkflowsLockYmlGlob`.
+
+Exported configuration variables provide shared allowlists, lookup sets,
+dependency ordering, and field priorities. Callers should treat these values as
+read-only as described in [Thread Safety](#thread-safety):
+`AllowedExpressionsSet`, `CopilotBotNames`, `DangerousPropertyNames`,
+`DangerousPropertyNamesSet`, `DefaultAllowedDomains`,
+`DefaultAllowedMemoryExtensions`, `DefaultBashTools`, `DefaultGitHubToolsRemote`,
+`DefaultThreatDetectSHA256`, `IgnoredFrontmatterFields`, `KnownBuiltInJobNames`,
+`MaintenanceJobDependencies`, `PriorityJobFields`, `PriorityStepFields`,
+`PriorityWorkflowFields`, `SafeWorkflowEvents`, and `SharedWorkflowForbiddenFields`.
 
 ## Usage Examples
 

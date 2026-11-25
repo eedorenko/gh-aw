@@ -19,7 +19,7 @@ func TestRecoveryEnvelopeValidationFollowsAllSecretMasks(t *testing.T) {
 		{"run": "echo second mask"},
 	}}}
 	var output strings.Builder
-	compiler.generateTrackedSecretRedactionStep(&output, "", data)
+	compiler.generateTrackedSecretRedactionStep(&output, "", data, false)
 	content := output.String()
 	assert.Less(t, strings.Index(content, "id: custom_mask"), strings.Index(content, "id: validate_recovery_envelopes"))
 	assert.Less(t, strings.Index(content, "id: redact_secrets_custom_1"), strings.Index(content, "id: validate_recovery_envelopes"))
@@ -124,6 +124,7 @@ func TestRecoveryArtifactScanRoots(t *testing.T) {
 		"${{ runner.temp }}/gh-aw/claims/*/aw-*.bundle",
 		"${{ env.ARTIFACT_ROOT }}/**/*.bundle",
 		"relative/custom/*.bundle",
+		conditionalOTLPMetricsArtifactPath,
 		"!/tmp/gh-aw/excluded",
 	}))
 }

@@ -5,12 +5,62 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
+	"github.com/goccy/go-yaml"
 	"github.com/stretchr/testify/require"
 )
+
+func TestLedgerPersistenceRequiresSuccessfulSafeOutputs(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		ledger string
+	}{
+		{name: "git", ledger: "  ledger: {}\n"},
+		{name: "comment", ledger: "  comment-memory:\n    target: 42\n  ledger:\n    storage: comment-memory\n"},
+		{name: "mixed", ledger: "  comment-memory:\n    target: 42\n  ledger:\n    thread:\n      storage: comment-memory\n    archive: {}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			filename := filepath.Join(dir, "ledger.md")
+			source := "---\non: workflow_dispatch\nengine: copilot\ntools:\n" + tc.ledger + "---\nRecord findings.\n"
+			require.NoError(t, os.WriteFile(filename, []byte(source), 0o600))
+			require.NoError(t, NewCompiler().CompileWorkflow(filename))
+			lock, err := os.ReadFile(filepath.Join(dir, "ledger.lock.yml"))
+			require.NoError(t, err)
+			var compiled struct {
+				Jobs map[string]struct {
+					If    string `yaml:"if"`
+					Needs any    `yaml:"needs"`
+					Steps []struct {
+						Name            string `yaml:"name"`
+						If              string `yaml:"if"`
+						ContinueOnError bool   `yaml:"continue-on-error"`
+					} `yaml:"steps"`
+				} `yaml:"jobs"`
+			}
+			require.NoError(t, yaml.Unmarshal(lock, &compiled))
+			job, ok := compiled.Jobs[pushLedgerChangesJobName]
+			require.True(t, ok)
+			require.Equal(t, "always() && needs.safe_outputs.result == 'success'", job.If)
+			require.Contains(t, job.Needs, "safe_outputs")
+			var guardedSteps []string
+			for _, step := range job.Steps {
+				switch step.Name {
+				case "Download validated ledger transactions", "Reconcile and push ledger changes":
+					guardedSteps = append(guardedSteps, step.Name)
+					require.Empty(t, step.If, "step must retain the implicit success() guard")
+					require.False(t, step.ContinueOnError)
+				}
+			}
+			require.Equal(t, []string{"Download validated ledger transactions", "Reconcile and push ledger changes"}, guardedSteps)
+		})
+	}
+}
 
 func TestParseStandaloneLedgerForms(t *testing.T) {
 	single, err := parseLedgerToolConfig(map[string]any{
@@ -33,6 +83,330 @@ func TestParseStandaloneLedgerForms(t *testing.T) {
 	namedReplay, err := parseLedgerToolConfig(map[string]any{"replay": map[string]any{}})
 	require.NoError(t, err)
 	require.Equal(t, "replay", namedReplay.Ledgers[0].Name)
+}
+
+func TestCommentBackedLedgerConfiguration(t *testing.T) {
+	config, err := parseLedgerToolConfig(map[string]any{"storage": "comment-memory", "type": "map"})
+	require.NoError(t, err)
+	require.True(t, config.hasCommentStorage())
+	require.Empty(t, config.Ledgers[0].BranchName)
+	require.Empty(t, config.compactionEnabledLedgers())
+	require.Nil(t, config.Ledgers[0].Compaction)
+	for _, invalid := range []map[string]any{
+		{"storage": "unknown"},
+		{"storage": "comment-memory", "compaction": true},
+		{"storage": "comment-memory", "compaction": map[string]any{"schedule": "manual"}},
+	} {
+		_, err := parseLedgerToolConfig(invalid)
+		require.Error(t, err)
+	}
+	_, err = parseLedgerToolConfig(map[string]any{"storage": "comment-memory", "compaction": false})
+	require.NoError(t, err)
+
+	root := t.TempDir()
+	path := filepath.Join(root, "comment-ledger.md")
+	source := "---\non:\n  issues:\n    types: [opened]\ntools:\n  comment-memory:\n    target: 42\n    github-token: ${{ secrets.MEMORY_TOKEN }}\n  ledger:\n    storage: comment-memory\n    type: map\n---\nRemember findings.\n"
+	require.NoError(t, os.WriteFile(path, []byte(source), 0o600))
+	compiler := NewCompiler()
+	data, err := compiler.ParseWorkflowFile(path)
+	require.NoError(t, err)
+	require.True(t, data.LedgerConfig.hasCommentStorage())
+	section := buildLedgerPromptSection(data.LedgerConfig)
+	require.Contains(t, section.Content, "/tmp/gh-aw/ledgers/default/ledger.db")
+	require.NotContains(t, section.Content, "ledger.jsonl")
+	require.Contains(t, section.Content, "read-only projection tables:")
+	require.Contains(t, section.Content, "Query the SQLite projection")
+	require.NoError(t, compiler.CompileWorkflow(path))
+	lock, err := os.ReadFile(filepath.Join(root, "comment-ledger.lock.yml"))
+	require.NoError(t, err)
+	require.Contains(t, string(lock), "ledger_map_put")
+	require.Contains(t, string(lock), "github-token: ${{ secrets.MEMORY_TOKEN }}")
+	require.Contains(t, extractJobSection(string(lock), pushLedgerChangesJobName), "queue: max")
+	job, err := compiler.buildPushLedgerChangesJob(data, false)
+	require.NoError(t, err)
+	require.Equal(t, "always() && needs.safe_outputs.result == 'success'", job.If)
+	require.Contains(t, job.Permissions, "contents: read")
+	require.Contains(t, job.Permissions, "issues: write")
+	require.NotContains(t, job.Permissions, "contents: write")
+	require.Contains(t, job.Concurrency, "'42'")
+	require.Contains(t, job.Concurrency, "queue: max")
+	require.Contains(t, strings.Join(job.Steps, ""), "Write comment-memory configuration")
+	require.Contains(t, strings.Join(job.Steps, ""), "GH_AW_COMMENT_MEMORY_TOKEN: ${{ secrets.MEMORY_TOKEN }}")
+	require.Contains(t, strings.Join(job.Steps, ""), `GH_AW_COMMENT_MEMORY_TOKEN_SOURCE: "unknown"`)
+	require.NotContains(t, strings.Join(job.Steps, ""), "github-token: ${{ secrets.MEMORY_TOKEN }}")
+	var projectionStep strings.Builder
+	require.NoError(t, compiler.generateLedgerProjectionStep(&projectionStep, data))
+	require.Contains(t, projectionStep.String(), "GH_AW_COMMENT_MEMORY_TOKEN: ${{ secrets.MEMORY_TOKEN }}")
+	require.Contains(t, projectionStep.String(), `GH_AW_COMMENT_MEMORY_TOKEN_SOURCE: "unknown"`)
+	require.NotContains(t, projectionStep.String(), "github-token: ${{ secrets.MEMORY_TOKEN }}")
+
+	for _, tc := range []struct {
+		replacement string
+		field       string
+		value       string
+		example     string
+	}{
+		{replacement: ""},
+		{replacement: "  comment-memory: false\n"},
+		{replacement: "  comment-memory:\n    target: invalid\n", field: "tools.comment-memory.target", value: `"invalid"`, example: "target: 42"},
+		{replacement: "  comment-memory:\n    target: ${{ inputs.number }}\n", field: "tools.comment-memory.target", value: `"${{ inputs.number }}"`, example: "target: 42"},
+		{replacement: "  comment-memory:\n    target: 0\n", field: "tools.comment-memory.target", value: `"0"`, example: "target: 42"},
+		{replacement: "  comment-memory:\n    target: -1\n", field: "tools.comment-memory.target", value: `"-1"`, example: "target: 42"},
+		{replacement: "  comment-memory:\n    target-repo: ${{ inputs.repo }}\n", field: "tools.comment-memory.target-repo", value: `"${{ inputs.repo }}"`, example: "target-repo: github/gh-aw"},
+	} {
+		invalid := strings.Replace(source, "  comment-memory:\n    target: 42\n    github-token: ${{ secrets.MEMORY_TOKEN }}\n", tc.replacement, 1)
+		require.NoError(t, os.WriteFile(path, []byte(invalid), 0o600))
+		_, err := NewCompiler().ParseWorkflowFile(path)
+		require.Error(t, err)
+		if tc.field != "" {
+			require.Contains(t, err.Error(), tc.field)
+			require.Contains(t, err.Error(), tc.value)
+			require.Contains(t, err.Error(), "Expected")
+			require.Contains(t, err.Error(), "Example:\ntools:\n  comment-memory:\n    "+tc.example)
+		}
+	}
+}
+
+func TestLedgerAuthoringGuideCommentBackedExampleCompiles(t *testing.T) {
+	guide, err := os.ReadFile("../../.github/aw/ledger.md")
+	require.NoError(t, err)
+	guideText := string(guide)
+
+	sentenceBoundary := regexp.MustCompile(`[.!?]\s+`)
+	branchStorageClaim := regexp.MustCompile(`(?i)\b(?:all|every|each)\s+(?:standalone\s+)?ledgers?\b[^.!?]{0,120}\bbranch(?:es)?\b|\bledgers?\b[^.!?]{0,120}\b(?:always\s+)?(?:use|uses|store|stores|persist|persists|are\s+stored|is\s+stored)\b[^.!?]{0,120}\bbranch(?:es)?\b`)
+	backendQualified := regexp.MustCompile(`(?i)\b(?:git|comment)[- ]backed\s+ledgers?\b|\b(?:git|comment)\s+storage\b`)
+	claimClauseBoundary := regexp.MustCompile(`(?i)\s+(?:and|but|while|whereas)\s+|[;,]\s*`)
+	hasUnqualifiedBranchClaim := func(text string) bool {
+		normalized := strings.Join(strings.Fields(text), " ")
+		for _, sentence := range sentenceBoundary.Split(normalized, -1) {
+			for _, clause := range claimClauseBoundary.Split(sentence, -1) {
+				if branchStorageClaim.MatchString(clause) && !backendQualified.MatchString(clause) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	for _, tc := range []struct {
+		name  string
+		text  string
+		claim bool
+	}{
+		{name: "all ledgers stored on branches", text: "All ledgers are stored on branches.", claim: true},
+		{name: "subject-first plural branch claim", text: "Ledgers always use a Git branch.", claim: true},
+		{name: "every ledger uses plural branches", text: "Every ledger uses Git branches.", claim: true},
+		{name: "singular ledger stored on branch", text: "A ledger is stored on a branch.", claim: true},
+		{name: "Git-backed ledger is qualified", text: "Each Git-backed ledger stores JSONL shards on a ledgers/<name> branch."},
+		{name: "comment-backed ledger is qualified", text: "Comment-backed ledgers use managed comments instead of a branch."},
+		{name: "qualified backend does not mask an unqualified claim", text: "Git-backed ledgers are stored in JSONL, but ledgers use branches.", claim: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.claim, hasUnqualifiedBranchClaim(tc.text))
+		})
+	}
+	require.False(t, hasUnqualifiedBranchClaim(guideText), "guide must not claim that every ledger uses a Git branch")
+
+	const exampleHeading = "### Example: comment-backed ledger"
+	exampleStart := strings.Index(guideText, exampleHeading)
+	require.NotEqual(t, -1, exampleStart, "guide must include the comment-backed ledger example")
+	exampleSection := guideText[exampleStart+len(exampleHeading):]
+	fenceStart := strings.Index(exampleSection, "```yaml\n")
+	require.NotEqual(t, -1, fenceStart, "comment-backed ledger example must be YAML")
+	exampleSection = exampleSection[fenceStart+len("```yaml\n"):]
+	fenceEnd := strings.Index(exampleSection, "```")
+	require.NotEqual(t, -1, fenceEnd, "comment-backed ledger example must be fenced")
+
+	source := "---\non: workflow_dispatch\nengine: copilot\n" + exampleSection[:fenceEnd] + "---\nRecord audit outcomes.\n"
+	filename := filepath.Join(t.TempDir(), "comment-ledger-guide.md")
+	require.NoError(t, os.WriteFile(filename, []byte(source), 0o600))
+	compiler := NewCompiler()
+	data, err := compiler.ParseWorkflowFile(filename)
+	require.NoError(t, err)
+	require.True(t, data.LedgerConfig.hasCommentStorage())
+	require.NoError(t, compiler.CompileWorkflow(filename))
+
+	lock, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "comment-ledger-guide.lock.yml"))
+	require.NoError(t, err)
+	require.Contains(t, string(lock), "gh-aw-comment-ledger")
+}
+
+func TestLedgerPersistenceConcurrencyQueue(t *testing.T) {
+	for _, storage := range []struct {
+		name        string
+		declaration map[string]any
+		hasComments bool
+	}{
+		{name: "git", declaration: map[string]any{}},
+		{name: "comment", declaration: map[string]any{"storage": "comment-memory"}, hasComments: true},
+		{name: "mixed", declaration: map[string]any{
+			"local": map[string]any{"storage": "comment-memory"}, "global": map[string]any{},
+		}, hasComments: true},
+	} {
+		for _, queue := range []struct {
+			name     string
+			features map[string]any
+			enabled  bool
+		}{
+			{name: "default", enabled: true},
+			{name: "enabled", features: map[string]any{"group-concurrency-queue": true}, enabled: true},
+			{name: "disabled", features: map[string]any{"group-concurrency-queue": false}},
+		} {
+			t.Run(storage.name+"/"+queue.name, func(t *testing.T) {
+				config, err := parseLedgerToolConfig(storage.declaration)
+				require.NoError(t, err)
+				job, err := NewCompiler().buildPushLedgerChangesJob(&WorkflowData{
+					LedgerConfig: config, CommentMemoryConfig: &CommentMemoryConfig{},
+					Features: queue.features,
+				}, false)
+				require.NoError(t, err)
+				require.Equal(t, "always() && needs.safe_outputs.result == 'success'", job.If)
+				if !storage.hasComments {
+					require.Empty(t, job.Concurrency)
+					return
+				}
+				require.Contains(t, job.Concurrency, "gh-aw-comment-ledger-")
+				require.Contains(t, job.Concurrency, "cancel-in-progress: false")
+				if queue.enabled {
+					require.Contains(t, job.Concurrency, "\n      queue: max")
+				} else {
+					require.NotContains(t, job.Concurrency, "queue:")
+				}
+			})
+		}
+	}
+}
+
+func TestMixedLedgerStoragePreservesGitCompactionAndPermissions(t *testing.T) {
+	config, err := parseLedgerToolConfig(map[string]any{
+		"local":  map[string]any{"storage": "comment-memory", "type": "notes"},
+		"global": map[string]any{"type": "log"},
+	})
+	require.NoError(t, err)
+	require.Len(t, config.compactionEnabledLedgers(), 1)
+	require.Equal(t, "global", config.compactionEnabledLedgers()[0].Name)
+	data := &WorkflowData{
+		LedgerConfig: config, CommentMemoryConfig: &CommentMemoryConfig{
+			BaseSafeOutputConfig: BaseSafeOutputConfig{GitHubToken: "${{ secrets.MEMORY_TOKEN }}"},
+		},
+	}
+	compiler := NewCompiler()
+	job, err := compiler.buildPushLedgerChangesJob(data, false)
+	require.NoError(t, err)
+	require.Contains(t, job.Permissions, "contents: write")
+	require.Contains(t, job.Permissions, "issues: write")
+	var projection strings.Builder
+	require.NoError(t, compiler.generateLedgerProjectionStep(&projection, data))
+	for _, step := range []string{projection.String(), strings.Join(job.Steps, "")} {
+		require.Contains(t, step, "GH_TOKEN: ${{ github.token }}")
+		require.Contains(t, step, "GH_AW_COMMENT_MEMORY_TOKEN: ${{ secrets.MEMORY_TOKEN }}")
+		require.Contains(t, step, `GH_AW_COMMENT_MEMORY_TOKEN_SOURCE: "unknown"`)
+		require.NotContains(t, step, "github-token: ${{ secrets.MEMORY_TOKEN }}")
+	}
+}
+
+func TestCommentMemoryLedgerTokenSource(t *testing.T) {
+	config, err := parseLedgerToolConfig(map[string]any{"storage": "comment-memory"})
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		token  string
+		source string
+	}{
+		{token: "${{github.token}}", source: "github_actions"},
+		{token: "${{  github.token  }}", source: "github_actions"},
+		{token: "${{ SECRETS.GITHUB_TOKEN }}", source: "github_actions"},
+		{token: "${{ github.token || secrets.CUSTOM_TOKEN }}", source: "unknown"},
+		{token: "${{ secrets.MEMORY_TOKEN }}", source: "unknown"},
+	} {
+		t.Run(tc.token, func(t *testing.T) {
+			data := &WorkflowData{LedgerConfig: config, CommentMemoryConfig: &CommentMemoryConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{GitHubToken: tc.token},
+			}}
+			var step strings.Builder
+			require.NoError(t, NewCompiler().generateLedgerProjectionStep(&step, data))
+			require.Contains(t, step.String(), "GH_AW_COMMENT_MEMORY_TOKEN_SOURCE: "+strconv.Quote(tc.source))
+		})
+	}
+}
+
+func TestCommentMemoryConfigWrittenOncePerJob(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		ledger string
+	}{
+		{name: "without ledger"},
+		{name: "git ledger", ledger: "  ledger: {}\n"},
+		{name: "comment ledger", ledger: "  ledger:\n    storage: comment-memory\n"},
+		{name: "mixed ledgers", ledger: "  ledger:\n    local:\n      storage: comment-memory\n    global: {}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "memory.md")
+			source := `---
+on:
+  workflow_dispatch:
+  restore-memory: true
+  steps:
+    - name: Gate check
+      run: echo gate
+engine: copilot
+strict: false
+tools:
+  comment-memory:
+    target: 42
+` + tc.ledger + `steps:
+  - name: Agent custom step
+    run: echo agent
+jobs:
+  reader:
+    runs-on: ubuntu-latest
+    restore-memory: true
+    steps:
+      - name: Read memory
+        run: echo reader
+---
+Read prior memory.
+`
+			require.NoError(t, os.WriteFile(path, []byte(source), 0o600))
+			require.NoError(t, NewCompiler().CompileWorkflow(path))
+			lock, err := os.ReadFile(filepath.Join(root, "memory.lock.yml"))
+			require.NoError(t, err)
+			for _, job := range []struct {
+				name       string
+				customStep string
+			}{
+				{name: "agent", customStep: "Agent custom step"},
+				{name: "pre_activation", customStep: "Gate check"},
+				{name: "reader", customStep: "Read memory"},
+			} {
+				section := extractJobSection(string(lock), job.name)
+				require.NotEmpty(t, section, job.name)
+				require.Equal(t, 1, strings.Count(section, "- name: Write comment-memory configuration"), job.name)
+				assertLedgerStepOrderInSection(t, section,
+					"- name: Write comment-memory configuration",
+					"- name: Prepare comment memory files",
+					"- name: "+job.customStep,
+				)
+				if job.name == "agent" && strings.Contains(tc.ledger, "storage: comment-memory") {
+					assertLedgerStepOrderInSection(t, section,
+						"- name: Write comment-memory configuration",
+						"- name: Create read-only ledger projections",
+						"- name: Prepare comment memory files",
+					)
+				}
+			}
+		})
+	}
+}
+
+func assertLedgerStepOrderInSection(t *testing.T, section string, orderedSteps ...string) {
+	t.Helper()
+	previousIndex := -1
+	for _, step := range orderedSteps {
+		index := strings.Index(section, step)
+		require.NotEqual(t, -1, index, "step %q not found", step)
+		require.Greater(t, index, previousIndex, "step %q appears out of order", step)
+		previousIndex = index
+	}
 }
 
 func TestBuiltinLedgerDeclarations(t *testing.T) {
@@ -270,6 +644,14 @@ func TestStandaloneLedgerPrompt(t *testing.T) {
 	require.NotContains(t, NewCompiler().collectPromptSections(&WorkflowData{LedgerConfig: config}), PromptSection{Content: ledgerReplayPromptFile, IsFile: true})
 }
 
+func TestLedgerSchemaPromptPreservesUTF8(t *testing.T) {
+	config := &LedgerToolConfig{Ledgers: []LedgerConfig{{
+		Name: "records", Type: "log",
+		Schema: map[string]any{"description": "x" + strings.Repeat("\u00e9", 1100)},
+	}}}
+	require.True(t, utf8.ValidString(buildLedgerPromptSection(config).Content))
+}
+
 func TestStandaloneLedgerReplayConfiguration(t *testing.T) {
 	config, err := parseLedgerToolConfig(map[string]any{
 		"findings":    map[string]any{"type": "log"},
@@ -389,6 +771,26 @@ func TestStandaloneLedgerWiresValidationArtifactAndPersistenceJobs(t *testing.T)
 	require.Contains(t, jobSteps, ledgerTransactionsArtifactName)
 	require.Contains(t, jobSteps, "GH_AW_LEDGER_TRANSACTIONS")
 	require.Contains(t, jobSteps, "GH_AW_LEDGER_CONFIG_BASE64")
+
+	var uploadState safeOutputsHandlerOutputsAndActionState
+	NewCompiler().appendLedgerTransactionsArtifactUpload(data, &uploadState)
+	uploadSteps := strings.Join(uploadState.steps, "")
+	require.Contains(t, uploadSteps, "name: "+ledgerTransactionsArtifactName)
+	require.Contains(t, uploadSteps, "path: "+ledgerTransactionsArtifactPath+"\n")
+	require.Contains(t, jobSteps, "GH_AW_LEDGER_TRANSACTIONS: "+ledgerTransactionsArtifactPath+"\n")
+	require.Contains(t, jobSteps, "GH_AW_LEDGER_TRANSACTIONS_ARTIFACT_NAME: "+ledgerTransactionsArtifactName+"\n")
+	downloadStart := strings.Index(jobSteps, "      - name: Download validated ledger transactions\n")
+	require.NotEqual(t, -1, downloadStart)
+	downloadStep := jobSteps[downloadStart:]
+	if nextStep := strings.Index(downloadStep, "\n      - name: "); nextStep >= 0 {
+		downloadStep = downloadStep[:nextStep]
+	}
+	require.Contains(t, downloadStep, "          path: "+ledgerTransactionsArtifactDir)
+	handlerManagerSteps, err := NewCompiler().buildHandlerManagerStep(data)
+	require.NoError(t, err)
+	require.Contains(t, strings.Join(handlerManagerSteps, ""), "GH_AW_LEDGER_TRANSACTIONS: "+ledgerTransactionsArtifactPath+"\n")
+	safeOutputsEnv := NewCompiler().buildJobLevelSafeOutputEnvVars(data, "")
+	require.NotContains(t, safeOutputsEnv, "GH_AW_LEDGER_TRANSACTIONS")
 
 	var projectionStep strings.Builder
 	require.NoError(t, NewCompiler().generateLedgerProjectionStep(&projectionStep, data))

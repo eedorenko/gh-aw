@@ -1,0 +1,214 @@
+// @ts-check
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
+const { randomUUID } = require("node:crypto");
+const { tryRecordDurableSessionEvent } = require("./durable_session_record.cjs");
+const { readJsonlFile } = require("./jsonl_helpers.cjs");
+const SESSION_ID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+
+/** @param {any} value */
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** @param {any} value */
+function isEntryId(value) {
+  return typeof value === "string" && value.length > 0;
+}
+
+/** Validate native envelopes and tree links without constraining extension-owned payloads.
+ * @param {any} entry @param {Set<string>} ids */
+function validatePiNativeEntry(entry, ids) {
+  if (
+    !isRecord(entry) ||
+    !isEntryId(entry.type) ||
+    entry.type === "session" ||
+    !isEntryId(entry.id) ||
+    ids.has(entry.id) ||
+    typeof entry.timestamp !== "string" ||
+    !Number.isFinite(Date.parse(entry.timestamp)) ||
+    (entry.parentId !== null && (!isEntryId(entry.parentId) || !ids.has(entry.parentId)))
+  ) {
+    throw new Error("Invalid durable Pi native session entry or parent reference");
+  }
+  if (entry.type === "message" && (!isRecord(entry.message) || !isEntryId(entry.message.role))) throw new Error("Invalid durable Pi native message entry");
+  if (entry.type === "compaction" && (!isEntryId(entry.firstKeptEntryId) || (entry.firstKeptEntryId !== entry.id && !ids.has(entry.firstKeptEntryId)))) {
+    throw new Error("Invalid durable Pi native compaction reference");
+  }
+  if ((entry.type === "label" || entry.type === "context_edit") && (!isEntryId(entry.targetId) || !ids.has(entry.targetId))) {
+    throw new Error("Invalid durable Pi native target reference");
+  }
+  // fromId is provenance: "root" is a sentinel, and a fork can omit the abandoned branch.
+  if (entry.type === "branch_summary" && !isEntryId(entry.fromId)) throw new Error("Invalid durable Pi native branch summary reference");
+  ids.add(entry.id);
+}
+
+function piDurableSessionState(file, directory, id, env) {
+  let startupRecorded = false;
+  return {
+    file,
+    directory,
+    get id() {
+      return id;
+    },
+    started(sessionId) {
+      if (typeof sessionId !== "string" || !SESSION_ID.test(sessionId) || (id && sessionId !== id)) throw new Error("Durable Pi startup must use the selected native session");
+      id = sessionId;
+      if (startupRecorded) return;
+      tryRecordDurableSessionEvent("durable.session", { status: env.GH_AW_DURABLE_RESUMED === "true" ? "resumed" : "fresh", sessionId, parentRunId: env.GH_AW_DURABLE_PARENT_RUN_ID }, { env });
+      startupRecorded = true;
+    },
+  };
+}
+
+function openPiDurableSession(env = process.env) {
+  if (env.GH_AW_DURABLE_STORAGE !== "artifact" || env.GH_AW_PI_SUBAGENT_CHILD === "1") return undefined;
+  const directory = env.GH_AW_DURABLE_SESSION_DIR;
+  if (env.GH_AW_DURABLE_ENGINE !== "pi" || !directory || !path.isAbsolute(directory)) throw new Error("Missing engine-owned durable Pi session configuration");
+  const file = path.join(directory, "session.jsonl");
+  if (fs.lstatSync(directory, { throwIfNoEntry: false })?.isSymbolicLink()) throw new Error("Durable Pi session directory must not be a symlink");
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!stat) {
+    if (env.GH_AW_DURABLE_RESUMED === "true") throw new Error("Restored durable Pi session transcript is missing; refusing to start an unrelated conversation");
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    return piDurableSessionState(file, directory, undefined, env);
+  }
+  if (!stat.isFile()) throw new Error("Durable Pi session transcript must be a regular file");
+  let header;
+  const ids = new Set();
+  for (const record of readJsonlFile(file, {
+    fatalUTF8: true,
+    onError(error) {
+      throw error;
+    },
+  })) {
+    if (header === undefined) {
+      if (
+        !isRecord(record) ||
+        record.type !== "session" ||
+        record.version !== 3 ||
+        typeof record.id !== "string" ||
+        !SESSION_ID.test(record.id) ||
+        typeof record.timestamp !== "string" ||
+        !Number.isFinite(Date.parse(record.timestamp)) ||
+        typeof record.cwd !== "string" ||
+        (record.parentSession !== undefined && typeof record.parentSession !== "string")
+      ) {
+        throw new Error("Invalid durable Pi native session header");
+      }
+      header = record;
+    } else {
+      validatePiNativeEntry(record, ids);
+    }
+  }
+  if (!header) throw new Error("Invalid durable Pi native session header");
+  return piDurableSessionState(file, directory, header.id, env);
+}
+
+function readCopilotCaptureBaseline(directory) {
+  const file = path.join(directory, "capture-offset.json");
+  if (!fs.existsSync(file)) return undefined;
+  const baseline = JSON.parse(fs.readFileSync(file, "utf8"));
+  if (!SESSION_ID.test(baseline.id || "") || !Number.isSafeInteger(baseline.bytes) || baseline.bytes < 0) throw new Error("Invalid durable Copilot capture baseline");
+  return baseline;
+}
+
+function openDurableSession(engine, env = process.env) {
+  if (env.GH_AW_DURABLE_STORAGE !== "artifact") return undefined;
+  const configuredDirectory = env.GH_AW_DURABLE_SESSION_DIR;
+  if (env.GH_AW_DURABLE_ENGINE !== engine || !configuredDirectory || !path.isAbsolute(configuredDirectory)) throw new Error("Missing engine-owned durable session configuration");
+  const directory = configuredDirectory;
+  const file = path.join(directory, "session.json");
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  if (fs.lstatSync(file, { throwIfNoEntry: false })?.isSymbolicLink()) throw new Error("Durable session selector must not be a symlink");
+  let id = "";
+  let startupRecorded = false;
+  const resumed = env.GH_AW_DURABLE_RESUMED === "true";
+  if (fs.existsSync(file)) {
+    const state = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (state.version !== 1 || state.engine !== engine || !SESSION_ID.test(state.id || "")) throw new Error("Invalid durable session selector");
+    id = state.id;
+  } else if (env.GH_AW_DURABLE_RESUMED === "true") {
+    throw new Error("Restored durable state has no exact session ID; refusing to start an unrelated conversation");
+  }
+  function save(sessionId) {
+    if (typeof sessionId !== "string" || !SESSION_ID.test(sessionId)) throw new Error("Durable continuation requires an exact session UUID");
+    if (id && id !== sessionId) throw new Error("Durable continuation cannot switch to an unrelated session");
+    const temporary = path.join(directory, `session-${randomUUID()}.tmp`);
+    fs.writeFileSync(temporary, JSON.stringify({ version: 1, engine, id: sessionId }) + "\n", { mode: 0o600, flag: "wx" });
+    fs.renameSync(temporary, file);
+    id = sessionId;
+  }
+  function copilotSession(sessionId = id || randomUUID()) {
+    if (!SESSION_ID.test(sessionId)) throw new Error("Invalid durable Copilot session UUID");
+    const baseline = readCopilotCaptureBaseline(directory);
+    const runId = env.GITHUB_RUN_ID || "local";
+    const runAttempt = env.GITHUB_RUN_ATTEMPT || "1";
+    const baselineIsCurrent = baseline && baseline.runId === runId && baseline.runAttempt === runAttempt;
+    if (baselineIsCurrent && baseline.id !== sessionId) {
+      throw new Error("Durable Copilot continuation cannot select a different session");
+    }
+    const target = path.join(env.COPILOT_HOME || path.join(env.HOME || os.homedir(), ".copilot"), "session-state", sessionId);
+    if (!baselineIsCurrent) {
+      if (fs.existsSync(target) && !id) throw new Error("Refusing to overwrite an unrelated native Copilot session");
+      if (id && !fs.existsSync(path.join(target, "events.jsonl"))) {
+        const source = path.join(directory, "session-state", sessionId);
+        if (!fs.existsSync(path.join(source, "events.jsonl"))) throw new Error("Durable Copilot session transcript is missing");
+        fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+        fs.cpSync(source, target, { recursive: true, dereference: false });
+      }
+      const events = path.join(target, "events.jsonl");
+      const captureBaselineFile = path.join(directory, "capture-offset.json");
+      const temporaryBaselineFile = path.join(directory, `capture-offset-${randomUUID()}.tmp`);
+      fs.writeFileSync(temporaryBaselineFile, JSON.stringify({ id: sessionId, bytes: fs.existsSync(events) ? fs.statSync(events).size : 0, runId, runAttempt }), { mode: 0o600, flag: "wx" });
+      fs.renameSync(temporaryBaselineFile, captureBaselineFile);
+    }
+    return sessionId;
+  }
+  return {
+    get id() {
+      return id;
+    },
+    save,
+    copilotSession,
+    started(sessionId = id) {
+      if (!SESSION_ID.test(sessionId) || sessionId !== id) throw new Error("Durable startup must use the selected native session");
+      if (startupRecorded) return;
+      tryRecordDurableSessionEvent(
+        "durable.session",
+        {
+          status: resumed ? "resumed" : "fresh",
+          sessionId,
+          parentRunId: env.GH_AW_DURABLE_PARENT_RUN_ID,
+        },
+        { env }
+      );
+      startupRecorded = true;
+    },
+  };
+}
+
+function observeDurableSession(session, engine, line) {
+  if (!session) return;
+  let event;
+  try {
+    event = JSON.parse(line);
+  } catch {
+    return; // Harness diagnostics are interleaved with structured CLI events.
+  }
+  if (!event || typeof event !== "object") return;
+  if (engine === "pi") {
+    if (event.type === "session" && event.version === 3) session.started(event.id);
+    return;
+  }
+  const id = engine === "codex" && event.type === "thread.started" ? event.thread_id : engine === "claude" && event.type === "system" && event.subtype === "init" ? event.session_id : undefined;
+  if (id !== undefined) {
+    session.save(id);
+    session.started(id);
+  }
+}
+
+module.exports = { openDurableSession, observeDurableSession, readCopilotCaptureBaseline, openPiDurableSession };

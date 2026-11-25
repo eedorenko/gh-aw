@@ -1,12 +1,50 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
-const { compactUnifiedSession, readCompactUnifiedSession, MAX_COMPACT_SESSION_BYTES, MAX_COMPACT_SESSION_EVENTS, MAX_COMPACT_STRING_BYTES, MAX_SOURCE_LINE_BYTES, MAX_SOURCE_SCAN_BYTES } = require("./compact_unified_session.cjs");
+const { collectUnifiedSession } = require("./unified_session.cjs");
+const {
+  compactUnifiedSession,
+  readCompactUnifiedSession,
+  sessionEventPriority,
+  leastEssentialSessionEventIndex,
+  MAX_COMPACT_SESSION_BYTES,
+  MAX_COMPACT_SESSION_EVENTS,
+  MAX_COMPACT_STRING_BYTES,
+  MAX_SOURCE_LINE_BYTES,
+  MAX_SOURCE_SCAN_BYTES,
+} = require("./compact_unified_session.cjs");
 const event = (type, data) => ({ type, data, timestamp: "2026-10-20T19:00:00Z", provenance: { component: "agent", phase: "agent", path: "agent-session.jsonl", index: 0 } });
 const parse = result => (result.session.trim() ? result.session.trim().split("\n").map(JSON.parse) : []);
 
 describe("compact unified session projection", () => {
+  it("preserves invocation decision evidence without retaining question content", () => {
+    const data = {
+      proposedAttempt: 1,
+      outcome: "deny",
+      questions: [{ question: 1, outcome: "deny", instructions: "private contents" }],
+      latencyMs: 1,
+      timestamp: 1000,
+      avoidedInvocation: true,
+      providerBody: "private body",
+    };
+    const result = compactUnifiedSession([event("harness.decision", data)]);
+    expect(parse(result)[0].data).toMatchObject({ proposedAttempt: 1, outcome: "deny", latencyMs: 1, avoidedInvocation: true, questions: [{ question: 1, outcome: "deny" }] });
+    expect(result.session).not.toContain("private");
+    expect(sessionEventPriority(event("harness.decision", data))).toBe(4);
+  });
+
+  it("preserves durable lineage but excludes historical content", () => {
+    const events = [
+      event("durable.restore", { engine: "codex", storage: "artifact", status: "restored", runId: "200", runAttempt: "1", parentRunId: "100", artifactId: "999", transcript: "private history" }),
+      event("durable.session", { engine: "codex", storage: "artifact", status: "resumed", runId: "200", runAttempt: "1", parentRunId: "100", sessionId: "native-id" }),
+    ];
+    const result = compactUnifiedSession(events);
+    expect(parse(result)).toHaveLength(2);
+    expect(parse(result)[1].data).toMatchObject({ status: "resumed", sessionId: "native-id" });
+    expect(result.session).not.toContain("private history");
+    expect(sessionEventPriority(events[0])).toBe(2);
+  });
+
   it("retains bounded accounting and outcome metadata without mutating the source", () => {
     const events = [
       event("session.format", { version: 1 }),
@@ -17,6 +55,7 @@ describe("compact unified session projection", () => {
       event("guardrail.daily_aic", { status: "under_budget", exceeded: false, total: 2 }),
       event("workflow.job_result", { jobId: "agent", result: "success", durationMs: 42 }),
       event("execution.result", { outcome: "success", exitCode: 0 }),
+      event("safe_output.execution", { type: "create_issue", messageIndex: 2, status: "success", staged: false, operation_outcome: "indeterminate", url: "https://github.com/org/repo/issues/1", body: "private" }),
       event("harness.retry", {
         attempts: 2,
         exitCode: 0,
@@ -47,7 +86,8 @@ describe("compact unified session projection", () => {
     const projected = parse(result);
     expect(projected[2].data).toEqual({ aic: 1.5, model: "model", usage: { inputTokens: 10, outputTokens: 3, inputTokensIncludeCache: false } });
     expect(projected[3].data).toEqual({ status: "success", numTurns: 2, usage: { totalTokens: 13 } });
-    expect(projected[8].data).toEqual({
+    expect(projected[8].data).toEqual({ type: "create_issue", messageIndex: 2, status: "success", staged: false, operation_outcome: "indeterminate" });
+    expect(projected[9].data).toEqual({
       attempts: 2,
       exitCode: 0,
       attemptResults: [
@@ -55,8 +95,8 @@ describe("compact unified session projection", () => {
         { attempt: 2, exitCode: 0, failureClasses: [] },
       ],
     });
-    expect(projected[9].data).toEqual({ value: 1, run: { passed: 1, errors: 0 } });
-    expect(projected[10].data).toEqual({
+    expect(projected[10].data).toEqual({ value: 1, run: { passed: 1, errors: 0 } });
+    expect(projected[11].data).toEqual({
       memoryId: "default",
       jobResult: "failure",
       outcome: "success",
@@ -65,6 +105,7 @@ describe("compact unified session projection", () => {
       commit: "b".repeat(40),
     });
     expect(result.session).not.toContain("private");
+    expect(result.session).not.toContain("github.com");
     expect(JSON.stringify(events)).toBe(original);
   });
 
@@ -123,6 +164,13 @@ describe("compact unified session projection", () => {
     expect(projected.map(item => item.provenance.attemptId)).toEqual(["harness:2", "startup:1", undefined, undefined, "startup:2:harness:3", undefined, undefined]);
     expect(projected.every(item => item.provenance.startupAttemptId === "startup:1")).toBe(true);
     expect(compactUnifiedSession(events).session).not.toContain("PRIVATE");
+  });
+
+  it("preserves only finite source-normalized provenance clocks", () => {
+    const clocks = [0, 1700000000123.5, NaN, Infinity, "PRIVATE", { content: "PRIVATE" }];
+    const inputs = clocks.map(timestampMs => ({ ...event("usage.report", { aic: 1 }), provenance: { timestampMs } }));
+    expect(parse(compactUnifiedSession(inputs)).map(item => item.provenance.timestampMs)).toEqual([0, 1700000000123.5, undefined, undefined, undefined, undefined]);
+    expect(compactUnifiedSession(inputs).session).not.toContain("PRIVATE");
   });
 
   it("preserves bounded native reconnect counters without creating harness events", () => {
@@ -202,6 +250,93 @@ describe("compact unified session projection", () => {
     expect(compactUnifiedSession(events)).toEqual(result);
   });
 
+  it("prioritizes metadata, outcomes, guardrails/graders, retries, usage, then memory", () => {
+    const types = ["session.format", "workflow.info", "execution.result", "safe_output.execution", "grader.result", "engine.retry", "usage.report", "memory.push"];
+    expect(types.map(type => sessionEventPriority({ type, data: {} }))).toEqual([0, 1, 2, 2, 3, 4, 5, 6]);
+    expect(leastEssentialSessionEventIndex(types.map(type => ({ type, data: {} })))).toBe(7);
+  });
+
+  it.each([
+    ["grader.result", { passed: false }],
+    ["grader.result", { run: { errors: 1 } }],
+    ["guardrail.admission", { status: "denied" }],
+    ["guardrail.daily_aic", { exceeded: true }],
+    ["guardrail.daily_aic", { status: "structural_error" }],
+    ["guardrail.daily_aic", { status: "transient_error" }],
+    ["guardrail.daily_aic", { status: "quota_blocked", exceeded: false }],
+    ["memory.push", { jobResult: "failure" }],
+    ["harness.attempt", { exitCode: 1 }],
+    ["workflow.job_result", { result: "timed_out" }],
+  ])("promotes failure evidence for %s", (type, data) => {
+    expect(sessionEventPriority({ type, data })).toBe(2);
+  });
+
+  it.each(["structural_error", "transient_error", "quota_blocked"])("retains a late daily-AIC %s ahead of successful guardrails and graders", status => {
+    const successes = Array.from({ length: MAX_COMPACT_SESSION_EVENTS }, (_, index) =>
+      index % 2 === 0 ? { type: "guardrail.daily_aic", data: { status: "under_budget", exceeded: false } } : { type: "grader.result", data: { id: String(index), passed: true } }
+    );
+    const failure = { type: "guardrail.daily_aic", data: { status, exceeded: false } };
+    const result = compactUnifiedSession([...successes, failure]);
+    expect(parse(result)).toEqual([...successes.slice(0, -1), failure]);
+    expect(result.includedEvents).toBe(MAX_COMPACT_SESSION_EVENTS);
+    expect(result.omittedEvents).toBe(1);
+    expect(result.truncated).toBe(true);
+  });
+
+  it("evicts early low-priority records for late outcomes without reordering or mutating input", () => {
+    const events = [
+      { type: "session.format", data: { version: 1 } },
+      ...Array.from({ length: 200 }, (_, stepIndex) => ({ type: "usage.report", data: { stepIndex, aic: 1 } })),
+      { type: "execution.result", data: { outcome: "failure", exitCode: 1 } },
+      { type: "grader.result", data: { id: "quality", passed: false } },
+    ];
+    const original = structuredClone(events);
+    const result = compactUnifiedSession(events);
+    const retained = parse(result);
+    expect(result.includedEvents).toBe(128);
+    expect(result.omittedEvents).toBe(events.length - 128);
+    expect(result.truncated).toBe(true);
+    expect(retained[0].type).toBe("session.format");
+    expect(retained.at(-2)).toEqual(events.at(-2));
+    expect(retained.at(-1)).toEqual(events.at(-1));
+    expect(retained.filter(item => item.type === "usage.report").map(item => item.data.stepIndex)).toEqual(Array.from({ length: 125 }, (_, i) => i));
+    expect(events).toEqual(original);
+    expect(compactUnifiedSession(events)).toEqual(result);
+  });
+
+  it("reclaims byte budget from several low-priority records for later essential evidence", () => {
+    const usage = { type: "usage.report", data: { model: "x".repeat(256), provider: "x".repeat(256) } };
+    const events = [
+      ...Array.from({ length: 100 }, () => usage),
+      { type: "workflow.info", data: { engineId: "x".repeat(256), agentVersion: "x".repeat(256), cliVersion: "x".repeat(256) } },
+      { type: "session.result", data: { status: "failure", usage: { inputTokens: 10 } } },
+    ];
+    const result = compactUnifiedSession(events);
+    expect(Buffer.byteLength(result.session)).toBeLessThanOrEqual(MAX_COMPACT_SESSION_BYTES);
+    expect(parse(result).slice(-2)).toEqual(events.slice(-2));
+    expect(result.truncated).toBe(true);
+  });
+
+  it("preserves lower-priority evidence when a candidate cannot fit beside earlier equal-priority records", () => {
+    const usage = { type: "usage.report", data: { model: "x".repeat(256), provider: "x".repeat(256) } };
+    const memory = { type: "memory.push", data: { memoryId: "abc" } };
+    const candidate = { type: "usage.report", data: { ...usage.data, purpose: "xxx" } };
+    expect([usage, memory, candidate].map(item => Buffer.byteLength(JSON.stringify(item) + "\n"))).toEqual([570, 49, 586]);
+    const events = [...Array(28).fill(usage), memory];
+    const original = structuredClone(events);
+    const baseline = compactUnifiedSession(events);
+    expect(baseline.includedEvents).toBe(29);
+    expect(baseline.truncated).toBe(false);
+    const result = compactUnifiedSession([...events, candidate]);
+    expect(result.session).toBe(baseline.session);
+    expect(parse(result)).toEqual(events);
+    expect(result.includedEvents).toBe(29);
+    expect(result.omittedEvents).toBe(1);
+    expect(result.truncated).toBe(true);
+    expect(events).toEqual(original);
+    expect(compactUnifiedSession([...events, candidate])).toEqual(result);
+  });
+
   it.each(["🦊", '"', "\\", "\u0000"])("bounds UTF-8 JSONL bytes after serialization with %j", character => {
     const value = character.repeat(Math.floor(MAX_COMPACT_STRING_BYTES / Buffer.byteLength(character)));
     const events = Array.from({ length: 1000 }, () => event("workflow.info", { engineId: value, agentVersion: value, cliVersion: value, model: value, repository: value }));
@@ -239,12 +374,61 @@ describe("bounded compact session file reader", () => {
   let directory;
   let file;
   beforeEach(() => {
-    directory = fs.mkdtempSync(path.join(os.tmpdir(), "compact-session-"));
+    directory = fs.mkdtempSync(path.resolve(".gh-aw-compact-session-"));
     file = path.join(directory, "aw_session.jsonl");
   });
   afterEach(() => {
     vi.restoreAllMocks();
     fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  it("preserves retry and final execution metadata with three evaluations of 100 errored questions", () => {
+    const decisions = Array.from({ length: 3 }, (_, index) => ({
+      proposedAttempt: index + 1,
+      outcome: "unknown",
+      questions: Array.from({ length: 100 }, (_, question) => ({ question: question + 1, outcome: "unknown", error: "evaluation_failed" })),
+      latencyMs: 25,
+      timestamp: 1000 + index * 100,
+      avoidedInvocation: false,
+    }));
+    const attempts = Array.from({ length: 3 }, (_, index) => ({
+      attempt: index + 1,
+      exitCode: index === 2 ? 0 : 1,
+      failureClasses: index === 2 ? [] : ["rate_limit_error"],
+      outcome: index === 2 ? "success" : "failure",
+    }));
+    const record = { attempts: 3, exitCode: 0, attemptResults: attempts, decisionResults: decisions };
+    fs.mkdirSync(path.join(directory, "agent"));
+    fs.writeFileSync(path.join(directory, "agent/harness_retry.json"), JSON.stringify(record));
+    fs.writeFileSync(path.join(directory, "agent_execution.json"), JSON.stringify({ outcome: "success", exitCode: 0 }));
+    const { events } = collectUnifiedSession({ rootDir: directory });
+    const original = JSON.stringify(events);
+    const fullRetry = events.find(item => item.type === "harness.retry");
+    const fullDecisions = events.filter(item => item.type === "harness.decision");
+    expect(fullRetry.data).toEqual(record);
+    expect(Buffer.byteLength(JSON.stringify(fullRetry))).toBeGreaterThan(MAX_SOURCE_LINE_BYTES);
+    expect(fullDecisions.map(item => item.data)).toEqual(decisions);
+    for (const decision of fullDecisions) {
+      expect(Buffer.byteLength(JSON.stringify(decision))).toBeLessThan(MAX_SOURCE_LINE_BYTES);
+      const projected = compactUnifiedSession([decision]);
+      expect(parse(projected)[0].data).toEqual(decision.data);
+      expect(Buffer.byteLength(projected.session)).toBeLessThan(MAX_SOURCE_LINE_BYTES);
+      expect(projected.truncated).toBe(false);
+    }
+    const result = compactUnifiedSession(events);
+    const projected = parse(result);
+    expect(projected.find(item => item.type === "harness.retry").data).toEqual({ attempts: 3, exitCode: 0, attemptResults: attempts });
+    expect(projected.filter(item => item.type === "harness.attempt").map(item => item.data)).toEqual(attempts.map(attempt => ({ ...attempt, attemptId: `harness:${attempt.attempt}`, layer: "harness" })));
+    expect(projected.find(item => item.type === "execution.result").data).toEqual({ outcome: "success", exitCode: 0 });
+    expect(projected.filter(item => item.type === "harness.decision").length).toBeGreaterThan(0);
+    expect(result.session).not.toContain("decisionResults");
+    expect(Buffer.byteLength(result.session)).toBeLessThanOrEqual(MAX_COMPACT_SESSION_BYTES);
+    expect(JSON.stringify(events)).toBe(original);
+    fs.writeFileSync(file, result.session);
+    const reread = readCompactUnifiedSession(file);
+    expect(reread.oversizedLines).toBe(0);
+    expect(parse(reread)).toEqual(projected);
+    expect(JSON.parse(fs.readFileSync(path.join(directory, "agent/harness_retry.json"), "utf8"))).toEqual(record);
   });
 
   it("skips multi-chunk oversized agent messages and retains subsequent accounting", () => {
@@ -268,6 +452,16 @@ describe("bounded compact session file reader", () => {
     const result = readCompactUnifiedSession(file);
     expect(result.includedEvents).toBe(1);
     expect(result.oversizedLines).toBe(1);
+  });
+
+  it("continues scanning after compact output fills to retain late failures", () => {
+    const events = [...Array.from({ length: 300 }, (_, stepIndex) => ({ type: "usage.report", data: { stepIndex } })), { type: "execution.result", data: { exitCode: 1, outcome: "failure" } }];
+    fs.writeFileSync(file, events.map(JSON.stringify).join("\n") + "\n");
+    const result = readCompactUnifiedSession(file);
+    expect(parse(result).at(-1)).toEqual(events.at(-1));
+    expect(result.includedEvents).toBe(128);
+    expect(result.omittedEvents).toBe(173);
+    expect(result.truncated).toBe(true);
   });
 
   it("bounds source scanning even for a huge file and marks incomplete coverage", () => {

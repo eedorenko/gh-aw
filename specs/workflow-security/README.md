@@ -49,7 +49,7 @@ sandboxed agent principal, even when GitHub Actions runs both in the same job.
 | Issue relationships | [`IssueRelationshipAuthorization.tla`](IssueRelationshipAuthorization.tla) | Resolved repository authorization before reads, writes, or per-item mention lookups; fixed/triggering parents, staged isolation, and deferred revalidation. |
 | Bundle Git operations | [`SafeOutputGit.tla`](SafeOutputGit.tla) | Explicit prerequisite recovery, offline optional discovery, bounded comparison/history work, credential roles, and separate size/protection provenance. |
 | Host-side MCP compilation | [`MCPCompile.tla`](MCPCompile.tla) | Startup write capability, actor authorization, early option rejection, filesystem isolation, cached-only imports, repository-root cache selection, validation, and write-enabled emission. |
-| Cooperative activation admission | [`ActivationAdmission.tla`](ActivationAdmission.tla) | Optional endpoint, isolated admission/conclusion OIDC capabilities, verified identity, retry/outage classification, independently resolved runtime allowances, privacy, and caller-owned trace correlation. |
+| Cooperative activation admission | [`ActivationAdmission.tla`](ActivationAdmission.tla) | Optional endpoint, activation/conclusion OIDC capabilities, verified identity, retry/outage classification, independently resolved runtime allowances, privacy, and caller-owned trace correlation. |
 | Admission conclusion delivery | [`AdmissionConclusion.tla`](AdmissionConclusion.tla) | Artifact-first compact delivery, hard payload bounds, upload-bound artifact references, full-artifact preservation, fresh OIDC, stable retries, outcome-preserving warnings, and durable deduplicated acceptance. |
 
 The `issue` effect creates at most one validated issue in the main public
@@ -155,8 +155,14 @@ represented by a skipped state-machine slot, not a real runtime job.
 [`ActivationAdmission.tla`](ActivationAdmission.tla) formalizes the
 [admission service contract](../../docs/src/content/docs/specs/admission-service-specification.md),
 including the implemented client's daily-validation precedence, optional
-component allowances, and admission/conclusion OIDC capability isolated from activation. It is a bounded reference model, not a proof of the runtime
-or deployment-owned authority. Admission runs in an endpoint-gated job.
+component allowances, and admission OIDC capability confined to activation and conclusion jobs. It is a bounded reference model, not a proof of the runtime
+or deployment-owned authority. Admission runs in an endpoint-gated step inside
+activation, after trusted setup and before author pre-steps and daily validation.
+An empty endpoint skips the step, not the runner or job bootstrap. When admission is compiled in,
+activation and conclusion jobs retain job-wide `id-token: write` even when their
+authority-request steps are skipped; activation hooks and conclusion actions
+share that capability. The endpoint gate prevents those steps from acquiring
+admission credentials, not other steps in the same job from minting OIDC tokens.
 Activation requires successful or intentionally skipped admission; a successful
 activation is required before agent execution. Independent OIDC features are
 outside this admission-only permission model.
@@ -177,7 +183,7 @@ Request identity and credentials are not handed off; component accounting is unc
 
 | Contract | Checked invariants |
 |---|---|
-| Optional configuration, isolated OIDC capability and activation dependency | `NoEndpointNoRequest`, `InvalidConfigurationBlocks`, `AdmissionJobIsolation`, `AdmissionDependency`, `ActivationGate` |
+| Optional configuration, activation/callback OIDC capability and admission step gate | `NoEndpointNoRequest`, `InvalidConfigurationBlocks`, `AdmissionOIDCScope`, `AdmissionStepGate`, `ActivationGate` |
 | OIDC-only authentication, verified claim/workflow mapping, independently checked rerun initiator, original actor privileges | `OIDCOnly`, `IdentityVerified`, `TriggeringActorVerified`, `OriginalActorPrivileges`, `InvocationBound` |
 | Lost responses, replica changes, token-renewal abstraction, bounded retries, denial/protocol errors, explicit outage policy | `StableRetryDecision`, `RetryBound`, `DenialBlocks`, `MalformedBlocks`, `FatalErrorsBlock`, `OutagePolicyHonored` |
 | Terminal deadline expiry, approved admission bypassing daily validation, daily fallback required for skip/ignored outage | `DeadlineHonored`, `DailyAdmissionPrecedence`, `DailyFallbackEnforced` |
@@ -200,15 +206,15 @@ lost-response recovery through another replica; a verified rerun initiator;
 admission with request trace context but no client export; existing and generated
 caller traces; all four optional-allowance combinations; terminal denial;
 admission despite a blocking daily result; daily blocks after skipped
-admission and ignored outages; early timeout fallback; and an admission job
-failing after approval still preventing activation.
+admission and ignored outages; early timeout fallback; and an admission step
+failing after approval still preventing activation from completing successfully.
 In particular, skipped and fail-open starts deliberately demonstrate
 why this is **cooperative admission, not unbypassable organization policy or a
 hard spending cap**. The model consumes already-resolved runtime settings;
-repository-variable shadowing and an editor removing the job remain outside
+repository-variable shadowing and an editor removing the step remain outside
 the participating-workflow machine.
 
-Use the same checksum-pinned TLA+ Tools v1.8.0 described below:
+Use the same checksum-pinned TLA+ Tools v1.7.4 described below:
 
 ```bash
 TLA2TOOLS_JAR=/path/to/tla2tools.jar JAVA_BIN=/path/to/java \
@@ -258,8 +264,8 @@ this model.
 [`AdmissionConclusion.cfg`](AdmissionConclusion.cfg) model completion independently
 of start-time admission, avoiding a product of unrelated protocol states.
 The eligible conclusion job consumes a symbolic completed agent outcome and a
-valid or invalid redacted unified-session file; an isolated callback job handles
-authority delivery after it finishes. A skipped conclusion job makes no upload
+valid or invalid redacted unified-session file; its final callback step handles
+authority delivery after artifact publication attempts finish. A skipped conclusion job makes no upload
 or authority request.
 
 For an eligible job, generation precedes the first artifact upload. A failed
@@ -274,7 +280,7 @@ to change the captured outcome.
 | Contract | Checked invariants |
 |---|---|
 | Artifact-first order, existing job eligibility, absent endpoint and invalid session/configuration | `ArtifactBeforeConclusion`, `JobEligibility`, `NoEndpointNoRequest`, `InvalidInputNoRequest` |
-| Fresh isolated callback-job OIDC, independently verified identity, compact metadata, hard request bounds and unchanged retries | `ConclusionOIDCOnly`, `InvocationVerified`, `CompactProjection`, `BoundedPayload`, `StablePayload` |
+| Fresh conclusion-job OIDC, independently verified identity, compact metadata, hard request bounds and unchanged retries | `ConclusionOIDCOnly`, `InvocationVerified`, `CompactProjection`, `BoundedPayload`, `StablePayload` |
 | Upload-bound artifact locators and unchanged full session evidence | `ArtifactReferences`, `FullArtifactPreserved` |
 | Three-attempt maximum, terminal deadline, preserved workflow outcome and caller trace | `RetryBound`, `DeadlineHonored`, `BestEffort`, `TraceCorrelation` |
 | Durable acceptance before acknowledgement, deduplicated processing, immutable accepted payload and no billing mutation | `DurableAcceptance`, `SingleProcessing`, `AcceptedSessionImmutable`, `NoFinancialEffects` |
@@ -758,30 +764,30 @@ implementation and unit-test mapping in compiler threat §7.3.
 ## Run the machine
 
 Use Java 21, Python 3 (standard library only), the repository's Go toolchain,
-and official [TLA+ Tools v1.8.0](https://github.com/tlaplus/tlaplus/releases/tag/v1.8.0).
-The runner verifies this jar SHA-256 before executing it (the v1.8.0 release
-asset SHA-256 published by GitHub for asset `670958559`, updated on
-2026-10-24; the release notes publish SHA-1):
+and official [TLA+ Tools v1.7.4](https://github.com/tlaplus/tlaplus/releases/tag/v1.7.4)
+(TLC 2.19). Both runners verify this jar SHA-256 before executing it:
 
 ```text
-011267fca25d0752cf18894dd585cd28b96960c112ea8a20b823ea770e7e10cd
+936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
 ```
 
-Upstream rebuilds this release asset and moves the `v1.8.0` tag; its versioned
-URL is not immutable. This pin identifies the 4,502,259-byte asset uploaded by
-[upstream build 40049599214](https://github.com/tlaplus/tlaplus/actions/runs/40049599214)
-at source commit `2ef2af8c767b76e5db5cba2878f027ac07aad36c`.
-The downloaded SHA-256 matches both GitHub's asset metadata and that build's
-upload log. This correlation is not an independent build attestation.
+The repository-owned [installer](../../.github/scripts/install_tla_runtime.sh)
+uses the same pin. Its digest matches the prior work-queue pin, and the verified
+bytes match the v1.7.4 publisher's historical SHA-1; SHA-256, not SHA-1, enforces
+installation integrity. The apparent v1.8.0 release is a rolling build and is
+not the supported runtime. See the [runtime provenance contract](../../.github/aw/formal-methods.md)
+for the publisher evidence and pinned Linux x64 Temurin JRE.
 
-When upstream replaces the asset again, verification must fail closed. Do not
-derive the expected checksum dynamically or bypass either runtime check.
-When intentionally updating the release pin, verify the downloaded bytes
-against the release asset metadata and the upstream build's upload log, then
-update the workflow and generated lock, runner, regression test, and this digest
-together. An immutable, vetted distribution would be needed to prevent future
-release-URL drift.
+Release URLs are not immutable: replacements must fail closed. Do not derive
+the expected checksum dynamically or bypass either runner's integrity check.
+For intentional updates, independently verify publisher release/asset identity
+and digest, then update the installer, trusted workflow source hashes and locks,
+runners, regression test, and this digest together. The full installer checks
+Java startup separately and requires TLC's expected help text and exit status 1;
+a JVM startup error or another TLC status is not a successful smoke check.
 Existing example reports retain the jar digest used to generate their evidence.
+The historical v1.8.0 model results above do not verify this v1.7.4 runtime;
+the bounded models must be revalidated before claiming equivalent results.
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s specs/workflow-security -p '*_test.py'
@@ -805,7 +811,7 @@ cleanup failure. The additional runtime-checkout model exhausts both job kinds
 and verifies the controls and witnesses described above. The MCP compilation
 model adds its secure baseline, nineteen negative controls, and seven witnesses.
 
-Counterexamples include raw `tlc-trace.json`, normalized `trace.json`, and
+Counterexamples include the full textual trace in `TLC.log`, normalized `trace.json`, and
 `events.txt`. `CompiledWorkflow` negative controls also generate `source.md` and
 `counterexample.json`; runtime-checkout controls generate classification reports
 without inventing source-level exploits. Only `agent-write` directly changes a supported
@@ -825,7 +831,13 @@ failed/stopped workflows are terminal; no liveness or fairness theorem is made.
 ### Connect source to compiled jobs
 
 The compile-only seed uses fictitious credentials and a fake dependency.
-Never dispatch it. Compile a copy into a new temporary directory:
+Never dispatch it.
+
+The expected checkout-token and GitHub App safe-output counts in the header of
+`fixtures/cross-repo.md` are parsed and asserted by `check.py` against the
+compiled lock. Update the counts when the fixture's expected bindings change.
+
+Compile a copy into a new temporary directory:
 
 ```bash
 make build
@@ -841,8 +853,9 @@ repository-write agent permissions, checkout credentials without immediately
 following fail-closed cleanup and verification,
 cross-run artifact downloads, missing strict detector gates, unpinned external
 actions, wrong dependency credentials, excessive app scopes, or disabled token
-revocation. Its `daily` profile omits seed-specific token/app assertions while
-still requiring detection. The `compiled` profile reads an independent
+revocation. Docker actions require a full SHA-256 image digest; other external
+actions require a full commit SHA. Its `daily` profile omits seed-specific
+token/app assertions while still requiring detection. The `compiled` profile reads an independent
 `gh-aw-manifest.threat_detection` declaration emitted by the compiler. Missing
 or unknown policy is an error; absent jobs cannot establish an opt-out. Reports
 include the effective policy so a disabled detector is never presented as
@@ -887,17 +900,23 @@ The architecture review identified **contract distinctions, not confirmed
 exploitable bugs**. Preserve them rather than strengthening the model's
 assumptions until real behavior disappears:
 
-| Boundary not fully modeled | Evidence / required refinement |
-|---|---|
-| Pre-activation actor authorization, bots, replay | A:608–660,966–1012; CTR-027/029; model trusted event identity and separate membership/checkout gates. |
-| Compiler expressions and freshness | CTR-010/016/018; model expression classification, manifest approvals, frontmatter/body hashes, legacy fallbacks, and status-function augmentation. |
-| Detection warning handling | WTD1–3; disabled/conditional modes are modeled, but warning-mode annotated publication, push-to-PR conversion, and abort-only operations still need operation-specific refinement. |
-| Authorized custom steps/tools and augmented app grants | CTR-017; agent-job host secrets and explicit tool grants are legitimate. Do not assume all job secrets or permission augmentation are forbidden. |
-| Redaction coverage and exceptions | Ordering checks do not guarantee successful redaction of every artifact. Binary/unscanned exceptions and fallback `always()` uploads need explicit coverage/lifecycle states. |
-| Cache integrity and publication | CTR-019; model policy/integrity namespaces, restoration, detection-gated publication, and detection-disabled post-action saving. |
-| Checkout merging, primary target, and directory identity | Entry identity is `(repository,path,wiki)`; `current` does not change cwd. Model token/app alternatives, unioned fetch/sparse patterns, and deepest history selection. |
-| Safe-output token precedence | Runtime entry precedence, representative missing-key fallbacks, and independence from neighboring scoped Apps are modeled. Static/shared checkout target selection, installation grants, and handler/head-token variants still require separate refinement. |
-| Filesystem and platform enforcement | Artifact service origin, immutable event metadata, AWF/gateway isolation, labels, action pin integrity, post-job cleanup, and revocation are environmental assumptions at this layer. |
+Priority is sequencing, not a severity claim. P1 covers foundational actor,
+admission, credential, and data-flow trust boundaries; P2 covers follow-on
+operational and environmental refinements outside those core boundaries.
+
+| Boundary not fully modeled | Priority | Owner / tracking | Target TLA+ module | Evidence / required refinement |
+|---|---|---|---|---|
+| Pre-activation actor authorization, bots, replay | P1 | gh-aw maintainers · [#76553](https://github.com/github/gh-aw/issues/76553) | `CommentTriggeredPRCheckout.tla` | A:608–660,966–1012; CTR-027/029; model trusted event identity and separate membership/checkout gates. |
+| Compiler expressions and freshness | P1 | gh-aw maintainers · [#76553](https://github.com/github/gh-aw/issues/76553) | `CompiledWorkflow.tla` | CTR-010/016/018; model expression classification, manifest approvals, frontmatter/body hashes, legacy fallbacks, and status-function augmentation. |
+| Detection warning handling | P2 | gh-aw maintainers · [#76553](https://github.com/github/gh-aw/issues/76553) | `CompiledWorkflow.tla` | WTD1–3; disabled/conditional modes are modeled, but warning-mode annotated publication, push-to-PR conversion, and abort-only operations still need operation-specific refinement. |
+| Authorized custom steps/tools and augmented app grants | P1 | gh-aw maintainers · [#76553](https://github.com/github/gh-aw/issues/76553) | `CompiledWorkflow.tla` | CTR-017; agent-job host secrets and explicit tool grants are legitimate. Do not assume all job secrets or permission augmentation are forbidden. |
+| Redaction coverage and exceptions | P1 | gh-aw maintainers · [#76553](https://github.com/github/gh-aw/issues/76553) | `SafeOutputTransport.tla` | Ordering checks do not guarantee successful redaction of every artifact. Binary/unscanned exceptions and fallback `always()` uploads need explicit coverage/lifecycle states. |
+| Cache integrity and publication | P2 | gh-aw maintainers · [#76553](https://github.com/github/gh-aw/issues/76553) | `CompiledWorkflow.tla` | CTR-019; model policy/integrity namespaces, restoration, detection-gated publication, and detection-disabled post-action saving. |
+| Checkout merging, primary target, and directory identity | P1 | gh-aw maintainers · [#76553](https://github.com/github/gh-aw/issues/76553) | `RuntimeRepositoryCheckout.tla` | Entry identity is `(repository,path,wiki)`; `current` does not change cwd. Model token/app alternatives, unioned fetch/sparse patterns, and deepest history selection. |
+| Safe-output token precedence | P1 | gh-aw maintainers · [#76553](https://github.com/github/gh-aw/issues/76553) | `SafeOutputGeneration.tla` | Runtime entry precedence, representative missing-key fallbacks, and independence from neighboring scoped Apps are modeled. Static/shared checkout target selection, installation grants, and handler/head-token variants still require separate refinement. |
+| Filesystem and platform enforcement | P2 | gh-aw maintainers · [#76553](https://github.com/github/gh-aw/issues/76553) | `SafeOutputTransport.tla` | Artifact service origin, immutable event metadata, AWF/gateway isolation, labels, action pin integrity, post-job cleanup, and revocation are environmental assumptions at this layer. |
+
+Before model checking, `check.py` verifies that every P1 backlog target names an existing TLA+ module in this directory.
 
 ## Daily investigation
 

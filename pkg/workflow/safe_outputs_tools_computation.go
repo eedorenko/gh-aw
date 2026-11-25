@@ -30,38 +30,11 @@ func computeEnabledToolNames(data *WorkflowData) map[string]struct {
 		enabledTools["create_issue"] = struct {
 		}{}
 	}
-	if data.SafeOutputs.CreateWorkItems != nil {
-		enabledTools["ado_create_work_item"] = struct {
-		}{}
+	if data.SafeOutputs.CreateSecurityAdvisory != nil {
+		enabledTools["create_security_advisory"] = struct{}{}
 	}
-	if data.SafeOutputs.UpdateWorkItems != nil {
-		enabledTools["ado_update_work_item"] = struct {
-		}{}
-	}
-	if data.SafeOutputs.CommentOnWorkItems != nil {
-		enabledTools["ado_comment_on_work_item"] = struct {
-		}{}
-	}
-	if data.SafeOutputs.AssignWorkItems != nil {
-		enabledTools["ado_assign_work_item"] = struct {
-		}{}
-	}
-	if data.SafeOutputs.LinkWorkItems != nil {
-		enabledTools["ado_link_work_items"] = struct {
-		}{}
-	}
-	if data.SafeOutputs.UploadWorkItemAttachments != nil {
-		enabledTools["ado_upload_workitem_attachment"] = struct {
-		}{}
-	}
-	if data.SafeOutputs.LinearCreateIssue != nil {
-		enabledTools["linear_create_issue"] = struct{}{}
-	}
-	if data.SafeOutputs.LinearAddComment != nil {
-		enabledTools["linear_add_comment"] = struct{}{}
-	}
-	if data.SafeOutputs.LinearUpdateIssue != nil {
-		enabledTools["linear_update_issue"] = struct{}{}
+	if data.SafeOutputs.AddSecurityAdvisoryComment != nil {
+		enabledTools["add_security_advisory_comment"] = struct{}{}
 	}
 	if data.SafeOutputs.CreateAgentSessions != nil {
 		enabledTools["create_agent_session"] = struct {
@@ -198,6 +171,12 @@ func computeEnabledToolNames(data *WorkflowData) map[string]struct {
 	if data.SafeOutputs.MissingData != nil {
 		enabledTools["report_missing_data"] = struct {
 		}{}
+	}
+	if data.SafeOutputs.ReportIncomplete != nil {
+		enabledTools["report_incomplete"] = struct{}{}
+	}
+	if data.SafeOutputs.RequestContinuation != nil {
+		enabledTools["request_continuation"] = struct{}{}
 	}
 	if data.SafeOutputs.UpdateRelease != nil {
 		enabledTools["update_release"] = struct {

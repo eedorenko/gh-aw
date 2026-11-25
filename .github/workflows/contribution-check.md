@@ -16,18 +16,17 @@ permissions:
 env:
   TARGET_REPOSITORY: ${{ vars.TARGET_REPOSITORY || github.repository }}
 
+model: router/economy
 engine:
   id: copilot
   # GPT delegates need Responses while the auto-selected Claude main uses Chat Completions.
   copilot-sdk: true
   agent: contribution-checker
   max-continuations: 25
-  model-routing:
-    goal: cost
-    mode: economy
 
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
   bash: ["cat", "ls", "find", "grep", "head", "tail", "wc", "git", "jq *"]
@@ -37,10 +36,13 @@ tools:
     allowed-repos: all
     min-integrity: none
 safe-outputs:
+  request-continuation:
+    max: 1
   create-issue:
     title-prefix: "[Contribution Check Report]"
     labels:
       - contribution-report
+      - "backlog:reports"
     close-older-issues: true
     group-by-day: true
     expires: 1d
@@ -162,6 +164,8 @@ evals:
 ---
 
 ## Target Repository
+
+If useful evaluation work remains when the run budget is nearly exhausted, call `request_continuation` once with a message identifying the remaining PRs and target repository. This records a follow-up request only; it does not restart the workflow or confirm evaluation completion. Use `noop` only when no further action is needed, and `report_incomplete` for blocking failures.
 
 The target repository is `${{ env.TARGET_REPOSITORY }}`. All PR fetching and subagent dispatch use this value.
 

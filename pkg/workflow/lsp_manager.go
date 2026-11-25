@@ -3,7 +3,7 @@ package workflow
 import (
 	"fmt"
 	"maps"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
@@ -19,7 +19,7 @@ type LSPServerConfig struct {
 	// Version pins the package version for the language server. When set, it overrides the
 	// built-in default version for known LSP servers. Accepts standard semver version strings
 	// (e.g. "5.3.0") without a leading "v". Has no effect for custom servers not in the
-	// built-in install spec table.
+	// built-in install spec table. TypeScript only supports the bundled lockfile version.
 	Version string `json:"version,omitempty"`
 }
 
@@ -37,7 +37,7 @@ func NewLSPManager(servers map[string]LSPServerConfig) *LSPManager {
 	for k := range servers {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 
 	normalized := make(map[string]LSPServerConfig, len(servers))
 	for _, key := range keys {
@@ -91,19 +91,19 @@ func (m *LSPManager) CopilotLSPServers() map[string]LSPServerConfig {
 // For npm-based servers the generated install command respects the workflow's
 // runtime-manager settings:
 //   - workflowData.RunInstallScripts (runtimes.node.run-install-scripts) controls
-//     whether --ignore-scripts is omitted (default: scripts disabled).
+//     whether NPM_CONFIG_IGNORE_SCRIPTS is injected (default: scripts disabled).
 //   - resolveRuntimeCooldown (runtimes.node.cooldown) controls whether
 //     NPM_CONFIG_MIN_RELEASE_AGE is injected (default: cooldown enabled).
 //
-// Pass nil for workflowData to get secure defaults (--ignore-scripts, cooldown on).
+// Pass nil for workflowData to get secure defaults (scripts disabled, cooldown on).
 func (m *LSPManager) GenerateInstallSteps(workflowData *WorkflowData) []GitHubActionStep {
 	if !m.HasServers() {
 		return nil
 	}
 
-	// Determine npm install flags from runtime-manager settings.
+	// Determine npm install policy from runtime-manager settings.
 	// Defaults match the runtime manager's secure defaults:
-	//   - --ignore-scripts ON (supply-chain protection)
+	//   - NPM_CONFIG_IGNORE_SCRIPTS ON (supply-chain protection)
 	//   - cooldown ON (NPM_CONFIG_MIN_RELEASE_AGE)
 	runInstallScripts := false
 	cooldownEnabled := true
@@ -116,7 +116,7 @@ func (m *LSPManager) GenerateInstallSteps(workflowData *WorkflowData) []GitHubAc
 	for language := range m.servers {
 		langs = append(langs, language)
 	}
-	sort.Strings(langs)
+	slices.Sort(langs)
 
 	var steps []GitHubActionStep
 	for _, language := range langs {
@@ -132,76 +132,89 @@ func (m *LSPManager) GenerateInstallSteps(workflowData *WorkflowData) []GitHubAc
 		effectiveVersion := strings.TrimPrefix(config.Version, "v")
 
 		var step GitHubActionStep
-		if len(spec.NpmPackages) > 0 {
-			// npm-based LSP server: build install command from runtime-manager settings.
-			args := []string{"npm", "install", "-g"}
-			if !runInstallScripts {
-				args = append(args, "--ignore-scripts")
+		switch {
+		case language == "typescript":
+			step = appendNpmLSPInstallPolicy(generateTypeScriptLSPInstallStep(), runInstallScripts, cooldownEnabled)
+			if workflowData != nil && isWindowsWSLRunner(workflowData.RunsOn) {
+				step = renderWindowsTypeScriptLSPInstallStep(step)
 			}
-			// Pin each npm package to its version. The primary (last) package is the
-			// LSP server binary itself; its version can be overridden via the frontmatter
-			// 'version' field. All other packages use their hardcoded default version.
-			primaryPkg := spec.NpmPackages[len(spec.NpmPackages)-1]
-			for _, pkg := range spec.NpmPackages {
-				ver := spec.NpmPackageVersions[pkg]
-				if pkg == primaryPkg && effectiveVersion != "" {
-					ver = effectiveVersion
-				}
-				if ver != "" {
-					args = append(args, pkg+"@"+ver)
-				} else {
-					args = append(args, pkg)
-				}
-			}
-			installCmd := strings.Join(args, " ")
-			step = GitHubActionStep{
-				"      - name: " + spec.StepName,
-				"        run: " + installCmd,
-			}
-			if cooldownEnabled {
-				step = append(step,
-					"        env:",
-					fmt.Sprintf("          NPM_CONFIG_MIN_RELEASE_AGE: '%d'", npmDefaultCooldownDays),
-				)
-			}
-			step = append(step, "        timeout-minutes: 10")
-		} else {
-			// Non-npm LSP server (go install, gem install, rustup): build versioned command.
-			var installCmd string
-			switch language {
-			case "go":
-				ver := spec.DefaultVersion
-				if effectiveVersion != "" {
-					ver = effectiveVersion
-				}
-				if ver != "" {
-					installCmd = "go install golang.org/x/tools/gopls@v" + ver
-				} else {
-					installCmd = "go install golang.org/x/tools/gopls@latest"
-				}
-			case "ruby":
-				ver := spec.DefaultVersion
-				if effectiveVersion != "" {
-					ver = effectiveVersion
-				}
-				if ver != "" {
-					installCmd = "gem install solargraph -v " + ver
-				} else {
-					installCmd = "gem install solargraph"
-				}
-			default:
-				installCmd = "rustup component add rust-analyzer"
-			}
-			step = GitHubActionStep{
-				"      - name: " + spec.StepName,
-				"        run: " + installCmd,
-				"        timeout-minutes: 10",
-			}
+		case len(spec.NpmPackages) > 0:
+			step = generateNpmLSPInstallStep(spec, effectiveVersion, runInstallScripts, cooldownEnabled)
+		default:
+			step = generateNonNpmLSPInstallStep(language, spec, effectiveVersion)
 		}
 		steps = append(steps, step)
 	}
 
 	return steps
+}
+
+func generateNpmLSPInstallStep(spec lspInstallSpec, effectiveVersion string, runInstallScripts, cooldownEnabled bool) GitHubActionStep {
+	args := []string{"npm", "install", "-g"}
+	// The primary (last) package is the LSP binary; only its version is overridden.
+	var primaryPkg string
+	for _, pkg := range spec.NpmPackages {
+		primaryPkg = pkg
+	}
+	for _, pkg := range spec.NpmPackages {
+		ver := spec.NpmPackageVersions[pkg]
+		if pkg == primaryPkg && effectiveVersion != "" {
+			ver = effectiveVersion
+		}
+		if ver != "" {
+			args = append(args, pkg+"@"+ver)
+		} else {
+			args = append(args, pkg)
+		}
+	}
+	return appendNpmLSPInstallPolicy(GitHubActionStep{
+		"      - name: " + spec.StepName,
+		"        run: " + strings.Join(args, " "),
+	}, runInstallScripts, cooldownEnabled)
+}
+
+func appendNpmLSPInstallPolicy(step GitHubActionStep, runInstallScripts, cooldownEnabled bool) GitHubActionStep {
+	if !runInstallScripts || cooldownEnabled {
+		step = append(step, "        env:")
+	}
+	if !runInstallScripts {
+		step = append(step, "          NPM_CONFIG_IGNORE_SCRIPTS: 'true'")
+	}
+	if cooldownEnabled {
+		step = append(step,
+			fmt.Sprintf("          NPM_CONFIG_MIN_RELEASE_AGE: '%d'", npmDefaultCooldownDays),
+		)
+	}
+	return append(step, "        timeout-minutes: 10")
+}
+
+func generateNonNpmLSPInstallStep(language string, spec lspInstallSpec, effectiveVersion string) GitHubActionStep {
+	ver := spec.DefaultVersion
+	if effectiveVersion != "" {
+		ver = effectiveVersion
+	}
+	var installCmd string
+	switch language {
+	case "go":
+		if ver != "" {
+			installCmd = "go install golang.org/x/tools/gopls@v" + ver
+		} else {
+			installCmd = "go install golang.org/x/tools/gopls@latest"
+		}
+	case "ruby":
+		if ver != "" {
+			installCmd = "gem install solargraph -v " + ver
+		} else {
+			installCmd = "gem install solargraph"
+		}
+	default:
+		installCmd = "rustup component add rust-analyzer"
+	}
+	return GitHubActionStep{
+		"      - name: " + spec.StepName,
+		"        run: " + installCmd,
+		"        timeout-minutes: 10",
+	}
 }
 
 // RuntimeRequirements returns the set of runtime requirements for all configured LSP
@@ -230,7 +243,7 @@ func (m *LSPManager) RuntimeRequirements() []RuntimeRequirement {
 	for language := range m.servers {
 		langs = append(langs, language)
 	}
-	sort.Strings(langs)
+	slices.Sort(langs)
 
 	for _, language := range langs {
 		spec, ok := lspInstallSpecs[language]
@@ -297,12 +310,6 @@ var lspInstallSpecs = map[string]lspInstallSpec{
 		RuntimeID: "", // Rust is not in knownRuntimes; runtime setup is done via rustup
 	},
 	"typescript": {
-		StepName:    "Install TypeScript LSP dependencies",
-		NpmPackages: []string{"typescript", "typescript-language-server"},
-		NpmPackageVersions: map[string]string{
-			"typescript":                 "5.8.3",
-			"typescript-language-server": "4.3.3",
-		},
 		RuntimeID: "node",
 	},
 	"yaml": {

@@ -96,7 +96,15 @@ type ModelRoutingSummary struct {
 	DeviatedTrafficCost             ModelRoutingCost        `json:"deviated_traffic_cost"`
 	MainAgentCost                   ModelRoutingCost        `json:"main_agent_cost,omitzero"`
 	SubagentCosts                   []ModelRoutingAgentCost `json:"subagent_costs,omitempty"`
+	Observation                     *RoutingObservation     `json:"observation,omitempty"`
 	EndpointOnlyDeviationNormalized bool                    `json:"endpoint_only_deviation_normalized,omitempty"`
+}
+
+// RoutingObservation is the unified session's verdict on a routed run (T-UAS-094):
+// whether its result counts as evidence about the selected pair, and if not, why.
+type RoutingObservation struct {
+	Outcome string `json:"outcome"`
+	Reason  string `json:"reason,omitempty"`
 }
 
 type effectiveModelAttribution struct {
@@ -130,6 +138,11 @@ func resolveEffectiveModelAttribution(runDir string, info *AwInfo, routing *Mode
 	}
 	if result.RequestedModel == "" && (info.ModelRouting != nil || (routing != nil && routing.Status != "" && routing.Status != "not_routed")) {
 		result.RequestedModel = info.Model
+	}
+	// A router model value (for example router/economy) is what the workflow requested;
+	// show it next to the model the router picked.
+	if requested := info.requestedRouterValue(); requested != "" {
+		result.RequestedModel = requested
 	}
 
 	primaryModel := primaryTokenUsageModel(usage)
@@ -185,6 +198,9 @@ func mergeSessionModelRoutingAwInfo(runDir string, info *AwInfo) *AwInfo {
 	}
 	if modelRouting := sessionRouting.modelRouting(); modelRouting != nil {
 		sessionInfo.ModelRouting = modelRouting
+	}
+	if sessionRouting.ModelConfig != nil {
+		sessionInfo.ModelConfig = sessionRouting.ModelConfig
 	}
 	return &sessionInfo
 }
@@ -259,8 +275,8 @@ func findModelRoutingFile(runDir string) string {
 		return legacy
 	}
 	var found string
-	_ = filepath.WalkDir(runDir, func(path string, entry os.DirEntry, err error) error {
-		if err != nil || entry.IsDir() {
+	if err := filepath.WalkDir(runDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.IsDir() {
 			return nil
 		}
 		if entry.Name() == "model-routing.jsonl" {
@@ -268,7 +284,9 @@ func findModelRoutingFile(runDir string) string {
 			return filepath.SkipAll
 		}
 		return nil
-	})
+	}); err != nil {
+		tokenUsageSubagentLog.Printf("failed to search for model routing records: %v", err)
+	}
 	return found
 }
 
@@ -340,6 +358,7 @@ func applySessionModelRouting(summary *ModelRoutingSummary, session *sessionMode
 	if summary == nil || session == nil {
 		return
 	}
+	summary.Observation = session.Observation
 	routing := session.modelRouting()
 	if routing == nil {
 		return
@@ -427,7 +446,11 @@ func parseModelRoutingFile(path string, usageEntries []TokenUsageEntry) *ModelRo
 	if err != nil {
 		return &ModelRoutingSummary{Status: "unavailable"}
 	}
-	defer file.Close()
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			tokenUsageSubagentLog.Printf("failed to close model routing records: %v", closeErr)
+		}
+	}()
 
 	summary := &ModelRoutingSummary{
 		Status:        "not_routed",
@@ -585,7 +608,7 @@ func aggregateModelRoutingCosts(summary *ModelRoutingSummary, requests []modelRo
 		}
 	}
 
-	for _, entry := range usageEntries {
+	for _, entry := range tokenUsageEntriesWithCreditDeltas(usageEntries) {
 		var bucket *ModelRoutingCost
 		switch {
 		case entry.Purpose == "routing_classification":
@@ -602,11 +625,7 @@ func aggregateModelRoutingCosts(summary *ModelRoutingSummary, requests []modelRo
 		bucket.OutputTokens += entry.OutputTokens
 		bucket.CacheReadTokens += entry.CacheReadTokens
 		bucket.CacheWriteTokens += entry.CacheWriteTokens
-		delta, _, valid := parseOptionalNonNegativeFloat(entry.AICreditsThisResponse)
-		if !valid {
-			inputTokensIncludeCache, _, _ := parseOptionalBool(entry.InputTokensIncludeCache)
-			delta = computeModelInferenceAICWithCacheSemantics(entry.Provider, entry.Model, entry.InputTokens, entry.OutputTokens, entry.CacheReadTokens, entry.CacheWriteTokens, entry.ReasoningTokens, inputTokensIncludeCache)
-		}
+		delta := tokenUsageEntryCredits(entry)
 		bucket.AIC += delta
 	}
 }

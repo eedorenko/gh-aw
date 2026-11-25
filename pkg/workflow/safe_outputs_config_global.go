@@ -13,6 +13,7 @@ import (
 //
 //nolint:largefunc // Legacy global configuration extraction is intentionally centralized.
 func (c *Compiler) extractGlobalConfigFields(outputMap map[string]any, config *SafeOutputsConfig) {
+	config.TokenBroker = sectionTokenBrokerEnabled(outputMap)
 	// Handle steering issue mode.
 	if steer, exists := outputMap["steer"]; exists {
 		if steerBool, ok := steer.(bool); ok {
@@ -59,6 +60,10 @@ func (c *Compiler) extractGlobalConfigFields(outputMap map[string]any, config *S
 		}
 	}
 
+	if requireAgentSuccess, ok := outputMap["require-agent-success"].(bool); ok {
+		config.RequireAgentSuccess = requireAgentSuccess
+	}
+
 	// Handle staged flag
 	if err := preprocessBoolFieldAsString(outputMap, "staged", safeOutputsConfigLog); err != nil {
 		safeOutputsConfigLog.Printf("staged: %v", err)
@@ -89,12 +94,6 @@ func (c *Compiler) extractGlobalConfigFields(outputMap map[string]any, config *S
 	if githubToken, exists := outputMap["github-token"]; exists {
 		if githubTokenStr, ok := githubToken.(string); ok {
 			config.GitHubToken = githubTokenStr
-		}
-	}
-
-	if linearToken, exists := outputMap["linear-token"]; exists {
-		if linearTokenStr, ok := linearToken.(string); ok {
-			config.LinearToken = linearTokenStr
 		}
 	}
 

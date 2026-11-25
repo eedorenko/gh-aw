@@ -1,6 +1,7 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const { getIssueLabel, getIssueLabelQuery } = require("./issue_label.cjs");
 const { createReportIssue, renderIssueParameters } = require("./issue_report.cjs");
 
 const { iterateJsonl, readJsonlFileEvents, iterateLines } = require("./jsonl_helpers.cjs");
@@ -41,7 +42,7 @@ const { parseTokenUsageJsonl, generateTokenUsageSummary } = require("./parse_mcp
 const { readDedupedTokenUsage, getTokenUsagePaths } = require("./parse_token_usage.cjs");
 const { extractShellCommandDetailsFromToolData } = require("./tool_call_details.cjs");
 const { resolveFailureIssueRepo } = require("./repo_helpers.cjs");
-const { GITHUB_API_VERSION, STEP_NAME_START_MCP_GATEWAY } = require("./constants.cjs");
+const { GITHUB_API_VERSION, STEP_NAME_START_MCP_GATEWAY, TMP_GH_AW_PATH } = require("./constants.cjs");
 const { buildEmptyOutputOutcome, buildCompletionEvidence, EMPTY_OUTPUT_CAUSES, EMPTY_OUTPUT_FAILURE_CAUSES } = require("./empty_output_outcome.cjs");
 const { isAgentExecutionEvent } = require("./agent_execution.cjs");
 const { collectUnifiedSession, isModelEndpointMismatchData } = require("./unified_session.cjs");
@@ -49,7 +50,6 @@ const { validateSessionFileHeader } = require("./unified_session_render.cjs");
 const { isTaskCompleteRegistrationIssue, hasAgentTerminalReasonCompleted, shouldIgnoreTaskCompleteRegistrationReports } = require("./load_agent_output.cjs");
 const fs = require("fs");
 const https = require("https");
-const os = require("os");
 const path = require("path");
 
 const DEFAULT_ACTION_FAILURE_ISSUE_EXPIRES_HOURS = 24 * 7;
@@ -92,7 +92,7 @@ const FAILURE_ISSUE_WINDOW_MS = FAILURE_ISSUE_DEDUP_WINDOW_HOURS * 60 * 60 * 100
 const DEFAULT_OTEL_JSONL_PATH = "/tmp/gh-aw/otel.jsonl";
 /** Path to the failure categories file written by handle_agent_failure and read by the OTLP conclusion span. */
 const FAILURE_CATEGORIES_PATH = "/tmp/gh-aw/failure_categories.json";
-const COPILOT_SESSION_STATE_DIR = path.join(os.tmpdir(), "gh-aw", "sandbox", "agent", "logs", "copilot-session-state");
+const COPILOT_SESSION_STATE_DIR = path.join(TMP_GH_AW_PATH, "sandbox", "agent", "logs", "copilot-session-state");
 const RECENT_TOOL_CALLS_WITH_COMMAND_PREVIEW = new Set(["bash", "shell"]);
 const ELLIPSIS = "...";
 const ELLIPSIS_LENGTH = ELLIPSIS.length;
@@ -603,7 +603,10 @@ function isReusableFailureIssue(body, options) {
     return failureMarker.failure_cause === options.failureCause;
   }
 
-  return (failureMarker.failure_categories || "") === options.failureCategories.join("|");
+  // Supplemental diagnostics can vary between incomplete runs without changing
+  // the completion failure. Preserve other categories so distinct causes stay separate.
+  const matchCategories = categories => (categories.includes("report_incomplete") ? categories.filter(category => !["missing_data", "missing_tool"].includes(category)) : [...categories]).sort().join("|");
+  return matchCategories((failureMarker.failure_categories || "").split("|")) === matchCategories(options.failureCategories);
 }
 
 /**
@@ -651,7 +654,7 @@ async function findExistingFailureIssue(options) {
   const since = new Date(windowStartMs).toISOString().slice(0, 19) + "Z";
   const escapedWorkflowId = escapeGitHubSearchPhrase(workflowId);
   const failureCauseQuery = typeof failureCause === "string" ? ` "failure_cause: ${failureCause}"` : "";
-  const searchQuery = `repo:${owner}/${repo} is:issue is:open label:agentic-workflows created:>=${since} ` + `"gh-aw-agentic-workflow:" "workflow_id: ${escapedWorkflowId}"${failureCauseQuery} in:body`;
+  const searchQuery = `repo:${owner}/${repo} is:issue is:open ${getIssueLabelQuery()} created:>=${since} ` + `"gh-aw-agentic-workflow:" "workflow_id: ${escapedWorkflowId}"${failureCauseQuery} in:body`;
   const perPage = 100;
   for (let page = 1; ; page += 1) {
     const searchResult = await github.rest.search.issuesAndPullRequests({
@@ -709,7 +712,7 @@ async function countRecentFailureIssuesByCategory(options) {
   const windowStartMs = Date.now() - FAILURE_ISSUE_WINDOW_MS;
   const since = new Date(windowStartMs).toISOString().slice(0, 19) + "Z";
   const escapedCategory = escapeGitHubSearchPhrase(category);
-  const searchQuery = `repo:${owner}/${repo} is:issue is:open label:agentic-workflows created:>=${since} ` + `"gh-aw-failure-issue:" "failure_categories:" "${escapedCategory}" in:body`;
+  const searchQuery = `repo:${owner}/${repo} is:issue is:open ${getIssueLabelQuery()} created:>=${since} ` + `"gh-aw-failure-issue:" "failure_categories:" "${escapedCategory}" in:body`;
   const perPage = 100;
   let count = 0;
 
@@ -793,12 +796,12 @@ async function ensureParentIssue(previousParentNumber = null, ownerOverride, rep
   const owner = ownerOverride || contextOwner;
   const repo = repoOverride || contextRepo;
   const parentTitle = "[aw] Failed runs";
-  const parentLabel = "agentic-workflows";
+  const parentLabel = getIssueLabel();
 
   core.info(`Searching for parent issue: "${parentTitle}"`);
 
   // Search for existing parent issue
-  const searchQuery = `repo:${owner}/${repo} is:issue is:open label:${parentLabel} in:title "${parentTitle}"`;
+  const searchQuery = `repo:${owner}/${repo} is:issue is:open ${getIssueLabelQuery()} in:title "${parentTitle}"`;
 
   try {
     const searchResult = await github.rest.search.issuesAndPullRequests({
@@ -1762,17 +1765,17 @@ function buildPermissionDeniedContext(items, workflowId) {
  * Load max-tool-denials guard events from Copilot SDK session events.jsonl files.
  * @returns {Array<{denialCount: number, threshold: number, reason: string, recentToolCalls: Array<string>, timestamp: string}>}
  */
-function loadToolDenialsExceededEvents() {
+function loadToolDenialsExceededEvents(sessionStateDir = COPILOT_SESSION_STATE_DIR) {
   try {
-    if (!fs.existsSync(COPILOT_SESSION_STATE_DIR)) {
+    if (!fs.existsSync(sessionStateDir)) {
       return [];
     }
 
     const events = [];
-    const sessionDirs = fs.readdirSync(COPILOT_SESSION_STATE_DIR, { withFileTypes: true });
+    const sessionDirs = fs.readdirSync(sessionStateDir, { withFileTypes: true });
     for (const entry of sessionDirs) {
       if (!entry.isDirectory()) continue;
-      const eventsPath = path.join(COPILOT_SESSION_STATE_DIR, entry.name, "events.jsonl");
+      const eventsPath = path.join(sessionStateDir, entry.name, "events.jsonl");
       if (!fs.existsSync(eventsPath)) continue;
       const content = fs.readFileSync(eventsPath, "utf8");
       /** @type {Array<string>} */
@@ -1899,45 +1902,85 @@ function loadReportIncompleteMessages(items) {
 }
 
 /**
- * Build report_incomplete context string for display in failure issues/comments.
+ * Build report_incomplete context for display in failure issues/comments.
  * This surfaces the agent's structured incompletion signal so maintainers can
  * distinguish an incomplete task from a confirmed task outcome.
  * @param {Array<any>} [items] - Optional pre-loaded agent output items. When provided, avoids re-reading the output file.
- * @param {{collectorEmptyOutputCause?: string, rootDir?: string}} [options]
+ * @param {{collectorEmptyOutputCause?: string, rootDir?: string, runId?: number}} [options]
  * @returns {ReportBlock[]}
  */
-function buildReportIncompleteContext(items, { collectorEmptyOutputCause, rootDir } = {}) {
+function buildReportIncompleteContext(items, options = {}) {
+  const { signal, reasons, evidence } = buildReportIncompleteParts(items, options);
+  return [...signal, ...reasons, ...evidence];
+}
+
+/**
+ * @param {Array<any> | undefined} items
+ * @param {{collectorEmptyOutputCause?: string, rootDir?: string, runId?: number}} options
+ * @returns {{signal: ReportBlock[], reasons: ReportBlock[], evidence: ReportBlock[]}}
+ */
+function buildReportIncompleteParts(items, { collectorEmptyOutputCause, rootDir, runId }) {
   const trustedCollectorCause = typeof collectorEmptyOutputCause === "string" && Object.hasOwn(EMPTY_OUTPUT_CAUSES, collectorEmptyOutputCause) ? collectorEmptyOutputCause : undefined;
   const messages = loadReportIncompleteMessages(items).filter(message => message.reason !== trustedCollectorCause);
 
   if (messages.length === 0 && !trustedCollectorCause) {
-    return [];
+    return { signal: [], reasons: [], evidence: [] };
   }
 
   if (messages.length > 0) {
     core.info(`Found ${messages.length} report_incomplete signal(s)`);
   }
 
-  const context = nodes.warning("Task Could Not Be Completed", [nodes.text("The workflow recorded a "), nodes.code("report_incomplete"), nodes.text(" signal: the task was not completed or completion could not be confirmed.")]);
-  if (messages.length > 0) {
-    context.push(
-      nodes.list(messages.map(message => [nodes.paragraph([nodes.strong([nodes.text("Reported reason (agent-declared, unverified):")]), nodes.text(" "), nodes.code(redactAndBoundDiagnostics(message.reason, { maxLength: 1000 }))])]))
-    );
-  }
+  const missingTerminalSignal = trustedCollectorCause === "missing_terminal_safe_output" && messages.length === 0;
+  const signal = missingTerminalSignal
+    ? nodes.warning("Completion Signal Missing", [nodes.text("No terminal safe output was recorded, so completion is unconfirmed; whether the requested work finished is unknown.")])
+    : nodes.warning("Task Could Not Be Completed", [nodes.text("The workflow recorded a "), nodes.code("report_incomplete"), nodes.text(" signal: the task was not completed or completion could not be confirmed.")]);
+  const reasons = messages.length
+    ? [nodes.list(messages.map(message => [nodes.paragraph([nodes.strong([nodes.text("Reported reason (agent-declared, unverified):")]), nodes.text(" "), nodes.code(redactAndBoundDiagnostics(message.reason, { maxLength: 1000 }))])]))]
+    : [];
+  /** @type {ReportBlock[]} */
+  const evidence = [];
   // Rebuild collector diagnostics from runtime evidence, never from message text.
   if (trustedCollectorCause) {
     const outcome = buildEmptyOutputOutcome(trustedCollectorCause === "invalid_safe_outputs" ? ["validation_failed"] : [], rootDir);
-    if (outcome.details) context.push(...renderErrorDetails(outcome.details));
+    if (outcome.details) evidence.push(...renderErrorDetails(outcome.details));
   } else {
-    context.push(...renderErrorDetails(["Completion signal: agent reported incomplete", ...buildCompletionEvidence(rootDir)].join("\n")));
+    evidence.push(...renderErrorDetails(["Completion signal: agent reported incomplete", ...buildCompletionEvidence(rootDir)].join("\n")));
   }
-  context.push(
+  evidence.push(
     nodes.paragraph([
-      nodes.text("A comment or other safe output does not confirm that the requested task was completed. Reported reasons are not verified causes; runtime evidence is shown separately and agent diagnostic details are excluded."),
+      nodes.text("A successful agent job only confirms a clean process exit, not that the requested work was completed. Treat any agent-declared reason as a lead, not a confirmed root cause; agent diagnostic details are excluded."),
     ])
   );
+  if (typeof runId === "number" && Number.isSafeInteger(runId) && runId > 0) {
+    evidence.push(nodes.paragraph([nodes.text("For a runtime-focused investigation, run "), nodes.code(`gh aw audit ${runId}`), nodes.text(".")]));
+  }
 
-  return context;
+  return { signal, reasons, evidence };
+}
+
+/**
+ * Build safe next-step guidance for a report_incomplete signal.
+ * @param {Array<any>} items
+ * @param {{runId?: number, secretRedactionFailed?: boolean, detectionApproved?: boolean, collectorEmptyOutputCause?: string}} [options]
+ * @returns {string}
+ */
+function buildReportIncompleteFailureMessage(items, { runId, secretRedactionFailed = false, detectionApproved = false, collectorEmptyOutputCause } = {}) {
+  const collectorCause = typeof collectorEmptyOutputCause === "string" && Object.hasOwn(EMPTY_OUTPUT_CAUSES, collectorEmptyOutputCause) ? collectorEmptyOutputCause : undefined;
+  const hasReportedReason = loadReportIncompleteMessages(items).some(message => message.reason !== collectorCause);
+  const opening = collectorCause && !hasReportedReason ? "The workflow recorded a report_incomplete signal; task completion was not confirmed." : "Agent reported that it could not complete the task (report_incomplete).";
+  const signalSource = collectorCause ? `Collector classification: ${collectorCause}.` : "Signal source: explicit agent report (not a collector fallback).";
+  let summaryGuidance = "The report_incomplete signal had no usable reason.";
+  if (secretRedactionFailed) {
+    summaryGuidance = "The conclusion job summary was suppressed because secret redaction failed.";
+  } else if (hasReportedReason) {
+    summaryGuidance = detectionApproved ? "Check the conclusion job summary for the agent-declared, unverified reason, if available." : "The conclusion job summary withholds the agent-declared reason because detection did not approve it.";
+  } else if (collectorCause) {
+    summaryGuidance = "Check the conclusion job summary for runtime evidence, if available.";
+  }
+  const auditCommand = typeof runId === "number" && Number.isSafeInteger(runId) && runId > 0 ? `gh aw audit ${runId}` : "gh aw audit <run-id>";
+
+  return `${opening} A successful agent job does not confirm task completion. ${signalSource} ${summaryGuidance} Inspect agent_output.json in the agent artifact or run ${auditCommand} for runtime evidence.`;
 }
 
 /**
@@ -3933,7 +3976,7 @@ async function findRecentFailureIssues(owner, repo) {
   const since = windowStart.toISOString().slice(0, 19) + "Z"; // e.g. "2026-05-22T02:00:00Z"
 
   // GitHub search API supports `created:>=YYYY-MM-DDTHH:MM:SSZ`
-  const searchQuery = `repo:${owner}/${repo} is:issue is:open label:agentic-workflows "[aw]" in:title created:>=${since}`;
+  const searchQuery = `repo:${owner}/${repo} is:issue is:open ${getIssueLabelQuery()} "[aw]" in:title created:>=${since}`;
 
   try {
     const result = await github.rest.search.issuesAndPullRequests({
@@ -3986,7 +4029,7 @@ async function findExistingCascadeRollupIssue(owner, repo) {
  * @returns {Promise<{number: number, html_url: string} | null>}
  */
 async function findOrCreateDailyCapRollupIssue(owner, repo) {
-  const searchQuery = `repo:${owner}/${repo} is:issue is:open label:agentic-workflows in:title "${DAILY_CAP_ROLLUP_TITLE}"`;
+  const searchQuery = `repo:${owner}/${repo} is:issue is:open ${getIssueLabelQuery()} in:title "${DAILY_CAP_ROLLUP_TITLE}"`;
   try {
     const result = await github.rest.search.issuesAndPullRequests({
       q: searchQuery,
@@ -4024,7 +4067,7 @@ async function findOrCreateDailyCapRollupIssue(owner, repo) {
         owner,
         repo,
         title: DAILY_CAP_ROLLUP_TITLE,
-        labels: ["agentic-workflows", DAILY_CAP_ROLLUP_LABEL],
+        labels: [getIssueLabel(), DAILY_CAP_ROLLUP_LABEL],
         headers: { "X-GitHub-Api-Version": GITHUB_API_VERSION },
       },
       report
@@ -4148,7 +4191,7 @@ async function detectAndHandleFailureCascade(owner, repo, triggeringIssueNumber)
           owner,
           repo,
           title: CASCADE_ROLLUP_TITLE,
-          labels: ["agentic-workflows", CASCADE_ROLLUP_LABEL],
+          labels: [getIssueLabel(), CASCADE_ROLLUP_LABEL],
           headers: { "X-GitHub-Api-Version": GITHUB_API_VERSION },
         },
         rollupReport
@@ -4467,6 +4510,7 @@ async function main() {
     let hasMissingSafeOutputs = false;
     let hasOnlyNoopOutputs = false;
     let hasReportIncomplete = false;
+    let reportIncompleteItems = [];
     // Tracks the case where agentConclusion is "failure" but the agent completed its work
     // successfully (terminal_reason: completed) and produced valid non-noop safe outputs.
     // This is a false-positive failure caused by a transient error after the agent's task
@@ -4501,9 +4545,9 @@ async function main() {
         hasMissingSafeOutputs = true;
         core.info("Agent succeeded but produced no safe outputs");
       } else {
-        // Check if all outputs are noop types
-        const nonNoopItems = agentOutputResult.items.filter(item => item.type !== "noop");
-        if (nonNoopItems.length === 0) {
+        const hasNoopOutput = agentOutputResult.items.some(item => item.type === "noop");
+        const taskOutputItems = agentOutputResult.items.filter(item => item.type !== "noop" && item.type !== "request_continuation");
+        if (taskOutputItems.length === 0 && hasNoopOutput) {
           hasOnlyNoopOutputs = true;
           core.info("Agent succeeded with only noop outputs - this is not a failure");
         }
@@ -4514,11 +4558,12 @@ async function main() {
       // causing exit code 1. In that case we should not report a failure issue since the
       // agent completed its intended work.
       if (agentOutputResult.success && agentOutputResult.items && agentOutputResult.items.length > 0) {
-        const nonNoopItems = agentOutputResult.items.filter(item => item.type !== "noop");
-        if (nonNoopItems.length === 0) {
+        const hasNoopOutput = agentOutputResult.items.some(item => item.type === "noop");
+        const taskOutputItems = agentOutputResult.items.filter(item => item.type !== "noop" && item.type !== "request_continuation");
+        if (taskOutputItems.length === 0 && hasNoopOutput) {
           hasOnlyNoopOutputs = true;
           core.info("Agent failed with exit code 1 but produced only noop outputs - treating as successful no-action (transient AI model error)");
-        } else if (!nonNoopItems.some(item => item.type === "report_incomplete" && !isTaskCompleteRegistrationIssue(item))) {
+        } else if (taskOutputItems.length > 0 && !taskOutputItems.some(item => item.type === "report_incomplete" && !isTaskCompleteRegistrationIssue(item))) {
           // The agent produced valid non-noop safe outputs (e.g. create_discussion) but the
           // job exit code is non-zero. If terminal_reason: completed is present in the log,
           // the failure was a transient error after the agent finished its task — do not report
@@ -4538,16 +4583,13 @@ async function main() {
     // classified as a successful review or other completed task.
     if (agentOutputResult.success && agentOutputResult.items && agentOutputResult.items.length > 0) {
       // Cancellation can interrupt the agent before it starts or emits a terminal safe output.
-      const reportIncompleteItems = agentOutputResult.items.filter(item => item.type === "report_incomplete" && !(isCancelledEmptyOutput && item.reason === collectorEmptyOutputCause));
+      reportIncompleteItems = agentOutputResult.items.filter(item => item.type === "report_incomplete" && !(isCancelledEmptyOutput && item.reason === collectorEmptyOutputCause));
       if (reportIncompleteItems.length > 0) {
         if (taskCompleteRegistrationIssueOnlyReportIncomplete) {
           core.info("Ignoring report_incomplete signal(s) caused only by task_complete registration trouble after successful task-level outputs");
         } else {
           hasReportIncomplete = true;
           core.info(`Agent emitted ${reportIncompleteItems.length} report_incomplete signal(s) - activating failure handling`);
-          // Continue after marking the step failed so optional issue reporting can still run.
-          // eslint-disable-next-line gh-aw-custom/require-return-after-core-setfailed
-          core.setFailed("Agent reported that it could not complete the task");
         }
       }
     }
@@ -4647,6 +4689,13 @@ async function main() {
     }
 
     failureDiagnostics ??= await getFailedAgentDiagnostics({ startupFailure: collectorEmptyOutputCause === "agent_startup_failure" });
+    const detectionApproved = process.env.GH_AW_DETECTION_ACCEPTED === "true" && process.env.GH_AW_DETECTION_CONCLUSION === "success";
+    if (hasReportIncomplete) {
+      const message = buildReportIncompleteFailureMessage(reportIncompleteItems, { runId: context.runId, secretRedactionFailed: failureDiagnostics.secretRedactionFailed, detectionApproved, collectorEmptyOutputCause });
+      // Continue after marking the step failed so optional issue reporting can still run.
+      // eslint-disable-next-line gh-aw-custom/require-return-after-core-setfailed
+      core.setFailed(message);
+    }
     if (failureDiagnostics.hasNoJobs && !hasCheckoutFailure) {
       core.info("Skipping failure reporting: no workflow jobs started; the run may not have been approved.");
       return;
@@ -4695,7 +4744,17 @@ async function main() {
         !(isCancelledEmptyOutput && item?.type === "report_incomplete" && item.reason === collectorEmptyOutputCause)
     );
     const hasReportedIncomplete = hasReportIncomplete && reportItems.some(item => item?.type === "report_incomplete");
-    const reportIncompleteContext = buildReportIncompleteContext(reportItems, { collectorEmptyOutputCause: emptyOutputCause, rootDir: path.dirname(getAgentStdioLogPath()) });
+    const {
+      signal: incompleteSignal,
+      reasons: incompleteReasons,
+      evidence: incompleteEvidence,
+    } = buildReportIncompleteParts(reportItems, {
+      collectorEmptyOutputCause: emptyOutputCause,
+      rootDir: path.dirname(getAgentStdioLogPath()),
+      runId: context.runId,
+    });
+    const approvedIncompleteReasons = agentOutputResult.success && !failureDiagnostics.secretRedactionFailed && detectionApproved ? incompleteReasons : [];
+    const reportIncompleteContext = [...incompleteSignal, ...approvedIncompleteReasons, ...incompleteEvidence];
     if (hasReportedIncomplete && reportIncompleteContext.length > 0 && !failureDiagnostics.secretRedactionFailed) {
       try {
         const summary = renderSizedReport({ type: "report", title: "Incomplete result", children: reportIncompleteContext, agentTainted: false }).body;
@@ -5334,7 +5393,9 @@ async function main() {
               ? buildWarningAlertLine("Tool Denial Limit Exceeded", "The runtime recorded a tool-denial limit signal; agent text is excluded.")
               : ""
             : toolDenialsExceededContext,
-          report_incomplete_context: reportIncompleteContext,
+          report_incomplete_context: incompleteSignal,
+          agent_report_context: approvedIncompleteReasons,
+          completion_evidence_context: incompleteEvidence,
           failure_diagnostics_context: failureDiagnosticsContext,
           missing_safe_outputs_context: missingSafeOutputsContext,
           engine_failure_context: needsFailureDiagnostics ? "" : engineFailureContext,
@@ -5382,12 +5443,12 @@ async function main() {
         });
 
         report.preamble = getDetectionCautionBlocks(workflowName, runUrl);
-        const request = renderIssueParameters({ owner, repo, title: issueTitle, labels: ["agentic-workflows"], headers: { "X-GitHub-Api-Version": GITHUB_API_VERSION } }, report);
+        const request = renderIssueParameters({ owner, repo, title: issueTitle, labels: [getIssueLabel()], headers: { "X-GitHub-Api-Version": GITHUB_API_VERSION } }, report);
         const { title: reportTitle, body: issueBody } = request;
 
         let newIssue;
         if (failureIssue) {
-          const labels = [...new Set([...(failureIssue.labels || []).map(label => (typeof label === "string" ? label : label.name || "")).filter(Boolean), "agentic-workflows"])];
+          const labels = [...new Set([...(failureIssue.labels || []).map(label => (typeof label === "string" ? label : label.name || "")).filter(Boolean), getIssueLabel()])];
           newIssue = await github.rest.issues.update({
             owner,
             repo,

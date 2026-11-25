@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Security
 
+Require Go 1.27.4 for repository builds, tooling, and owned workflow runtimes to
+fix [GO-2026-6859 (CVE-2026-97054)](https://pkg.go.dev/vuln/GO-2026-6859), an
+HTTP/1 server crash caused by a `net/http` header race. Release builds reject
+older toolchains. Rebuild binaries and devcontainers with Go 1.27.4 or newer.
+
 Allow explicitly `on.bots`-listed Apps to check out same-repository PRs on
 `edited` events only when the webhook reports a non-null object-valued `body`
 change and no other changed fields. Missing change metadata, title/base changes,
@@ -13,33 +18,101 @@ and mixed edits continue to require write-or-higher repository permission.
 
 ### Breaking changes
 
+`issue-intent` is now experimental and disabled by default for `close-issue`,
+`add-labels`, `assign-to-agent`, `assign-to-user`, `set-issue-type`, and
+`set-issue-field`. Workflows that relied on the implicit default no longer
+include intent metadata (`rationale`, `confidence`, `suggest`) in their tool
+schemas or send it to handlers. Set `issue-intent: true` on each affected
+safe output and recompile to retain that behavior; enabling it emits an
+experimental-feature warning. With intent enabled, `add-labels` requires label
+objects with `rationale` and `confidence` rather than plain strings.
+
+The experimental built-in TypeScript LSP accepts only the bundled server
+version (`6.1.0`, paired with TypeScript `6.0.3`). Omit `lsp.typescript.version`
+to use the bundled lockfile. To retain the former server (`4.3.3`) and TypeScript
+(`5.8.3`) or use other versions, rename the `lsp.typescript` entry to a key
+not used by a built-in server and remove `version`. Install the desired
+packages from a checked-in npm project using `npm ci` in `pre-agent-steps`,
+and point `command` to the installed executable using a workspace-relative path.
+
+Safe-output lifecycle reporting now uses `logs --delivery` and `logs --adoption`,
+with the same evaluator available in single-run `audit` and episode retrieval.
+Replace `--outcomes`, `--outcomes-dir`, and `GH_AW_OUTCOMES_DIR` with `--adoption`,
+`--adoption-dir`, and `GH_AW_ADOPTION_DIR`; use the `delivery` artifact selector.
+JSON fields use `delivery`, `adoption`, `adoption_summary`, `adoption_status`,
+and `episode_adoption`. Experiment metrics use `adoption:accepted` and
+`adoption:zero_touch`, with `adoption_window` and `analyze --adoption`.
+No aliases remain. Adoption separates verified human decisions from explicit
+delivery-time fallback; neither an adoption count nor a current survival snapshot
+establishes measured attributed value. See the delivery/adoption reference for
+retention, coverage, and the complete migration.
+
+Standalone reporting, historical repository scoring, and the separate offline
+episode-join command are removed. Use `logs --episodes --adoption` for recorded
+episode membership and joined adoption summaries.
+
+Safe-output execution facts now use `safe_output.execution` and
+`safe-output-executions.jsonl`; update consumers of the removed generic event and
+artifact names and recompile workflows. Existing sessions remain immutable.
+
+Eligible workflows that select neither a model nor routing now default to
+`goal: cost`, `mode: auto` model routing on GitHub Copilot inference. If task
+classification is unavailable or returns `unknown`, `auto` falls back to
+`balanced`. After recompilation, the selected model, output, and cost may
+differ. To retain the previous non-routed model selection, set
+`engine.model-routing: false` and recompile; to keep a stable model, configure
+it explicitly. Explicit routing configurations are unchanged. Review generated
+locks and audit model and cost changes after recompilation.
+
+Native Jira, Linear, and Azure DevOps tools, safe-output handlers, and gateway
+issue triggers have been replaced by the declarative connector runtime. Legacy
+`auth` and `allowed` settings and the old `connectors` gateway wrapper are
+rejected, and seven native read methods are no longer exposed. Migrate by
+importing the provider declaration from
+`.github/workflows/connectors/<provider>.md`, selecting read profiles and write
+effects explicitly, configuring the required credentials, and recompiling.
+Native integrations are not retained as a compatibility path; imports do not
+install provider webhooks, and unsupported operations may require workflow
+changes.
+
+`merge-pull-request` now blocks merges when the target PR changes protected
+files. Existing workflows that merged such changes will refuse those merges
+unless configured otherwise. Keep the default and merge those PRs manually,
+configure scoped exceptions with
+`safe-outputs.merge-pull-request.protected-files.exclude`, or set
+`safe-outputs.merge-pull-request.protected-files: allowed` when protected-file
+merges are intentional, then recompile. The opt-out does not bypass other merge
+gates.
+
 `pull_request_target` workflows now default to same-repository PRs only in both
 strict and non-strict mode. Omitting `forks` is equivalent to `forks: []`; no
 explicit empty list is required. To admit forks, configure exact `owner/repo`
 entries or deliberately trusted `owner/*` patterns, then recompile. Explicit
-`"*"` permits unrestricted admission in both modes; strict mode warns and
-recommends restricting forks instead of rejecting compilation. Strict mode still
-rejects expressions and unsupported pattern forms. Actor
-authorization and trusted-checkout restrictions remain mandatory in strict mode;
-`acknowledge-risk`, disabled checkout, and trusted checkout policies do not bypass
-fork-pattern validation or suppress the unrestricted-forks warning.
+`"*"` permits unrestricted admission in both modes, but strict mode rejects it
+unless the main workflow's top-level `features.dangerously-allow-pull-request-target-forks-all: true`
+is set; imported features do not enable this opt-in. Strict mode still rejects
+expressions and unsupported pattern forms. The compiler warns whenever unrestricted
+admission is allowed. Actor authorization and trusted-checkout restrictions remain
+mandatory in strict mode; `acknowledge-risk`, disabled checkout, and trusted checkout
+policies do not bypass fork-pattern validation or suppress the unrestricted-forks warning.
 
-The `gh aw outcomes` command has been removed. Use `gh aw logs --outcomes`
-to evaluate selected runs, or pipe a run ID to
-`gh aw logs --stdin --repo owner/repo --outcomes`. JSON reports now carry
-per-run observations in `.outcomes[]` and episode rollups in `.episode_outcomes`.
-Historical repository scoring and the separate offline episode-join command have
-also been removed. Use `gh aw logs --episodes --outcomes` for episode summaries.
-`--outcomes-dir` remains available for JSONL export.
+`compile --dry-run` accepts workflow `steps` and `post-steps` but omits their
+code and credentials from emitted locks, so separate dispatch cannot execute
+them. It rejects `pre-steps`, `pre-agent-steps`, `on.steps`, custom MCP
+servers/scripts, custom safe-output scripts, and authored
+OIDC permissions, including imports. Custom jobs and custom safe-output jobs
+become disabled, credential-free placeholders with empty outputs. Existing
+actionable scanner findings fail alongside added findings. Migrate by removing
+unsupported declarations in a separate diagnostic workflow, reviewing omitted
+steps and skipped dependencies, and resolving actionable findings before live
+testing. Ordinary compilation is unchanged; dry-run is still not a hosted
+execution sandbox.
 
-`compile --dry-run` now rejects authored host steps, custom MCP servers/scripts,
-custom safe-output scripts, enabled Bash graders, and authored OIDC permissions,
-including imports. Custom jobs and custom safe-output jobs become disabled,
-credential-free placeholders with empty outputs. Existing actionable scanner
-findings fail alongside added findings. Migrate by removing unsupported
-declarations in a separate diagnostic workflow, reviewing skipped dependencies,
-and resolving actionable findings before live testing. Ordinary compilation is
-unchanged; dry-run is still not a hosted execution sandbox.
+The local compiler now rejects `tools.github.roles` and
+`tools.github.private-repos` instead of silently ignoring these unsupported
+GitHub MCP access-control fields. Remove them to restore compilation; they were
+not enforced before, and no local-compiler replacement is available while
+support remains deferred. Do not rely on them for authorization.
 
 AWF and downloaded Copilot CLI releases now require a reviewed checksum-manifest
 digest bundled in the trusted setup action or supplied as literal
@@ -53,7 +126,7 @@ manifest digests through an independently trusted channel and update/recompile
 workflows to consume the new setup action. Explicit Copilot pins bypass
 toolcache selection; without a supplied pin, trusted toolcache behavior is
 unchanged. Repository Go tooling, module requirements and generated runtime
-defaults now use Go 1.27.3; release builds reject older toolchains. Go root
+defaults now use Go 1.27.4; release builds reject older toolchains. Go root
 capture and Serena setup clear stale GOROOT values before discovering the
 selected toolchain, preventing mixed-version compiler/standard-library failures.
 
@@ -73,11 +146,15 @@ unified session. Ten fast built-ins are enabled by default; other built-ins
 require explicit opt-in. Custom JavaScript runs only in a separate restricted
 `graders` job, using immutable `session`, `config`, and `helpers` inputs.
 Conclusion never receives custom executable definitions or user-provided steps.
-Repository-owned `graders.operational-value.run` Bash runs only in that separate
-job: replace legacy stdin requests with the session JSONL file in `$1` /
-`GH_AW_SESSION_FILE` and JSON config in `GH_AW_GRADER_CONFIG`. Existing metric
-arrays remain supported. Compiler validation and `grader-shell-file-write`
-reject detected file writes; trusted shell is not yet microVM-isolated.
+Reserved `graders.operational-value.script` now uses the same restricted
+JavaScript lane and returns a nonempty ordered metric array. The first metric
+remains the primary value; remaining metrics remain diagnostics; schema-v2
+artifacts/events retain the full array and implementation digest. CLI replay,
+offline regrading, experiments, audit/logs, telemetry, and adapters continue to
+consume the same top-level source/value identity.
+`graders.operational-value.run` has been removed; migrate manually to restricted
+`graders.operational-value.script`. Invalid legacy declarations fail explicitly
+and are never ignored or translated.
 Recompile workflows to move grading out of the
 agent job. Read schema-version-2 results from `usage/graders/`; CLI replay now
 accepts unified-session JSONL or a JSON event array instead of legacy trace

@@ -7,7 +7,6 @@ on:
   push:
     branches: [main]
     paths: ['cmd/**', 'pkg/**', '*.go', 'go.mod', 'actions/setup/js/**']
-  schedule: every 2 days
   pull_request:
     types: [opened, synchronize, reopened]
     paths: ['cmd/**', 'pkg/**', '*.go', 'go.mod', 'actions/setup/js/**']
@@ -36,7 +35,7 @@ safe-outputs:
   create-issue:
     max: 1
     title-prefix: "[smoke-ci] "
-    labels: [ai-generated]
+    labels: [ai-generated, "backlog:smoke-tests"]
     close-older-issues: true
     close-older-key: "smoke-ci-memory-safe-outputs"
     samples:

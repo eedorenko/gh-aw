@@ -113,7 +113,7 @@ func TestValidateDockerImage_RejectsHyphenPrefix(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateDockerImage(tt.image, false, false)
+			err := validateDockerImageWithMode(tt.image, false, false, false)
 			if err == nil {
 				t.Errorf("expected error for image %q but got none", tt.image)
 				return
@@ -462,12 +462,33 @@ printf "%s\n" "$@" >> "$GH_AW_TEST_PIP_ARGS_FILE"
 	}
 	t.Setenv("GH_AW_TEST_PIP_ARGS_FILE", argsFile)
 
-	compiler.validatePythonPackagesWithPip([]string{"--index-url"}, "pip", fakePip)
+	compiler.validatePythonPackagesWithPip([]string{"--index-url", "pkg;whoami", "pkg$(whoami)", "pkg`whoami`"}, "pip", fakePip)
 
 	if _, err := os.Stat(argsFile); err == nil {
 		t.Fatalf("expected invalid package to be rejected before exec; args file %q was created", argsFile)
 	} else if !os.IsNotExist(err) {
 		t.Fatalf("failed to stat recorded pip arguments file: %v", err)
+	}
+}
+
+func TestValidatePythonPackagesWithPip_SkipsInvalidExecutablePath(t *testing.T) {
+	compiler := NewCompiler()
+	tempDir := t.TempDir()
+	argsFile := filepath.Join(tempDir, "pip-args.txt")
+	fakePip := filepath.Join(tempDir, "pip")
+	script := `#!/bin/sh
+printf "%s\n" "$@" >> "$GH_AW_TEST_PIP_ARGS_FILE"
+`
+	if err := os.WriteFile(fakePip, []byte(script), 0o755); err != nil {
+		t.Fatalf("failed to write fake pip executable: %v", err)
+	}
+	t.Setenv("PATH", tempDir)
+	t.Setenv("GH_AW_TEST_PIP_ARGS_FILE", argsFile)
+
+	compiler.validatePythonPackagesWithPip([]string{"requests"}, "pip", "pip")
+
+	if _, err := os.Stat(argsFile); !os.IsNotExist(err) {
+		t.Fatalf("expected invalid executable path to be rejected before exec; stat error = %v", err)
 	}
 }
 
@@ -500,9 +521,9 @@ printf "%s\n" "$@" >> "$GH_AW_TEST_PIP_ARGS_FILE"
 	}
 	args := string(argsData)
 
-	// validatePythonPackagesWithPip executes: pip index versions <package> --pre
+	// validatePythonPackagesWithPip executes: pip index versions --pre -- <package>
 	gotArgs := strings.Split(strings.TrimSpace(args), "\n")
-	wantArgs := []string{"index", "versions", "requests", "--pre"}
+	wantArgs := []string{"index", "versions", "--pre", "--", "requests"}
 	if len(gotArgs) != len(wantArgs) {
 		t.Fatalf("expected one pip invocation with %d args, got %d args: %q", len(wantArgs), len(gotArgs), args)
 	}
@@ -513,12 +534,100 @@ printf "%s\n" "$@" >> "$GH_AW_TEST_PIP_ARGS_FILE"
 	}
 }
 
+func TestValidateUvPackages_ExecutesFixedArguments(t *testing.T) {
+	tempDir := t.TempDir()
+	argsFile := filepath.Join(tempDir, "uv-args.txt")
+	uvPath := filepath.Join(tempDir, "uv")
+	script := `#!/bin/sh
+printf "%s\n" "$@" > "$GH_AW_TEST_UV_ARGS_FILE"
+`
+	if err := os.WriteFile(uvPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("failed to write fake uv executable: %v", err)
+	}
+	t.Setenv("PATH", tempDir)
+	t.Setenv("GH_AW_TEST_UV_ARGS_FILE", argsFile)
+
+	if err := NewCompiler().validateUvPackages(&WorkflowData{CustomSteps: "uvx requests"}); err != nil {
+		t.Fatalf("validateUvPackages returned an error: %v", err)
+	}
+
+	argsData, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("failed to read recorded uv arguments: %v", err)
+	}
+	gotArgs := strings.Split(strings.TrimSpace(string(argsData)), "\n")
+	wantArgs := []string{"pip", "show", "--no-cache", "--", "requests"}
+	if len(gotArgs) != len(wantArgs) {
+		t.Fatalf("expected %d fixed uv arguments, got %d: %q", len(wantArgs), len(gotArgs), gotArgs)
+	}
+	for i, want := range wantArgs {
+		if gotArgs[i] != want {
+			t.Fatalf("unexpected uv args at position %d: got %q, want %q (all args: %q)", i, gotArgs[i], want, gotArgs)
+		}
+	}
+}
+
+func TestValidateUvPackagesWithExecutable_RejectsDashPrefixBeforeExec(t *testing.T) {
+	tempDir := t.TempDir()
+	argsFile := filepath.Join(tempDir, "uv-args.txt")
+	uvPath := filepath.Join(tempDir, "uv")
+	script := `#!/bin/sh
+printf "%s\n" "$@" > "$GH_AW_TEST_UV_ARGS_FILE"
+`
+	if err := os.WriteFile(uvPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("failed to write fake uv executable: %v", err)
+	}
+	t.Setenv("GH_AW_TEST_UV_ARGS_FILE", argsFile)
+
+	err := NewCompiler().validateUvPackagesWithExecutable([]string{"--index-url"}, uvPath)
+	if err == nil {
+		t.Fatal("expected dash-prefixed package name to be rejected")
+	}
+	if _, err := os.Stat(argsFile); !os.IsNotExist(err) {
+		t.Fatalf("expected invalid package to be rejected before uv execution; stat error = %v", err)
+	}
+}
+
+func TestValidateUvPackagesWithExecutable_RejectsUnvalidatedExecutablePath(t *testing.T) {
+	tempDir := t.TempDir()
+	argsFile := filepath.Join(tempDir, "uv-args.txt")
+	uvPath := filepath.Join(tempDir, "uv")
+	script := `#!/bin/sh
+printf "%s\n" "$@" > "$GH_AW_TEST_UV_ARGS_FILE"
+`
+	if err := os.WriteFile(uvPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("failed to write fake uv executable: %v", err)
+	}
+	t.Setenv("GH_AW_TEST_UV_ARGS_FILE", argsFile)
+	t.Chdir(tempDir)
+
+	err := NewCompiler().validateUvPackagesWithExecutable([]string{"requests"}, "./uv")
+	if err == nil {
+		t.Fatal("expected relative executable path to be rejected")
+	}
+	if _, err := os.Stat(argsFile); !os.IsNotExist(err) {
+		t.Fatalf("expected invalid executable path to be rejected before uv execution; stat error = %v", err)
+	}
+}
+
 // TestValidateUvPackages_RejectsInvalidPackageName verifies that uv package names
 // which do not conform to the PyPI naming rules are rejected before being passed
 // as arguments to the uv CLI. This validation happens before uv/pip is resolved
 // or invoked, so the test is deterministic regardless of whether uv is installed
 // on the host running the test.
 func TestValidateUvPackages_RejectsInvalidPackageName(t *testing.T) {
+	tempDir := t.TempDir()
+	argsFile := filepath.Join(tempDir, "uv-args.txt")
+	fakeUv := filepath.Join(tempDir, "uv")
+	script := `#!/bin/sh
+printf "%s\n" "$@" >> "$GH_AW_TEST_UV_ARGS_FILE"
+`
+	if err := os.WriteFile(fakeUv, []byte(script), 0o755); err != nil {
+		t.Fatalf("failed to write fake uv executable: %v", err)
+	}
+	t.Setenv("PATH", tempDir)
+	t.Setenv("GH_AW_TEST_UV_ARGS_FILE", argsFile)
+
 	compiler := NewCompiler()
 	err := compiler.validateUvPackages(&WorkflowData{
 		CustomSteps: "uvx pkg;whoami",
@@ -528,6 +637,9 @@ func TestValidateUvPackages_RejectsInvalidPackageName(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid pip package name") {
 		t.Errorf("expected error to mention invalid package name, got: %v", err)
+	}
+	if _, err := os.Stat(argsFile); !os.IsNotExist(err) {
+		t.Fatalf("expected invalid package to be rejected before uv execution; stat error = %v", err)
 	}
 }
 

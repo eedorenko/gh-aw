@@ -31,6 +31,22 @@ const { persistDetectionMasks } = require("./detection_mask_state.cjs");
 const redactScript = fs.readFileSync(path.join(__dirname, "redact_secrets.cjs"), "utf8");
 describe("redact_secrets.cjs", () => {
   let tempDir, ambientPathsSpy;
+  it("redacts dynamically selected secret values from artifacts", async () => {
+    const { main } = require("./redact_secrets.cjs");
+    const secret = "synthetic-dynamic-secret-value";
+    vi.stubEnv("GH_AW_DYNAMIC_SECRET_VALUE_0", secret);
+    const directory = path.join(process.env.RUNNER_TEMP, "gh-aw");
+    fs.mkdirSync(directory, { recursive: true });
+    const file = path.join(directory, "dynamic-secret.json");
+    fs.writeFileSync(file, JSON.stringify({ token: secret }));
+
+    await main();
+
+    expect(fs.readFileSync(file, "utf8")).not.toContain(secret);
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual({ token: "***REDACTED***" });
+    expect(mockCore.setFailed).not.toHaveBeenCalled();
+  });
+
   it("sanitizes detection results, copied firewall logs and late-created accounting files", async () => {
     const { main } = require("./redact_secrets.cjs");
     const secret = "synthetic-detection-private-value";
@@ -74,6 +90,59 @@ describe("redact_secrets.cjs", () => {
     expect(JSON.parse(fs.readFileSync(usage, "utf8"))).toEqual({ primary_model: "***REDACTED***", ai_credits: 2 });
     expect(JSON.parse(fs.readFileSync(usageJSONL, "utf8"))).toEqual({ provider: "***REDACTED***", ai_credits: 2 });
     expect(mockCore.setFailed).not.toHaveBeenCalled();
+  });
+  it("warns and invalidates only a rejected durable checkpoint", async () => {
+    const { main } = require("./redact_secrets.cjs");
+    const durableRoot = path.join(process.env.RUNNER_TEMP, "gh-aw/durable-agent");
+    const bundle = path.join(durableRoot, "durable/bundle");
+    fs.mkdirSync(bundle, { recursive: true });
+    fs.writeFileSync(path.join(bundle, "manifest.json"), "{}");
+    vi.stubEnv("GH_AW_DURABLE_FILES", JSON.stringify([path.join(durableRoot, "session-state")]));
+    vi.stubEnv("GH_AW_DURABLE_ENGINE", "copilot");
+    const durableFiles = require("./durable_files.cjs");
+    const reject = vi.spyOn(durableFiles, "redactCopilotCheckpoint").mockImplementation(() => {
+      throw new Error("unsafe checkpoint details");
+    });
+
+    try {
+      await main({ redactDurableCopilot: true, durableRoot });
+    } finally {
+      reject.mockRestore();
+    }
+
+    expect(fs.existsSync(bundle)).toBe(false);
+    expect(mockCore.setOutput).toHaveBeenCalledWith("durable_checkpoint_safe", "false");
+    expect(mockCore.warning).toHaveBeenCalledWith("ERR_VALIDATION: Rejected the durable Copilot checkpoint during secret redaction");
+    expect(mockCore.setFailed).not.toHaveBeenCalled();
+  });
+  it("redacts a staged Copilot transcript only once before validating its checkpoint", async () => {
+    const { main } = require("./redact_secrets.cjs");
+    const { stageFiles, validateFiles } = require("./durable_files.cjs");
+    const { createHash } = require("node:crypto");
+    const root = path.join(process.env.RUNNER_TEMP, "gh-aw/agent");
+    const id = "6f9f1648-1234-4000-8000-000000000001";
+    const state = path.join(root, "session-state");
+    const eventFile = path.join(state, id, "events.jsonl");
+    const secret = "synthetic-checkpoint-secret-value";
+    fs.mkdirSync(path.dirname(eventFile), { recursive: true });
+    fs.writeFileSync(eventFile, JSON.stringify({ type: "user.message", id: "event-1", data: { content: `before ${secret} after` } }) + "\n");
+    vi.stubEnv("GH_AW_DURABLE_FILES", JSON.stringify([state]));
+    vi.stubEnv("GH_AW_DURABLE_ENGINE", "copilot");
+    stageFiles({ core: mockCore, root });
+    vi.stubEnv("GH_AW_SECRET_NAMES", "CHECKPOINT");
+    vi.stubEnv("SECRET_CHECKPOINT", secret);
+    const blob = path.join(root, "durable/bundle", createHash("sha256").update(`0/${id}/events.jsonl`).digest("hex") + ".json");
+    const write = vi.spyOn(fs, "writeFileSync");
+    try {
+      await main({ redactDurableCopilot: true, durableRoot: root });
+      expect(write.mock.calls.filter(([file]) => file === blob)).toHaveLength(1);
+    } finally {
+      write.mockRestore();
+    }
+    expect(fs.readFileSync(blob, "utf8")).not.toContain(secret);
+    expect(mockCore.setOutput).toHaveBeenCalledWith("durable_checkpoint_safe", "true");
+    expect(mockCore.setFailed).not.toHaveBeenCalled();
+    expect(() => validateFiles({ core: mockCore, root })).not.toThrow();
   });
   it("fails closed and removes detection output when file redaction fails", async () => {
     const { main } = require("./redact_secrets.cjs");
@@ -332,6 +401,32 @@ describe("redact_secrets.cjs", () => {
       }
     }),
     describe("file handling", () => {
+      it.each(["secret_leak", "reasons"])("fails closed when redaction changes a verdict field: %s", mask => {
+        const { processFile } = require("./redact_secrets.cjs");
+        const directory = path.join(tempDir, "threat-detection");
+        fs.mkdirSync(directory);
+        const file = path.join(directory, "detection_result.json");
+        fs.writeFileSync(file, JSON.stringify({ prompt_injection: false, secret_leak: true, malicious_patch: false, reasons: [] }));
+
+        processFile(file, [], [mask]);
+
+        expect(fs.existsSync(file)).toBe(false);
+        expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Removed artifact source after secret redaction failed"));
+      });
+
+      it("redacts verdict explanations without changing the verdict", () => {
+        const { processFile } = require("./redact_secrets.cjs");
+        const directory = path.join(tempDir, "threat-detection");
+        fs.mkdirSync(directory);
+        const file = path.join(directory, "detection_result.json");
+        fs.writeFileSync(file, JSON.stringify({ prompt_injection: false, secret_leak: true, malicious_patch: false, reasons: ["private-example"] }));
+
+        processFile(file, ["private-example"]);
+
+        expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual({ prompt_injection: false, secret_leak: true, malicious_patch: false, reasons: ["***REDACTED***"] });
+        expect(mockCore.setFailed).not.toHaveBeenCalled();
+      });
+
       it.each(["ordinary.json", "safeoutputs.jsonl"])("silently redacts UTF-8 payloads in %s", filename => {
         const { processFile } = require("./redact_secrets.cjs");
         const secret = "synthetic-private-value";
@@ -358,6 +453,18 @@ describe("redact_secrets.cjs", () => {
 
         expect(mockCore.info).not.toHaveBeenCalled();
         expect(mockCore.warning).not.toHaveBeenCalled();
+        expect(mockCore.setFailed).not.toHaveBeenCalled();
+      });
+
+      it.each(["utf8", "latin1"])("removes binary artifacts containing %s runtime credentials without rewriting them", encoding => {
+        const { processFile } = require("./redact_secrets.cjs");
+        const file = path.join(tempDir, "binary.json");
+        const secret = "caf\u00e9-runtime-credential";
+        fs.writeFileSync(file, Buffer.concat([Buffer.from([0xff, 0]), Buffer.from(secret, encoding), Buffer.from([0xfe])]));
+
+        expect(processFile(file, [], [secret])).toBeGreaterThan(0);
+
+        expect(fs.existsSync(file)).toBe(false);
         expect(mockCore.setFailed).not.toHaveBeenCalled();
       });
 
@@ -1190,27 +1297,54 @@ describe("redact_secrets.cjs", () => {
           spy.mockRestore();
         }
       });
-      it("continues redacting artifact files when a directory is inaccessible", async () => {
-        const cache = path.join(tempDir, "aw-mcp");
+      it.each([
+        ["root", "EACCES"],
+        ["nested", "EACCES"],
+        ["nested", "EPERM"],
+      ])("fails closed when a %s directory cannot be scanned (%s)", async (location, code) => {
+        const cache = location === "root" ? tempDir : path.join(tempDir, "aw-mcp");
         const artifact = path.join(tempDir, "agent-stdio.log");
-        fs.mkdirSync(cache);
+        const sentinel = path.join(tempDir, "external.md");
+        fs.mkdirSync(cache, { recursive: true });
         fs.writeFileSync(artifact, "secret-value");
+        fs.writeFileSync(sentinel, "external-private-sentinel");
+        fs.symlinkSync(sentinel, path.join(cache, "agent-step-summary.md"));
         process.env.GH_AW_SECRET_NAMES = "TEST_SECRET";
         process.env.SECRET_TEST_SECRET = "secret-value";
         const readDir = fs.readdirSync;
         const readDirSpy = vi.spyOn(fs, "readdirSync").mockImplementation((dir, options) => {
-          if (dir === cache) throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+          if (dir === cache) throw Object.assign(new Error("permission denied"), { code });
           return readDir(dir, options);
         });
         try {
           const modifiedScript = redactScript.replace('findFiles("/tmp/gh-aw", targetExtensions)', `findFiles("${tempDir}", targetExtensions)`);
           await eval(`(async () => { ${modifiedScript}; await main(); })()`);
           expect(readDirSpy).toHaveBeenCalledWith(cache, expect.anything());
-          expect(fs.readFileSync(artifact, "utf8")).toBe("***REDACTED***");
-          expect(mockCore.setFailed).not.toHaveBeenCalled();
-          expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Skipping inaccessible directory"));
+          expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to scan directory"));
+          expect(mockCore.warning).not.toHaveBeenCalledWith(expect.stringContaining("Skipping inaccessible directory"));
+          expect(fs.readFileSync(sentinel, "utf8")).toBe("external-private-sentinel");
         } finally {
           readDirSpy.mockRestore();
+        }
+      });
+      it("fails closed when a planted summary symlink cannot be removed", async () => {
+        const sentinel = path.join(tempDir, "external.md");
+        const summary = path.join(tempDir, "agent-step-summary.md");
+        fs.writeFileSync(sentinel, "external-private-sentinel");
+        fs.symlinkSync(sentinel, summary);
+        const unlink = fs.unlinkSync;
+        const spy = vi.spyOn(fs, "unlinkSync").mockImplementation(file => {
+          if (file === summary) throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+          return unlink(file);
+        });
+        try {
+          const modifiedScript = redactScript.replace('findFiles("/tmp/gh-aw", targetExtensions)', `findFiles("${tempDir}", targetExtensions)`);
+          await eval(`(async () => { ${modifiedScript}; await main(); })()`);
+          expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to scan directory"));
+          expect(fs.readFileSync(sentinel, "utf8")).toBe("external-private-sentinel");
+          expect(fs.lstatSync(summary).isSymbolicLink()).toBe(true);
+        } finally {
+          spy.mockRestore();
         }
       });
       it("redacts readable MCP artifact logs", async () => {

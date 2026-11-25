@@ -12,7 +12,10 @@ import remarkStripEmojis from "./src/lib/remark/stripEmojis.js";
 import remarkTableDataLabels from "./src/lib/remark/tableDataLabels.js";
 import remarkInlineMarkdownInHtml from "./src/lib/remark/inlineMarkdownInHtml.js";
 import remarkAgenticsWorkflow from "./src/lib/remark/agenticsWorkflow.js";
+import rehypeDeduplicateTitle from "./src/lib/rehype/deduplicateTitle.js";
 import rehypeTableWrapper from "./src/lib/rehype/tableWrapper.js";
+import cracktroMetadata from "./src/lib/cracktro/integration.js";
+import redirectFragments from "./src/lib/redirect-fragments.js";
 
 const agenticsWorkflowsDirectory = process.env.AGENTICS_WORKFLOWS_DIR ?? fileURLToPath(new URL("../../agentics/workflows/", import.meta.url));
 
@@ -39,7 +42,7 @@ export default defineConfig({
   markdown: {
     processor: unified({
       remarkPlugins: [remarkStripEmojis, remarkTableDataLabels, remarkInlineMarkdownInHtml, [remarkAgenticsWorkflow, { sourceDirectory: agenticsWorkflowsDirectory }]],
-      rehypePlugins: [rehypeTableWrapper],
+      rehypePlugins: [rehypeDeduplicateTitle, rehypeTableWrapper],
     }),
   },
   vite: {
@@ -194,6 +197,8 @@ export default defineConfig({
     "/guides/telemetry/": "/gh-aw/reference/open-telemetry/",
     "/guides/opentelemetry/": "/gh-aw/reference/open-telemetry/",
     "/experimental/opentelemetry/": "/gh-aw/reference/open-telemetry/",
+    "/experimental/ledger-replay/": "/gh-aw/reference/ledger-replay/",
+    "/experimental/ledger-compaction/": "/gh-aw/reference/ledger-compaction/",
     "/patterns/opentelemetry/": "/gh-aw/reference/open-telemetry/",
     "/guides/getting-started-mcp/": "/gh-aw/guides/mcps/",
     "/patterns/data-ops/": "/gh-aw/patterns/deterministic-ops/",
@@ -214,10 +219,12 @@ export default defineConfig({
     "/guides/memoryops/": "/gh-aw/patterns/memory-ops/",
     "/guides/memory-ops/": "/gh-aw/patterns/memory-ops/",
     "/guides/serena/": "/gh-aw/reference/serena/",
-    "/guides/experiments/": "/gh-aw/experimental/experiments/",
-    "/practices/experiments/": "/gh-aw/experimental/experiments/",
-    "/practices/experiments-specification/": "/gh-aw/experimental/experiments-specification/",
-    "/reference/experiments-specification/": "/gh-aw/experimental/experiments-specification/",
+    "/guides/experiments/": "/gh-aw/reference/experiments/",
+    "/practices/experiments/": "/gh-aw/reference/experiments/",
+    "/experimental/experiments/": "/gh-aw/reference/experiments/",
+    "/practices/experiments-specification/": "/gh-aw/specs/experiments-specification/",
+    "/reference/experiments-specification/": "/gh-aw/specs/experiments-specification/",
+    "/experimental/experiments-specification/": "/gh-aw/specs/experiments-specification/",
     "/reference/ai-credits-specification/": "/gh-aw/specs/ai-credits-specification/",
     "/reference/copilot-sdk-driver-specification/": "/gh-aw/specs/copilot-sdk-driver-specification/",
     "/reference/effective-tokens-specification/": "/gh-aw/specs/ai-credits-specification/",
@@ -230,7 +237,7 @@ export default defineConfig({
     "/reference/safe-outputs-specification/": "/gh-aw/specs/safe-outputs-specification/",
     "/practices/organization-practices/": "/gh-aw/guides/using-at-scale/",
 
-    "/reference/awf-reflect/": "/gh-aw/experimental/awf-reflect/",
+    "/experimental/awf-reflect/": "/gh-aw/reference/awf-reflect/",
 
     // Patterns → Experimental
     "/patterns/correction-ops/": "/gh-aw/experimental/correction-ops/",
@@ -262,6 +269,18 @@ export default defineConfig({
     "/reference/enclaves/": "/gh-aw/experimental/enclaves/",
     "/reference/lockdown-mode/": "/gh-aw/reference/integrity/",
     "/reference/repository-package-manifest/": "/gh-aw/reference/aw-yml-package-manifest/",
+
+    // Connector documentation has its own section.
+    "/reference/connector-validation/": "/gh-aw/reference/connectors/",
+    "/reference/connector-assembly/": "/gh-aw/reference/connectors/#configuration",
+    "/reference/linear-connector/": "/gh-aw/reference/connectors/#linear",
+    "/reference/jira-connector/": "/gh-aw/reference/connectors/#jira",
+    "/reference/azure-devops-connector/": "/gh-aw/reference/connectors/#azure-devops",
+    "/reference/slack-connector/": "/gh-aw/reference/connectors/#slack",
+    "/reference/teams-connector/": "/gh-aw/reference/connectors/#microsoft-teams",
+    "/reference/confluence-connector/": "/gh-aw/reference/connectors/#confluence",
+    "/reference/sentry-connector/": "/gh-aw/reference/connectors/#sentry",
+    "/reference/servicenow-connector/": "/gh-aw/reference/connectors/#servicenow",
   },
   integrations: [
     // Dev-only pages for the social preview images (see scripts/capture-og.mjs).
@@ -275,6 +294,9 @@ export default defineConfig({
         },
       },
     },
+    // Adds the slide list from .github/skills/cracktro/slides.md to the talk page's JSON-LD.
+    cracktroMetadata(),
+    redirectFragments(),
     sitemap(),
     mermaid({
       mermaidConfig: {
@@ -485,6 +507,7 @@ export default defineConfig({
         {
           label: "Reference",
           items: [
+            { label: "A/B Experiments", link: "/reference/experiments/" },
             { label: "AI Engines", link: "/reference/engines/" },
             { label: "AI Engines (Copilot)", link: "/reference/engines/copilot/" },
             { label: "AI Engines (Claude)", link: "/reference/engines/claude/" },
@@ -494,6 +517,7 @@ export default defineConfig({
             { label: "AI Engines (Agy)", link: "/reference/engines/agy/" },
             { label: "AI Engines (Custom)", link: "/reference/third-party-agent/" },
             { label: "AI Engines (Azure BYOK)", link: "/reference/azure-openai-byok/" },
+            { label: "AWF Reflect Route", link: "/reference/awf-reflect/" },
             { label: "Authentication", link: "/reference/auth/" },
             { label: "Authentication (Projects)", link: "/reference/auth-projects/" },
             { label: "Compilation Process", link: "/reference/compilation-process/" },
@@ -522,7 +546,8 @@ export default defineConfig({
             { label: "Imports (Copilot Agent Files)", link: "/reference/copilot-custom-agents/" },
             { label: "Imports (Copilot Inline Sub-Agents)", link: "/reference/inline-sub-agents/" },
             { label: "Imports (Dependabot)", link: "/reference/dependabot/" },
-            { label: "Outcomes", link: "/reference/outcomes/" },
+            { label: "Delivery and adoption", link: "/reference/delivery-adoption/" },
+            { label: "Value report", link: "/reference/value/" },
             { label: "OpenTelemetry", link: "/reference/open-telemetry/" },
             { label: "OpenTelemetry Attributes", link: "/reference/open-telemetry-attributes/" },
             { label: "Package Manifest", link: "/reference/aw-yml-package-manifest/" },
@@ -579,9 +604,6 @@ export default defineConfig({
           collapsed: true,
           items: [
             { label: "Agy Engine (experimental)", link: "/engines/agy/" },
-            { label: "A/B Experiments", link: "/experimental/experiments/" },
-            { label: "A/B Experiments (Spec)", link: "/experimental/experiments-specification/" },
-            { label: "AWF Reflect Route", link: "/experimental/awf-reflect/" },
             { label: "CorrectionOps", link: "/experimental/correction-ops/" },
             { label: "Drive Memory (Private Preview)", link: "/experimental/drive-memory/" },
             { label: "Private Repository Enclaves", link: "/experimental/enclaves/" },
@@ -589,10 +611,12 @@ export default defineConfig({
             { label: "Monitoring with Projects", link: "/experimental/monitoring-with-projects/" },
             { label: "QMD Documentation Search", link: "/experimental/qmd/" },
             { label: "Safe-Outputs Samples", link: "/experimental/safe-outputs-samples/" },
+            { label: "Token Broker", link: "/experimental/token-broker/" },
             { label: "TrialOps", link: "/experimental/trial-ops/" },
             { label: "WASM Compilation", link: "/reference/wasm-compilation/" },
           ],
         },
+        { label: "Connectors", link: "/reference/connectors/" },
         { label: "Agent Factory", link: "/agent-factory-status/" },
         { label: "Editors", link: "/reference/editors/" },
         { label: "About", link: "/about/" },

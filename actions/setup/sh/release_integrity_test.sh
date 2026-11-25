@@ -9,9 +9,10 @@ trap 'rm -rf "$TEMP_DIR"' EXIT
 # shellcheck source=actions/setup/sh/release_integrity.sh
 source "$SCRIPT_DIR/release_integrity.sh"
 
-mkdir -p "$TEMP_DIR/bin" "$TEMP_DIR/home" "$TEMP_DIR/scripts" "$TEMP_DIR/copilot-fixture"
+mkdir -p "$TEMP_DIR/bin" "$TEMP_DIR/home" "$TEMP_DIR/scripts" "$TEMP_DIR/copilot-fixture" "$TEMP_DIR/runner"
 cp "$SCRIPT_DIR/install_awf_binary.sh" "$TEMP_DIR/scripts/"
 cp "$SCRIPT_DIR/install_copilot_cli.sh" "$TEMP_DIR/scripts/"
+cp "$SCRIPT_DIR/install_privileges.sh" "$TEMP_DIR/scripts/"
 printf '#!/usr/bin/env bash\necho EXECUTED >>"$EXECUTION_LOG"\n' >"$TEMP_DIR/payload"
 payload_digest="$(shasum -a 256 "$TEMP_DIR/payload" | awk '{print $1}')"
 for asset in awf-bundle.js awf-linux-x64 awf-linux-arm64 awf-darwin-x64 awf-darwin-arm64; do
@@ -68,11 +69,6 @@ fi
 case "$url" in
   */compat.json) cp "$TEST_ROOT/compat.json" "$out" ;;
   */checksums.txt) cp "$TEST_ROOT/checksums.txt" "$out" ;;
-  */release-identity.txt)
-    version="${url%/*}"
-    version="${version##*/}"
-    digest=$(shasum -a 256 "$TEST_ROOT/checksums.txt" | awk '{print $1}')
-    printf '%s  refs/tags/%s\n' "$digest" "$version" > "$out" ;;
   */SHA256SUMS.txt) cp "$TEST_ROOT/SHA256SUMS.txt" "$out" ;;
   */awf-bundle.js|*/awf-linux-*|*/awf-darwin-*) cp "$TEST_ROOT/payload" "$out" ;;
   */copilot-linux-x64.tar.gz) cp "$TEST_ROOT/copilot-linux-x64.tar.gz" "$out" ;;
@@ -84,17 +80,9 @@ EOF
 cat >"$TEMP_DIR/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-test "$1" = attestation
-test "$2" = verify
-test "$4" = --hostname
-test "$5" = github.com
-test "$6" = --repo
-test "$7" = github/gh-aw-firewall
-test "$8" = --signer-workflow
-test "$9" = github/gh-aw-firewall/.github/workflows/release.yml
-test "${10}" = --cert-oidc-issuer
-test "${11}" = https://token.actions.githubusercontent.com
-test "${12}" = --deny-self-hosted-runners
+printf '%s\n' "$*" >>"$TEST_ROOT/gh.log"
+echo "HTTP 401: Bad credentials (https://api.github.com)" >&2
+exit 1
 EOF
 cat >"$TEMP_DIR/bin/node" <<'EOF'
 #!/usr/bin/env bash
@@ -114,6 +102,7 @@ chmod +x "$TEMP_DIR/bin/"*
 
 run_awf() {
   env TEST_ROOT="$TEMP_DIR" EXECUTION_LOG="$TEMP_DIR/executions" HOME="$TEMP_DIR/home" \
+    GH_HOST=example.ghe.com GH_TOKEN=enterprise-test-token \
     GITHUB_PATH="$TEMP_DIR/github-path" PATH="$TEMP_DIR/bin:$PATH" \
     bash "$TEMP_DIR/scripts/install_awf_binary.sh" "$@" >"$TEMP_DIR/output" 2>&1
 }
@@ -125,11 +114,22 @@ run_copilot() {
     GH_AW_COPILOT_MIN_VERSION="${PIN_TEST_MIN_VERSION:-}" PATH="$TEMP_DIR/bin:$PATH" \
     bash "$TEMP_DIR/scripts/install_copilot_cli.sh" "$@" >"$TEMP_DIR/output" 2>&1
 }
+COPILOT_INSTALL_DIR="$TEMP_DIR/runner/gh-aw/bin"
 
 run_awf v0.28.62 --rootless
 test -x "$TEMP_DIR/home/.local/bin/awf"
 grep -q EXECUTED "$TEMP_DIR/executions"
 echo "PASS: authenticated AWF bundle installs and executes"
+
+for node_version in v24.0.0 v18.0.0; do
+  rm -f "$TEMP_DIR/executions" "$TEMP_DIR/curl.log" "$TEMP_DIR/home/.local/bin/awf"
+  AWF_TEST_NODE_VERSION="$node_version" run_awf v0.29.11 --rootless --checksums-sha256 "$manifest_digest"
+  test -x "$TEMP_DIR/home/.local/bin/awf"
+  grep -q EXECUTED "$TEMP_DIR/executions"
+  test "$(wc -l <"$TEMP_DIR/curl.log" | tr -d ' ')" = 2
+  test ! -e "$TEMP_DIR/gh.log"
+done
+echo "PASS: modern AWF bundle and binary verify real checksums on ghe.com without calling gh"
 
 for failure in '504 22' '404 22' '000 28' '200 23'; do
   read -r http_status curl_exit <<<"$failure"
@@ -175,13 +175,36 @@ test "$(wc -l <"$TEMP_DIR/curl.log" | tr -d ' ')" = 2
 echo "PASS: failed platform-binary downloads cannot install or execute partial files"
 
 run_copilot --rootless
-test -x "$TEMP_DIR/home/.local/bin/copilot"
+test -x "$COPILOT_INSTALL_DIR/copilot"
 grep -q '/v1.0.103/copilot-linux-x64.tar.gz' "$TEMP_DIR/curl.log"
 echo "PASS: default Copilot release installs with its reviewed manifest pin"
 run_copilot 1.0.98 --rootless
-test -x "$TEMP_DIR/home/.local/bin/copilot"
-rm -f "$TEMP_DIR/home/.local/bin/copilot"
+test -x "$COPILOT_INSTALL_DIR/copilot"
+rm -f "$COPILOT_INSTALL_DIR/copilot"
 echo "PASS: authenticated Copilot archive installs and executes"
+
+cat >"$TEMP_DIR/bin/id" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in -u) echo 12345 ;; -g) echo 31 ;; *) exit 1 ;; esac
+EOF
+cat >"$TEMP_DIR/bin/chown" <<'EOF'
+#!/usr/bin/env bash
+test "$1" = -R && test "$2" = 12345:31 && test "$3" = "$HOME/.copilot"
+EOF
+cat >"$TEMP_DIR/bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+echo "$*" >>"$TEST_ROOT/sudo.log"
+exit 1
+EOF
+chmod +x "$TEMP_DIR/bin/id" "$TEMP_DIR/bin/chown" "$TEMP_DIR/bin/sudo"
+rm -f "$TEMP_DIR/github-path"
+run_copilot 1.0.98
+test -x "$COPILOT_INSTALL_DIR/copilot"
+grep -qF "$COPILOT_INSTALL_DIR" "$TEMP_DIR/github-path"
+test "$(cat "$TEMP_DIR/sudo.log")" = "-n true"
+echo "PASS: native UID 12345/GID 31 installs a checksum-verified Copilot archive without privileged file operations"
+rm -f "$TEMP_DIR/bin/id" "$TEMP_DIR/bin/chown" "$COPILOT_INSTALL_DIR/copilot"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$TEMP_DIR/bin/sudo"
 
 printf '%s\n' '{"agent-compat-v1":{"copilot":[{"min-gh-aw":"0.72.0","max-gh-aw":"*","min-agent":"1.0.21","max-agent":"1.0.103"}]}}' >"$TEMP_DIR/compat.json"
 PIN_TEST_COMPILED_VERSION=v0.93.0 PIN_TEST_MIN_VERSION=1.0.35 run_copilot --rootless
@@ -220,7 +243,7 @@ if run_copilot 9.9.9 --rootless; then
   echo "FAIL: explicit unreviewed release silently fell back" >&2; exit 1
 fi
 test ! -e "$TEMP_DIR/curl.log"
-rm -f "$TEMP_DIR/home/.local/bin/copilot"
+rm -f "$COPILOT_INSTALL_DIR/copilot"
 echo "PASS: fallback respects compatibility bounds, feature minimums, and explicit versions"
 
 for platform in Linux Darwin; do
@@ -268,7 +291,7 @@ if grep -q CACHED_EXECUTED "$TEMP_DIR/executions"; then
   echo "FAIL: prefer-toolcache selected a different version" >&2; exit 1
 fi
 echo "PASS: a cache miss downloads the exact version with checksum verification"
-rm -f "$cache_bin/copilot" "$TEMP_DIR/home/.local/bin/copilot"
+rm -f "$cache_bin/copilot" "$COPILOT_INSTALL_DIR/copilot"
 
 rm -f "$TEMP_DIR/curl.log" "$TEMP_DIR/executions"
 for bad_pin in "" abc "${copilot_digest^^}" '${{ inputs.pin }}'; do
@@ -304,23 +327,35 @@ rm -f "$TEMP_DIR/executions" "$TEMP_DIR/curl.log"
 printf 'attacker payload\n' >"$TEMP_DIR/payload"
 attacker_digest="$(shasum -a 256 "$TEMP_DIR/payload" | awk '{print $1}')"
 printf '%s  awf-bundle.js\n' "$attacker_digest" >"$TEMP_DIR/checksums.txt"
-if run_awf v0.28.62 --rootless; then
-  echo "FAIL: AWF accepted artifact-plus-manifest replacement" >&2; exit 1
-fi
-grep -q 'Trusted SHA256 verification failed' "$TEMP_DIR/output"
-test ! -e "$TEMP_DIR/executions"
-test "$(wc -l <"$TEMP_DIR/curl.log" | tr -d ' ')" = 1
+for version in v0.28.62 v0.29.11; do
+  rm -f "$TEMP_DIR/curl.log" "$TEMP_DIR/home/.local/bin/awf"
+  if run_awf "$version" --rootless --checksums-sha256 "$manifest_digest"; then
+    echo "FAIL: AWF accepted artifact-plus-manifest replacement" >&2; exit 1
+  fi
+  grep -q 'Trusted SHA256 verification failed' "$TEMP_DIR/output"
+  test ! -e "$TEMP_DIR/executions"
+  test ! -e "$TEMP_DIR/home/.local/bin/awf"
+  test "$(wc -l <"$TEMP_DIR/curl.log" | tr -d ' ')" = 1
+done
 echo "PASS: AWF rejects artifact-plus-manifest replacement before downloading executable"
 
 # An authentic manifest must not allow a tampered bundle to trigger a binary fallback.
 cp "$TEMP_DIR/valid-checksums.txt" "$TEMP_DIR/checksums.txt"
-rm -f "$TEMP_DIR/curl.log"
-if run_awf v0.28.62 --rootless; then
-  echo "FAIL: AWF accepted a tampered bundle" >&2; exit 1
-fi
-grep -q 'refusing fallback' "$TEMP_DIR/output"
-test ! -e "$TEMP_DIR/executions"
-test "$(wc -l <"$TEMP_DIR/curl.log" | tr -d ' ')" = 2
+for version in v0.28.62 v0.29.11; do
+  for node_version in v24.0.0 v18.0.0; do
+    rm -f "$TEMP_DIR/curl.log"
+    if AWF_TEST_NODE_VERSION="$node_version" run_awf "$version" --rootless --checksums-sha256 "$manifest_digest"; then
+      echo "FAIL: AWF accepted a tampered payload" >&2; exit 1
+    fi
+    grep -q 'Checksum verification failed' "$TEMP_DIR/output"
+    if [ "$node_version" = v24.0.0 ]; then
+      grep -q 'refusing fallback' "$TEMP_DIR/output"
+    fi
+    test ! -e "$TEMP_DIR/executions"
+    test ! -e "$TEMP_DIR/home/.local/bin/awf"
+    test "$(wc -l <"$TEMP_DIR/curl.log" | tr -d ' ')" = 2
+  done
+done
 echo "PASS: AWF bundle integrity failure cannot fall back"
 
 printf '%s  copilot-linux-x64.tar.gz\n' "$attacker_digest" >"$TEMP_DIR/SHA256SUMS.txt"
@@ -330,7 +365,7 @@ if run_copilot 1.0.98 --rootless; then
 fi
 grep -q 'Trusted SHA256 verification failed' "$TEMP_DIR/output"
 test "$(wc -l <"$TEMP_DIR/curl.log" | tr -d ' ')" = 1
-test ! -e "$TEMP_DIR/home/.local/bin/copilot"
+test ! -e "$COPILOT_INSTALL_DIR/copilot"
 echo "PASS: Copilot authenticates its manifest before downloading or extracting executable"
 
 rm -f "$TEMP_DIR/curl.log"
@@ -366,10 +401,31 @@ echo "PASS: missing-pin errors explain upgrade, recompile, and independently tru
 test -n "$(release_artifact_sha256 github/gh-aw-firewall v0.28.62 checksums.txt)"
 test "$(release_artifact_sha256 github/gh-aw-firewall v0.29.0 checksums.txt)" = \
   "2d49727b3b65630b5d0ba5375168687a852afac319d05c911d4769c43fa2ed61"
+test "$(release_artifact_sha256 github/gh-aw-firewall v0.29.13 checksums.txt)" = \
+  "8b26d786ec7fef8b44d9d71b8ba52627c8696f6655d5554c3c40c44ee70f67fa"
+test "$(release_artifact_sha256 github/gh-aw-firewall v0.29.14 checksums.txt)" = \
+  "63de9cabca7739d852315932a01ffb3cc6e0bd639887afe6f5d1fc920ff315f6"
+test "$(release_artifact_sha256 github/gh-aw-firewall v0.29.16 checksums.txt)" = \
+  "6891cd50542511cbae92fc89adbec0bbe0586d332d038bd494e582be76afa478"
+test "$(release_artifact_sha256 github/gh-aw-firewall v0.29.17 checksums.txt)" = \
+  "f56a82090eb65c9afba912c43fb2aa08de2ca54f8776f27a3fb851bbac21fa92"
+test "$(release_artifact_sha256 github/gh-aw-firewall v0.29.18 checksums.txt)" = \
+  "bd7b3b0ed6d7a29d5711e1b7ce066e229c2a38577be0c363da899ef17b036b86"
+test "$(release_artifact_sha256 github/gh-aw-firewall v0.29.20 checksums.txt)" = \
+  "344d3c3dda4c1ee5cbd2ce9090ad2e5fc3482770494efd07f32565f8bb218cfd"
+for version in v0.29.10 0.29.10; do
+  test "$(release_artifact_sha256 github/gh-aw-firewall "$version" checksums.txt)" = \
+    "a60c61e67aad4810e9a4f52ae26d3b2a58a7cf190aff66aeb338238b7b0e1467"
+done
 test "$(release_artifact_sha256 github/copilot-cli v1.0.101 SHA256SUMS.txt)" = \
   "018625eac68670d66ede904b9b82cdcd6ab8f87ba20e6e1fbdf0b62c8295d5be"
 test "$(release_artifact_sha256 github/copilot-cli v1.0.103 SHA256SUMS.txt)" = \
   "26cd3e4b32cde498e4961fb4d48e7b85d7859fc69af1a645a19201fdd577bdb2"
+sdk_companion_pin="854036b59b745d4f4b44a169327ffc0eab007f39e74b3dc3670f4d609a6c1072"
+test "$(release_artifact_sha256 github/copilot-cli v1.0.113 SHA256SUMS.txt "$sdk_companion_pin")" = "$sdk_companion_pin"
+if release_artifact_sha256 github/copilot-cli v1.0.113 SHA256SUMS.txt >/dev/null 2>&1; then
+  echo "FAIL: SDK companion release resolved without its compiler-supplied pin" >&2; exit 1
+fi
 if release_artifact_sha256 github/gh-aw-firewall v0.28.62 wrong-asset >/dev/null 2>&1; then
   echo "FAIL: digest pin was not asset-bound" >&2; exit 1
 fi
@@ -391,3 +447,13 @@ if curl --proto '=https' --proto-redir '=https' -fsSL --max-time 2 http://127.0.
 fi
 grep -qi 'protocol.*disabled' "$TEMP_DIR/curl-output"
 echo "PASS: real curl refuses HTTP before connecting"
+
+# Lock files compiled by older gh-aw versions call these from inline helper steps.
+verify_release_identity "$TEMP_DIR/valid-checksums.txt" "$TEMP_DIR/release-identity.txt" \
+  github/gh-aw-firewall v0.29.11 "$manifest_digest"
+if verify_release_identity "$TEMP_DIR/valid-checksums.txt" "$TEMP_DIR/release-identity.txt" \
+  github/gh-aw-firewall v0.29.11 "$payload_digest" 2>/dev/null; then
+  echo "FAIL: legacy identity shim accepted an untrusted manifest" >&2; exit 1
+fi
+verify_release_attestation "$TEMP_DIR/payload" github/gh-aw-firewall 2>/dev/null
+echo "PASS: legacy attestation entry points remain callable and enforce the trusted manifest digest"

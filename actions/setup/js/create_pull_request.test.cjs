@@ -149,6 +149,62 @@ describe("create_pull_request - draft policy enforcement", () => {
     return global.core.warning.mock.calls.filter(args => String(args[0]).includes("Agent requested draft"));
   }
 
+  it.each([
+    ["warn", "init_miss_fail"],
+    ["error", "init_miss_nerr_fail"],
+    ["ignore", "init_miss_ignr_fail"],
+  ])("traces the exercised %s policy when the patch is missing", async (ifNoChanges, expectedTrace) => {
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ if_no_changes: ifNoChanges });
+
+    const result = await handler({ title: "Test PR" }, {});
+
+    expect(result.success).toBe(false);
+    expect(result.execution_trace).toBe(expectedTrace);
+  });
+
+  it.each(["error", "ignore"])("does not trace staged or %s no-change routes before repository validation", async ifNoChanges => {
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ staged: true, if_no_changes: ifNoChanges });
+
+    const result = await handler({ title: "Test PR", repo: "other-owner/other-repo" }, {});
+
+    expect(result.success).toBe(false);
+    expect(result.execution_trace).toBe("init_repo_fail");
+    expect(global.core.summary.addRaw).not.toHaveBeenCalled();
+  });
+
+  it("traces the staged preview rather than the no-change policy for a missing patch", async () => {
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ staged: true, if_no_changes: "error" });
+
+    const result = await handler({ title: "Test PR" }, {});
+
+    expect(result.staged).toBe(true);
+    expect(result.execution_trace).toBe("init_miss_stag_done");
+    expect(global.core.summary.addRaw).toHaveBeenCalled();
+  });
+
+  it("retains the empty-push failure route when transport integrity fails", async () => {
+    const patchPath = canonicalPatchPath("empty-push-integrity");
+    fs.writeFileSync(patchPath, "");
+    global.exec.exec.mockImplementation(async (cmd, args) => {
+      if (cmd === "git" && args[0] === "commit") {
+        fs.writeFileSync(patchPath, "tampered during empty commit");
+        throw new Error("empty commit failed");
+      }
+      return 0;
+    });
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ allow_empty: true });
+
+    const result = await handler({ title: "Test PR", branch: "empty-push-integrity" }, {});
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("SECURITY:");
+    expect(result.execution_trace).toBe("init_ecmt_eper_fail");
+  });
+
   it("should propagate the created pull request's durable id and node_id", async () => {
     global.github.rest.pulls.create = vi.fn().mockResolvedValue({
       data: { id: 555111222, node_id: "PR_kwDOtest456", number: 1, html_url: "https://github.com/test", head: { sha: "abc123" } },
@@ -160,6 +216,7 @@ describe("create_pull_request - draft policy enforcement", () => {
 
     expect(result.success).toBe(true);
     expect(result.id).toBe(555111222);
+    expect(result.execution_trace).toBe("init_miss_alwe_ecmt_publ_capt_done");
     expect(result.metadata).toEqual({ node_id: "PR_kwDOtest456" });
   });
 
@@ -610,6 +667,7 @@ index 0000000..abc1234
 
     expect(result.success).toBe(false);
     expect(result.error).toContain("allow-full-history-fetch: true");
+    expect(result.execution_trace).toBe("init_bund_bfal_fail");
     expect(result.error).toContain("safe-outputs.create-pull-request");
     const directFetch = global.exec.exec.mock.calls.find(([, args]) => Array.isArray(args) && args[0] === "fetch" && args.includes("origin") && args.includes(prereq));
     expect(directFetch).toBeUndefined();
@@ -648,6 +706,7 @@ index 0000000..abc1234
 
     expect(result.success).toBe(true);
     expect(pushSignedSpy).toHaveBeenCalledWith(expect.objectContaining({ signedCommits: false }));
+    expect(result.execution_trace).toBe("init_bund_push_publ_capt_done");
   });
 
   it("should create the PR when the bundle push fails once with a transient workflows-scope timeout and succeeds on retry", async () => {
@@ -685,6 +744,7 @@ index 0000000..abc1234
 
       expect(result.success).toBe(true);
       expect(result.fallback_used).not.toBe(true);
+      expect(result.execution_trace).toBe("init_bund_push_push_publ_capt_done");
       expect(pushSignedSpy).toHaveBeenCalledTimes(2);
       expect(global.github.rest.pulls.create).toHaveBeenCalled();
       expect(global.github.rest.issues.create).not.toHaveBeenCalled();
@@ -796,6 +856,7 @@ index 0000000..abc1234
     expect(result.fallback_used).not.toBe(true);
     expect(pushSignedSpy).toHaveBeenCalledTimes(2);
     expect(global.exec.exec).toHaveBeenCalledWith("git", ["reset", "--soft", "origin/main"]);
+    expect(result.execution_trace).toBe("init_bund_push_sign_publ_capt_done");
     expect(global.exec.exec).toHaveBeenCalledWith("git", ["commit", "-m", "bundle merge headline"]);
     expect(global.github.rest.issues.create).not.toHaveBeenCalled();
   });
@@ -2106,12 +2167,18 @@ describe("create_pull_request - allowed-files strict allowlist", () => {
         repos: {
           get: vi.fn().mockResolvedValue({ data: { default_branch: "main" } }),
         },
+        issues: {
+          listForRepo: vi.fn().mockResolvedValue({ data: [] }),
+        },
       },
+      paginate: vi.fn().mockResolvedValue([]),
       graphql: vi.fn(),
     };
     global.context = {
       eventName: "workflow_dispatch",
       repo: { owner: "test-owner", repo: "test-repo" },
+      runId: 123,
+      serverUrl: "https://github.com",
       payload: {},
     };
     global.exec = {
@@ -2201,6 +2268,7 @@ ${diffs}
 
     expect(result.success).toBe(false);
     expect(result.error).toContain("outside the allowed-files list");
+    expect(result.execution_trace).toBe("init_deny_fail");
     expect(result.error).toContain("src/index.js");
   });
 
@@ -2265,13 +2333,14 @@ ${diffs}
     expect(result.error).toContain("protected files");
   });
 
-  it("should create PR with caution and request-changes review when protected-files is request_review", async () => {
+  it("should disable auto-merge even after a successful protected-files request-changes review", async () => {
     const patchPath = writePatch("should-create-pr-with-caution-and-request-changes-review-whe", createPatchWithFiles(".github/aw/instructions.md"));
 
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({
       protected_path_prefixes: [".github/"],
       protected_files_policy: "request_review",
+      auto_merge: true,
     });
     const result = await handler({ title: "Test PR", body: "Body text", branch: "should-create-pr-with-caution-and-request-changes-review-whe" }, {});
 
@@ -2286,6 +2355,9 @@ ${diffs}
     expect(createReviewCall.event).toBe("REQUEST_CHANGES");
     expect(createReviewCall.body).toContain("Protected files were modified");
     expect(createReviewCall.body).toContain(".github/aw/instructions.md");
+    expect(global.github.graphql).not.toHaveBeenCalledWith(expect.stringContaining("enablePullRequestAutoMerge"), expect.anything());
+    expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("Auto-merge is disabled"));
+    expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("Manual review by an independent reviewer is required before merge"));
   });
 
   it("should default to request_review when protected-files policy is unset", async () => {
@@ -2304,24 +2376,168 @@ ${diffs}
     expect(createReviewCall.event).toBe("REQUEST_CHANGES");
   });
 
-  it("should retry with COMMENT when REQUEST_CHANGES review is rejected on own pull request", async () => {
-    const patchPath = writePatch("should-retry-with-comment-when-request-changes-review-is-rej", createPatchWithFiles(".github/aw/instructions.md"));
-    global.github.rest.pulls.createReview = vi
-      .fn()
-      .mockRejectedValueOnce(new Error("Can not request changes on your own pull request"))
-      .mockResolvedValueOnce({ data: { id: 78, html_url: "https://github.com/test/review/78" } });
+  it("should disable auto-merge without downgrading a rejected protected-files review to COMMENT", async () => {
+    writePatch("protected-review-own-pr", createPatchWithFiles(".github/aw/instructions.md"));
+    global.github.rest.pulls.createReview.mockRejectedValue(new Error("Can not request changes on your own pull request"));
 
     const { main } = require("./create_pull_request.cjs");
     const handler = await main({
       protected_path_prefixes: [".github/"],
       protected_files_policy: "request_review",
+      auto_merge: true,
     });
-    const result = await handler({ title: "Test PR", body: "Body text", branch: "should-retry-with-comment-when-request-changes-review-is-rej" }, {});
+    const result = await handler({ title: "Test PR", body: "Body text", branch: "protected-review-own-pr" }, {});
 
     expect(result.success).toBe(true);
-    expect(global.github.rest.pulls.createReview).toHaveBeenCalledTimes(2);
+    expect(global.github.rest.pulls.createReview).toHaveBeenCalledTimes(1);
     expect(global.github.rest.pulls.createReview.mock.calls[0][0].event).toBe("REQUEST_CHANGES");
-    expect(global.github.rest.pulls.createReview.mock.calls[1][0].event).toBe("COMMENT");
+    expect(global.github.graphql).not.toHaveBeenCalledWith(expect.stringContaining("enablePullRequestAutoMerge"), expect.anything());
+    expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("independent reviewer"));
+  });
+
+  it("should disable auto-merge when a protected-files review fails for another reason", async () => {
+    writePatch("protected-review-failure", createPatchWithFiles(".github/aw/instructions.md"));
+    global.github.rest.pulls.createReview.mockRejectedValue(new Error("Review permission denied"));
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({
+      protected_path_prefixes: [".github/"],
+      protected_files_policy: "request_review",
+      auto_merge: true,
+    });
+    const result = await handler({ title: "Test PR", body: "Body text", branch: "protected-review-failure" }, {});
+
+    expect(result.success).toBe(true);
+    expect(global.github.graphql).not.toHaveBeenCalledWith(expect.stringContaining("enablePullRequestAutoMerge"), expect.anything());
+    expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("Review permission denied"));
+    expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("independent reviewer"));
+  });
+
+  it("should update an existing issue and link the run for an identical protected-file proposal", async () => {
+    const patchContent = createPatchWithFiles(".github/aw/instructions.md");
+    writePatch("feature/protected-identical", patchContent);
+    const promptsDir = path.join(tempDir, "prompts");
+    fs.mkdirSync(promptsDir, { recursive: true });
+    copyPromptTemplate(promptsDir, "manifest_protection_create_pr_fallback.md");
+    copyPromptTemplate(promptsDir, "safe_outputs_disclosure_header.md");
+    process.env.GH_AW_PROMPTS_DIR = promptsDir;
+
+    const { getProtectedFallbackIssueFingerprint } = require("./create_pull_request.cjs");
+    const fingerprint = getProtectedFallbackIssueFingerprint("Test PR", patchContent);
+    const existingIssue = {
+      number: 76,
+      title: "Test PR",
+      body: `<!-- gh-aw-protected-file-fallback:${fingerprint} -->`,
+      html_url: "https://github.com/test-owner/test-repo/issues/76",
+      state: "closed",
+      labels: [{ name: "priority" }, { name: "pull-request-fallback" }],
+    };
+    global.github.rest.issues = {
+      create: vi.fn(),
+      update: vi
+        .fn()
+        .mockResolvedValueOnce({ data: { number: 76, html_url: existingIssue.html_url } })
+        .mockRejectedValueOnce(new Error("auto-close update failed")),
+      listForRepo: vi.fn(),
+    };
+    global.github.paginate.mockResolvedValue([existingIssue]);
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({
+      protected_path_prefixes: [".github/"],
+      protected_files_policy: "fallback-to-issue",
+    });
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "feature/protected-identical" }, {});
+
+    expect(result.issue_number).toBe(76);
+    expect(result.execution_trace).toBe("init_fall_ptch_prot_reus_done");
+    expect(global.github.rest.issues.create).not.toHaveBeenCalled();
+    expect(global.github.paginate).toHaveBeenCalledWith(global.github.rest.issues.listForRepo, expect.objectContaining({ owner: "test-owner", repo: "test-repo", state: "all", labels: "pull-request-fallback" }));
+    const updateCall = global.github.rest.issues.update.mock.calls[0][0];
+    expect(updateCall).toMatchObject({ issue_number: 76, title: "Test PR", labels: expect.arrayContaining(["priority", "pull-request-fallback"]), state: "open" });
+    expect(updateCall.body).toContain("https://github.com/test-owner/test-repo/actions/runs/123");
+    expect(updateCall.body).toContain(`<!-- gh-aw-protected-file-fallback:${fingerprint} -->`);
+    expect(global.github.rest.issues.update.mock.calls[1][0].body).toContain(`<!-- gh-aw-protected-file-fallback:${fingerprint} -->`);
+    expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("Failed to update protected-file-protection fallback issue #76 with auto-close link"));
+  });
+
+  it("should fingerprint identical diffs despite regenerated format-patch headers", () => {
+    const { getProtectedFallbackIssueFingerprint } = require("./create_pull_request.cjs");
+    const diff = "diff --git a/.github/aw/instructions.md b/.github/aw/instructions.md\nindex 1234567..abcdef0 100644\n";
+    const firstPatch = `From 1111111111111111111111111111111111111111 Mon Sep 17 00:00:00 2001\nDate: Mon, 1 Jan 2024 12:00:00 +0000\nX-GH-AW-Base-Commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\n${diff}`;
+    const regeneratedPatch = `From 2222222222222222222222222222222222222222 Mon Sep 17 00:00:00 2001\nDate: Tue, 2 Jan 2024 13:00:00 +0000\nX-GH-AW-Base-Commit: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\n${diff}`;
+
+    expect(getProtectedFallbackIssueFingerprint("Test PR", firstPatch)).toBe(getProtectedFallbackIssueFingerprint("Test PR", regeneratedPatch));
+  });
+
+  it("should create a new issue if protected-file fallback lookup fails", async () => {
+    const patchContent = createPatchWithFiles(".github/aw/instructions.md");
+    writePatch("feature/protected-lookup-failure", patchContent);
+    const promptsDir = path.join(tempDir, "prompts");
+    fs.mkdirSync(promptsDir, { recursive: true });
+    copyPromptTemplate(promptsDir, "manifest_protection_create_pr_fallback.md");
+    copyPromptTemplate(promptsDir, "safe_outputs_disclosure_header.md");
+    process.env.GH_AW_PROMPTS_DIR = promptsDir;
+
+    global.github.rest.issues = {
+      create: vi.fn().mockResolvedValue({ data: { number: 77, html_url: "https://github.com/test-owner/test-repo/issues/77" } }),
+      update: vi.fn().mockResolvedValue({ data: {} }),
+      listForRepo: vi.fn(),
+    };
+    global.github.paginate.mockRejectedValue(Object.assign(new Error("Service unavailable"), { status: 503 }));
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({
+      protected_path_prefixes: [".github/"],
+      protected_files_policy: "fallback-to-issue",
+    });
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "feature/protected-lookup-failure" }, {});
+
+    expect(result.issue_number).toBe(77);
+    expect(global.github.rest.issues.create).toHaveBeenCalledTimes(1);
+    expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("Failed to look up an existing protected-file fallback issue; creating a new issue"));
+  });
+
+  it("should create a new issue when the protected-file proposal changes", async () => {
+    const originalPatch = createPatchWithFiles(".github/aw/old-instructions.md");
+    const changedPatch = createPatchWithFiles(".github/aw/new-instructions.md");
+    writePatch("feature/protected-changed", changedPatch);
+    const promptsDir = path.join(tempDir, "prompts");
+    fs.mkdirSync(promptsDir, { recursive: true });
+    copyPromptTemplate(promptsDir, "manifest_protection_create_pr_fallback.md");
+    copyPromptTemplate(promptsDir, "safe_outputs_disclosure_header.md");
+    process.env.GH_AW_PROMPTS_DIR = promptsDir;
+
+    const { getProtectedFallbackIssueFingerprint } = require("./create_pull_request.cjs");
+    const oldFingerprint = getProtectedFallbackIssueFingerprint("Test PR", originalPatch);
+    global.github.rest.issues = {
+      create: vi.fn().mockResolvedValue({ data: { number: 77, html_url: "https://github.com/test-owner/test-repo/issues/77" } }),
+      update: vi.fn().mockResolvedValue({ data: {} }),
+      listForRepo: vi.fn(),
+    };
+    global.github.paginate.mockResolvedValue([
+      {
+        number: 76,
+        title: "Test PR",
+        body: `<!-- gh-aw-protected-file-fallback:${oldFingerprint} -->`,
+        html_url: "https://github.com/test-owner/test-repo/issues/76",
+      },
+    ]);
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({
+      protected_path_prefixes: [".github/"],
+      protected_files_policy: "fallback-to-issue",
+    });
+    const result = await handler({ title: "Test PR", body: "Test body", branch: "feature/protected-changed" }, {});
+
+    expect(result.issue_number).toBe(77);
+    expect(global.github.rest.issues.create).toHaveBeenCalledTimes(1);
+    const createCall = global.github.rest.issues.create.mock.calls[0][0];
+    const newFingerprint = getProtectedFallbackIssueFingerprint("Test PR", changedPatch);
+    expect(newFingerprint).not.toBe(oldFingerprint);
+    expect(createCall.body).toContain(`<!-- gh-aw-protected-file-fallback:${newFingerprint} -->`);
+    expect(createCall.body).toContain("https://github.com/test-owner/test-repo/actions/runs/123");
   });
 
   it.each([
@@ -3311,17 +3527,18 @@ describe("create_pull_request - patch apply fallback to original base commit", (
     return false;
   }
 
-  it("should create the PR branch from the patch-embedded base commit when available", async () => {
+  it.each(["warn", "error", "ignore"])("should create the PR branch from the patch-embedded base commit with %s no-change policy", async ifNoChanges => {
     global.exec = {
       exec: vi.fn().mockResolvedValue(0),
       getExecOutput: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" }),
     };
 
     const { main } = require("./create_pull_request.cjs");
-    const handler = await main({});
+    const handler = await main({ if_no_changes: ifNoChanges });
     const result = await handler({ title: "Test PR", body: "Test body", branch: "test-branch", base_commit: `  ${MOCK_BASE_COMMIT_SHA}  ` }, {});
 
     expect(result.success).toBe(true);
+    expect(result.execution_trace).toBe("init_ptch_publ_capt_done");
     expect(global.exec.exec).toHaveBeenCalledWith("git", ["cat-file", "-e", MOCK_BASE_COMMIT_SHA]);
     const checkoutWithBaseCommit = global.exec.exec.mock.calls.find(([cmd, args]) => cmd === "git" && Array.isArray(args) && args[0] === "checkout" && args[1] === "-b" && args[3] === MOCK_BASE_COMMIT_SHA);
     expect(checkoutWithBaseCommit).toBeTruthy();
@@ -3407,6 +3624,7 @@ describe("create_pull_request - patch apply fallback to original base commit", (
 
     expect(result.success).toBe(true);
     // Should warn that the PR will show merge conflicts
+    expect(result.execution_trace).toBe("init_ptch_pfal_rply_publ_capt_done");
     expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("merge conflicts"));
   });
 
@@ -4046,6 +4264,52 @@ describe("create_pull_request - threat detection caution", () => {
     delete global.context;
     delete global.exec;
     vi.clearAllMocks();
+  });
+
+  it.each([
+    ["warning", "threat_detected", "[!CAUTION]"],
+    ["failure", "agent_failure", "[!WARNING]"],
+    ["failure", "parse_error", "[!WARNING]"],
+  ])("should disable auto-merge for detection %s / %s even after requesting reviewers", async (conclusion, reason, alert) => {
+    process.env.GH_AW_DETECTION_CONCLUSION = conclusion;
+    process.env.GH_AW_DETECTION_REASON = reason;
+    process.env.GH_AW_DETECTION_THREAT_KINDS = "prompt_injection,secret_leak,PRIVATE_TEXT";
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ allow_empty: true, auto_merge: true, draft: false, reviewers: ["human-reviewer"] });
+    const result = await handler({ title: "Test PR", body: "Agent body content" }, {});
+
+    expect(result.success).toBe(true);
+    expect(global.github.rest.pulls.create).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining(alert) }));
+    expect(global.github.rest.pulls.requestReviewers).toHaveBeenCalledWith(expect.objectContaining({ reviewers: ["human-reviewer"] }));
+    expect(global.github.rest.pulls.createReview).toHaveBeenCalledWith(expect.objectContaining({ event: "REQUEST_CHANGES", body: expect.stringContaining(reason) }));
+    for (const mock of [global.github.rest.pulls.create, global.github.rest.pulls.createReview]) {
+      const body = mock.mock.lastCall[0].body;
+      expect(body).not.toContain("PRIVATE_TEXT");
+      if (reason === "threat_detected") {
+        expect(body).toContain("Detected threat types: prompt injection, secret leak.");
+      } else {
+        expect(body).not.toContain("Detected threat types:");
+      }
+    }
+    expect(global.github.graphql).not.toHaveBeenCalledWith(expect.stringContaining("enablePullRequestAutoMerge"), expect.anything());
+    expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("Auto-merge is disabled"));
+  });
+
+  it.each(["Can not request changes on your own pull request", "Review permission denied"])("should keep auto-merge disabled when the detection review fails: %s", async errorMessage => {
+    process.env.GH_AW_DETECTION_CONCLUSION = "warning";
+    process.env.GH_AW_DETECTION_REASON = "threat_detected";
+    global.github.rest.pulls.createReview.mockRejectedValue(new Error(errorMessage));
+
+    const { main } = require("./create_pull_request.cjs");
+    const handler = await main({ allow_empty: true, auto_merge: true, draft: false });
+    const result = await handler({ title: "Test PR", body: "Agent body content" }, {});
+
+    expect(result.success).toBe(true);
+    expect(global.github.rest.pulls.createReview).toHaveBeenCalledTimes(1);
+    expect(global.github.rest.pulls.createReview).toHaveBeenCalledWith(expect.objectContaining({ event: "REQUEST_CHANGES" }));
+    expect(global.github.graphql).not.toHaveBeenCalledWith(expect.stringContaining("enablePullRequestAutoMerge"), expect.anything());
+    expect(global.core.warning).toHaveBeenCalledWith(expect.stringContaining("independent reviewer"));
   });
 
   it("should prepend caution alert at top of PR body when GH_AW_DETECTION_CONCLUSION is warning", async () => {
@@ -4903,6 +5167,7 @@ describe("create_pull_request - E003 file-limit fallback-to-issue", () => {
     expect(global.github.rest.issues.create).toHaveBeenCalledTimes(1);
     expect(result.success).toBe(false);
     expect(result.error).toContain("SECURITY:");
+    expect(result.execution_trace).toBe("init_flim_fail");
   });
 
   it("should use the actual received file count (not maxFiles*2) as the suggested limit", async () => {
@@ -4949,6 +5214,7 @@ describe("create_pull_request - E003 file-limit fallback-to-issue", () => {
     // Staged mode: no API side effects, just a preview
     expect(result.success).toBe(true);
     expect(result.staged).toBe(true);
+    expect(result.execution_trace).toBe("init_flim_stag_done");
     expect(result.fallback_used).toBeUndefined();
     expect(global.github.rest.issues.create).not.toHaveBeenCalled();
     expect(global.github.rest.pulls.create).not.toHaveBeenCalled();

@@ -28,7 +28,7 @@ concurrency:
 
 runs-on: windows-latest
 
-model: copilot/gpt-5.6-terra
+model: copilot/gpt-6-luna
 engine:
   id: codex
   model-provider: github
@@ -51,7 +51,7 @@ safe-outputs:
     title-prefix: "[windows] "
     labels: [automation, ai-generated]
     max: 1
-  missing-tool:
+  report-missing-tool:
 
 timeout-minutes: 10
 strict: true

@@ -1,5 +1,6 @@
 """Documentation contract regressions, not an LLM or live workflow evaluation."""
 
+import hashlib
 import json
 from pathlib import Path
 import posixpath
@@ -26,6 +27,15 @@ def heading_anchor(heading):
     return re.sub(r"[^\w -]", "", heading.lower()).replace(" ", "-")
 
 
+def normalized(text):
+    return " ".join(text.split())
+
+
+def has_dreaming_implementation_heading(text):
+    headings = re.findall(r"^#{1,6}\s+(.+?)\s*#*\s*$", text, re.MULTILINE)
+    return any(heading.strip().lower() == "write the dreaming prompt" for heading in headings)
+
+
 def checklist(text):
     if "## Model and engine misconfiguration\n" not in text:
         return text
@@ -33,6 +43,508 @@ def checklist(text):
 
 
 class GuidanceTests(unittest.TestCase):
+    def test_agentic_engine_selection_routes_survive_prefix_reads(self):
+        for name in (
+            "create-agentic-workflow.md", "designer.md",
+            "update-agentic-workflow.md", "custom-declarative-agentic-engine.md",
+            "syntax-engine.md",
+        ):
+            guide = ROOT / ".github/aw" / name
+            with self.subTest(guide=name):
+                self.assertIn("](agentic-engine.md)", guide.read_bytes()[:7500].decode("utf-8"))
+        for guide in (
+            ROOT / ".github/skills/agentic-workflows/SKILL.md",
+            ROOT / "pkg/cli/data/agentic_workflows_skill.md",
+        ):
+            with self.subTest(guide=guide):
+                self.assertIn(".github/aw/agentic-engine.md", guide.read_bytes()[:7500].decode("utf-8"))
+        skill = ROOT / ".github/skills/agentic-engine/SKILL.md"
+        self.assertIn("](../../aw/agentic-engine.md)", skill.read_text())
+
+    def test_agentic_engine_selection_contract(self):
+        guide = ROOT / ".github/aw/agentic-engine.md"
+        prefix, marker, _ = guide.read_bytes().partition(b"<!-- instruction-prefix-end -->")
+        self.assertTrue(marker)
+        self.assertLessEqual(len(prefix) + len(marker), 7500)
+        contract = normalized(prefix.decode("utf-8"))
+        for required in (
+            "`copilot`", "`claude`", "`codex`", "`pi`",
+            "repository-root `preferences.md`", "explicit, inferred, or Pi fallback",
+            "prefer confirmed choices to inference", "Prefer corroborated active usage",
+            "`AGENTS.md` and `.agents/skills/` as shared, not engine evidence",
+            "no clear preference applies and Pi meets all requirements",
+            "`engine: pi`", "Omission uses the compiler default",
+            "Preserve engine and inference on unrelated updates",
+            "Do not execute scripts, install tools",
+            "Never weaken required security controls", "Store no credentials",
+            "For recommendations, propose a preference entry without writing",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, contract)
+
+    def test_inference_selection_contract_survives_prefix_reads(self):
+        guide = ROOT / ".github/aw/agentic-engine.md"
+        contract = normalized(guide.read_text().split("<!-- instruction-prefix-end -->")[0])
+        for required in (
+            "up to three similar repository-owned `.github/workflows/` sources",
+            "Distinguish explicit settings from inherited defaults",
+            "With no clearer choice, prefer GitHub Copilot inference",
+            "`permissions.copilot-requests: write`",
+            "organization-owned repo has centralized Copilot billing and Actions token access",
+            "Personal repos are ineligible",
+            "Otherwise omit the permission",
+            "if already authorized, list Actions secret names",
+            "Match documented provider names",
+            "never read or log values",
+            "mark availability unknown",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, contract)
+
+    def test_browser_decision_routes_survive_prefix_reads(self):
+        route = "playwright.md#browser-decision-and-readiness"
+        for name in (
+            "github-agentic-workflows.md", "create-agentic-workflow.md",
+            "designer.md", "update-agentic-workflow.md",
+            "create-agentic-workflow-validation.md", "debug-agentic-workflow.md",
+            "designer-mappings.md", "syntax-tools-imports.md", "visual-regression.md",
+        ):
+            guide = ROOT / ".github/aw" / name
+            data = guide.read_bytes()
+            contract = data.split(b"<!-- instruction-prefix-end -->", 1)[0]
+            with self.subTest(guide=name):
+                self.assertLessEqual(len(contract), 7500)
+                self.assertIn(route, data[:7500].decode("utf-8"))
+                for link in re.findall(r"\]\(([^)]+)\)", contract.decode("utf-8")):
+                    if link.startswith("https://"):
+                        continue
+                    path, _, anchor = link.partition("#")
+                    target = guide.parent / path if path else guide
+                    self.assertTrue(target.is_file(), link)
+                    if anchor:
+                        headings = re.findall(r"^#{1,6} (.+)$", target.read_text(), re.MULTILINE)
+                        self.assertIn(anchor, [heading_anchor(heading) for heading in headings], link)
+
+    def test_browser_decision_covers_rendered_and_static_only_work(self):
+        guide = ROOT / ".github/aw/playwright.md"
+        contract = normalized(guide.read_text().split("<!-- instruction-prefix-end -->", 1)[0])
+        for required in (
+            "Rendered pages", "JavaScript interactions", "UI/navigation flows",
+            "screenshots", "browser-based accessibility/E2E checks",
+            "Source-only edits/reviews", "API checks", "plain-text documentation retrieval",
+            "Do not add a browser", 'not just the word "browser"',
+            "compiler provisions CLI, skills, and Chromium",
+            "never install during agent execution", "Same-sandbox loopback needs no `local`",
+            "startup, directory creation, bounded `curl` readiness, and PID cleanup",
+            "trailing", "normalized away", "exact full-command",
+            "Never use unrestricted Bash", "asynchronous shell mode",
+            "artifact publication", "required browser checks failed",
+            "mounted upload staging directory", "staging-relative `allowed-paths`",
+            "No-dispatch requests prohibit hosted execution, not explicitly authorized local work",
+            "grants no execution or live-test authorization",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, contract)
+
+    def test_browser_network_mappings_do_not_require_local_ecosystem(self):
+        mappings = (ROOT / ".github/aw/designer-mappings.md").read_text()
+        syntax = (ROOT / ".github/aw/syntax-tools-imports.md").read_text()
+        visual = (ROOT / ".github/aw/visual-regression.md").read_text()
+        self.assertIn("loopback is available by default; do not add `local`", mappings)
+        self.assertIn("retrieve plain-text web pages/docs", mappings)
+        self.assertIn("inspect rendered pages, test UI flows, or capture screenshots", mappings)
+        self.assertNotIn("restrict network to `local` + `playwright`", syntax)
+        self.assertNotIn("    - local\n", visual)
+        self.assertIn("does not supply that application lifecycle", normalized(visual))
+
+    def test_split_creator_routes_resolve_without_hidden_tail_reads(self):
+        creator = ROOT / ".github/aw/create-agentic-workflow.md"
+        topics = (
+            "create-agentic-workflow-design.md",
+            "create-agentic-workflow-validation.md",
+            "create-agentic-workflow-evaluation.md",
+        )
+        prefix = creator.read_bytes()[:8000].decode("utf-8")
+        for topic in topics:
+            with self.subTest(topic=topic):
+                self.assertIn(f"]({topic})", prefix)
+                self.assertLessEqual(len((creator.parent / topic).read_bytes()), 7500)
+        for source in (creator, *(creator.parent / topic for topic in topics)):
+            for link in re.findall(r"\]\(([^)]+)\)", source.read_text()):
+                if link.startswith("https://"):
+                    continue
+                path, _, anchor = link.partition("#")
+                target = source.parent / path if path else source
+                with self.subTest(source=source.name, link=link):
+                    self.assertTrue(target.is_file())
+                    if anchor:
+                        headings = re.findall(r"^#{1,6} (.+)$", target.read_text(), re.MULTILINE)
+                        self.assertIn(anchor, [heading_anchor(heading) for heading in headings])
+
+    def test_creator_requires_references_and_distinguishes_incomplete_from_noop(self):
+        creator = (ROOT / ".github/aw/create-agentic-workflow.md").read_text()
+        required_reads = creator.split("## Load These References First\n", 1)[1].split(
+            "\n## Modes\n", 1
+        )[0]
+        paths = (
+            "intent.md", "github-agentic-workflows.md", "workflow-editing.md",
+            "workflow-constraints.md", "workflow-patterns.md", "safe-outputs.md",
+            "syntax.md", "mcp-clis.md",
+        )
+        for earlier, later in zip(paths, paths[1:]):
+            with self.subTest(earlier=earlier, later=later):
+                self.assertLess(required_reads.index(earlier), required_reads.index(later))
+        self.assertIn("stop and report its path", required_reads)
+        self.assertIn("`report_incomplete`", required_reads)
+        self.assertIn("reserve `noop`", required_reads)
+
+    def test_persona_evaluator_excludes_ambient_guidance_or_marks_contamination(self):
+        workflow = (ROOT / ".github/workflows/agent-persona-explorer.md").read_text()
+        probe = workflow.split("### Paired prefix probe\n", 1)[1].split(
+            "\n## Phase 4:", 1
+        )[0]
+        evaluator = workflow.split("## agent: `persona-evaluator`\n", 1)[1]
+        for label, source in (("probe", probe), ("evaluator", evaluator)):
+            with self.subTest(source=label):
+                self.assertIn("ambient", source)
+                self.assertIn("AGENTS.md", source)
+                self.assertIn("skill inventories", source)
+                self.assertIn("contaminated", source)
+
+    def test_execution_routes_and_completion_survive_prefix_only_reads(self):
+        contracts = {
+            "AGENTS.md": ("make agent-report-progress", "make recompile", "pkg/logger", "prompt-token-efficiency"),
+            ".github/aw/github-agentic-workflows.md": ("syntax.md", "safe-outputs.md", "gh aw compile", "squad.md"),
+            ".github/aw/create-agentic-workflow.md": (
+                "read-only", "create-agentic-workflow-design.md", "create-agentic-workflow-validation.md",
+                "gh aw compile <workflow-id>", "noop", "Default:",
+            ),
+            ".github/aw/debug-agentic-workflow.md": (
+                "Non-dry-run dispatch remains prohibited", "before execution or upload",
+                "debug-security-review.md", "Report mode", "#collect-existing-evidence",
+            ),
+            ".github/skills/agentic-workflows/SKILL.md": (
+                "Create a new connector:", ".github/aw/squad.md",
+                "tools.work-queue", "Token acquisition/refresh",
+            ),
+        }
+        for name, required in contracts.items():
+            data = (ROOT / name).read_bytes()
+            prefix = data[:7500].decode("utf-8", errors="ignore")
+            for rule in required:
+                with self.subTest(path=name, rule=rule):
+                    self.assertIn(rule, prefix)
+
+    def test_connector_creation_routes_to_spec_and_skill(self):
+        skill = ROOT / ".github/skills/create-connector/SKILL.md"
+        spec = ROOT / "docs/src/content/docs/specs/connector-specification.md"
+        guide = ROOT / ".github/aw/connectors.md"
+        self.assertTrue(spec.is_file())
+        text = skill.read_text()
+        self.assertIn("name: create-connector", text)
+        for boundary in (
+            "Importing alone must select nothing",
+            "secret NAMES",
+            "An agent-phase test DOES contact the provider",
+            "explicit effect scope",
+        ):
+            with self.subTest(boundary=boundary):
+                self.assertIn(boundary.lower(), text.lower())
+        self.assertIn("../skills/create-connector/SKILL.md", guide.read_text())
+        for router in (SKILL / "SKILL.md", ROOT / "pkg/cli/data/agentic_workflows_skill.md"):
+            with self.subTest(router=router):
+                self.assertIn("Create a new connector:", router.read_text())
+                self.assertIn(".github/skills/create-connector/SKILL.md", router.read_text())
+        for link in re.findall(r"\]\(([^)]+)\)", text):
+            with self.subTest(link=link):
+                path, _, anchor = link.partition("#")
+                target = skill.parent / path
+                self.assertTrue(target.is_file())
+                if anchor:
+                    headings = re.findall(r"^#{1,6} (.+)$", target.read_text(), re.MULTILINE)
+                    self.assertIn(anchor, [heading_anchor(heading) for heading in headings])
+        spec_text = spec.read_text()
+        for contract in (
+            "There is no public connector `context`",
+            "github.com/gh-aw/connectors/v1",
+            "Importing a declaration selects nothing",
+            "experimental",
+            "responseResourceInputs",
+            "operational: false",
+            "synthetic contract",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, spec_text)
+
+    def test_ad_hoc_recommendations_name_defaults_and_bound_targets(self):
+        creator = normalized((ROOT / ".github/aw/create-agentic-workflow.md").read_text())
+        self.assertIn("For each material undefined term, propose and clearly label a reasonable `Default:`", creator)
+        for contract in (
+            "Verify config files named in the request",
+            "if missing, do not guess; use `report_incomplete` if their absence prevents meaningful work",
+            "what “adds” covers",
+            "lockfile scope",
+            "zero-item behavior",
+            "in the proposed prompt, not only notes",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, creator)
+
+        safe_outputs = normalized((ROOT / ".github/aw/safe-outputs-content.md").read_text())
+        self.assertIn('Avoid `target: "*"` when a workflow needs to act on the triggering issue/PR and one known tracker', safe_outputs)
+        self.assertIn('`target: "triggering"`', safe_outputs)
+        self.assertIn("tracker's explicit issue/PR number", safe_outputs)
+
+        triggers = normalized((ROOT / ".github/aw/create-agentic-workflow-trigger-details.md").read_text())
+        self.assertIn("`opened` and process that event only when `github.event.issue.milestone != null`", triggers)
+        self.assertIn("events-that-trigger-workflows#issues", triggers)
+
+    def test_pr_policy_checks_use_trusted_policy_sources(self):
+        triggers = normalized((ROOT / ".github/aw/triggers.md").read_text())
+        self.assertIn(
+            "read the policy from the default branch or a CODEOWNERS-protected path, never the PR head",
+            triggers,
+        )
+
+    def test_workflow_guidance_covers_deterministic_checks_outputs_and_pr_diffs(self):
+        patterns = normalized((ROOT / ".github/aw/workflow-patterns.md").read_text())
+        self.assertIn("Prefer `steps:` for fixed checks such as status probes, deterministic diffs, or policy tests", patterns)
+
+        safe_outputs = normalized((ROOT / ".github/aw/safe-outputs.md").read_text())
+        self.assertIn("Set `max` explicitly for `create-issue` and `add-comment`", safe_outputs)
+        self.assertIn("state the reason in the workflow instructions", safe_outputs)
+
+        triggers = normalized((ROOT / ".github/aw/triggers.md").read_text())
+        for contract in ("`previous_filename`", "`fetch-depth: 0`", "three-dot diff"):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, triggers)
+
+    def test_local_sdlc_routes_to_squad_alongside_workflow_creation(self):
+        for path, workflow_route in (
+            (".github/skills/agentic-workflows/SKILL.md", "- Design workflows from scratch"),
+            ("pkg/cli/data/agentic_workflows_skill.md", "- Design workflows from scratch"),
+            (".github/agents/agentic-workflows.md", "- **Creating new workflows**"),
+            ("pkg/cli/data/agentic_workflows_agent.md", "- **Creating new workflows**"),
+        ):
+            content = (ROOT / path).read_text()
+            route = next(line for line in content.splitlines() if line.startswith("- ") and "Local SDLC issue bootstrap" in line)
+            with self.subTest(router=path):
+                self.assertIn(".github/aw/squad.md", route)
+                self.assertLessEqual(len(route.split()), 12)
+                self.assertIn(workflow_route, content)
+
+    def test_agent_lists_squad_after_workflow_routes(self):
+        for path in (".github/agents/agentic-workflows.md", "pkg/cli/data/agentic_workflows_agent.md"):
+            content = (ROOT / path).read_text()
+            section = content.split("## What This Agent Does\n", 1)[1].split("\nWorkflows may optionally include:", 1)[0]
+            routes = [line for line in section.splitlines() if line.startswith("- ")]
+            with self.subTest(agent=path):
+                self.assertTrue(routes[0].startswith("- **Creating new workflows**"))
+                self.assertTrue(routes[-1].startswith("- **Local SDLC issue bootstrap"))
+
+    def test_squad_is_discoverable_from_instructions_and_pattern_router(self):
+        for path in (
+            ".github/aw/instructions.md",
+            ".github/aw/github-agentic-workflows.md",
+            ".github/aw/patterns.md",
+        ):
+            content = normalized((ROOT / path).read_text())
+            with self.subTest(instructions=path):
+                self.assertIn("squad.md", content)
+                self.assertIn("local", content.lower())
+        fallback = json.loads((ROOT / "pkg/cli/data/agentic_workflows_fallback_aw_files.json").read_text())
+        self.assertIn("squad.md", fallback)
+        skill = (SKILL / "SKILL.md").read_text()
+        self.assertIn("- `.github/aw/squad.md`", skill)
+
+    def test_squad_bootstrap_prompt_is_verbatim(self):
+        guide = (ROOT / ".github/aw/squad.md").read_bytes()
+        block = guide.split(b"```text\n", 1)[1].split(b"\n```", 1)[0]
+        self.assertEqual(
+            hashlib.sha256(block).hexdigest(),
+            "3a59b74939616d97b41ebb161fe302a2f329de031efd9422aabc829374407f11",
+        )
+
+    def test_squad_bootstrap_requires_local_intent_and_preserves_existing_teams(self):
+        guide = normalized((ROOT / ".github/aw/squad.md").read_text().split("```text", 1)[0])
+        for required in (
+            "Substantial work or a mention of Squad alone is not enough",
+            "Keep explicit GitHub Actions automation requests on the workflow routes",
+            "establish local SDLC intent before including setup authorization",
+            "If Squad is already initialized, use the existing team",
+            "unless the user explicitly requests reinitialization",
+            "for a coding agent",
+            "Copy the entire `<details>` section from the code block verbatim",
+            "do not paraphrase, customize, or execute the prompt while preparing the issue",
+        ):
+            with self.subTest(guard=required):
+                self.assertIn(required, guide)
+
+    def test_creator_discovers_memory_reuse_before_selecting_persistence(self):
+        designer = (ROOT / ".github/aw/designer.md").read_text()
+        phase = designer.split("### Phase 4: Data Strategy\n", 1)[1].split("\n### Phase 5:", 1)[0]
+        phase = normalized(phase)
+        creator = (ROOT / ".github/aw/create-agentic-workflow.md").read_text()
+        design = (ROOT / ".github/aw/create-agentic-workflow-design.md").read_text()
+        self.assertLess(phase.index("#### Memory reuse checkpoint"), phase.index("Ask:"))
+        self.assertIn("](memory.md#scheduled-dreaming)", phase)
+        for required in (
+            "Before choosing tools or persistence",
+            "repeated investigations",
+            "growing history or recall cost",
+            "stale/contradictory advice",
+            "even when the user does not mention memory or dreaming",
+            "loading the guide does not mean adding a dreamer",
+            "That guide owns the deterministic-first decision, cost gate, and input-scope checks",
+            "Apply its decision before loading implementation guidance",
+        ):
+            with self.subTest(checkpoint=required):
+                self.assertIn(required, phase)
+        route = "](designer.md#memory-reuse-checkpoint)"
+        self.assertIn(route, creator)
+        self.assertLess(design.index(route), design.index("### 4. Select tools"))
+        self.assertIn("even without an explicit memory or dreaming request", creator)
+        memory = (ROOT / ".github/aw/memory.md").read_text()
+        self.assertIn("A recurring schedule or a growing note count alone is not enough", normalized(memory))
+
+    def test_dreaming_selection_prefers_deterministic_existing_work(self):
+        memory = (ROOT / ".github/aw/memory.md").read_text()
+        section = memory.split("## Scheduled dreaming\n", 1)[1].split("\n## ", 1)[0]
+        section = normalized(section)
+        self.assertLess(section.index("Deterministic cleanup in the existing workflow"), section.index("Bounded review by the already-running agent"))
+        self.assertLess(section.index("Bounded review by the already-running agent"), section.index("A separate dreamer"))
+        for required in (
+            "Use the cheapest sufficient option, in this order",
+            "no model invocation",
+            "already-running agent; no additional workflow",
+            "primary evidence",
+            "later consumer",
+            "extra workflow, model invocation, and maintenance",
+            "Compare total cost",
+            "quick design decision, not a separate investigation",
+            "defer the dreamer",
+            "one-off task",
+            "small, current, and cheap to use",
+            "does not verify the new assertion's meaning",
+            "Never prune canonical ledger evidence or producer task state",
+            "If the benefit is uncertain, do not add the dreamer",
+        ):
+            with self.subTest(cost_gate=required):
+                self.assertIn(required, section)
+        dreaming = normalized((ROOT / ".github/aw/dreaming.md").read_text())
+        self.assertIn("post-agent `noop` does not avoid the model invocation cost", dreaming)
+
+    def test_dreaming_is_discoverable_and_uses_current_memory_contracts(self):
+        memory = (ROOT / ".github/aw/memory.md").read_text()
+        section = normalized(memory.split("## Scheduled dreaming\n", 1)[1].split("\n## ", 1)[0])
+        dreaming = normalized((ROOT / ".github/aw/dreaming.md").read_text())
+        creator = normalized((ROOT / ".github/aw/create-agentic-workflow.md").read_text())
+        self.assertIn("](memory.md#scheduled-dreaming)", creator)
+        self.assertIn("](dreaming.md)", creator)
+        self.assertIn("only after the [memory decision and input-scope checks](memory.md#scheduled-dreaming)", creator)
+        self.assertIn("](dreaming.md)", section)
+        self.assertIn("Do not load implementation details", section)
+        self.assertIn("](memory.md#scheduled-dreaming)", dreaming)
+        self.assertIn("Load this guide only after", dreaming)
+        for implementation in ("```yaml", "max-patch-size", "ledger_note_add"):
+            self.assertNotIn(implementation, section)
+        self.assertFalse(has_dreaming_implementation_heading(section))
+        for heading in ("## Write the Dreaming Prompt", "### Write the dreaming prompt"):
+            with self.subTest(heading=heading):
+                self.assertTrue(has_dreaming_implementation_heading(heading))
+        for router in (SKILL / "SKILL.md", ROOT / "pkg/cli/data/agentic_workflows_skill.md"):
+            routing = router.read_text()
+            self.assertIn(".github/aw/memory.md#scheduled-dreaming", routing)
+            self.assertIn(".github/aw/dreaming.md` only when the decision and input scope justify implementation", routing)
+        fallback = json.loads((ROOT / "pkg/cli/data/agentic_workflows_fallback_aw_files.json").read_text())
+        self.assertIn("dreaming.md", fallback)
+        for required in (
+            "filters **persistence**, not reads",
+            "logical record IDs",
+            "ledger_note_add",
+            "ledger_note_vote",
+            "mode=ro",
+            "not durable success",
+            "not atomic",
+            "Omission or local deletion does not remove",
+            "explicit authorization",
+            "consumer",
+        ):
+            with self.subTest(contract=required):
+                self.assertIn(normalized(required), dreaming)
+        for guidance in (section, dreaming):
+            for link in re.findall(r"\]\(([^)]+)\)", guidance):
+                if not link.startswith("https://"):
+                    path, _, anchor = link.partition("#")
+                    target = (ROOT / ".github/aw") / path
+                    with self.subTest(link=link):
+                        self.assertTrue(target.is_file())
+                        if anchor:
+                            headings = re.findall(r"^#{1,6} (.+)$", target.read_text(), re.MULTILINE)
+                            self.assertIn(anchor, [heading_anchor(heading) for heading in headings])
+
+    def test_dreaming_cache_scope_is_owned_by_memory_guide(self):
+        memory = (ROOT / ".github/aw/memory.md").read_text()
+        section = normalized(memory.split("## Scheduled dreaming\n", 1)[1].split("\n## ", 1)[0])
+        for required in (
+            "scheduled and manual dreamer runs must use the repository's actual default branch",
+            "default-branch history only, not PR-local caches",
+            "PR merge-ref run may restore an eligible default-branch cache",
+            "updates do not flow back to the default branch",
+            "Keep PR-local cleanup inside the PR workflow",
+            "default keys are workflow-scoped",
+            "`scope: repo` broadens eligible restore keys, not GitHub's branch visibility",
+            "Do not silently export PR content into shared memory",
+        ):
+            with self.subTest(scope=required):
+                self.assertIn(required, section)
+        for path in (".github/aw/designer.md", ".github/aw/create-agentic-workflow.md", ".github/aw/dreaming.md"):
+            guidance = normalized((ROOT / path).read_text())
+            with self.subTest(router=path):
+                self.assertIn("](memory.md#scheduled-dreaming)", guidance)
+                self.assertNotIn("not PR-local caches", guidance)
+                self.assertNotIn("actual default branch", guidance)
+                self.assertNotIn("Try deterministic cleanup first", guidance)
+                self.assertNotIn("Choose dreaming only", guidance)
+        reference = " ".join((ROOT / "docs/src/content/docs/reference/cache-memory.md").read_text().split())
+        self.assertIn("cannot restore those PR-local caches, even with the same key or `scope: repo`", reference)
+        self.assertIn("updates do not flow back to the default branch", reference)
+
+    def test_dreaming_and_producer_have_disjoint_persistence_ownership(self):
+        producer = (ROOT / ".github/workflows/daily-safeoutputs-git-simulator.md").read_text()
+        dreamer = (ROOT / ".github/workflows/weekly-git-simulator-dreaming.md").read_text()
+        producer_files = json.loads(re.search(r"file-glob: (\[.*\])", producer).group(1))
+        dreaming_files = json.loads(re.search(r"file-glob: (\[.*\])", dreamer).group(1))
+        self.assertEqual(producer_files, ["git-sim-state.json", "git-sim-strategies.md"])
+        self.assertEqual(dreaming_files, ["dreaming-index.md", "dreaming-lessons.md", "dreaming-review.json"])
+        self.assertFalse(set(producer_files) & set(dreaming_files))
+        for guide in (producer, dreamer):
+            self.assertIn("branch-name: memory/git-simulator", guide)
+        self.assertIn("git-simulator-lessons: type: notes max-record-kb: 4 max-patch-kb: 16", normalized(dreamer))
+        self.assertIn("mode=ro", dreamer)
+        self.assertNotIn("\n  ledger:", producer)
+        self.assertIn("schedule: weekly", dreamer)
+        self.assertIn("cancel-in-progress: false", dreamer)
+        self.assertIn("allowed: []", dreamer)
+        self.assertIn("max-patch-size: 65536", dreamer)
+        self.assertIn("this workflow never persists changes to them", normalized(producer))
+        self.assertIn("alter `next_index` or tested cells", " ".join(producer.split()))
+        self.assertIn("without creating an empty view or ledger operations", normalized(dreamer))
+
+    def test_dreaming_workflow_declares_memory_limits_and_validation(self):
+        dreamer = (ROOT / ".github/workflows/weekly-git-simulator-dreaming.md").read_text()
+        for declaration in ("max-file-size: 16384", "max-file-count: 3", "max-patch-size: 65536", "validation: script: |"):
+            with self.subTest(declaration=declaration):
+                self.assertIn(declaration, normalized(dreamer))
+
+    def test_daily_simulator_has_no_ledger_mutation_handlers(self):
+        source = (ROOT / ".github/workflows/daily-safeoutputs-git-simulator.md").read_text()
+        lock = (ROOT / ".github/workflows/daily-safeoutputs-git-simulator.lock.yml").read_text()
+        self.assertNotIn("\n  ledger:", source)
+        for operation in ("ledger_note_add", "ledger_note_vote", "ledger_request_compaction"):
+            with self.subTest(operation=operation):
+                self.assertNotIn(operation, lock)
+
     def test_persona_intents_have_explicit_routes_before_cli_setup(self):
         guide = BOOTSTRAP.read_text()
         index = SCENARIOS.read_text()
@@ -147,6 +659,25 @@ class GuidanceTests(unittest.TestCase):
             self.assertIn(required, guide)
         self.assertNotIn("Dispatch timeout/no run ID |", DEBUG_GUIDE.read_text())
 
+    def test_unmodified_default_branch_runs_do_not_require_dry_run(self):
+        guide = normalized(LIVE_TESTING.read_text().split(
+            "## Run an Unmodified Default-Branch Workflow\n", 1
+        )[1].split("\n## ", 1)[0])
+        for required in (
+            "user explicitly requests",
+            "**dry-run is not required** if the workflow is unmodified",
+            "Do not recompile",
+            "actual default branch",
+            "Review the published source, generated lock, imports and pins",
+            "[Live Debug Loop](#live-debug-loop)",
+            "gh aw run WORKFLOW --ref DEFAULT_BRANCH",
+            "verifying the resulting run SHA",
+            "does not override stricter host or repository restrictions",
+            "Any workflow change returns to the branch preparation and review gates",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, guide)
+
     def test_cli_mapping_uses_capabilities_not_client_assumptions(self):
         commands = (ROOT / ".github/aw/cli-commands.md").read_text()
         mapping = commands.split("## CLI vs MCP Tool", 1)[1].split("## Command Reference", 1)[0]
@@ -162,11 +693,16 @@ class GuidanceTests(unittest.TestCase):
         commands = (ROOT / ".github/aw/cli-commands.md").read_text()
         compile_section = commands.split("### `gh aw compile`\n", 1)[1].split("\n---", 1)[0]
         run_section = commands.split("### `gh aw run`\n", 1)[1].split("\n---", 1)[0]
-        self.assertIn("](debug-compilation.md)", compile_section)
-        self.assertNotIn("warnings are errors", compile_section)
-        self.assertIn("Low-severity/informational notices are not blanket failures", compile_section)
-        self.assertIn("debug-security-review.md#session-authorization", run_section)
-        self.assertIn("without repeated human approval", run_section)
+        contract = commands.split("<!-- instruction-prefix-end -->", 1)[0]
+        compile_rules = contract.split("### `gh aw compile` rules\n", 1)[1]
+        run_rules = contract.split("### `gh aw run` rules\n", 1)[1].split("\n### ", 1)[0]
+        self.assertIn("](#gh-aw-compile-rules)", compile_section)
+        self.assertIn("](#gh-aw-run-rules)", run_section)
+        self.assertIn("](debug-compilation.md)", compile_rules)
+        self.assertNotIn("warnings are errors", compile_rules)
+        self.assertIn("Low-severity/informational notices are not blanket failures", compile_rules)
+        self.assertIn("debug-security-review.md#session-authorization", run_rules)
+        self.assertIn("without repeated human approval", run_rules)
         self.assertIn("--ref REVIEWED_REF", run_section)
         self.assertNotIn("--ref main", run_section)
         evidence_section = EVIDENCE_GUIDE.read_text().split("### Diagnostic and Development Compilation\n", 1)[1].split("\n## ", 1)[0]
@@ -769,6 +1305,18 @@ class GuidanceTests(unittest.TestCase):
         self.assertIn("including its fragment", start)
         self.assertNotIn('gh aw audit "$RUN_ID"', start)
 
+    def test_debug_playbook_preserves_policy_and_tool_scope_guidance(self):
+        guide = (ROOT / ".github/aw/debug-playbook.md").read_text()
+        self.assertIn("advisory/pending/skipped/policy-denied", guide)
+        rows = {
+            line.split("|")[1].strip(): line
+            for line in guide.splitlines() if line.startswith("|")
+        }
+        self.assertIn("Fix tool/config/auth; retain permission scope.", rows["`tool_error`"])
+        self.assertIn("Fix tool/server/config/auth; retain permission scope.",
+                      rows["`mcp_server_failures`, `tools_not_available`"])
+        self.assertIn("provider policy", rows["`subagent_model_unavailable`"])
+
     def test_diagnostic_routing_mini_eval_contract(self):
         guide = (ROOT / ".github/aw/debug-playbook.md").read_text()
         for case in FIXTURES["diagnostic_routing"]:
@@ -812,7 +1360,7 @@ class GuidanceTests(unittest.TestCase):
             for pattern in code_patterns:
                 for code in set(re.findall(pattern, path.read_text())):
                     with self.subTest(path=path.name, code=code):
-                        self.assertTrue(code in rows, f"{code} needs an evidence/remedy row")
+                        self.assertTrue(code in rows, f"{code} needs an evidence/remedy row in .github/aw/debug-playbook.md")
         registries = (
             ("pkg/cli/audit_finding_codes.go", r'AuditFindingCode = "([^"]+)"'),
             ("actions/setup/js/error_codes.cjs", r'const [A-Z_0-9]+ = "([^"]+)"'),
@@ -824,11 +1372,11 @@ class GuidanceTests(unittest.TestCase):
             for code in re.findall(pattern, (ROOT / name).read_text()):
                 if code != "missing_model_pricing_model_name":
                     with self.subTest(registry=name, code=code):
-                        self.assertTrue(code in rows, f"{code} needs an evidence/remedy row")
+                        self.assertTrue(code in rows, f"{code} needs an evidence/remedy row in .github/aw/debug-playbook.md")
         causes = (ROOT / "actions/setup/js/empty_output_outcome.cjs").read_text()
         for block in re.findall(r"const EMPTY_OUTPUT_(?:FAILURE_)?CAUSES = Object.freeze\(\{(.*?)\}\)", causes, re.S):
             for code in re.findall(r"^\s+([a-z_]+):", block, re.M):
-                self.assertTrue(code in rows, f"{code} needs an evidence/remedy row")
+                self.assertTrue(code in rows, f"{code} needs an evidence/remedy row in .github/aw/debug-playbook.md")
         self.assertIn("debug-playbook.md", DEBUG_GUIDE.read_text())
         for required in ("gh aw audit", "--no-baseline", "gh aw models", "--refresh-observed=false",
                          "Do not dispatch workflows", "first failing boundary", "Unmapped codes"):
@@ -921,10 +1469,36 @@ class GuidanceTests(unittest.TestCase):
         self.assertIn("policy/compliance", creator)
         self.assertIn("structurally", creator)
 
+    def test_ad_hoc_evaluation_uses_requirement_first_triggers_and_targeted_guidance(self):
+        creator = (ROOT / ".github/aw/create-agentic-workflow.md").read_text()
+        ad_hoc = creator.split("## Ad Hoc Evaluation Mode\n", 1)[1].split(
+            "\n### Invocation Surface", 1
+        )[0]
+        self.assertIn("relevant guidance sections", ad_hoc)
+        self.assertIn("[trigger decision matrix](triggers.md#decision-matrix)", ad_hoc)
+        self.assertIn(
+            "[least-privilege checklist](workflow-patterns.md#"
+            "least-privilege-for-review-only-and-comment-only-workflows)",
+            ad_hoc,
+        )
+        self.assertIn(
+            "recommend the trigger that satisfies the requirement first",
+            ad_hoc,
+        )
+        patterns = (ROOT / ".github/aw/workflow-patterns.md").read_text()
+        checklist = patterns.split(
+            "## Least Privilege for Review-Only and Comment-Only Workflows\n", 1
+        )[1].split("\n## ", 1)[0]
+        self.assertIn("Remove `edit` and other write-capable tools", checklist)
+        self.assertIn("use `safe-outputs.add-comment`", checklist)
+
     def test_persona_rotation_finishes_remaining_personas(self):
         explorer = (ROOT / ".github/workflows/agent-persona-explorer.md").read_text()
         self.assertIn("If 1 or 2 remain, select those before resetting", explorer)
         self.assertIn("If the updated list now contains all 9 personas, reset to an empty list", explorer)
+        labels = re.search(r"^    labels: (\[.*\])$", explorer.split("\n---", 1)[0], re.MULTILINE)
+        self.assertIsNotNone(labels)
+        self.assertTrue({"agent-research", "cookie"}.issubset(json.loads(labels.group(1))))
         self.assertNotIn("If fewer than 3 remain, reset", explorer)
 
     def test_security_reporting_omits_empty_findings_tables(self):

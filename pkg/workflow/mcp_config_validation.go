@@ -2,7 +2,7 @@
 //
 // # MCP Validation Entry Points
 //
-//   - ValidateMCPConfigs() - Orchestrates MCP validation for merged tools map entries
+//   - validateMCPConfigsWithWarnings() - Orchestrates MCP validation for merged tools map entries
 //   - ValidateToolsSection() - Validates built-in tool names in tools:
 //   - getRawMCPConfig() - Extracts raw MCP config fields and checks unknown properties
 //   - inferMCPType() - Infers MCP type (http/stdio) from present fields
@@ -31,7 +31,6 @@ var mcpValidationLog = logger.New("workflow:mcp_config_validation")
 // Custom MCP servers must be placed under mcp-servers: instead.
 var builtInToolNames = map[string]bool{
 	"github":            true,
-	"jira":              true,
 	"playwright":        true,
 	"agentic-workflows": true,
 	"cache-memory":      true,
@@ -44,7 +43,6 @@ var builtInToolNames = map[string]bool{
 	"edit":              true,
 	"web-fetch":         true,
 	"web-search":        true,
-	"linear":            true,
 	"safety-prompt":     true,
 	"timeout":           true,
 	"startup-timeout":   true,
@@ -58,14 +56,6 @@ var builtInToolNamesForError = func() string {
 	return strings.Join(names, ", ")
 }()
 
-// ValidateMCPConfigs validates all MCP configurations in the tools section using JSON schema.
-// It validates MCP server entries (from mcp-servers, merged into tools) but does not check
-// for unknown tool names — that is done earlier by ValidateToolsSection.
-func ValidateMCPConfigs(tools map[string]any) error {
-	_, err := validateMCPConfigsWithWarnings(tools)
-	return err
-}
-
 func validateMCPConfigsWithWarnings(tools map[string]any) ([]string, error) {
 	mcpValidationLog.Printf("Validating MCP configurations for %d tools", len(tools))
 	var warnings []string
@@ -77,7 +67,7 @@ func validateMCPConfigsWithWarnings(tools map[string]any) ([]string, error) {
 		toolConfig := tools[toolName]
 
 		// Skip built-in tools - they have their own schema validation
-		if builtInToolNames[toolName] && toolName != "linear" {
+		if builtInToolNames[toolName] {
 			compatibilityWarnings, err := builtinMCPExpressionDiagnostics(toolName, toolConfig)
 			if err != nil {
 				return nil, err

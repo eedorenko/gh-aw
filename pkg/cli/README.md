@@ -12,6 +12,8 @@ Besides Cobra entry points, the package also exposes reusable helpers for workfl
 
 All diagnostic output MUST go to `stderr` using `console` formatting helpers. Structured output (JSON, hashes, graphs) goes to `stdout`.
 
+`gh aw models --json` retains the deprecated `catalog` and `observed[].in_catalog` fields for compatibility. They always contain `[]` and `false`, respectively; no repository-owned pricing catalog or membership lookup is used. Use AWF model metadata for catalog information and `observed` for locally recorded model evidence. The console report lists aliases and observed models only.
+
 ## Command Groups
 
 | Command | Entry Point | Description |
@@ -62,7 +64,7 @@ All diagnostic output MUST go to `stderr` using `console` formatting helpers. St
 | `gh aw forecast` | `NewForecastCommand` | Forecast token usage and costs for agentic workflows |
 | `gh aw trial` | `NewTrialCommand` | Run trial workflow executions |
 | `gh aw deploy` | `NewDeployCommand` | Deploy agentic workflows to a target repository using a pull request |
-| `gh aw logs --outcomes` | `NewLogsCommand` | Check what happened to selected runs' safe outputs |
+| `gh aw logs --adoption` | `NewLogsCommand` | Check what happened to selected runs' safe outputs |
 | _No `gh aw deps` command_ | `deps_*.go` (internal utilities) | Dependency reporting/advisory helpers used by other commands |
 | `gh aw doctor` | `NewDoctorCommand` | Run diagnostics to verify CLI authentication and repository setup |
 | `gh aw version` | `versionCmd` (main.go) | Show version information |
@@ -91,6 +93,7 @@ The `cli` package is intentionally large and command-oriented. The tables below 
 | `ChecksConfig` | struct | Inputs for normalizing CI check state for a pull request. |
 | `ChecksResult` | struct | Normalized check-rollup result returned by `FetchChecksResult`. |
 | `OutcomesData` | struct | Structured outcomes report for JSON output. |
+| `IncompleteReport` | struct | Report that an agent could not finish because of an infrastructure or tool failure. |
 | `UpdateWorkflowsOptions` | struct | Options controlling `gh aw update` behavior for sourced workflows. |
 | `WorkflowStatus` | struct | Status view for a workflow, combining list metadata with latest run state. |
 | `MCPRegistryClient` | struct | Client for the MCP registry used by MCP subcommands. |
@@ -121,6 +124,7 @@ The `cli` package is intentionally large and command-oriented. The tables below 
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `NewAddCommand` | `func NewAddCommand(validateEngine func(string) error) *cobra.Command` | Constructs the `gh aw add` command. |
+| `NewAdvisoryCommand` | `func NewAdvisoryCommand() *cobra.Command` | Constructs the experimental local security advisory handoff commands. |
 | `AddWorkflows` | `func AddWorkflows(ctx context.Context, workflows []string, opts AddOptions) (*AddWorkflowsResult, error)` | Resolves and installs one or more workflows. |
 | `AddResolvedWorkflows` | `func AddResolvedWorkflows(ctx context.Context, workflowStrings []string, resolved *ResolvedWorkflows, opts AddOptions) (*AddWorkflowsResult, error)` | Installs workflows from a pre-resolved batch. |
 | `ResolveWorkflows` | `func ResolveWorkflows(ctx context.Context, workflows []string, verbose bool) (*ResolvedWorkflows, error)` | Parses workflow specs and fetches their source content. |
@@ -134,7 +138,6 @@ The `cli` package is intentionally large and command-oriented. The tables below 
 | `RunAuditDiff` | `func RunAuditDiff(ctx context.Context, baseRunID int64, compareRunIDs []int64, opts AuditOptions) error` | Diffs multiple audit reports. |
 | `DownloadWorkflowLogs` | `func DownloadWorkflowLogs(ctx context.Context, opts LogsDownloadOptions) error` | Downloads and parses workflow logs and artifacts. |
 | `NewHealthCommand` | `func NewHealthCommand() *cobra.Command` | Constructs the `gh aw health` command. |
-| `RunHealth` | `func RunHealth(config HealthConfig) error` | Computes workflow health metrics for one workflow or all workflows. |
 | `CalculateWorkflowHealth` | `func CalculateWorkflowHealth(workflowName string, runs []WorkflowRun, threshold float64) WorkflowHealth` | Calculates success-rate and trend metrics for one workflow. |
 | `CalculateHealthSummary` | `func CalculateHealthSummary(workflowHealths []WorkflowHealth, period string, threshold float64) HealthSummary` | Aggregates workflow health results. |
 | `NewChecksCommand` | `func NewChecksCommand() *cobra.Command` | Constructs the `gh aw checks` command. |
@@ -182,6 +185,15 @@ The `cli` package is intentionally large and command-oriented. The tables below 
 | `GetCurrentRepoSlug` | `func GetCurrentRepoSlug() (string, error)` | Returns the current repository slug. |
 | `GetVersion` | `func GetVersion() string` | Returns the CLI version string. |
 | `SetVersionInfo` | `func SetVersionInfo(v string)` | Sets the CLI version string at startup. |
+| `CheckAndPrepareDockerImagesWithDetachedDownloads` | `func(ctx context.Context, opts DockerImagesOptions) error` | Checks requested scanner images and starts bounded downloads where needed. |
+| `DryRunRequiredBoolFlags` | `func() []string` | Lists development-compile checks that cannot be disabled. |
+| `NewSkillCommand` | `func() *cobra.Command` | Constructs the skill command. |
+| `NewWorkCommandWithNativeDeliveryHost` | `func(host *workqueue.NativeDeliveryHost) *cobra.Command` | Constructs the protected native work command using a host-supplied delivery boundary. |
+| `NewConnectorsCommand` | `func() *cobra.Command` | Constructs commands for validating and inspecting connector definitions and hosting frozen plans. |
+| `NewConnectorCommand` | `func() *cobra.Command` | Constructs the id-first setup and local-test interface for AW Markdown connectors. |
+| `NewValueCommand` | `func() *cobra.Command` | Constructs the longitudinal value report command. |
+| `RetrieveEpisodeLogs` | `func(ctx context.Context, opts EpisodeRetrievalOptions) (LogsData, error)` | Collects canonical workflow-run members using compact artifacts and the standard log report builder. |
+| `ValidateDevelopmentCompileFlags` | `func(dev bool, flags map[string]bool) error` | Rejects explicit development-compile opt-outs while allowing omitted defaults. |
 
 ### Constants
 
@@ -194,7 +206,6 @@ The `cli` package is intentionally large and command-oriented. The tables below 
 | `CheckStateSuccess` | `CheckState` | `"success"` | Normalized CI state indicating all required checks passed. |
 | `CheckAndPrepareDockerImages` | `func(ctx context.Context, opts DockerImagesOptions) error` | Pre-pulls security-scanner Docker images |
 | `UpdateContainerPins` | `func(ctx context.Context, workflowDir string, verbose bool) (bool, error)` | Updates container image SHA pins in workflow files |
-| `CreatePRWithChanges` | `func(ctx context.Context, branchPrefix, commitMessage, prTitle, prBody string, verbose bool) (string, error)` | Creates a GitHub PR from uncommitted changes |
 | `AutoMergePullRequestsCreatedAfter` | `func(repoSlug string, createdAfter time.Time, verbose bool) error` | Auto-merges eligible PRs created after a given time |
 | `PreflightCheckForCreatePR` | `func(bool) error` | Validates prerequisites before creating a PR |
 | `DisableAllWorkflowsExcept` | `func(repoSlug string, exceptWorkflows []string, verbose bool) error` | Disables all workflows in a repo except the named ones |
@@ -252,6 +263,8 @@ The `cli` package exports many types used across its command implementations. Th
 | `CopilotCodingAgentDetector` | struct | Detector for Copilot coding-agent log patterns |
 | `CreatedItemReport` | struct | Report of an item created by a safe-output action (type, URL, number, repo) |
 | `CrossRunSummary` | struct | Summary of cross-run metrics across multiple workflow runs |
+| `DeliveredItem` | struct | One verified safe-output delivery with its identity and delivery evidence |
+| `DeliveryData` | struct | Delivery report for a workflow run, including items, coverage, errors, and retention |
 | `DependencyInfo` | struct | Metadata for a single dependency in `go.mod` or `package.json` |
 | `DependencyInfoWithIndirect` | struct | `DependencyInfo` extended with an `Indirect` flag |
 | `DevcontainerBuild` | struct | Build configuration section of `devcontainer.json` |
@@ -320,7 +333,7 @@ The `cli` package exports many types used across its command implementations. Th
 | `OverviewData` | struct | High-level overview data for a workflow run |
 | `OutcomeEvaluation` | struct | Evaluation state embedded in `OutcomeReport` (status, merge/close metadata) |
 | `OutcomeReport` | struct | Result of evaluating one safe output item — outcome, timing, human engagement, and objective value |
-| `OutcomeStatus` | string alias | Outcome classification: `accepted`, `rejected`, `ignored`, `pending`, `skipped`, `unknown`, `lifecycle`, `lifecycle_close`, `error` |
+| `OutcomeStatus` | string alias | Outcome classification: `accepted`, `rejected`, `ignored`, `pending`, `skipped`, `unknown`, `lifecycle`, `lifecycle_close`, `error`, `not_applicable` (`OutcomeStatusNotApplicable`) |
 | `OutcomeSummary` | struct | Aggregated outcome statistics across multiple safe output items |
 | `PRCheckRun` | struct | A single CI check run attached to a pull request |
 | `PRCommitStatus` | struct | A commit status context for a pull request |
@@ -343,6 +356,7 @@ The `cli` package exports many types used across its command implementations. Th
 | `RedactedDomainsLogSummary` | struct | Summarised redacted-domain log data |
 | `Release` | struct | A GitHub release entry |
 | `Remote` | struct | A Git remote |
+| `RetainedAdoptionData` | struct | Results and coverage from refreshing retained safe-output adoption records |
 | `RepoSpec` | struct | A parsed repository specifier (`owner/repo[@ref]`) |
 | `Repository` | struct | A GitHub repository |
 | `RuleHitStats` | struct | Statistics for a single AWF firewall rule |
@@ -393,7 +407,6 @@ The `cli` package exports many types used across its command implementations. Th
 | `WorkflowSpec` | struct | A fully resolved workflow specification with source metadata |
 | `WorkflowStats` | struct | Aggregate statistics for a workflow |
 | `LogMetrics` | type alias | Alias for `workflow.LogMetrics` — log parsing metrics |
-| `PostTransformFunc` | func type | A post-compilation transformation function |
 | `LogParser[T]` | generic func type | Generic log-parser function type parameterized on analysis result |
 | `ExperimentState` | struct | State stored in `experiments/*` git branches (counts and run history) |
 | `ExperimentRunRecord` | struct | A single workflow run record in experiment state history |
@@ -403,6 +416,15 @@ The `cli` package exports many types used across its command implementations. Th
 | `ForecastWorkflowResult` | struct | Per-workflow forecast result including Monte Carlo projections |
 | `ForecastMonteCarloSummary` | struct | Monte Carlo simulation summary (P10/P50/P90 confidence intervals) |
 | `ForecastEvaluation` | struct | Backtesting evaluation comparing forecast against actual runs |
+| `AdoptionErrorData` | struct | Identifies a run whose lifecycle evidence could not be evaluated; its coverage remains unavailable. |
+| `AuthorizationFinding` | struct | A policy verification finding with an optional workflow route and expected policy fingerprint. |
+| `AuthorizationPolicy` | struct | Versioned repository authorization policy binding eligible outputs to a literal authority. |
+| `AuthorizationPolicyResult` | struct | Verification result and policy fingerprints for a candidate commit. |
+| `AuthorizationRouteResult` | struct | A compiler-resolved authorization route and its observed binding. |
+| `AuthorizationWorkflowResult` | struct | Source, lock, import, and route evidence for one workflow in policy verification. |
+| `ContinuationRequestReport` | struct | Records a continuation request as intent, not as dispatch or successful continuation. |
+| `HealthContinuationRequestRun` | struct | Per-run continuation request count and evidence status in a health report. |
+| `HealthContinuationRequests` | struct | Aggregate continuation request counts, including unavailable run evidence. |
 
 ### Constants and Sentinel Errors
 
@@ -427,7 +449,7 @@ The `cli` package exports many types used across its command implementations. Th
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `ZizmorImage` | `"ghcr.io/zizmorcore/zizmor:1.31.1@sha256:42d409dbb851d4c5d35a058cf042b828bea1e3f2884378c526eb0974780e18d9"` | Default image for Zizmor security scanner. |
+| `ZizmorImage` | `"ghcr.io/zizmorcore/zizmor:1.33.1@sha256:ecd3ffe6158de1322e05a044ed43749bee12b1dccb7e1a7859bc6ac4b2a1c516"` | Default image for Zizmor security scanner. |
 | `PoutineImage` | `"ghcr.io/boostsecurityio/poutine:1.1.6@sha256:722a8e0999b583c1540fe2974e691032b2d9d21b9256a17965132b6bfd0081b0"` | Default image for Poutine supply-chain scanner. |
 | `ActionlintImage` | `"rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667"` | Default image for Actionlint workflow linter. |
 | `RunnerGuardImage` | `"ghcr.io/vigilant-llc/runner-guard:3.1.5@sha256:2df426ef96d21f1622e05b21329f26bd263fc46110609cefb6afe43457613ac0"` | Default image for Runner Guard sandbox. |
@@ -537,16 +559,6 @@ err := cli.AuditWorkflowRun(ctx, runID, cli.AuditOptions{
 })
 ```
 
-### Checking workflow health
-
-```go
-err := cli.RunHealth(cli.HealthConfig{
-    Pattern:   "*.md",
-    Threshold: 0.8,
-    Period:    "30d",
-})
-```
-
 ## Design Decisions
 
 - **File-per-feature decomposition**: Large feature domains (compile, audit, logs, run) are split into multiple files (`_command.go`, `_config.go`, `_helpers.go`, `_orchestrator.go`, etc.) to keep each file focused and under 300 lines.
@@ -558,6 +570,7 @@ err := cli.RunHealth(cli.HealthConfig{
 ## Dependencies
 
 **Internal**:
+- `github.com/github/gh-aw/pkg/lifecycle` — provider-independent safe-output delivery, adoption, and survival records and rules
 - `github.com/github/gh-aw/pkg/workflow` — workflow compilation and data types
 - `github.com/github/gh-aw/pkg/parser` — markdown frontmatter parsing
 - `github.com/github/gh-aw/pkg/console` — terminal output formatting
@@ -582,7 +595,7 @@ err := cli.RunHealth(cli.HealthConfig{
 - `github.com/github/gh-aw/pkg/syncutil` — thread-safe one-shot caching (used for repository slug lookup)
 - `github.com/github/gh-aw/pkg/github` — label-based objective value mapping for issue prioritization scoring
 - `github.com/github/gh-aw/pkg/intent` — intent attribution and resolution for mapping PRs and issues to labelled intent records
-- `github.com/github/gh-aw/pkg/modelsdev` — model pricing lookup backed by the public `models.dev` catalog
+- `github.com/github/gh-aw/pkg/modelsdev` — provider and model identifier normalization helpers
 - `github.com/github/gh-aw/pkg/setutil` — set operations backed by `map[K]struct{}`
 - `github.com/github/gh-aw/pkg/colorwriter` — color-profile-aware writers and ANSI degradation for terminal output
 - `github.com/github/gh-aw/pkg/ctxutil` — non-nil `context.Context` fallback for optional context options
@@ -763,10 +776,10 @@ This appendix is generated from the current non-test Go source files in this pac
 | `mcp_registry_types.go` | `const` | `ArgumentTypePositional` | `const ArgumentTypePositional = "positional"` | Argument type constants |
 | `mcp_registry_types.go` | `const` | `StatusActive` | `const StatusActive = "active"` | Status constants for server status |
 | `mcp_registry_types.go` | `const` | `StatusInactive` | `const StatusInactive = "inactive"` | Status constants for server status |
-| `docker_images.go` | `const` | `GrantImage` | `const GrantImage = "anchore/grant:v0.6.8@sha256:..."` | GrantImage is the pinned image used to run Grant license scanning. |
-| `docker_images.go` | `const` | `GrypeImage` | `const GrypeImage = "anchore/grype:v0.121.0@sha256:..."` | GrypeImage is the pinned image used to run Grype vulnerability scanning. |
+| `docker_images.go` | `const` | `GrantImage` | `const GrantImage = "anchore/grant:v0.7.1@sha256:..."` | GrantImage is the pinned image used to run Grant license scanning. |
+| `docker_images.go` | `const` | `GrypeImage` | `const GrypeImage = "anchore/grype:v0.121.3@sha256:..."` | GrypeImage is the pinned image used to run Grype vulnerability scanning. |
 | `docker_images.go` | `const` | `ShellcheckImage` | `const ShellcheckImage = "koalaman/shellcheck:v0.11.0@sha256:..."` | ShellcheckImage is the pinned image used for shellcheck validation. |
-| `docker_images.go` | `const` | `SyftImage` | `const SyftImage = "anchore/syft:v1.55.0@sha256:..."` | SyftImage is the pinned image used for Syft SBOM generation. |
+| `docker_images.go` | `const` | `SyftImage` | `const SyftImage = "anchore/syft:v1.57.1@sha256:..."` | SyftImage is the pinned image used for Syft SBOM generation. |
 | `docker_images.go` | `const` | `YamllintImage` | `const YamllintImage = "pipelinecomponents/yamllint:latest@sha256:..."` | YamllintImage is the pinned image used for yamllint checks. |
 | `flags.go` | `const` | `EngineFlagFilterUsage` | `const EngineFlagFilterUsage = "Filter logs by AI engine (...)"` | EngineFlagFilterUsage is the CLI help text for `--engine` log filtering. |
 | `flags.go` | `const` | `EngineFlagOverrideUsage` | `const EngineFlagOverrideUsage = "Override AI engine (...)"` | EngineFlagOverrideUsage is the CLI help text for `--engine-override`. |
@@ -820,7 +833,7 @@ This appendix is generated from the current non-test Go source files in this pac
 | `file_tracker.go` | `(*FileTracker).TrackModified` | `func (*FileTracker).TrackModified(filePath string)` | TrackModified adds a file to the modified files list and stores its original content |
 | `file_tracker.go` | `NewFileTracker` | `func NewFileTracker() *FileTracker` | NewFileTracker creates a new file tracker |
 | `firewall_log.go` | `(*FirewallAnalysis).AddMetrics` | `func (*FirewallAnalysis).AddMetrics(other LogAnalysis)` | AddMetrics adds metrics from another analysis |
-| `fix_codemods.go` | `(*GuidedError).Unwrap` | `func (*GuidedError).Unwrap() error` | Exported function or method declared in `fix_codemods.go`. |
+| `fix_codemods.go` | `(*GuidedError).Unwrap` | `func (*GuidedError).Unwrap() error` | Returns the underlying cause for error-chain inspection with `errors.Is` and `errors.As`. |
 | `fix_codemods.go` | `GetCodemods` | `func GetCodemods(disabledIDs []string) ([]Codemod, error)` | GetCodemods returns all codemods except any explicitly disabled by ID. |
 | `frontmatter_editor.go` | `RemoveTopLevelFieldFromFrontmatter` | `func RemoveTopLevelFieldFromFrontmatter(content, fieldName string) (string, error)` | RemoveTopLevelFieldFromFrontmatter removes a root-level frontmatter key while preserving YAML structure. |
 | `gateway_logs_timeline.go` | `BuildUnifiedTimeline` | `func BuildUnifiedTimeline(logDir string, verbose bool) ([]UnifiedTimelineEvent, error)` | BuildUnifiedTimeline collects all JSONL events from the MCP Gateway, the AWF firewall, the agent session, and the AWF API proxy in logDir, merges them into a single slice, and sorts the slice in ascending wall-clock ord… |
@@ -918,7 +931,7 @@ Method-form symbols on exported types (e.g. `(*FileTracker).TrackCreated`, `(*Do
 | `logs_multi.go` | `DownloadWorkflowLogsForTargets` | `func DownloadWorkflowLogsForTargets(ctx context.Context, opts LogsDownloadOptions, targets []logsWorkflowTarget, initialErrors []error) (err error)` | Downloads several workflow reports concurrently and renders one combined report, using an isolated output directory per target so run IDs from different repositories cannot collide in the local cache. |
 | `mcp_schema.go` | `GenerateNamedOutputSchema` | `func GenerateNamedOutputSchema(name string) ([]byte, error)` | Generates and serializes a known CLI output schema by name (e.g. `audit`). |
 | `mcp_schema.go` | `MarshalOutputSchema` | `func MarshalOutputSchema(schema *jsonschema.Schema) ([]byte, error)` | Serializes a generated output schema using the CLI's standard indented JSON format. |
-| `models_command.go` | `NewModelsCommand` | `func NewModelsCommand() *cobra.Command` | Creates the `models` command that lists model catalog pricing, aliases, and observed automation models. |
+| `models_command.go` | `NewModelsCommand` | `func NewModelsCommand() *cobra.Command` | Creates the `models` command that lists aliases and observed automation models. |
 
 ### Additional exported symbols (verified 2026-10-06)
 
@@ -938,9 +951,74 @@ Method-form symbols on exported types (e.g. `(*FileTracker).TrackCreated`, `(*Do
 
 Methods on unexported types (e.g. `cachedLogsJSONLWriter.Append*`, `githubGraderRunArtifactSource.Load`) are not part of the public API.
 
+### Additional exported report and analysis symbols
+
+| Area | Exported symbols | Description |
+|------|------------------|-------------|
+| Audit and detection | `AuditComparisonRoute`, `AuditComparisonRouteDelta`, `AuditDecision`, `AuditDecisionQuestion`, `AuditHarnessRoutingOutcome`, `AuditModelCatalog`, `AuditModelCatalogEndpoint`, `AuditCatalogModel`, `AuditRetrySummary`, `AuditEngineRetry`, `AuditRetryAttempt`, `AuditEvidenceSearch`, `AuditEvidenceMatch`, `AuditEvidenceExcerpt`, `AuditEvidenceRef`, `AuditEvidenceNativeRef`, `DetectionModelUsage`, `EvalsSummary`, `ObsoletePREvidence` | Structured audit comparisons, advisory decisions, model and retry observations, query-specific evidence, detection traffic, and PR lifecycle evidence. These records do not establish completeness, authorization, or root cause. |
+| Doctor and health | `DoctorAgentAssignmentCheck`, `DoctorAssignmentRunHistory`, `DoctorAssignmentRunEvidence`, `DoctorTokenValidation`, `DoctorReleaseCheck`, `DoctorCompiledWorkflowCheck`, `HealthApprovalEvidence`, `HealthCacheEvidence`, `HealthCollection`, `HealthDetectionFailure`, `HealthDurableRun`, `HealthDurableSessions`, `HealthPotentialIssue`, `HealthJobEvidence`, `HealthPRLifecycleEvidence`, `HealthRevisionCohort`, `HealthRevisionStatus`, `HealthSubagentFailure`, `HealthWorkQueue` | Bounded repository, run, cache, revision, durable-session, and work-queue observations used by doctor and health reports. |
+| Dry-run, durable sessions, and graders | `DryRunCompileReport`, `DryRunScannerCheck`, `DryRunScannerDifferential`, `DurableSessionReport`, `ValidationScriptLocation`, `RegradedRun`, `RegradeDefinition`, `RegradeOriginalEvidence`, `SecondaryMetricAnalysis`, `SecondaryMetricVariantAnalysis`, `OutcomeMetricCoverage`, `OutcomeWindowInfo` | Compilation and scanner-gate results, validated session restoration, grader evidence, secondary metrics, and outcome maturity coverage. |
+| Episodes and failures | `EpisodeRoot`, `EpisodeCoverage`, `EpisodeHop`, `EpisodeHopEdge`, `EpisodeRunCost`, `EpisodeExplanation`, `EpisodeRetrievalIssue`, `EpisodeOutcomeObservation`, `EpisodeOutcomesData`, `EpisodeOutcomeMembershipCoverage`, `EpisodeOutcomeData`, `FailureSignal`, `FailureCluster`, `FailureRunIdentity`, `FailureClusterTarget`, `FailureInvestigation`, `FailureInvestigationTarget`, `FailureClusterStatistics` | Bounded workflow-invocation and failure-sample evidence; shared symptoms are not diagnoses, and selected runs are not presumed to exhaust an episode. |
+| Model routing and usage | `AwInfoModelConfig`, `AwInfoModelConfigRouting`, `AwInfoModelSelection`, `AwInfoModelRouting`, `ModelEndpointMismatch`, `ModelRoutingLogsSummary`, `ModelRoutingRouteSummary`, `ModelRoutingLabels`, `ModelRoutingChoice`, `ModelRoutingFailure`, `ModelRoutingCost`, `ModelRoutingDeviation`, `ModelRoutingAgentCost`, `ModelRoutingSummary`, `AgentUsageBreakdown`, `AgentModelUsage`, `TokenUsageSteering`, `SteeringNotice` | Configured and observed model routes, endpoint compatibility, costs, failures, agent attribution, and steering notices. Detection traffic remains separate from agent usage. |
+| Work-queue and cached-log reports | `WorkQueueCurrentSnapshot`, `WorkQueueAssignmentReceipt`, `WorkQueueClaimReceipt`, `WorkQueueFinishReceipt`, `WorkQueueDiagnostics`, `WorkQueueAssignedClaimDiagnostics` | Snapshot-based queue diagnostics; receipts describe validated facts. |
+
+### Additional exported status and event identifiers
+
+The audit append methods add normalized evidence to the corresponding report
+collections: `AppendAudit`, `AppendRateLimit`, and `AppendWorkflowRuns`.
+`ArtifactSetGraders`, `ArtifactSetInfo`, `ArtifactSetOutcomes`, and
+`ArtifactSetWorkQueue` name supported artifact groups.
+
+`AuditFindingAgenticDelegatedContext`, `AuditFindingAgenticModelDowngrade`,
+`AuditFindingAgenticOverkill`, `AuditFindingAgenticPartiallyReducible`,
+`AuditFindingAgenticPoorControl`, `AuditFindingAgenticResourceHeavy`,
+`AuditFindingBlockedNetworkRequests`, `AuditFindingDetectionJobFailed`,
+`AuditFindingEngineStepFailed`, `AuditFindingHighTokenUsage`,
+`AuditFindingMCPServerFailures`, `AuditFindingManyIterations`,
+`AuditFindingModelAvailabilityUnknown`, `AuditFindingModelEndpointUnsupported`,
+`AuditFindingModelResolutionFailed`, `AuditFindingModelUnavailable`,
+`AuditFindingMultipleErrors`, `AuditFindingSafeOutputsBlocked`,
+`AuditFindingSubagentFailed`, `AuditFindingSubagentModelNotObserved`,
+`AuditFindingSubagentModelUnavailable`, `AuditFindingThreatDetected`,
+`AuditFindingToolsNotAvailable`, `AuditFindingWorkflowFailed`,
+`AuditFindingWorkflowSucceeded`, and `AuditFindingWorkflowTimeout` are
+machine-readable audit finding categories.
+
+Experiment evaluation exposes `ExperimentDecisionExtend`,
+`ExperimentDecisionInconclusive`, `ExperimentDecisionPromote`,
+`ExperimentDecisionReject`, and the reason codes
+`ExperimentDecisionReasonAnalysisUnavailable`,
+`ExperimentDecisionReasonCandidateImproved`,
+`ExperimentDecisionReasonCandidateRegressed`,
+`ExperimentDecisionReasonEffectBelowThreshold`,
+`ExperimentDecisionReasonEvidenceInsufficient`,
+`ExperimentDecisionReasonGuardrailFailed`,
+`ExperimentDecisionReasonGuardrailUnsupported`,
+`ExperimentDecisionReasonInsufficientObservations`,
+`ExperimentDecisionReasonInsufficientSamples`, and
+`ExperimentDecisionReasonUnsupportedMultiVariant`. The
+`ExperimentReadinessCollecting` and `ExperimentReadinessReady` values mark
+whether normal analysis requirements have enough usable data.
+
+`FrictionStateCausal`, `FrictionStateMeasured`, `FrictionStateStatistical`,
+`FrictionStateUnavailable`, and `FrictionStateUnsupported` describe the evidence
+state for execution-friction estimates.
+`GuardrailStatusFail`, `GuardrailStatusInsufficientObservations`,
+`GuardrailStatusMissing`, `GuardrailStatusPass`, and
+`GuardrailStatusUnsupported` are stable guardrail outcomes.
+`RateLimitWarningThresholdPercent` configures the warning boundary for rate
+limit reports. `SteeringDelivery` and `TokenUsageSteeringDelivery` identify
+token-usage steering delivery records.
+
+`EpisodeRetrieval` records the bounded inputs, coverage, and result of gathering
+related workflow runs. The TUI hooks `Init` and `View` and the report writer's
+`Write` method implement Bubble Tea lifecycle and output behavior.
+
 ## Source Synchronization
 
 Re-verified on 2026-10-06: the exported symbols listed above were previously undocumented and are now covered.
+
+Verified against source on 2026-11-13: added grouped coverage for the audit, doctor, health, episode, failure, model-routing, grader, and work-queue report types above.
 
 Reviewed against recent source updates on 2026-08-08; the "Additional exported top-level functions" table above was added after diffing the full exported-symbol list against this README. Re-verified on 2026-09-26: diffed the full exported top-level function list against all documented tables and added the "Additional exported top-level functions (verified 2026-09-26)" table above for 10 previously undocumented functions. No other public-contract deltas were identified beyond the sections above.
 

@@ -34,7 +34,7 @@ Workflow specifications:
   - Version can be tag, branch, or SHA (for remote workflows)
 
 The -n flag allows you to specify a custom name for the workflow file (not allowed when adding multiple workflows at once).
-The --dir flag allows you to specify the workflow directory (default: .github/workflows).
+The --dir flag allows you to specify the workflow directory (default: $GH_AW_WORKFLOWS_DIR or .github/workflows).
 The --create-pull-request flag creates a pull request with the workflow changes.
 The --force flag overwrites existing workflow files.
 When a package contains .github/workflows/aw.json, its project settings are
@@ -54,7 +54,7 @@ Note: For guided interactive setup, use the 'add-wizard' command instead.`
   ` + string(constants.CLIExtensionPrefix) + ` add https://example.com/my-workflow.md           # Add workflow from any HTTPS URL
   ` + string(constants.CLIExtensionPrefix) + ` add https://example.com/workflow.json            # Import JSON workflow definition
   ` + string(constants.CLIExtensionPrefix) + ` add githubnext/agentics/ci-doctor --create-pull-request --force
-  ` + string(constants.CLIExtensionPrefix) + ` add githubnext/agentics/ci-doctor --pr --auto-merge  # Open a pull request and enable auto-merge
+  ` + string(constants.CLIExtensionPrefix) + ` add githubnext/agentics/ci-doctor --create-pull-request --auto-merge  # Open a pull request and enable auto-merge
   ` + string(constants.CLIExtensionPrefix) + ` add ./my-workflow.md                             # Add local workflow
   ` + string(constants.CLIExtensionPrefix) + ` add ./*.md                                       # Add all local workflows
   ` + string(constants.CLIExtensionPrefix) + ` add githubnext/agentics/ci-doctor --dir .github/workflows/shared   # Add to .github/workflows/shared/`
@@ -126,7 +126,7 @@ func NewAddCommand(validateEngine func(string) error) *cobra.Command {
 		Example: addCommandExample,
 		Args: func(cmd *cobra.Command, args []string) error {
 			if len(args) < 1 {
-				return fmt.Errorf("missing workflow specification. Expected at least one workflow source argument. Example: %[1]s githubnext/agentics/daily-repo-status\n\nUsage:\n  %[1]s <workflow>...\n\nExamples:\n  %[1]s githubnext/agentics/daily-repo-status      Add from repository\n  %[1]s ./my-workflow.md                           Add local workflow\n\nRun '%[1]s --help' for more information", cmd.CommandPath())
+				return fmt.Errorf("missing workflow specification. Expected at least one workflow source argument. Example: %[1]s githubnext/agentics/daily-repo-status\n\nUsage:\n  %[1]s <workflow>...\n\nExamples:\n  %[1]s githubnext/agentics/daily-repo-status      Add from repository\n  %[1]s ./my-workflow.md                           Add local workflow\n\nRun '%[1]s --help' for more information", cliCommandPath(cmd))
 			}
 			return nil
 		},
@@ -197,7 +197,7 @@ func runAddCommand(cmd *cobra.Command, args []string, validateEngine func(string
 	if err := rejectBootstrapProfileForRegularAdd(args, resolved.BootstrapProfile); err != nil {
 		return err
 	}
-	if err := ensureAddRepositoryInitialized(engineOverride, verbose, noGitattributes); err != nil {
+	if err := ensureAddRepositoryInitialized(cmd.Context(), engineOverride, verbose, noGitattributes); err != nil {
 		return err
 	}
 	if _, err := AddResolvedWorkflows(cmd.Context(), args, resolved, opts); err != nil {
@@ -240,7 +240,7 @@ func registerAddCommandFlags(cmd *cobra.Command) {
 	cmd.Flags().Bool("create-pull-request", false, "Create a pull request with the workflow changes")
 	addPRMessageFlag(cmd)
 	cmd.Flags().Bool("pr", false, "Alias for --create-pull-request")
-	cmd.Flags().Bool("auto-merge", false, "Enable auto-merge on the created pull request (requires --pr or --create-pull-request)")
+	cmd.Flags().Bool("auto-merge", false, "Enable auto-merge on the created pull request (requires --create-pull-request)")
 	_ = cmd.Flags().MarkHidden("pr") // Hide the short alias from help output
 
 	// Add force flag to add command

@@ -6,6 +6,8 @@ import os from "os";
 import path from "path";
 
 const require = createRequire(import.meta.url);
+const { CYBERSECURITY_POLICY_REJECTION_PREFIX } = require("./github_provider_policy_rejection.cjs");
+const { withCompilerFixtures, prepareMarkdownFixtures } = require("../../../scripts/markdown_metadata_test_adapter.cjs");
 const {
   resolveClaudePromptFileArgs,
   stripPromptFileArgs,
@@ -57,6 +59,9 @@ function runHarnessWithStub({ stubScript, prompt = "fix the bug", extraArgs = []
 
   const env = { ...harnessChildEnv, GH_AW_TMP_DIR: tempDir, GH_AW_AWF_CONFIG_PATH: path.join(tempDir, "missing-awf-config.json"), ...extraEnv, CLAUDE_HARNESS_STUB_CALLS: callsPath };
   try {
+    const { currentMarkdownMetadata, metadataManifestFields } = require("./markdown_metadata.cjs");
+    fs.mkdirSync(env.GH_AW_TMP_DIR, { recursive: true });
+    fs.writeFileSync(path.join(env.GH_AW_TMP_DIR, "aw_info.json"), JSON.stringify(metadataManifestFields(currentMarkdownMetadata())));
     if (reflectData) {
       const preloadPath = path.join(tempDir, "reflect-fixture.cjs");
       fs.writeFileSync(preloadPath, `require(${JSON.stringify(require.resolve("./awf_reflect.cjs"))}).fetchAWFReflect = async () => ({ ok: true, reflectData: ${JSON.stringify(reflectData)} });`, "utf8");
@@ -85,6 +90,112 @@ function runHarnessWithStub({ stubScript, prompt = "fix the bug", extraArgs = []
 }
 
 describe("claude_harness.cjs", () => {
+  it.each([
+    { progress: true, challenge: true, retries: true },
+    { progress: false, challenge: true, retries: true },
+    { progress: true, challenge: false, retries: true },
+    { progress: false, challenge: false, retries: false },
+  ])("recovers from first-attempt errors based on progress and challenge: %j", ({ progress, challenge, retries }) => {
+    const sessionId = "12345678-1234-1234-1234-123456789abc";
+    const message = challenge ? "Failed to authenticate. API Error: Just a moment..." : "Authentication failed (Request ID: abc)";
+    const { result, calls } = runHarnessWithStub({
+      extraEnv: { GH_AW_SAFE_OUTPUTS: "", GH_AW_HARNESS_MAX_RETRIES: "1", GH_AW_LLM_PROVIDER: "anthropic" },
+      stubScript: `
+const fs = require("fs");
+const callsPath = process.env.CLAUDE_HARNESS_STUB_CALLS;
+const firstAttempt = !fs.existsSync(callsPath);
+fs.appendFileSync(callsPath, JSON.stringify(process.argv.slice(2)) + "\\n");
+if (!firstAttempt) process.exit(0);
+const session_id = ${JSON.stringify(sessionId)};
+const text = ${JSON.stringify(message)};
+if (${progress}) console.log(JSON.stringify({type:"assistant", session_id, message:{content:[{type:"text", text:"Working"}]}}));
+console.log(JSON.stringify({type:"assistant", session_id, message:{model:"<synthetic>", content:[{type:"text",text}]}, error:"authentication_failed", is_api_error_message:true}));
+console.log(JSON.stringify({type:"result", session_id, is_error:true, num_turns:${progress ? 45 : 0}, terminal_reason:"api_error", api_error_status:${challenge ? 403 : 401}, result:text}));
+process.exit(1);`,
+    });
+    expect(result.status, result.stderr).toBe(retries ? 0 : 1);
+    expect(calls).toHaveLength(retries ? 2 : 1);
+    expect(calls[1]?.includes("--resume") ?? false).toBe(progress);
+    expect(result.stderr).toContain(`isAuthenticationFailedError=${!challenge}`);
+  });
+
+  it.each([
+    ["1", "2000", 2, "rate_limit_error", true],
+    ["245", "60000", 1, "rate_limit_wait_exceeded", true],
+    ["1", "2000", 2, "rate_limit_error", false],
+    ["245", "60000", 1, "rate_limit_wait_exceeded", false],
+  ])("honors Retry-After=%s within timeout budget, backoff cap=%s, attempts=%i, class=%s, GitHub=%s", (delay, cap, attempts, failureClass, github) => {
+    const { result, calls, harnessRetry } = runHarnessWithStub({
+      extraEnv: {
+        GH_AW_SAFE_OUTPUTS: "",
+        GH_AW_HARNESS_MAX_RETRIES: "1",
+        GH_AW_HARNESS_MAX_DELAY_MS: cap,
+        GH_AW_TIMEOUT_MINUTES: "2",
+        GH_AW_LLM_PROVIDER: github ? "github" : "anthropic",
+        ...(github ? { ANTHROPIC_MODEL: "claude-sonnet-5" } : {}),
+      },
+      ...(github ? { reflectData: { endpoints: [{ provider: "copilot", configured: true, port: 43123, models_url: "http://api-proxy:43123/models" }] } } : {}),
+      stubScript: `
+        const fs = require("fs");
+        fs.appendFileSync(process.env.CLAUDE_HARNESS_STUB_CALLS, "{}\\n");
+        const attempts = fs.readFileSync(process.env.CLAUDE_HARNESS_STUB_CALLS, "utf8").trim().split("\\n").length;
+        if (attempts === 1) {
+          console.log(JSON.stringify({type:"result", is_error:true, result:"HTTP 429\\nRetry-After: ${delay}"}));
+          console.log(JSON.stringify({type:"result", is_error:true, result:"HTTP 429"}));
+          process.exit(1);
+        }
+      `,
+    });
+    expect(result.status, result.stderr).toBe(attempts === 2 ? 0 : 1);
+    expect(calls).toHaveLength(attempts);
+    if (failureClass) expect(harnessRetry.attempt_results[0].failure_classes).toEqual([failureClass]);
+    else expect(harnessRetry.attempt_results[0].failure_classes || []).not.toContain("rate_limit_wait_exceeded");
+    if (attempts === 2) expect(harnessRetry.attempt_results[1].backoff_ms).toBe(1000);
+  });
+
+  it("does not use stderr Retry-After as timing evidence", () => {
+    const { result, calls, harnessRetry } = runHarnessWithStub({
+      extraEnv: { GH_AW_SAFE_OUTPUTS: "", GH_AW_HARNESS_MAX_RETRIES: "1" },
+      stubScript: `
+        const fs = require("fs");
+        fs.appendFileSync(process.env.CLAUDE_HARNESS_STUB_CALLS, "{}\\n");
+        if (fs.readFileSync(process.env.CLAUDE_HARNESS_STUB_CALLS, "utf8").trim().split("\\n").length === 1) {
+          console.error("HTTP 429\\nRetry-After: 245");
+          process.exit(1);
+        }
+      `,
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(calls).toHaveLength(2);
+    expect(harnessRetry.attempt_results[0].failure_classes).not.toContain("rate_limit_wait_exceeded");
+    expect(harnessRetry.attempt_results[1].backoff_ms).toBe(1);
+  });
+
+  it("handles structured permission failures without replaying work", () => {
+    const directory = makeHarnessTempDir("claude-permission-output-");
+    const safeOutputsPath = path.join(directory, "safe-outputs.jsonl");
+    try {
+      const { result, calls, harnessRetry } = runHarnessWithStub({
+        extraEnv: { GH_AW_SAFE_OUTPUTS: safeOutputsPath, GH_AW_SAFEOUTPUTS_CLI: "true", GH_AW_HARNESS_MAX_RETRIES: "2" },
+        stubScript: `
+          const fs = require("fs");
+          fs.appendFileSync(process.env.CLAUDE_HARNESS_STUB_CALLS, "{}\\n");
+          console.log(JSON.stringify({
+            type: "result", is_error: true, result: "Tool access failed",
+            permission_denials: [1, 2, 3].map(id => ({ tool_use_id: String(id), tool_input: { command: "observed command " + id } }))
+          }));
+          process.exit(1);
+        `,
+      });
+      expect(result.status, result.stderr).toBe(1);
+      expect(calls).toHaveLength(1);
+      expect(harnessRetry.attempt_results[0].failure_classes).toContain("permission_denied");
+      expect(result.stderr).toContain("classified as missing tool/permission issue");
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("checkpoints an initial explicit resume before spawning rather than inferring a retry", () => {
     const { result, calls, harnessRetry } = runHarnessWithStub({
       extraArgs: ["--resume", "private-session"],
@@ -132,6 +243,24 @@ describe("claude_harness.cjs", () => {
       expect(attempt.started_at).toBeLessThanOrEqual(attempt.finished_at);
       expect(attempt.backoff_ms).toBe(index === 0 ? 0 : 1);
     }
+  });
+
+  it("stops a native terminal 429 when fresh AWF reflection confirms the shared invocation cap", () => {
+    const reflectData = { runs: { enabled: true, max_runs: 60, invocation_count: 60, remaining_runs: 0 } };
+    const { result, calls, harnessRetry } = runHarnessWithStub({
+      reflectData,
+      extraEnv: { AWF_REFLECT_ENABLED: "1", GH_AW_HARNESS_MAX_RETRIES: "2", GH_AW_HARNESS_STARTUP_RETRIES: "0", GH_AW_SAFE_OUTPUTS: "" },
+      stubScript: `
+        const fs = require("fs");
+        fs.appendFileSync(process.env.CLAUDE_HARNESS_STUB_CALLS, JSON.stringify({ called: true }) + "\\n");
+        console.error("429 Too Many Requests");
+        process.exitCode = 1;
+      `,
+    });
+    expect(result.status, result.stderr).toBe(1);
+    expect(calls).toEqual([{ called: true }]);
+    expect(harnessRetry.attempt_results[0].failure_classes).toContain("invocation_cap_exceeded");
+    expect(result.stderr).toContain("AWF shared invocation budget exhausted (60/60)");
   });
 
   describe("threat detection model aliases", () => {
@@ -234,6 +363,66 @@ describe("claude_harness.cjs", () => {
         { provider: "copilot", configured: true, port: 43123, models_url: "http://api-proxy:43123/models" },
       ],
     };
+
+    it.each(["agent", "detection"])("sends the Copilot ID to Claude in the %s phase, including CLI model overrides", phase => {
+      const stubScript = `
+        const fs = require("fs");
+        fs.appendFileSync(process.env.CLAUDE_HARNESS_STUB_CALLS, JSON.stringify({
+          args: process.argv.slice(2), model: process.env.ANTHROPIC_MODEL
+        }) + "\\n");
+        process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "done" }) + "\\n");
+      `;
+      for (const extraArgs of [[], ["--model", "claude-opus-5-5"], ["--model=claude-opus-5-5"]]) {
+        const { result, calls } = runHarnessWithStub({
+          stubScript,
+          reflectData,
+          extraArgs,
+          extraEnv: {
+            GH_AW_PHASE: phase,
+            GH_AW_LLM_PROVIDER: "github",
+            ANTHROPIC_MODEL: "claude-opus-5-5",
+            GH_AW_CLAUDE_SETTINGS: '{"modelOverrides":{"claude-opus-5-5":"claude-opus-5.5"}}',
+            GH_AW_SAFE_OUTPUTS: "",
+            GH_AW_HARNESS_MAX_RETRIES: "0",
+          },
+        });
+        expect(result.status, result.stderr).toBe(0);
+        expect(calls).toHaveLength(1);
+        expect(calls[0].model).toBe("claude-opus-5.5");
+        expect(calls[0].args).toEqual(["--print", ...extraArgs.map(arg => arg.replace("claude-opus-5-5", "claude-opus-5.5")), "--settings", '{"modelOverrides":{"claude-opus-5-5":"claude-opus-5.5"}}']);
+      }
+    });
+
+    it("normalizes a dynamic fallback model before setting ANTHROPIC_MODEL", async () => {
+      const child = await buildClaudeChildEnv(reflectData, { GH_AW_LLM_PROVIDER: "github", GH_AW_MODEL_FALLBACK: "claude-opus-5-5" }, () => {});
+      expect(child.ANTHROPIC_MODEL).toBe("claude-opus-5.5");
+    });
+
+    it.each(["agent", "detection"])("supplies runtime Claude model overrides for aliases and routing in %s", phase => {
+      const stubScript = `
+        const fs = require("fs");
+        fs.appendFileSync(process.env.CLAUDE_HARNESS_STUB_CALLS, JSON.stringify({
+          args: process.argv.slice(2), model: process.env.ANTHROPIC_MODEL
+        }) + "\\n");
+        process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "done" }) + "\\n");
+      `;
+      for (const routed of [false, true]) {
+        const reflect = {
+          endpoints: [{ ...reflectData.endpoints[1], models: ["claude-opus-5.5"] }],
+          ...(routed ? { routing: { status: "selected", selection: { provider: "github", model: "github-copilot/claude-opus-5.5", wire_model: "claude-opus-5.5", endpoint: "/v1/messages" } } } : {}),
+        };
+        const { result, calls } = runHarnessWithStub({
+          stubScript,
+          reflectData: reflect,
+          extraEnv: { GH_AW_PHASE: phase, GH_AW_LLM_PROVIDER: "github", ANTHROPIC_MODEL: "opus", GH_AW_MODEL_ROUTING: routed ? "1" : "", GH_AW_CLAUDE_SETTINGS: "", GH_AW_SAFE_OUTPUTS: "", GH_AW_HARNESS_MAX_RETRIES: "0" },
+        });
+        expect(result.status, result.stderr).toBe(0);
+        expect(calls[0].model).toBe("claude-opus-5.5");
+        const settingsIndex = calls[0].args.indexOf("--settings");
+        expect(settingsIndex).toBeGreaterThan(-1);
+        expect(JSON.parse(calls[0].args[settingsIndex + 1])).toEqual({ modelOverrides: { "claude-opus-5-5": "claude-opus-5.5" } });
+      }
+    });
 
     it.each(["auto", "copilot/auto"])("starts the real harness with an unset bootstrap URL and %s resolved in environment and CLI model inputs", model => {
       const reflect = { endpoints: [{ ...reflectData.endpoints[1], models: ["gpt-6.1-sol", "claude-sonnet-5"] }] };
@@ -1583,6 +1772,36 @@ process.exit(1);`,
       expect(result.status).toBe(0);
       expect(result.stderr).toContain("noop message found in safe-outputs — not retrying");
     });
+
+    it("preserves failure and stops after a GitHub cybersecurity-policy rejection even when noop is written", () => {
+      const tempDir = makeHarnessTempDir("claude-provider-policy-noop-");
+      try {
+        const safeOutputsPath = path.join(tempDir, "safe-outputs.jsonl");
+        const { result, calls, harnessRetry } = runHarnessWithStub({
+          extraEnv: {
+            GH_AW_LLM_PROVIDER: "github",
+            GH_AW_HARNESS_MAX_RETRIES: "2",
+            GH_AW_SAFE_OUTPUTS: safeOutputsPath,
+            ANTHROPIC_MODEL: "claude-sonnet-5",
+          },
+          reflectData: { endpoints: [{ provider: "copilot", configured: true, port: 43123, models_url: "http://api-proxy:43123/models" }] },
+          stubScript: `
+          const fs = require("fs");
+          fs.appendFileSync(process.env.CLAUDE_HARNESS_STUB_CALLS, "{}\\n");
+          fs.appendFileSync(process.env.GH_AW_SAFE_OUTPUTS, JSON.stringify({type:"noop",message:"nothing to do"}) + "\\n");
+          console.log(JSON.stringify({type:"result",is_error:true,result:${JSON.stringify(`${CYBERSECURITY_POLICY_REJECTION_PREFIX} Try rephrasing your request.`)}}));
+          process.exit(1);
+        `,
+        });
+
+        expect(result.status, result.stderr).toBe(1);
+        expect(calls).toHaveLength(1);
+        expect(harnessRetry.attempt_results[0].failure_classes).toContain("content_filter");
+        expect(result.stderr).toContain("GitHub provider blocked the request for cybersecurity policy");
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("AI credits budget enforcement exits 0", () => {
@@ -1789,11 +2008,31 @@ describe("applyClaudeSettingsEnv", () => {
     expect(applyClaudeSettingsEnv(["--settings", "{}"], { GH_AW_CLAUDE_SETTINGS: settings })).toEqual(["--settings", "{}"]);
     expect(applyClaudeSettingsEnv(["--settings={}"], { GH_AW_CLAUDE_SETTINGS: settings })).toEqual(["--settings={}"]);
   });
+
+  it("builds runtime overrides only from configured Copilot inventory and resolved models", () => {
+    const reflectData = {
+      endpoints: [
+        { provider: "anthropic", configured: true, models: ["claude-opus-99.1"] },
+        { provider: "copilot", configured: false, models: ["claude-opus-98.1"] },
+        { provider: "copilot", configured: true, models: ["claude-haiku-4.5", "gpt-5.5"] },
+      ],
+    };
+    const result = applyClaudeSettingsEnv(["--print"], { GH_AW_LLM_PROVIDER: "github", ANTHROPIC_MODEL: "claude-opus-5.5?effort=high" }, reflectData, ["copilot/claude-sonnet-5.5"]);
+    expect(result.slice(0, 2)).toEqual(["--print", "--settings"]);
+    expect(JSON.parse(result[2])).toEqual({ modelOverrides: { "claude-haiku-4-5": "claude-haiku-4.5", "claude-opus-5-5": "claude-opus-5.5", "claude-sonnet-5-5": "claude-sonnet-5.5" } });
+  });
+
+  it("does not override explicit inline, file-based, or detector settings with live metadata", () => {
+    const env = { GH_AW_LLM_PROVIDER: "github", ANTHROPIC_MODEL: "claude-opus-5.5" };
+    for (const args of [["--settings", '{"modelOverrides":{"custom":"chosen"}}'], ["--settings=custom-settings.json"]]) expect(applyClaudeSettingsEnv(args, env)).toEqual(args);
+    expect(applyClaudeSettingsEnv(["--print"], { ...env, GH_AW_CLAUDE_SETTINGS: "custom-settings.json" })).toEqual(["--print", "--settings", "custom-settings.json"]);
+    expect(applyClaudeSettingsEnv(["--print"], { ...env, GH_AW_LLM_PROVIDER: "anthropic" })).toEqual(["--print"]);
+  });
 });
 
 describe("Claude sub-agent models before spawn (github/gh-aw#70667)", () => {
   const runs = require("./fixtures/claude_codex_subagent_runs.cjs");
-  const { writeInlineSubAgents } = require("./extract_inline_sub_agents.cjs");
+  const { writeInlineSubAgents } = withCompilerFixtures(require("./extract_inline_sub_agents.cjs"));
   const typistAgent = () => fs.readFileSync(path.join(runs.typistAgentsDir, "duplicate-type-finder.md"), "utf8");
   // The stub records the agent files Claude Code would load from the project and whether
   // the model-resolution record already existed when the CLI started.
@@ -1808,13 +2047,17 @@ describe("Claude sub-agent models before spawn (github/gh-aw#70667)", () => {
     process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "done" }) + "\\n");
   `;
 
-  function runWithStagedAgent({ agentContent, reflectData = runs.typistReflect(), env = {} }) {
+  function runWithStagedAgent({ agentContent, stagedContent, reflectData = runs.typistReflect(), env = {} }) {
     const dir = makeHarnessTempDir("claude-subagents-");
     const ostmp = path.join(dir, "ostmp");
     const workspace = path.join(dir, "workspace");
     const recordsDir = path.join(dir, "records");
     // Activation staging plus restore_inline_sub_agents.sh.
     writeInlineSubAgents(`# Typist\n\n## agent: \`duplicate-type-finder\`\n${agentContent}`, workspace, path.join(ostmp, "gh-aw"), "claude");
+    if (stagedContent !== undefined) {
+      prepareMarkdownFixtures(stagedContent);
+      fs.writeFileSync(path.join(ostmp, "gh-aw/.claude/agents/duplicate-type-finder.md"), stagedContent);
+    }
     fs.mkdirSync(path.join(workspace, ".claude/agents"), { recursive: true });
     fs.copyFileSync(path.join(ostmp, "gh-aw/.claude/agents/duplicate-type-finder.md"), path.join(workspace, ".claude/agents/duplicate-type-finder.md"));
     try {
@@ -1849,8 +2092,7 @@ describe("Claude sub-agent models before spawn (github/gh-aw#70667)", () => {
     expect(result.status, result.stderr).toBe(0);
     expect(calls).toHaveLength(1);
     const loaded = calls[0].agents["duplicate-type-finder.md"];
-    expect(loaded).toMatch(/^---\nname: "duplicate-type-finder"\n/);
-    expect(loaded).toContain('model: "claude-haiku-5-5"');
+    expect(JSON.parse(loaded.split("\n", 3)[1])).toMatchObject({ name: "duplicate-type-finder", model: "claude-haiku-5-5" });
     const resolved = { engine: "claude", role: "duplicate-type-finder", configured_model: "small", resolved_model: "claude-haiku-5-5", provider: "anthropic", status: "resolved", cause: null };
     expect(calls[0].records).toContainEqual(resolved);
     expect(records).toContainEqual(resolved);
@@ -1866,12 +2108,12 @@ describe("Claude sub-agent models before spawn (github/gh-aw#70667)", () => {
     expect(calls).toEqual([]);
     expect(result.stderr).toContain("claude sub-agent 'duplicate-type-finder': The requested model is not supported: 'claude-haiku-5-5' is not available in the workflow's live model catalog.");
     expect(records).toContainEqual({ engine: "claude", role: "duplicate-type-finder", configured_model: "claude-haiku-5-5", resolved_model: null, provider: "anthropic", status: "failed", cause: "model_unavailable" });
-    expect(workspaceAgent).toContain("model: claude-haiku-5-5");
+    expect(JSON.parse(workspaceAgent.split("\n", 3)[1]).model).toBe("claude-haiku-5-5");
   });
 
   it("fails closed before spawn when a staged workflow sub-agent file cannot be parsed", () => {
     // Fixture mutation: malformed frontmatter in the staged inline agent.
-    const { result, calls, records } = runWithStagedAgent({ agentContent: "---\nname: [unterminated\nmodel: small\n---\nBody.\n" });
+    const { result, calls, records } = runWithStagedAgent({ agentContent: typistAgent(), stagedContent: "---\nname: [unterminated\nmodel: small\n---\nBody.\n" });
 
     expect(result.status).toBe(1);
     expect(calls).toEqual([]);
@@ -1991,10 +2233,9 @@ describe("Claude sub-agent models before spawn (github/gh-aw#70667)", () => {
       expect(calls[0].args).toContain("--plugin-dir");
       expect(calls[0].symlink).toBe(false);
       const loaded = calls[0].agents["duplicate-type-finder.md"];
-      expect(loaded).toMatch(/^---\nname: "duplicate-type-finder"\n/);
-      expect(loaded).toContain('model: "claude-haiku-5-5"');
+      expect(JSON.parse(loaded.split("\n", 3)[1])).toMatchObject({ name: "duplicate-type-finder", model: "claude-haiku-5-5" });
       expect(fs.readFileSync(path.join(ostmp, "gh-aw/.claude/agents/duplicate-type-finder.md"), "utf8")).toBe(staged);
-      expect(staged).toContain("model: small");
+      expect(JSON.parse(staged.split("\n", 3)[1]).model).toBe("small");
       expect(fs.readdirSync(path.join(ostmp, "agent"))).toEqual([]);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -2009,7 +2250,7 @@ describe("Claude sub-agent models before spawn (github/gh-aw#70667)", () => {
     expect(result.status, result.stderr).toBe(0);
     expect(calls).toHaveLength(1);
     expect(records).toEqual([]);
-    expect(workspaceAgent).toContain("model: claude-nonexistent-9");
+    expect(JSON.parse(workspaceAgent.split("\n", 3)[1]).model).toBe("claude-nonexistent-9");
     expect(result.stderr).not.toContain("sub-agent");
   });
 });

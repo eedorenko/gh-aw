@@ -21,6 +21,10 @@ set +o histexpand
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" ]]; then
+  # shellcheck source=assert_docker_lease.sh
+  source "${SCRIPT_DIR}/assert_docker_lease.sh" awmg-cli-proxy
+fi
 
 # Do not inherit TMPDIR: it can point inside an uploaded artifact directory.
 if ! DIAGNOSTIC_DIR="$(mktemp -d /tmp/gh-aw-cli-proxy.XXXXXX 2>/dev/null)"; then
@@ -52,34 +56,33 @@ if ! validate_diagnostic_directory 2>/dev/null; then
   echo "::error::CLI proxy diagnostics could not be captured safely"
   exit 1
 fi
-# Keep at most one extra byte to detect overflow; never publish a truncated log,
-# because a later add-mask directive may be required to redact an earlier value.
-MAX_DIAGNOSTIC_BYTES=1048576
 if ! mkfifo "$DIAGNOSTIC_DIR/capture" 2>/dev/null; then
   rmdir "$DIAGNOSTIC_DIR" 2>/dev/null || true
   echo "::error::CLI proxy diagnostics could not be captured safely"
   exit 1
 fi
 (
-  head -c "$((MAX_DIAGNOSTIC_BYTES + 1))" > "$DIAGNOSTIC_DIR/startup.log" &&
-    cat > /dev/null
-) < "$DIAGNOSTIC_DIR/capture" 2>/dev/null &
+  capture_status=0
+  node "${SCRIPT_DIR}/redact_cli_proxy_diagnostics.cjs" --capture || capture_status=$?
+  cat > /dev/null
+  exit "$capture_status"
+) < "$DIAGNOSTIC_DIR/capture" > "$DIAGNOSTIC_DIR/startup.log" 2>/dev/null &
 CAPTURE_PID=$!
 exec 3>&1 4>&2
 publish_diagnostics() {
   local status=$?
-  local sanitized capture_size
+  local capture_status=0
   exec 1>&3 2>&4
-  if ! wait "$CAPTURE_PID" ||
-    ! capture_size="$( { wc -c < "$DIAGNOSTIC_DIR/startup.log"; } 2>/dev/null)" ||
-    [ "$capture_size" -gt "$MAX_DIAGNOSTIC_BYTES" ]; then
-    echo "::error::CLI proxy diagnostics withheld because capture exceeded its limit or failed" >&4
-    status=1
-  elif sanitized="$(node "${SCRIPT_DIR}/redact_cli_proxy_diagnostics.cjs" "$DIAGNOSTIC_DIR/startup.log" 2>/dev/null)"; then
-    printf '%s\n' "$sanitized" >&3
+  wait "$CAPTURE_PID" || capture_status=$?
+  if [ "$capture_status" -eq 0 ]; then
+    cat "$DIAGNOSTIC_DIR/startup.log" >&3
+    printf '\n' >&3
     if [ "$status" -ne 0 ]; then
       echo "::error::CLI proxy startup failed (exit status $status)" >&4
     fi
+  elif [ "$capture_status" -eq 2 ]; then
+    echo "::error::CLI proxy diagnostics withheld because capture exceeded the byte limit" >&4
+    status=1
   else
     echo "::error::CLI proxy diagnostics withheld because secret redaction failed" >&4
     status=1
@@ -136,6 +139,7 @@ for proxy_var in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy
 done
 
 docker run -d --name awmg-cli-proxy "${DOCKER_NETWORK_ARGS[@]}" \
+  --label "io.github.gh-aw.invocation=${GH_AW_DOCKER_OWNER:-}" \
   --user "$(id -u):$(id -g)" \
   -e GH_TOKEN \
   -e GH_HOST \
@@ -155,7 +159,7 @@ docker run -d --name awmg-cli-proxy "${DOCKER_NETWORK_ARGS[@]}" \
     --log-dir "$MCP_LOG_DIR" \
     --tls --tls-dir "$TLS_DIR" \
     --guards-mode filter \
-    --trusted-bots github-actions[bot],github-actions,dependabot[bot],copilot
+    --trusted-bots github-actions[bot],github-actions,dependabot[bot],copilot,copilot-pull-request-reviewer,github-agentic-autofix[bot],github-agentic-autofix
 
 # Wait for TLS cert + health check (up to 30s)
 PROXY_READY=false
@@ -170,10 +174,9 @@ for i in $(seq 1 30); do
 done
 
 if [ "$PROXY_READY" = "false" ]; then
-  # Redact the complete log before truncating it for publication.
-  docker logs awmg-cli-proxy 2>&1 | head -c "$((MAX_DIAGNOSTIC_BYTES + 1))" || true
+  echo "::error::CLI proxy failed to start within 30s" >&4
+  docker logs awmg-cli-proxy 2>&1 || true
   docker rm -f awmg-cli-proxy 2>/dev/null || true
-  echo "::error::CLI proxy failed to start within 30s"
   exit 1
 fi
 
@@ -191,9 +194,9 @@ for attempt in 1 2 3; do
 done
 
 if [ "$UPSTREAM_READY" = "false" ]; then
-  docker logs awmg-cli-proxy 2>&1 | head -c "$((MAX_DIAGNOSTIC_BYTES + 1))" || true
+  echo "::error::CLI proxy could not reach the upstream GitHub API. Check runner connectivity and HTTP(S)_PROXY/NO_PROXY settings." >&4
+  docker logs awmg-cli-proxy 2>&1 || true
   docker rm -f awmg-cli-proxy 2>/dev/null || true
-  echo "::error::CLI proxy could not reach the upstream GitHub API. Check runner connectivity and HTTP(S)_PROXY/NO_PROXY settings."
   exit 1
 fi
 

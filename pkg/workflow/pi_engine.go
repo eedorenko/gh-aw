@@ -47,6 +47,7 @@ func NewPiEngine() *PiEngine {
 				ContextWindow:        true,
 				MaxContinuations:     false,
 				WebSearch:            false,
+				WebFetchFallback:     true,
 				NativeAgentFile:      false,
 				BareMode:             true,
 				BashCommandAllowlist: true,
@@ -224,7 +225,7 @@ func (e *PiEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHubActi
 
 		cooldownDays := resolveEngineCooldownDays(workflowData)
 		npmSteps := GenerateNpmInstallSteps(
-			"@earendil-works/pi-coding-agent",
+			piNpmPackageName,
 			version,
 			"Install Pi CLI",
 			"pi",
@@ -239,7 +240,7 @@ func (e *PiEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHubActi
 		// CLI in the hosted tool cache, so stage a second copy under RUNNER_TEMP.
 		if isCloudHypervisorRuntime(workflowData) || isNVXRuntime(workflowData) {
 			npmSteps = append(npmSteps, GenerateMicroVMNpmCLIInstallStep(
-				"@earendil-works/pi-coding-agent",
+				piNpmPackageName,
 				version,
 				"Install Pi CLI in microVM path",
 				"pi",
@@ -252,8 +253,8 @@ func (e *PiEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHubActi
 		steps = BuildNpmEngineInstallStepsWithAWF(npmSteps, workflowData)
 		steps = append(steps, GitHubActionStep{
 			"      - name: Record Pi package location",
-			"        run: |",
-			`          GH_AW_PI_PACKAGE_ROOT="$(npm root -g)/@earendil-works/pi-coding-agent"`,
+			"        run: | # zizmor: ignore[github-env] - value is derived from npm root -g and a constant package name, not user input.",
+			`          GH_AW_PI_PACKAGE_ROOT="$(npm root -g)/` + piNpmPackageName + `"`,
 			`          printf 'GH_AW_PI_PACKAGE_ROOT=%s\n' "$GH_AW_PI_PACKAGE_ROOT" >> "$GITHUB_ENV"`,
 		})
 	}
@@ -345,6 +346,7 @@ func (e *PiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile string)
 	piCommand := e.buildPiCommand(workflowData, commandName, piArgs, piModelsJSONSetup, driverConfigured)
 	command := e.buildPiExecutionCommand(workflowData, logFile, piCommand, firewallEnabled, modelConfigured, profile)
 	env := e.buildPiExecutionEnv(workflowData, profile, backend, firewallEnabled, modelConfigured, piModelsJSONSetup != "")
+	applyDurableExecutionEnv(env, workflowData)
 	step := e.buildPiExecutionStep(workflowData, command, env)
 	return []GitHubActionStep{step}
 }
@@ -353,7 +355,10 @@ func (e *PiEngine) buildPiArgs(workflowData *WorkflowData) []string {
 	piArgs := []string{"--print", "--mode", "json"}
 	modelRouting := isModelRoutingEnabled(workflowData)
 	session := piSessionSettings(workflowData)
-	if session.Enabled {
+	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Durable != nil {
+		root := durableSessionDirectory("pi")
+		piArgs = append(piArgs, "--session-dir", root, "--session", path.Join(root, "session.jsonl"))
+	} else if session.Enabled {
 		piArgs = append(piArgs, "--session-dir", PiSessionDirectory)
 		switch {
 		case session.Resume != "":
@@ -415,6 +420,10 @@ func piModelIsAlias(workflowData *WorkflowData) bool {
 	return ok
 }
 
+func piModelRequiresRuntimeResolution(workflowData *WorkflowData) bool {
+	return workflowData != nil && (piModelIsAlias(workflowData) || hasExpressionMarker(workflowData.Model))
+}
+
 // GetErrorDetectionScriptId returns the host-runner script that detects agent errors,
 // including an unavailable configured model reported by the shared model resolution step.
 func (e *PiEngine) GetErrorDetectionScriptId() string {
@@ -445,28 +454,17 @@ func (e *PiEngine) buildPiModelsJSONSetup(workflowData *WorkflowData, profile un
 		if workflowData.EngineConfig != nil && workflowData.EngineConfig.ContextWindow > 0 {
 			contextWindowAssignment = " GH_AW_PI_CONTEXT_WINDOW=" + shellEscapeArg(strconv.Itoa(workflowData.EngineConfig.ContextWindow))
 		}
-		modelIDAssignment := ""
-		if modelID != "" {
-			modelIDAssignment = "export GH_AW_PI_MODEL_ID=" + shellEscapeArg(modelID) + " && "
-		}
 		setup := fmt.Sprintf(
-			`%sexport GH_AW_PI_GATEWAY_SECRET_ENV=%s GH_AW_PI_GATEWAY_FALLBACK_PORT=%d GH_AW_LLM_PROVIDER=%s%s && ( %s "%s/pi_models_json.cjs" ) && `,
-			modelIDAssignment, shellEscapeArg(gatewaySecretEnvVar), profile.gatewayPort, shellEscapeArg(reflectProvider),
+			`export GH_AW_PI_GATEWAY_SECRET_ENV=%s GH_AW_PI_GATEWAY_FALLBACK_PORT=%d GH_AW_LLM_PROVIDER=%s%s && ( %s "%s/pi_models_json.cjs" ) && `,
+			shellEscapeArg(gatewaySecretEnvVar), profile.gatewayPort, shellEscapeArg(reflectProvider),
 			contextWindowAssignment,
 			nodeRuntimeResolutionCommand, SetupActionDestinationShell,
 		)
-		// An alias is resolved at runtime by pi_models_json.cjs (the shared "resolve configured
-		// model" step), which writes the resolved id to piResolvedModelFile; exact ids are never
-		// rewritten, so they stay static in the command line.
-		if !driverConfigured && !modelRouting && !piModelIsAlias(workflowData) {
-			piArgs = append(piArgs, "--model", "aw-gateway/"+modelID)
-		}
 		piLog.Printf("Pi: using /reflect-resolved models.json gateway routing for model %q via aw-gateway (fallback port %d)", modelID, profile.gatewayPort)
 		return setup, piArgs
 	}
 	if !driverConfigured {
 		nativeProvider := piExecutionProvider(workflowData)
-		piArgs = append(piArgs, "--model", path.Join(nativeProvider, modelID))
 		piLog.Printf("Pi: using native provider %q for model %q (no firewall)", nativeProvider, modelID)
 	}
 	return "", piArgs
@@ -483,8 +481,15 @@ func (e *PiEngine) buildPiCommand(workflowData *WorkflowData, commandName string
 		if isModelRoutingEnabled(workflowData) {
 			routingEnv = `GH_AW_PI_MODEL="aw-gateway/$(cat /tmp/gh-aw/pi-routing-model)" GH_AW_PI_NATIVE_PROVIDER="aw-gateway" `
 			modelArg = ` --model "aw-gateway/$(cat /tmp/gh-aw/pi-routing-model)"`
-		} else if piModelsJSONSetup != "" && piModelIsAlias(workflowData) {
+		} else if piModelsJSONSetup != "" && piModelRequiresRuntimeResolution(workflowData) {
 			modelArg = ` --model "aw-gateway/$(cat ` + piResolvedModelFile + `)"`
+		} else if workflowData.Model != "" {
+			// Keep model expressions in env, never in the shell source.
+			if piModelsJSONSetup != "" {
+				modelArg = ` --model "aw-gateway/${GH_AW_PI_MODEL#*/}"`
+			} else {
+				modelArg = ` --model "${GH_AW_PI_NATIVE_PROVIDER}/${GH_AW_PI_MODEL#*/}"`
+			}
 		}
 		piCommand = fmt.Sprintf(
 			`cat /tmp/gh-aw/aw-prompts/user.txt | %s%s %s%s%s --append-system-prompt /tmp/gh-aw/aw-prompts/system.txt --extension "${RUNNER_TEMP}/gh-aw/actions/pi_provider.cjs" --extension "${RUNNER_TEMP}/gh-aw/actions/pi_steering_extension.cjs" --extension "${RUNNER_TEMP}/gh-aw/actions/pi_tool_policy.cjs" --extension "${RUNNER_TEMP}/gh-aw/actions/pi_subagent_extension.cjs" --extension builtin:mcp --extension builtin:codemode --extension builtin:tool-search 2>&1 | tee %s`,
@@ -571,10 +576,7 @@ func (e *PiEngine) buildPiExecutionEnv(workflowData *WorkflowData, profile unive
 	}
 	applyPlaywrightBrowserEnv(env, workflowData)
 	injectWorkflowCallNetworkAllowedEnv(env, workflowData)
-	if modelConfigured {
-		env["GH_AW_PI_MODEL"] = workflowData.Model
-		env["GH_AW_PI_NATIVE_PROVIDER"] = piExecutionProvider(workflowData)
-	}
+	applyPiModelEnv(env, workflowData, modelConfigured)
 	maps.Copy(env, profile.env)
 	if backend == UniversalLLMBackendCopilot {
 		delete(env, "OPENAI_API_KEY")
@@ -606,6 +608,7 @@ func (e *PiEngine) buildPiExecutionEnv(workflowData *WorkflowData, profile unive
 		env["GH_AW_MAX_TURNS"] = compilerenv.BuildDefaultMaxTurnsExpression()
 	}
 	applyEngineCwdEnv(env, workflowData)
+	applyHarnessRetryPolicyEnv(env, workflowData)
 	e.applyPiConfigEnv(env, workflowData)
 	if workflowData.EngineConfig != nil && len(workflowData.EngineConfig.Env) > 0 {
 		maps.Copy(env, workflowData.EngineConfig.Env)
@@ -617,6 +620,13 @@ func (e *PiEngine) buildPiExecutionEnv(workflowData *WorkflowData, profile unive
 	applyPiToolPolicyEnv(env, workflowData)
 	applyModelRoutingEnv(env, workflowData)
 	return env
+}
+
+func applyPiModelEnv(env map[string]string, workflowData *WorkflowData, modelConfigured bool) {
+	if modelConfigured {
+		env["GH_AW_PI_MODEL"] = workflowData.Model
+		env["GH_AW_PI_NATIVE_PROVIDER"] = piExecutionProvider(workflowData)
+	}
 }
 
 func (e *PiEngine) buildPiExecutionStep(workflowData *WorkflowData, command string, env map[string]string) GitHubActionStep {

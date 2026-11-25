@@ -10,15 +10,14 @@ permissions:
   pull-requests: read
   security-events: read
 imports:
+- shared/pr-safe-output-defaults.md
 - uses: shared/daily-audit-base.md
   with:
     expires: 3d
     title-prefix: "[compiler-threat-spec] "
 - shared/otlp.md
 safe-outputs:
-  steer: true
   create-pull-request:
-    draft: false
     expires: 7d
     labels:
     - security
@@ -100,7 +99,9 @@ Never add version-history rows or dated audit entries to the specification file,
 
 ## Tooling Constraint
 
-This workflow uses a restricted Copilot SDK shell allowlist. For repository inspection, use the approved shell commands above (`git`, `cat`, `cut`, `find`, `ls`, `sed`, `awk`, `grep`, `head`, `pwd`, `go`) instead of built-in file read/view tools, and avoid requesting commands outside that set. If a command is denied, preserve the full denied command in the failure report and name the exact `tools.bash` entry required; do not broaden the allowlist.
+This workflow uses a restricted Copilot SDK shell allowlist. For repository inspection, use the approved shell commands above (`git`, `cat`, `cut`, `find`, `ls`, `sed`, `awk`, `grep`, `head`, `pwd`, `go`) instead of built-in file read/view tools, and avoid requesting commands outside that set. The defaults `tail`, `wc`, `sort`, `uniq`, `echo`, `printf`, `date`, and `yq` are also allowed, and GitHub data is available through the `github <tool> --owner ... --repo ...` CLI.
+
+Every command in a pipeline, `&&`/`||` chain, or loop must be allowed, or the whole call is denied. The run aborts after **3 denials**, so do not probe. Never use `python3`, `node`, `jq`, `mkdir`, `paste`, `xargs`, or `tee`. Filter `github` JSON output with `grep -o`, `sed`, `awk`, `cut`, and `head` only, and issue one `github` call per command instead of shell loops. `/tmp/gh-aw/agent/` already exists. If a command is denied, preserve the full denied command in the failure report and name the exact `tools.bash` entry required; do not broaden the allowlist.
 
 This workflow simulates a team of experts in:
 - GitHub Actions compilation
@@ -210,4 +211,6 @@ A successful run MUST:
 
 ### Output Format
 
-Wrap long content with `<details><summary><b>View Details</b></summary>...</details>`.
+- Use `###` or lower headings only in the report.
+- Keep the overview and key metrics/issues visible, and wrap long findings and supporting evidence in `<details><summary><b>View Details</b></summary>...</details>` blocks for progressive disclosure.
+- Structure the report as: overview → key metrics/issues → detailed evidence → next actions.

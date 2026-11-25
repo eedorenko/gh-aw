@@ -12,6 +12,8 @@ const { parseIntTemplatable } = require("./templatable.cjs");
 const { isProbingNoopMessage } = require("./intent_probe.cjs");
 const { buildEmptyOutputOutcome, collectOutcomeSession, hasFailedFinalResult } = require("./empty_output_outcome.cjs");
 const { normalizeSafeOutputName, normalizeSafeOutputConfig } = require("./safe_output_names.cjs");
+const { isDependencyUnsupportedType, validateSubmissionMetadata } = require("./safe_output_submission.cjs");
+const { routedRequestError } = require("./request_continuation_routes.cjs");
 
 const MENTION_AWARE_OUTPUT_TYPES = new Set(["add_comment", "close_discussion", "create_discussion", "create_issue", "create_pull_request", "create_pull_request_review_comment", "reply_to_pull_request_review_comment"]);
 
@@ -135,11 +137,16 @@ async function main() {
     }
     function validateItemWithSafeJobConfig(item, jobConfig, lineNum) {
       const errors = [];
+      const metadataError = validateSubmissionMetadata(item);
+      if (metadataError) errors.push(`Line ${lineNum}: ${metadataError}`);
+      const dependency = item["depends-on"] !== undefined ? item["depends-on"] : item.depends_on;
       const normalizedItem = { type: item.type };
+      if (item.output_id !== undefined) normalizedItem.output_id = item.output_id;
+      if (dependency !== undefined) normalizedItem["depends-on"] = dependency;
       if (!jobConfig || typeof jobConfig !== "object" || !jobConfig.inputs) {
         return {
-          isValid: true,
-          errors: [],
+          isValid: errors.length === 0,
+          errors,
           normalizedItem,
         };
       }
@@ -192,6 +199,7 @@ async function main() {
 
     core.info(`[INGESTION] Output file path: ${outputFile}`);
     const collectionErrors = [];
+    let collectorInfrastructureCause;
     if (!outputFile || !fs.existsSync(outputFile)) {
       core.info(outputFile ? `Output file does not exist: ${outputFile}` : "GH_AW_SAFE_OUTPUTS not set, no output to collect");
       const runnerTemp = process.env.RUNNER_TEMP || "/home/runner/work/_temp";
@@ -202,6 +210,7 @@ async function main() {
           `This is a gateway infrastructure failure, not a normal no-op. ` +
           `Check the MCP gateway startup logs for ECONNRESET errors or delayed backend registration and re-run the workflow.`;
         collectionErrors.push(reason);
+        collectorInfrastructureCause = "safeoutputs_gateway_empty";
         // eslint-disable-next-line gh-aw-custom/require-return-after-core-setfailed
         core.setFailed(reason);
       }
@@ -288,11 +297,26 @@ async function main() {
           rejectItem(`Line ${i + 1}: Unexpected output type '${itemType}'. Expected one of: ${Object.keys(expectedOutputTypes).join(", ")}`);
           continue;
         }
+        if ((item["depends-on"] !== undefined || item.depends_on !== undefined) && isDependencyUnsupportedType(itemType)) {
+          rejectItem(`Line ${i + 1}: depends-on is not supported for ${itemType}, which executes outside the safe-output handler manager.`);
+          continue;
+        }
+        // A routed request is rejected, never truncated, before lossy sanitization; it
+        // carries only its message (route, destination and budget are compiled).
+        const routedContinuation = itemType === "request_continuation" && expectedOutputTypes[itemType]?.route !== undefined;
+        if (routedContinuation) {
+          const routedError = routedRequestError(item);
+          if (routedError) {
+            rejectItem(`Line ${i + 1}: ${routedError}`);
+            continue;
+          }
+        }
         if (!queueScope && itemType === "noop" && isProbingNoopMessage(item.message)) {
           core.info(`[INGESTION] Line ${i + 1}: Ignoring probing noop message (does not count against the noop budget): ${JSON.stringify(item.message)}`);
           continue;
         }
-        const typeCount = parsedItems.filter(existing => existing.type === itemType && (!queueScope || (existing.claim_handle === item.claim_handle && !existing._claimScopeError))).length;
+        // Every accepted queue item belongs to the one assigned Claim; rejected records never count.
+        const typeCount = parsedItems.filter(existing => existing.type === itemType && (!queueScope || !existing._claimScopeError)).length;
         const maxAllowed = getMaxAllowedForType(itemType, expectedOutputTypes);
         if (typeCount >= maxAllowed) {
           rejectItem(`Line ${i + 1}: Too many items of type '${itemType}'. Maximum allowed: ${maxAllowed}.`);
@@ -301,6 +325,10 @@ async function main() {
         core.info(`Line ${i + 1}: type '${itemType}'`);
 
         const typeConfig = expectedOutputTypes[itemType];
+        if ((item["depends-on"] !== undefined || item.depends_on !== undefined) && typeConfig?.supports_dependencies === false) {
+          rejectItem(`Line ${i + 1}: depends-on is not supported for custom safe jobs, which execute outside the safe-output handler manager.`);
+          continue;
+        }
         const normalizeIssueClosingKeywords = typeConfig !== null && typeof typeConfig === "object" && typeConfig.normalize_closing_keywords === true;
         if (itemType === "dispatch_workflow") {
           const hasWorkflowName = typeof item.workflow_name === "string" && item.workflow_name.trim().length > 0;
@@ -323,6 +351,7 @@ async function main() {
             normalizeIssueClosingKeywords,
             dataEnabled: typeConfig !== null && typeof typeConfig === "object" && typeConfig.data_enabled === true,
             dataSchema: typeConfig !== null && typeof typeConfig === "object" ? typeConfig.data_schema : undefined,
+            collapseData: typeConfig !== null && typeof typeConfig === "object" ? typeConfig.collapse_data : undefined,
           });
           if (!validationResult.isValid) {
             rejectItem(validationResult.error || `Line ${i + 1}: Invalid ${itemType} output`);
@@ -331,6 +360,11 @@ async function main() {
           // Use the normalized item (with sanitized/validated fields) rather
           // than the raw input, so downstream consumers see the canonical form.
           core.info(`Line ${i + 1}: Valid ${itemType} item`);
+          const sanitizedRoutedError = routedContinuation ? routedRequestError(validationResult.normalizedItem) : null;
+          if (sanitizedRoutedError) {
+            rejectItem(`Line ${i + 1}: ${sanitizedRoutedError} after sanitization`);
+            continue;
+          }
           parsedItems.push(queueScope ? { ...validationResult.normalizedItem, ...(item.claim_handle ? { claim_handle: item.claim_handle } : {}) } : validationResult.normalizedItem);
         } else {
           // Fall back to validateItemWithSafeJobConfig for unknown types
@@ -357,23 +391,21 @@ async function main() {
       core.warning("Validation errors found:");
       errors.forEach(error => core.warning(`  - ${error}`));
     }
+    const handle = claimHandle || assignment?.claims[0].handle;
     for (const itemType of Object.keys(expectedOutputTypes)) {
       const minRequired = getMinRequiredForType(itemType, expectedOutputTypes);
       if (minRequired > 0) {
-        const handles = claimHandle ? [claimHandle] : assignment ? assignment.claims.map(member => member.handle) : [undefined];
-        for (const handle of handles) {
-          const actualCount = parsedItems.filter(item => item.type === itemType && (!queueScope || (!item._claimScopeError && item.claim_handle === handle))).length;
-          if (actualCount < minRequired) {
-            const message = `Too few items of type '${itemType}'. Minimum required: ${minRequired}, found: ${actualCount}.`;
-            errors.push(handle ? `Claim '${handle}': ${message}` : message);
-            if (handle) {
-              parsedItems.push({
-                type: itemType,
-                claim_handle: handle,
-                _claimScopeError: message,
-                _claimScopeErrorCode: "claim_scope_invalid",
-              });
-            }
+        const actualCount = parsedItems.filter(item => item.type === itemType && (!queueScope || !item._claimScopeError)).length;
+        if (actualCount < minRequired) {
+          const message = `Too few items of type '${itemType}'. Minimum required: ${minRequired}, found: ${actualCount}.`;
+          errors.push(handle ? `Claim '${handle}': ${message}` : message);
+          if (handle) {
+            parsedItems.push({
+              type: itemType,
+              claim_handle: handle,
+              _claimScopeError: message,
+              _claimScopeErrorCode: "claim_scope_invalid",
+            });
           }
         }
       }
@@ -384,7 +416,7 @@ async function main() {
     let collectorDriverExitCode;
     let collectorRetryCount;
     let collectorEngineErrorType;
-    const hasTerminalOutput = parsedItems.some(item => !["report_missing_tool", "report_missing_data"].includes(item.type));
+    const hasTerminalOutput = parsedItems.some(item => !["report_missing_tool", "report_missing_data", "request_continuation"].includes(item.type));
     let failedFinalResult = false;
     let session = process.env.GH_AW_PROTECTED_SESSION_CAPTURE === "1" ? collectOutcomeSession(TMP_GH_AW_PATH) : undefined;
     if (!queueScope && hasTerminalOutput) {
@@ -404,6 +436,11 @@ async function main() {
       collectorRetryCount = incompleteOutcome.retryCount;
       collectorEngineErrorType = incompleteOutcome.engineErrorType;
     }
+    for (const item of parsedItems) {
+      if (item.type === "request_continuation") {
+        item.timestamp = new Date().toISOString();
+      }
+    }
     const validatedOutput = {
       items: parsedItems,
       errors: errors,
@@ -412,6 +449,7 @@ async function main() {
       ...(collectorDriverExitCode !== undefined ? { collectorDriverExitCode } : {}),
       ...(collectorRetryCount !== undefined ? { collectorRetryCount } : {}),
       ...(collectorEngineErrorType ? { collectorEngineErrorType } : {}),
+      ...(collectorInfrastructureCause ? { collectorInfrastructureCause } : {}),
     };
     const path = require("path");
     const agentOutputFile = path.join(TMP_GH_AW_PATH, AGENT_OUTPUT_FILENAME);

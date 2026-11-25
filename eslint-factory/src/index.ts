@@ -13,6 +13,7 @@ import { preferGetErrorMessageOverStringRule } from "./rules/prefer-get-error-me
 import { preferNumberIsNanRule } from "./rules/prefer-number-isnan";
 import { noDeprecatedStringSubstrRule } from "./rules/no-deprecated-string-substr";
 import { noMapParseIntCallbackRule } from "./rules/no-map-parseint-callback";
+import { noPathStartsWithoutSeparatorRule } from "./rules/no-path-startswith-without-separator";
 import { requireAsyncEntrypointCatchRule } from "./rules/require-async-entrypoint-catch";
 import { requireAwaitCoreSummaryWriteRule } from "./rules/require-await-core-summary-write";
 import { requireFsCloseSyncRule } from "./rules/require-fs-close-sync";
@@ -66,9 +67,11 @@ import { requireFsChmodTryCatchRule } from "./rules/require-fs-chmod-try-catch";
 
 import { noDynamicStringReplacementRule } from "./rules/no-dynamic-string-replacement";
 import { noSingleCharStringReplaceRule } from "./rules/no-single-char-string-replace";
+import { requirePerPageOnGithubListCallRule } from "./rules/require-per-page-on-github-list-call";
 import { noAsyncForEachCallbackRule } from "./rules/no-async-foreach-callback";
 import { noUnguardedAsyncTimerCallbackRule } from "./rules/no-unguarded-async-timer-callback";
 import { requireFiniteCheckBeforeDateToIsoStringRule } from "./rules/require-finite-check-before-date-toisostring";
+import { requireNullCheckWithTypeofObjectRule } from "./rules/require-null-check-with-typeof-object";
 import { noSplitFilterTrimWithoutTrimMapRule } from "./rules/no-split-filter-trim-without-trim-map";
 
 const plugin = {
@@ -92,6 +95,7 @@ const plugin = {
     "prefer-number-isnan": preferNumberIsNanRule,
     "no-deprecated-string-substr": noDeprecatedStringSubstrRule,
     "no-map-parseint-callback": noMapParseIntCallbackRule,
+    "no-path-startswith-without-separator": noPathStartsWithoutSeparatorRule,
     "require-async-entrypoint-catch": requireAsyncEntrypointCatchRule,
     "require-await-core-summary-write": requireAwaitCoreSummaryWriteRule,
     "require-fs-close-sync": requireFsCloseSyncRule,
@@ -143,11 +147,13 @@ const plugin = {
     "no-misplaced-error-code-definition": noMisplacedErrorCodeDefinitionRule,
     "require-fs-chmod-try-catch": requireFsChmodTryCatchRule,
     "no-single-char-string-replace": noSingleCharStringReplaceRule,
+    "require-per-page-on-github-list-call": requirePerPageOnGithubListCallRule,
     "no-dynamic-string-replacement": noDynamicStringReplacementRule,
     "no-unguarded-async-timer-callback": noUnguardedAsyncTimerCallbackRule,
     "no-async-foreach-callback": noAsyncForEachCallbackRule,
     "no-split-filter-trim-without-trim-map": noSplitFilterTrimWithoutTrimMapRule,
     "require-finite-check-before-date-toisostring": requireFiniteCheckBeforeDateToIsoStringRule,
+    "require-null-check-with-typeof-object": requireNullCheckWithTypeofObjectRule,
   },
 };
 

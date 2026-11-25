@@ -146,11 +146,15 @@ Workflow and run positional parameters must not start with `-`; use the tool's n
 The read-only `health` tool is available without `--allow-write-tools` or actor validation. It uses the server's GitHub credentials to read a bounded current-revision sample. `days` accepts 7, 30, or 90 (default 7) and is mutually exclusive with `start_date`. Date parameters accept UTC dates, RFC3339 timestamps, or relative times such as `-24h`. `threshold` defaults to 80 percent. Failure clusters and sub-agent failures use the existing `logs_dir` cache only; the tool does not download artifacts or modify cached logs.
 
 > [!NOTE]
-> The `actionlint`, `zizmor`, and `poutine` scanners used by `compile` prefer compatible local binaries on `PATH` (actionlint ≥ 1.7.12, zizmor ≥ 1.31.1, poutine ≥ 1.1.6), falling back to Docker otherwise. Docker-based scanners, including `grant`, pull images on first use. If you see a "Docker images are being downloaded" message, wait 15–30 seconds and retry.
+> The `actionlint`, `zizmor`, and `poutine` scanners used by `compile` prefer compatible local binaries on `PATH` (actionlint ≥ 1.7.12, zizmor ≥ 1.33.1, poutine ≥ 1.1.6), falling back to Docker otherwise. Docker-based scanners, including `grant`, pull images on first use. If you see a "Docker images are being downloaded" message, wait 15–30 seconds and retry.
 
 For `audit`, each run identifier may be a numeric run ID, a run URL, a job URL, or a job URL with a step anchor such as `https://github.com/owner/repo/actions/runs/123/job/456#step:7:1`.
 
 The MCP `logs` response returns a `file_path` to the collected report. Truncated discovery sets `partial: true` and preserves either `continuation` or the per-target `continuations` array. Resume each target using its repository and all cursor parameters, including `end_date` and `before_run_id`. Episode evidence gaps also set `partial: true`, but may have no resumable cursor. For episode reports, `coverage_status` is `partial` or `unknown`, and `coverage_reasons` summarizes recorded gaps. An unknown status does not establish complete membership; the report retains per-episode coverage and `episode_retrieval` bounds, counters, stop reasons, and issues.
+
+`file_path` refers to a temporary local report. On Linux and macOS, each server process creates a private `0700` directory and `0600` report files. The built-in containerized backend shares reports with the agent through `/tmp/gh-aw`; both processes must use the same UID. Read reports while the server is running: graceful shutdown removes its report files, and a restarted server generates new paths. The legacy `/tmp/gh-aw/logs-cache/` cache is neither read nor migrated.
+
+Report-storage failures, including failed checks when an existing report is reused, are returned in the JSON `message` field without `file_path`; the MCP tool still returns a successful text result. When reusing an existing content-addressed report, the cache checks that report's privacy properties and digest before returning its path. These checks do not validate subsequent client reads. On unsupported platforms, including Windows, the message identifies that private report storage is unsupported.
 
 Cursor fields and optional episode coverage sections are decoded independently: malformed episode data does not discard valid cursors. Malformed report JSON exposes `coverage_status: "unknown"` with an `invalid_report_json` reason instead of an empty success state; malformed sections have section-specific `invalid_*` reasons. Any usable evidence of partial collection remains partial even when another section cannot be decoded. Parse uncertainty alone does not set `partial: true`, and neither unknown state nor the absence of a cursor proves completeness. The envelope does not change cached report bytes or access controls.
 
@@ -179,7 +183,7 @@ The `work-queue` tool requires `operation` and `repo` (`owner/repo`), matching t
 | Operation | Options | Returns |
 | --- | --- | --- |
 | `state` | `graph`, `pool`, `state`, `search`, `offset`, `limit` | Bounded metadata-only Work/Claim forest with counts, queue tip, and `next_offset` when more rows remain. |
-| `inspect` | Exactly one of `work_id` or `claim_id` | Metadata, dependencies, assignment membership, and delivery barriers. |
+| `inspect` | Exactly one of `work_id` or `claim_id` | Metadata, dependencies, dispatch, run binding, and recorded effects. |
 
 Options belonging to another operation are rejected. For `state`, the `state` filter accepts `available`, `claimed`, `completed`, or `cancelled`. Pagination uses a nonnegative `offset` and a `limit` of 1–256 (default 80).
 
@@ -195,7 +199,7 @@ Options belonging to another operation are rejected. For `state`, the `state` fi
 }
 ```
 
-Only `state` and `inspect` are exposed through MCP. Other read-only operations (`replay`, `stats`, `explain`, `trace`, and `evidence`) remain CLI-only, as do all mutating operations.
+Only `state` and `inspect` are exposed through MCP. Other read-only operations (`replay` and `stats`) remain CLI-only, as do all mutating operations.
 
 ## Using GH-AW as an MCP from an Agentic Workflow
 

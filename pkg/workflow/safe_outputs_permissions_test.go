@@ -321,20 +321,19 @@ func TestComputePermissionsForSafeOutputs(t *testing.T) {
 			},
 		},
 		{
-			name: "push-to-pull-request-branch default fallback - requires pull-requests write and administration read",
+			name: "push-to-pull-request-branch default fallback - requires pull-requests write",
 			safeOutputs: &SafeOutputsConfig{
 				PushToPullRequestBranch: &PushToPullRequestBranchConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{},
 				},
 			},
 			expected: map[PermissionScope]PermissionLevel{
-				PermissionContents:       PermissionWrite,
-				PermissionPullRequests:   PermissionWrite,
-				PermissionAdministration: PermissionRead,
+				PermissionContents:     PermissionWrite,
+				PermissionPullRequests: PermissionWrite,
 			},
 		},
 		{
-			name: "push-to-pull-request-branch with fallback-as-pull-request false - requires pull-requests read and administration read",
+			name: "push-to-pull-request-branch with fallback-as-pull-request false - requires pull-requests read",
 			safeOutputs: &SafeOutputsConfig{
 				PushToPullRequestBranch: &PushToPullRequestBranchConfig{
 					BaseSafeOutputConfig:  BaseSafeOutputConfig{},
@@ -342,9 +341,8 @@ func TestComputePermissionsForSafeOutputs(t *testing.T) {
 				},
 			},
 			expected: map[PermissionScope]PermissionLevel{
-				PermissionContents:       PermissionWrite,
-				PermissionPullRequests:   PermissionRead,
-				PermissionAdministration: PermissionRead,
+				PermissionContents:     PermissionWrite,
+				PermissionPullRequests: PermissionRead,
 			},
 		},
 		{
@@ -361,7 +359,7 @@ func TestComputePermissionsForSafeOutputs(t *testing.T) {
 			},
 		},
 		{
-			name: "push-to-pull-request-branch with check-branch-protection explicit true - includes administration read",
+			name: "push-to-pull-request-branch with check-branch-protection explicit true - no administration permission",
 			safeOutputs: &SafeOutputsConfig{
 				PushToPullRequestBranch: &PushToPullRequestBranchConfig{
 					BaseSafeOutputConfig:  BaseSafeOutputConfig{},
@@ -369,9 +367,8 @@ func TestComputePermissionsForSafeOutputs(t *testing.T) {
 				},
 			},
 			expected: map[PermissionScope]PermissionLevel{
-				PermissionContents:       PermissionWrite,
-				PermissionPullRequests:   PermissionWrite,
-				PermissionAdministration: PermissionRead,
+				PermissionContents:     PermissionWrite,
+				PermissionPullRequests: PermissionWrite,
 			},
 		},
 		{
@@ -638,7 +635,7 @@ func TestCompileMergePullRequestCheckPermissions(t *testing.T) {
 					handlerApp = "    " + appConfig
 				}
 				content := "---\non: issues\nengine: copilot\nsafe-outputs:\n" +
-					globalApp + "  merge-pull-request:\n    max: 1\n" + checks + handlerApp + "---\n\nTest workflow.\n"
+					globalApp + "  merge-pull-request:\n    allowed-base-branches: [agent-work/*]\n    max: 1\n" + checks + handlerApp + "---\n\nTest workflow.\n"
 				testFile := filepath.Join(t.TempDir(), "merge-permissions.md")
 				require.NoError(t, os.WriteFile(testFile, []byte(content), 0600))
 				compiler := NewCompiler(WithVersion("1.0.0"))

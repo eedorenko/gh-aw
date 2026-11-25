@@ -20,12 +20,11 @@ engine:
   id: copilot
   copilot-sdk: true
   bare: true
-  model-routing:
-    goal: cost
-    mode: economy
-    # claude-haiku-4.5 lists no reasoning efforts, so this also covers a Claude
-    # model selected without an effort. The sub-agent's model stays out of the pool.
-    allowed-models: [claude-haiku-4.5]
+model: router/economy
+model-routing:
+  # claude-haiku-4.5 lists no reasoning efforts, so this also covers a Claude
+  # model selected without an effort. The sub-agent's model stays out of the pool.
+  allowed-models: [claude-haiku-4.5]
 imports:
   - shared/reporting.md
 max-tool-denials: 3
@@ -35,7 +34,7 @@ safe-outputs:
     group: true
     close-older-issues: true
     close-older-key: "smoke-copilot-sdk-routed-claude"
-    labels: [automation, testing]
+    labels: [automation, testing, "backlog:smoke-tests"]
 timeout-minutes: 10
 features:
   gh-aw-detection: false

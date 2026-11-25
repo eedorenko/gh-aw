@@ -23,9 +23,12 @@ tools:
   edit:
   bash:
     - "*"
+imports:
+  - shared/reporting.md
+  - shared/pr-safe-output-defaults.md
 safe-outputs:
-  steer: true
   create-pull-request:
+    expires: false
     title-prefix: "[docs-diagram] "
     labels: [documentation, automation]
     draft: true
@@ -39,10 +42,10 @@ safe-outputs:
     max-patch-files: 2
     max-patch-size: 512
   noop:
+model: router/economy
 engine:
   id: codex
-  model-provider: openai
-model: openai/gpt-5.6-sol
+  model-provider: github
 strict: true
 timeout-minutes: 20
 evals:
@@ -76,6 +79,14 @@ Create one small, useful diagram for the next eligible documentation page. Keep 
    - use a system/Mona Sans-compatible font stack, 1px rules, square or minimally rounded corners, and no shadows or gradients
 5. Make the SVG accessible: include `role="img"`, a unique `aria-labelledby`, and first-child `<title>` and `<desc>` elements. Use concise, readable labels and preserve sufficient contrast.
 6. Add the diagram immediately after the section it explains, using the repository's existing MDX image syntax and meaningful alt text. Do not change unrelated wording or frontmatter.
+
+## PR body format
+
+Use `###` or lower headings in the generated PR body. Start with a concise
+overview, then the selected page, diagram concept, and validation result; put
+longer design or test evidence in
+`<details><summary><b>...</b></summary>...</details>`, and finish with any next
+action or limitation. Keep the page, concept, and build result visible.
 
 ## Validate and publish
 

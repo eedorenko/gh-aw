@@ -1,7 +1,10 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -42,6 +45,21 @@ func mcpHTTPServerDisplayURL(port int) string {
 	return fmt.Sprintf("http://127.0.0.1:%d", port)
 }
 
+func newMCPHTTPHandler(server *mcp.Server) http.Handler {
+	return mcp.NewStreamableHTTPHandler(func(req *http.Request) *mcp.Server {
+		return server
+	}, &mcp.StreamableHTTPOptions{
+		// Stateless mode is deliberately left disabled. Stateless servers opt into
+		// the 2026-07-28 protocol revision but drop session affinity, which the
+		// long-running logs/audit tools rely on for progress notifications over the
+		// lifetime of a session. Staying stateful lets the SDK negotiate down to
+		// 2025-11-25 for peers that still expect the initialize handshake.
+		SessionTimeout:             2 * time.Hour, // Close idle sessions after 2 hours
+		DisableLocalhostProtection: false,         // Keep the SDK's localhost Host-header checks enabled.
+		Logger:                     logger.NewSlogLoggerWithHandler(mcpLog),
+	})
+}
+
 func loggingHandler(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -75,22 +93,11 @@ func loggingHandler(handler http.Handler) http.Handler {
 }
 
 // runHTTPServer runs the MCP server with HTTP/SSE transport
-func runHTTPServer(server *mcp.Server, port int) error {
+func runHTTPServer(ctx context.Context, server *mcp.Server, port int) error {
 	mcpLog.Printf("Creating HTTP server on port %d", port)
 
 	// Create the streamable HTTP handler.
-	handler := mcp.NewStreamableHTTPHandler(func(req *http.Request) *mcp.Server {
-		return server
-	}, &mcp.StreamableHTTPOptions{
-		// Stateless mode is deliberately left disabled. Stateless servers opt into
-		// the 2026-07-28 protocol revision but drop session affinity, which the
-		// long-running logs/audit tools rely on for progress notifications over the
-		// lifetime of a session. Staying stateful lets the SDK negotiate down to
-		// 2025-11-25 for peers that still expect the initialize handshake.
-		SessionTimeout:             2 * time.Hour, // Close idle sessions after 2 hours
-		DisableLocalhostProtection: false,         // Keep the SDK's localhost Host-header checks enabled.
-		Logger:                     logger.NewSlogLoggerWithHandler(mcpLog),
-	})
+	handler := newMCPHTTPHandler(server)
 
 	handlerWithLogging := loggingHandler(handler)
 
@@ -104,16 +111,39 @@ func runHTTPServer(server *mcp.Server, port int) error {
 		Addr:              addr,
 		Handler:           handlerWithLogging,
 		ReadHeaderTimeout: MCPServerHTTPTimeout,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
 	}
 
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Starting MCP server on "+mcpHTTPServerDisplayURL(port)))
 	mcpLog.Printf("HTTP server listening on %s", addr)
 
-	// Run the HTTP server
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		mcpLog.Printf("HTTP server failed: %v", err)
-		return fmt.Errorf("HTTP server failed: %w", err)
+	done := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("HTTP server panicked: %v", r)
+			}
+		}()
+		done <- httpServer.ListenAndServe()
+	}()
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("HTTP server failed: %w", err)
+		}
+		return nil
+	case <-ctx.Done():
+		// The request contexts are canceled above, including active SSE streams.
+		// Wait for handlers to return before the command cleans up its reports.
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		err := httpServer.Shutdown(shutdownCtx)
+		if err != nil {
+			err = errors.Join(err, httpServer.Close())
+		}
+		if serveErr := <-done; serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			err = errors.Join(err, serveErr)
+		}
+		return err
 	}
-
-	return nil
 }

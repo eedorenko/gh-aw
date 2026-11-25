@@ -58,10 +58,11 @@ describe("custom safe-output issue API", () => {
   });
 
   it("re-exports only the supported public functions without wrapping them", () => {
-    expect(Object.keys(publicApi).sort()).toEqual(["createIssue", "logSpan", "setupGlobals"]);
+    expect(Object.keys(publicApi).sort()).toEqual(["createIssue", "logMetric", "logSpan", "setupGlobals"]);
     expect(createIssue).toBe(require("./create_issue.cjs").createIssue);
     expect(setupGlobals).toBe(require("./setup_globals.cjs").setupGlobals);
     expect(publicApi.logSpan).toBe(require("./otlp.cjs").logSpan);
+    expect(publicApi.logMetric).toBe(require("./otlp.cjs").logMetric);
   });
 
   it("keeps OTEL disabled without a valid trace ID", async () => {
@@ -95,6 +96,36 @@ describe("custom safe-output issue API", () => {
     });
   });
 
+  it.each(["true", "false"])("adds the requested expiry without sending helper options to GitHub when staged=%s", async staged => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-20T10:00:00Z"));
+    try {
+      process.env.GH_AW_SAFE_OUTPUTS_STAGED = staged;
+      const result = await createIssue({ title: "Finding", body: "Details", expiresHours: 48 });
+      const request = staged === "true" ? result.preview : github.rest.issues.create.mock.calls[0][0];
+      expect(request.body).toContain("<!-- gh-aw-expires: 2026-11-22T10:00:00.000Z -->");
+      expect(request).not.toHaveProperty("expiresHours");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves fractional-hour expiry deadlines through the custom issue API", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-20T10:00:00Z"));
+    try {
+      await createIssue({ title: "Finding", body: "Details", expiresHours: 0.5 });
+      expect(github.rest.issues.create.mock.calls[0][0].body).toContain("<!-- gh-aw-expires: 2026-11-20T10:30:00.000Z -->");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([0, -1, NaN, Infinity, "48"])("rejects invalid custom expiry %s without an API write", async expiresHours => {
+    await expect(createIssue({ title: "Finding", body: "Details", expiresHours })).rejects.toThrow("positive finite number");
+    expect(github.rest.issues.create).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["labels", MAX_LABELS],
     ["assignees", MAX_ASSIGNEES],
@@ -118,13 +149,7 @@ describe("custom safe-output issue API", () => {
     const { withClaimExecution } = require("./work_queue_claim_scope.cjs");
     const render = vi.spyOn(require("./report_ast.cjs"), "renderReport");
     const assignment = {
-      version: 3,
       dispatch_id: "dispatch",
-      request_id: "request",
-      commit_id: "commit",
-      policy_epoch: "policy",
-      pool: "default",
-      worker_profile: "default",
       claims: [{ handle: "claim", work_id: "work-id", claim_id: "claim-id", work: {}, result_refs: [] }],
     };
     await withClaimExecution({ assignment, claim_handle: "claim" }, async () => {

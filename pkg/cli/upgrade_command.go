@@ -8,9 +8,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/ctxutil"
 	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
@@ -63,19 +65,19 @@ Use --audit to check dependency health without performing upgrades. This include
 
 The --audit flag skips the normal upgrade process.
 
-This command always upgrades all Markdown files in .github/workflows.`,
+This command upgrades all Markdown files in the workflow directory (default .github/workflows).`,
 		Example: `  ` + string(constants.CLIExtensionPrefix) + ` upgrade                              # Upgrade all workflows
   ` + string(constants.CLIExtensionPrefix) + ` upgrade --no-fix                    # Update agent files only (skip codemods, actions, and compilation)
   ` + string(constants.CLIExtensionPrefix) + ` upgrade --no-actions                # Skip updating GitHub Actions versions
   ` + string(constants.CLIExtensionPrefix) + ` upgrade --no-compile                # Skip recompiling workflows (do not modify lock files)
   ` + string(constants.CLIExtensionPrefix) + ` upgrade --create-pull-request       # Upgrade and open a pull request
-  ` + string(constants.CLIExtensionPrefix) + ` upgrade --pr --auto-merge           # Open a pull request and enable auto-merge
-  ` + string(constants.CLIExtensionPrefix) + ` upgrade --org my-org --pr --auto-merge --yes  # Enable auto-merge for org upgrade pull requests
+  ` + string(constants.CLIExtensionPrefix) + ` upgrade --create-pull-request --auto-merge           # Open a pull request and enable auto-merge
+  ` + string(constants.CLIExtensionPrefix) + ` upgrade --org my-org --create-pull-request --auto-merge --yes  # Enable auto-merge for org upgrade pull requests
   ` + string(constants.CLIExtensionPrefix) + ` upgrade --dir custom/workflows      # Upgrade workflows in custom directory
   ` + string(constants.CLIExtensionPrefix) + ` upgrade --engine claude             # Override AI engine for compilation
   ` + string(constants.CLIExtensionPrefix) + ` upgrade --repo owner/repo           # Upgrade workflows in another repository
   ` + string(constants.CLIExtensionPrefix) + ` upgrade --org my-org                # Preview upgrade pull requests across an organization
-  ` + string(constants.CLIExtensionPrefix) + ` upgrade --org my-org --interactive --pr  # Select repositories and watch PR creation
+  ` + string(constants.CLIExtensionPrefix) + ` upgrade --org my-org --interactive --create-pull-request  # Select repositories and watch PR creation
   ` + string(constants.CLIExtensionPrefix) + ` upgrade --enterprise my-enterprise --dry-run  # Preview accessible enterprise organizations
   ` + string(constants.CLIExtensionPrefix) + ` upgrade --org my-org --repos '*-service'  # Limit org mode to matching repositories
   ` + string(constants.CLIExtensionPrefix) + ` upgrade --org my-org --create-pull-request  # Open upgrade pull requests in org repositories
@@ -197,9 +199,9 @@ This command always upgrades all Markdown files in .github/workflows.`,
 				if err != nil {
 					return err
 				}
-				prBody = appendPRMessage(prBody, opts.prMessage)
+				prBody = appendUpdatePRReleaseHighlights(cmd.Context(), prBody, opts.prMessage, "")
 				_, err = createPRWithChanges(cmd.Context(), "upgrade-agentic-workflows", "chore: upgrade agentic workflows",
-					"Upgrade agentic workflows", prBody, verbose, opts.autoMerge)
+					updatePRTitle("Upgrade agentic workflows"), prBody, verbose, opts.autoMerge)
 				return err
 			}
 			return nil
@@ -218,7 +220,7 @@ This command always upgrades all Markdown files in .github/workflows.`,
 	cmd.Flags().StringSlice("disable-codemod", nil, "Disable specific codemod IDs during the fix step (repeatable)")
 	cmd.Flags().Bool("create-pull-request", false, "Create a pull request with the upgrade changes")
 	cmd.Flags().Bool("pr", false, "Alias for --create-pull-request")
-	cmd.Flags().Bool("auto-merge", false, "Enable auto-merge on the created pull request (requires --pr or --create-pull-request)")
+	cmd.Flags().Bool("auto-merge", false, "Enable auto-merge on the created pull request (requires --create-pull-request)")
 	addPRMessageFlag(cmd)
 	_ = cmd.Flags().MarkHidden("pr") // Hide the short alias from help output
 	cmd.Flags().Bool("create-issue", false, "Open a GitHub issue in each org repository with agentic workflows (requires --org)")
@@ -236,6 +238,7 @@ This command always upgrades all Markdown files in .github/workflows.`,
 	// Register completions
 	RegisterEngineFlagCompletion(cmd)
 	RegisterDirFlagCompletion(cmd, "dir")
+	addUpdateJSONLFlag(cmd)
 
 	return cmd
 }
@@ -284,7 +287,7 @@ type upgradeOptions struct {
 // runUpgradeCommand executes the upgrade process
 //
 //nolint:largefunc // Upgrade side effects require ordered progress reporting and independent failure handling.
-func runUpgradeCommand(opts upgradeOptions) error {
+func runUpgradeCommand(opts upgradeOptions) (runErr error) {
 	upgradeLog.Printf("Running upgrade command: verbose=%v, workflowDir=%s, noFix=%v, noCompile=%v, noActions=%v, disabledCodemodIDs=%v, skipExtensionUpgrade=%v",
 		opts.verbose, opts.workflowDir, opts.noFix, opts.noCompile, opts.noActions, opts.disabledCodemodIDs, opts.skipExtensionUpgrade)
 
@@ -303,9 +306,9 @@ func runUpgradeCommand(opts upgradeOptions) error {
 		if upgraded {
 			upgradeLog.Print("Extension was upgraded; re-launching with new binary")
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Continuing upgrade with newly installed version..."))
-			// Pass installPath so relaunchWithSameArgs uses the pre-rename path;
+			// Pass installPath so relaunchUpgradeWithContext uses the pre-rename path;
 			// on Linux os.Executable() returns a "(deleted)" suffix after the rename.
-			if err := relaunchWithSameArgs("--skip-extension-upgrade", installPath); err != nil {
+			if err := relaunchUpgradeWithContext(opts.ctx, "--skip-extension-upgrade", installPath); err != nil {
 				return err
 			}
 			// The child process completed all upgrade steps (including any PR creation).
@@ -318,6 +321,11 @@ func runUpgradeCommand(opts upgradeOptions) error {
 	if err != nil {
 		return err
 	}
+	finish, err := observeUpdateChanges(opts.ctx, workflowDir)
+	if err != nil {
+		return err
+	}
+	defer func() { runErr = errors.Join(runErr, finish()) }()
 
 	// Step 1: Update dispatcher skill and related Copilot artifacts (like init command)
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Updating dispatcher skill..."))
@@ -338,6 +346,7 @@ func runUpgradeCommand(opts upgradeOptions) error {
 		upgradeLog.Print("Applying codemods to all workflows")
 
 		fixConfig := FixConfig{
+			Ctx:                        opts.ctx,
 			WorkflowIDs:                nil, // nil means all workflows
 			Write:                      true,
 			Verbose:                    opts.verbose,
@@ -345,11 +354,17 @@ func runUpgradeCommand(opts upgradeOptions) error {
 			DisabledCodemodIDs:         opts.disabledCodemodIDs,
 			SkipInstructionFileUpdates: true,
 		}
-		if opts.summary != nil {
-			fixConfig.OnApplied = opts.summary.recordFix
+		fixConfig.OnApplied = func(file string, fixes []string) {
+			if opts.summary != nil {
+				opts.summary.recordFix(file, fixes)
+			}
+			if reporter := updateReporter(opts.ctx); reporter != nil {
+				reporter.recordError(emitUpdateEvent(opts.ctx, updateJSONLEvent{Event: "codemod", Path: updateJSONLRelativePath(file), Codemods: fixes}))
+			}
 		}
 
 		if err := RunFix(fixConfig); err != nil {
+			reportUpdateWarning(opts.ctx, "codemods", err)
 			upgradeLog.Printf("Failed to apply codemods: %v", err)
 			// Don't fail the upgrade if fix fails - this is non-critical
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to apply codemods: %v", err)))
@@ -367,6 +382,7 @@ func runUpgradeCommand(opts upgradeOptions) error {
 		upgradeLog.Print("Updating GitHub Actions versions")
 
 		if err := UpdateActions(opts.ctx, false, opts.verbose, false, 0); err != nil {
+			reportUpdateWarning(opts.ctx, "actions", err)
 			upgradeLog.Printf("Failed to update actions: %v", err)
 			// Don't fail the upgrade if action updates fail - this is non-critical
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to update actions: %v", err)))
@@ -380,6 +396,7 @@ func runUpgradeCommand(opts upgradeOptions) error {
 			// deferred to Step 4.
 			upgradeLog.Print("Updating action references in workflow .md files")
 			if err := UpdateActionsInWorkflowFiles(opts.ctx, opts.workflowDir, opts.engineOverride, opts.verbose, false, true, 0, false); err != nil {
+				reportUpdateWarning(opts.ctx, "workflow_actions", err)
 				msg := fmt.Sprintf("Failed to update action references in workflow files: %v", err)
 				upgradeLog.Print(msg)
 				// Non-critical: warn but don't fail the upgrade
@@ -408,6 +425,7 @@ func runUpgradeCommand(opts upgradeOptions) error {
 		// Use the shared directory compile pipeline so post-processing, including
 		// maintenance workflow generation and implicit expiry reconciliation, runs.
 		if compileErr := compileWorkflowsForUpdate(opts.ctx, nil, opts.workflowDir, opts.engineOverride, opts.verbose, opts.approve); compileErr != nil {
+			reportUpdateWarning(opts.ctx, "compilation", compileErr)
 			upgradeLog.Printf("Failed to compile workflows: %v", compileErr)
 			// Don't fail the upgrade if compilation fails - this is non-critical
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to compile workflows: %v", compileErr)))
@@ -437,6 +455,7 @@ func runUpgradeCommand(opts upgradeOptions) error {
 		upgradeLog.Print("Updating container image digest pins")
 		newPins, err := UpdateContainerPins(opts.ctx, opts.workflowDir, opts.verbose)
 		if err != nil {
+			reportUpdateWarning(opts.ctx, "containers", err)
 			upgradeLog.Printf("Failed to update container pins: %v", err)
 			// Non-critical — Docker may not be available in all environments.
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to update container pins: %v", err)))
@@ -447,6 +466,7 @@ func runUpgradeCommand(opts upgradeOptions) error {
 			upgradeLog.Print("Recompiling workflows to embed new container digest pins")
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Recompiling workflows to embed container digest pins..."))
 			if recompileErr := recompileAllWorkflows(opts.ctx, opts.workflowDir, opts.engineOverride, opts.verbose, opts.approve); recompileErr != nil {
+				reportUpdateWarning(opts.ctx, "compilation", recompileErr)
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to recompile after container pin update: %v", recompileErr)))
 			}
 		}
@@ -462,7 +482,7 @@ func runUpgradeCommand(opts upgradeOptions) error {
 // updateCopilotArtifacts updates the dispatcher skill and related Copilot setup artifacts.
 func updateCopilotArtifacts(opts upgradeOptions, workflowDir string) error {
 	// Update dispatcher skill
-	if err := ensureAgenticWorkflowsDispatcher(opts.verbose, opts.noSkill, true); err != nil {
+	if err := ensureAgenticWorkflowsDispatcher(ctxutil.OrBackground(opts.ctx), opts.verbose, opts.noSkill, true); err != nil {
 		upgradeLog.Printf("Failed to update dispatcher skill: %v", err)
 		return fmt.Errorf("failed to update dispatcher skill: %w", err)
 	}
@@ -548,7 +568,7 @@ func upgradeUsesCopilot(opts upgradeOptions, workflowDir string) bool {
 	return false
 }
 
-// relaunchWithSameArgs re-executes the current binary with the original command-line
+// relaunchUpgradeWithContext re-executes the current binary with the original command-line
 // arguments plus the provided extraFlag. stdin/stdout/stderr are forwarded to the child
 // process. The function blocks until the child exits and returns its error.
 // It is used after a successful extension upgrade so that the freshly-installed binary
@@ -558,7 +578,7 @@ func upgradeUsesCopilot(opts upgradeOptions, workflowDir string) bool {
 // calling os.Executable(). On Linux the caller should pass the pre-rename install
 // path because os.Executable() returns a "(deleted)"-suffixed path after the binary
 // has been renamed out of the way during the upgrade.
-func relaunchWithSameArgs(extraFlag string, exeOverride string) error {
+func relaunchUpgradeWithContext(ctx context.Context, extraFlag string, exeOverride string) error {
 	allowedExtraFlags := map[string]struct{}{
 		"--skip-extension-upgrade": {},
 	}
@@ -566,16 +586,78 @@ func relaunchWithSameArgs(extraFlag string, exeOverride string) error {
 		return fmt.Errorf("invalid relaunch flag %q: expected --skip-extension-upgrade", extraFlag)
 	}
 
-	var exe string
-	if exeOverride != "" {
-		exe = exeOverride
-	} else {
+	exe, err := resolveUpgradeRelaunchExecutable(exeOverride)
+	if err != nil {
+		return err
+	}
+
+	// Explicitly copy os.Args[1:] so appending the extra flag does not modify
+	// the original slice backing array.
+	newArgs := append(append([]string(nil), os.Args[1:]...), extraFlag)
+	if updateReporter(ctx) != nil {
+		newArgs = append(newArgs, "--jsonl-continuation")
+	}
+	if !validUpgradeRelaunchArgs(newArgs) {
+		return errors.New("invalid relaunch arguments: argument contains invalid control characters. Example: compile .github/workflows/example.md")
+	}
+	upgradeLog.Printf("Re-launching with new binary: %s (argument count: %d)", exe, len(newArgs))
+
+	// #nosec G204 -- exe is validated as an absolute path above and originates from
+	// os.Executable() or the known install path. newArgs forwards os.Args[1:] (user-controlled)
+	// plus a hardcoded flag; exec.Command passes arguments directly to execve(2) without
+	// invoking a shell, so shell-injection (CWE-78) is not possible regardless of argv content.
+	cmd := exec.CommandContext(ctx, exe, newArgs...)
+	configureUpgradeRelaunchCancellation(cmd)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	var forwarder *updateJSONLForwarder
+	if updateReporter(ctx) != nil {
+		forwarder = &updateJSONLForwarder{ctx: ctx}
+		cmd.Stdout = forwarder
+	}
+
+	runErr := cmd.Run()
+	if forwarder != nil {
+		if err := forwarder.finish(); err != nil {
+			return errors.Join(runErr, err)
+		}
+	}
+	if runErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(runErr, &exitErr) {
+			// Preserve the child's exit code so the entry-point can propagate it.
+			return &ExitCodeError{Code: exitErr.ExitCode()}
+		}
+		return runErr
+	}
+	return nil
+}
+
+func configureUpgradeRelaunchCancellation(cmd *exec.Cmd) {
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		if err := cmd.Process.Signal(os.Interrupt); err != nil {
+			killErr := cmd.Process.Kill()
+			if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+				return errors.Join(err, killErr)
+			}
+		}
+		return nil
+	}
+	cmd.WaitDelay = 5 * time.Second
+}
+
+func resolveUpgradeRelaunchExecutable(exeOverride string) (string, error) {
+	exe := exeOverride
+	if exe == "" {
 		var err error
 		exe, err = os.Executable()
 		if err != nil {
-			return fmt.Errorf("failed to determine executable path: %w", err)
+			return "", fmt.Errorf("failed to determine executable path: %w", err)
 		}
-
 		// Resolve symlinks to ensure we exec the real binary, not a wrapper.
 		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
 			exe = resolved
@@ -583,42 +665,12 @@ func relaunchWithSameArgs(extraFlag string, exeOverride string) error {
 			upgradeLog.Printf("Failed to resolve symlink for executable %s (using as-is): %v", exe, err)
 		}
 	}
-
-	// Explicitly copy os.Args[1:] so appending the extra flag does not modify
-	// the original slice backing array.
-	newArgs := append(append([]string(nil), os.Args[1:]...), extraFlag)
-	if !validUpgradeRelaunchArgs(newArgs) {
-		return errors.New("invalid relaunch arguments: argument contains invalid control characters. Example: compile .github/workflows/example.md")
-	}
-	upgradeLog.Printf("Re-launching with new binary: %s (argument count: %d)", exe, len(newArgs))
-
-	// Validate the executable path before re-launching it (defense-in-depth).
-	// exe is always derived from os.Executable() or the pre-rename installPath which is
-	// itself obtained from os.Executable() + filepath.EvalSymlinks (all trusted OS calls).
-	originalExe := exe
-	exe, err := fileutil.ValidateExecutablePath(exe)
+	// Both sources are trusted OS paths; validate before starting the process.
+	validated, err := fileutil.ValidateExecutablePath(exe)
 	if err != nil {
-		return fmt.Errorf("invalid executable path %q: %w", originalExe, err)
+		return "", fmt.Errorf("invalid executable path %q: %w", exe, err)
 	}
-
-	// #nosec G204 -- exe is validated as an absolute path above and originates from
-	// os.Executable() or the known install path. newArgs forwards os.Args[1:] (user-controlled)
-	// plus a hardcoded flag; exec.Command passes arguments directly to execve(2) without
-	// invoking a shell, so shell-injection (CWE-78) is not possible regardless of argv content.
-	cmd := exec.Command(exe, newArgs...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			// Preserve the child's exit code so the entry-point can propagate it.
-			return &ExitCodeError{Code: exitErr.ExitCode()}
-		}
-		return err
-	}
-	return nil
+	return validated, nil
 }
 
 func validUpgradeRelaunchArgs(args []string) bool {

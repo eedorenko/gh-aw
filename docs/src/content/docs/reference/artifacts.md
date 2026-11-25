@@ -38,7 +38,7 @@ Artifact names and checksums identify selected content, not whether that content
 | `prompt` | — | Legacy/back-compat | Historical standalone prompt artifact (`prompt.txt`); in current compiled workflows `prompt.txt` is included in the `activation` artifact instead |
 | `experiment` | `constants.ExperimentArtifactName` | Multi-file | A/B experiment state (`state.json`) uploaded by the activation job when experiments are declared in the frontmatter |
 | `usage` | `constants.UsageArtifactName` | Multi-file | Compact conclusion-job artifact with workflow-run metadata and token-usage files used by lightweight reporting and forecasting paths |
-| `graders` | `constants.GradersArtifactName` | Conditional | Combined built-in and custom results and data-only manifest from the separate `graders` job, generated when JavaScript or operational-value Bash graders are enabled |
+| `graders` | `constants.GradersArtifactName` | Conditional | Combined built-in and custom JavaScript results and data-only manifest from the separate `graders` job |
 | `evals` | `constants.EvalsArtifactName` | Single-file | BinEval evaluation results (`evals.jsonl`) uploaded by the evals job when `evals` are declared in the workflow frontmatter |
 | `safe-outputs-items` | `constants.SafeOutputItemsArtifactName` | Multi-file | Safe output items manifest (`safe-output-items.jsonl`), temporary ID map (`temporary-id-map.json`), and failure diagnostics (`safe-output-errors.json`, written only when the `Process Safe Outputs` step fails) |
 | `code-scanning-sarif` | `constants.SarifArtifactName` | Single-file | SARIF file for code scanning results |
@@ -54,28 +54,31 @@ Artifact names and checksums identify selected content, not whether that content
 
 ## Artifact Sets
 
-The `gh aw logs` and `gh aw audit` commands support `--artifacts` to download only specific artifact groups:
+The `gh aw logs` and `gh aw audit` commands support `--artifacts` to download only specific artifact groups. `logs` defaults to `usage`; `audit` defaults to `all`.
 
 | Set Name | Artifacts Downloaded | Use Case |
 |----------|---------------------|----------|
-| `all` | Everything | Full analysis (default) |
-| `agent` | `agent` | Agent logs and outputs |
+| `all` | Everything | Full analysis |
+| `agent` | `agent`, `agent-output-fallback` | Agent logs and outputs |
 | `activation` | `activation` | Activation data (`aw_info.json`, `prompt.txt`) |
-| `firewall` | `firewall-audit-logs` | Network policy and firewall audit data |
-| `mcp` | `firewall-audit-logs` | MCP gateway traffic logs |
+| `info` | `info` | Compact workflow-run information (`aw_info.json`) |
+| `firewall` | `agent` | Network policy and firewall audit data |
+| `mcp` | `agent` | MCP gateway traffic logs |
 | `detection` | `detection` | Threat detection output |
 | `experiment` | `experiment`, `usage` | A/B experiment state (only present when experiments are declared) |
 | `usage` | `usage` | Compact conclusion-job artifact for lightweight reporting and forecasting |
 | `evals` | `usage` | BinEval evaluation results (only present when `evals` are declared) |
 | `graders` | `usage`, `graders`, legacy agent artifacts | Default built-ins and optional combined custom results |
 | `github-api` | `activation`, `agent` | GitHub API rate limit logs |
-| `outcomes` | `safe-outputs-items`, `agent-output-fallback` | Executed safe-output manifests and compact agent output for recovering references omitted from handler results |
+| `delivery` | `safe-outputs-items`, `agent-output-fallback`, `usage` | Executed safe-output manifests, compact agent output, and conclusion evidence for delivery reporting |
 | `work-queue` | `activation`, `agent` | Queue snapshots, finish intents, and workflow logs for coordinator operation reporting |
 
 ```bash
 # Download agent and firewall artifacts only
 gh aw logs <run-id> --artifacts agent --artifacts firewall
 ```
+
+The former `outcomes` set was replaced by `delivery` without a compatibility alias. Use `gh aw logs <run-id> --delivery` to report execution evidence, or `--adoption` to include later resource decisions. See [Delivery and adoption](/gh-aw/reference/delivery-adoption/) for evidence and refresh semantics.
 
 ## `firewall-audit-logs`
 
@@ -153,6 +156,7 @@ The unified `agent` artifact contains agent job outputs:
 - GitHub API rate limit logs (`github_rate_limits.jsonl`)
 - Token usage summary (`agent_usage.json`) — aggregated totals only; per-request data is in `sandbox/firewall/logs/api-proxy-logs/`. When AWF records include valid `ai_credits_this_response` and `ai_credits_total` values, the summary preserves those reported values instead of repricing the tokens.
 - `otel.jsonl` — OTLP span mirror written by gh-aw's JavaScript span exporters when `observability.otlp` is configured
+- `otel-metrics.jsonl` — OTLP metrics mirror included when `observability.otlp` is configured and `GH_AW_OTEL_METRICS` is the literal value `true` (the default). It contains agent-job measurements recorded before upload; other jobs' post-job metrics are exported separately. See [Metrics](/gh-aw/reference/open-telemetry/#metrics).
 
 The AWF API proxy log directory may also contain `token-usage.jsonl` and `model-routing.jsonl`. Both are available to `gh aw audit` and `gh aw logs` in supported artifact layouts.
 
@@ -205,7 +209,7 @@ The `🧪 A/B Experiments` section of the audit report shows the variant chosen 
   • style = concise (cumulative: concise:5, detailed:4)
 ```
 
-See [A/B Experiments](/gh-aw/experimental/experiments/) for how to declare experiments in workflow frontmatter.
+See [A/B Experiments](/gh-aw/reference/experiments/) for how to declare experiments in workflow frontmatter.
 
 ## `usage`
 
@@ -277,6 +281,8 @@ The conclusion job derives `gateway` and `integrity` from MCP gateway logs, fall
 The `steering` section aggregates AWF API proxy events by normalized event name. `gh aw audit --artifacts usage` exposes these counters in `firewall_token_usage.steering_event_counts`, so steering behavior can be inspected without downloading raw firewall logs.
 
 AWF records each steering notice it delivers as a `steering` field (`type` `ai_credit`, `timeout` or `token`, and `threshold` 80, 90, 95 or 99) on the request's `api-proxy-logs/token-usage.jsonl` record, and the conclusion job copies it onto the matching `firewall.token_usage` event in `usage/aw_session.jsonl`. `gh aw audit` and `gh aw logs --json` list these delivered notices in `steering_notices`, one entry per notice with `type`, `threshold`, `request_id` and `phase` (`agent` or `detection`). AWF versions before v0.28.51 do not write the field, so a missing list means no notice was recorded, not that none was delivered. Notices with a threshold other than exactly 80, 90, 95 or 99 are ignored. When `usage/aw_session.jsonl` cannot be read (for example, a truncated record), the output omits `steering_notices`, sets `steering_notices_unavailable: true`, and adds a warning to the token usage warnings. `gateway_steering_events`, read from the API proxy event log, now includes `ai_credit_steering` warnings and keeps each event's `threshold` and `request_id` when AWF records them.
+
+AWF releases after v0.29.11 send each notice to every conversation in a run, once, and add a "little left" notice when only a few requests' worth of AI credits, or a few minutes, remain. `steering` is still written at most once per threshold per run; a separate `steering_delivery` field (`type`, `trigger` `threshold` or `little_left`, `threshold` or `null`, an opaque 12-character `conversation` key or `null`, and `first`) is written on every delivery. The conclusion job copies it to `steeringDelivery` on the `firewall.token_usage` event, and `gh aw audit` and `gh aw logs --json` list every delivery in `steering_deliveries`, with `type`, `trigger`, `threshold` (`null` for a "little left" notice), `conversation` (`null` when AWF could not key the conversation), `first`, `request_id` and `phase`. Conversation keys are comparable only within one run. Runs on AWF v0.29.11 or older have no deliveries, so `steering_deliveries` is omitted. `gateway_steering_events` entries also carry `trigger` and `conversation` when AWF records them; a "little left" event has `trigger: "little_left"` and no `threshold`.
 
 `rebuild_factor` is `cumulative_input_tokens / peak_input_tokens`, where each invocation contributes the canonical `input_tokens` value from the agent `token_usage.jsonl` record. Cache-read and cache-write fields are not added because provider normalization has already produced that logical input count. The factor is omitted when `measurement_state` is `unavailable`; `partial` means usable records were measured but malformed or unsupported records were ignored.
 
@@ -400,12 +406,13 @@ contributes zero answers. Keep `UNKNOWN` separate from both `YES` and `NO`.
 
 The conclusion job computes fast built-in graders by default after collecting
 the redacted unified session. Results live under `graders/` in the `usage`
-artifact, alongside `aw_session.jsonl`. Custom JavaScript and operational-value Bash run only in a separate
-downstream job, publishing a standalone `graders` artifact with combined built-in
-and custom results. Neither kind runs in the agent job. The files are:
+artifact, alongside `aw_session.jsonl`. Custom JavaScript, including reserved
+operational-value JavaScript, runs only in a separate downstream job, publishing
+a standalone `graders` artifact with combined built-in and custom results.
+Custom graders do not run in the agent job. The files are:
 
 - `grader_manifest.json` — The configured graders with their unit, direction, and threshold
-- `grader_results.json` — The validated grader results (status, raw value, pass/fail) computed from the in-memory unified session
+- `grader_results.json` — Validated results, including the full ordered operational-value `metrics` array when configured
 
 ### Accessing graders data
 

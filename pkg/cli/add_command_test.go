@@ -61,7 +61,7 @@ func TestNewAddCommand(t *testing.T) {
 	autoMergeFlag := flags.Lookup("auto-merge")
 	require.NotNil(t, autoMergeFlag)
 	assert.Equal(t, "false", autoMergeFlag.DefValue)
-	assert.Contains(t, autoMergeFlag.Usage, "requires --pr or --create-pull-request")
+	assert.Contains(t, autoMergeFlag.Usage, "requires --create-pull-request")
 
 	// Check force flag
 	forceFlag := flags.Lookup("force")
@@ -105,7 +105,7 @@ func TestAddCommandAutoMergeRequiresPR(t *testing.T) {
 			}
 			err := cmd.RunE(cmd, []string{"owner/repo/workflow"})
 			if prFlag == "" {
-				require.ErrorContains(t, err, "--auto-merge requires --pr or --create-pull-request")
+				require.ErrorContains(t, err, "--auto-merge requires --create-pull-request")
 			} else {
 				require.ErrorIs(t, err, engineErr)
 			}
@@ -117,11 +117,11 @@ func TestAddOptionsAutoMergeRequiresPR(t *testing.T) {
 	t.Parallel()
 	opts := AddOptions{AutoMerge: true}
 	result, err := AddWorkflows(context.Background(), []string{"invalid-source"}, opts)
-	require.ErrorContains(t, err, "--auto-merge requires --pr or --create-pull-request")
+	require.ErrorContains(t, err, "--auto-merge requires --create-pull-request")
 	assert.Nil(t, result)
 
 	result, err = AddResolvedWorkflows(context.Background(), nil, nil, opts)
-	require.ErrorContains(t, err, "--auto-merge requires --pr or --create-pull-request")
+	require.ErrorContains(t, err, "--auto-merge requires --create-pull-request")
 	assert.Nil(t, result)
 }
 
@@ -141,7 +141,7 @@ func TestAddCommandAutoMergePropagation(t *testing.T) {
 				autoMergeRunGH = originalAutoMerge
 				addMissingInitMarkers = originalMissingMarkers
 			})
-			addMissingInitMarkers = func(string, string) ([]string, error) { return nil, nil }
+			addMissingInitMarkers = func(context.Context, string, string) ([]string, error) { return nil, nil }
 			const prURL = "https://github.com/octo/repo/pull/42"
 			created := false
 			createPRRunGHContextWithHost = func(_ context.Context, _, _ string, args ...string) ([]byte, error) {
@@ -231,7 +231,9 @@ Test.
 
 			var err error
 			if tracked {
-				err = compileWorkflowWithTrackingAndActionRef(context.Background(), workflowFile, false, true, "", "", NewFileTracker())
+				err = compileWorkflowWithTrackingAndOptions(context.Background(), workflowFile, trackedWorkflowCompileOptions{
+					quiet: true, tracker: NewFileTracker(),
+				})
 			} else {
 				err = compileWorkflowWithActionRef(context.Background(), workflowFile, false, true, "", "")
 			}
@@ -588,7 +590,7 @@ func TestEnsureAddRepositoryInitialized(t *testing.T) {
 
 	t.Run("skips initialization outside a git checkout", func(t *testing.T) {
 		addFindGitRoot = func() (string, error) { return "", gitutil.ErrNotGitRepository }
-		addMissingInitMarkers = func(string, string) ([]string, error) {
+		addMissingInitMarkers = func(context.Context, string, string) ([]string, error) {
 			t.Fatal("missing init markers check should be skipped outside a git checkout")
 			return nil, nil
 		}
@@ -597,14 +599,14 @@ func TestEnsureAddRepositoryInitialized(t *testing.T) {
 			return nil
 		}
 
-		err := ensureAddRepositoryInitialized("", false, false)
+		err := ensureAddRepositoryInitialized(t.Context(), "", false, false)
 		require.NoError(t, err)
 	})
 
 	t.Run("runs init when required markers are missing", func(t *testing.T) {
 		repoDir := t.TempDir()
 		addFindGitRoot = func() (string, error) { return repoDir, nil }
-		addMissingInitMarkers = func(baseDir string, engineOverride string) ([]string, error) {
+		addMissingInitMarkers = func(_ context.Context, baseDir string, engineOverride string) ([]string, error) {
 			assert.Equal(t, ".", baseDir)
 			assert.Equal(t, "claude", engineOverride)
 			return []string{".gitattributes"}, nil
@@ -625,7 +627,7 @@ func TestEnsureAddRepositoryInitialized(t *testing.T) {
 			return nil
 		}
 
-		err := ensureAddRepositoryInitialized("claude", true, true)
+		err := ensureAddRepositoryInitialized(t.Context(), "claude", true, true)
 		require.NoError(t, err)
 		assert.True(t, called)
 	})
@@ -633,13 +635,13 @@ func TestEnsureAddRepositoryInitialized(t *testing.T) {
 	t.Run("does nothing when markers are already present", func(t *testing.T) {
 		repoDir := t.TempDir()
 		addFindGitRoot = func() (string, error) { return repoDir, nil }
-		addMissingInitMarkers = func(string, string) ([]string, error) { return nil, nil }
+		addMissingInitMarkers = func(context.Context, string, string) ([]string, error) { return nil, nil }
 		addInitRepository = func(InitOptions) error {
 			t.Fatal("InitRepository should not run when markers are already present")
 			return nil
 		}
 
-		err := ensureAddRepositoryInitialized("", false, false)
+		err := ensureAddRepositoryInitialized(t.Context(), "", false, false)
 		require.NoError(t, err)
 	})
 }
@@ -667,7 +669,7 @@ func TestEnsureAddRepositoryInitializedWithDetails_AbsolutePaths(t *testing.T) {
 	skippedMarker := ".gitattributes"
 
 	addFindGitRoot = func() (string, error) { return repoDir, nil }
-	addMissingInitMarkers = func(string, string) ([]string, error) {
+	addMissingInitMarkers = func(context.Context, string, string) ([]string, error) {
 		return []string{writtenMarker, skippedMarker}, nil
 	}
 	addInitRepository = func(InitOptions) error {
@@ -679,7 +681,7 @@ func TestEnsureAddRepositoryInitializedWithDetails_AbsolutePaths(t *testing.T) {
 		return os.WriteFile(p, []byte(`{}`), 0644)
 	}
 
-	files, err := ensureAddRepositoryInitializedWithDetails("", false, true)
+	files, err := ensureAddRepositoryInitializedWithDetails(t.Context(), "", false, true)
 	require.NoError(t, err)
 
 	// Only the actually-written file should be returned.
@@ -740,7 +742,7 @@ on:
 # Worker
 `), 0o644))
 
-	compileDispatchWorkflowDependenciesWithActionRef(context.Background(), mainPath, false, true, "", "", false, nil)
+	compileDispatchWorkflowDependenciesWithOptions(context.Background(), mainPath, compileDepsOptions{quiet: true})
 
 	lockPath := filepath.Join(workflowsDir, "worker.lock.yml")
 	_, err := os.Stat(lockPath)
@@ -775,7 +777,9 @@ safe-outputs:
 	// Write an intentionally broken worker file (no frontmatter — compile will fail).
 	require.NoError(t, os.WriteFile(workerPath, []byte(`not valid workflow content`), 0o644))
 
-	err := compileCallWorkflowDependenciesWithActionRef(context.Background(), mainPath, false, true, "", "", false, nil)
+	err := compileCallWorkflowDependenciesWithOptions(context.Background(), mainPath, compileDepsOptions{
+		quiet: true, propagateErrors: true,
+	})
 	require.Error(t, err, "worker compilation failure should propagate as an error")
 	require.ErrorContains(t, err, "worker", "error should mention the worker name")
 }
@@ -814,13 +818,15 @@ on:
 	require.NoError(t, os.WriteFile(lockPath, []byte("# stale lock"), 0o644))
 
 	// Without force: stale lock is preserved.
-	err := compileCallWorkflowDependenciesWithActionRef(context.Background(), mainPath, false, true, "", "", false, nil)
+	err := compileCallWorkflowDependenciesWithOptions(context.Background(), mainPath, compileDepsOptions{quiet: true})
 	require.NoError(t, err)
 	content, _ := os.ReadFile(lockPath)
 	assert.Equal(t, "# stale lock", string(content), "without force, stale lock should not be recompiled")
 
 	// With force: stale lock gets recompiled.
-	err = compileCallWorkflowDependenciesWithActionRef(context.Background(), mainPath, false, true, "", "", true, nil)
+	err = compileCallWorkflowDependenciesWithOptions(context.Background(), mainPath, compileDepsOptions{
+		quiet: true, force: true,
+	})
 	require.NoError(t, err)
 	recompiled, _ := os.ReadFile(lockPath)
 	assert.NotEqual(t, "# stale lock", string(recompiled), "with force, stale lock should be recompiled")
@@ -903,13 +909,14 @@ func TestAddWorkflowWithTracking_SourceFieldVariants(t *testing.T) {
 	simpleContent := []byte("---\non: push\n---\n\n# Workflow\n")
 	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
-	tests := []struct {
+	type testCase struct {
 		name            string
 		spec            *WorkflowSpec
 		sourceInfo      *FetchedWorkflow
 		wantContains    string
 		wantNotContains string
-	}{
+	}
+	tests := []testCase{
 		{
 			// Local workflows must NOT get a source: field — the code guards on !sourceInfo.IsLocal.
 			name: "local workflow — no source field written",
@@ -942,7 +949,7 @@ func TestAddWorkflowWithTracking_SourceFieldVariants(t *testing.T) {
 				IsLocal:    false,
 				SourcePath: ".github/workflows/my-workflow.md", // identical — no fallback
 			},
-			wantContains:    "source: owner/repo/.github/workflows/my-workflow.md@" + sha,
+			wantContains:    "source: owner/repo/.github/workflows/my-workflow.md@main",
 			wantNotContains: "",
 		},
 		{
@@ -961,9 +968,30 @@ func TestAddWorkflowWithTracking_SourceFieldVariants(t *testing.T) {
 				IsLocal:    false,
 				SourcePath: ".github/workflows/my-workflow.md", // resolved via fallback
 			},
-			wantContains:    "source: current-org/current-repo/.github/workflows/my-workflow.md@" + sha,
+			wantContains:    "source: current-org/current-repo/.github/workflows/my-workflow.md@main",
 			wantNotContains: "source: current-org/current-repo/my-workflow.md",
 		},
+	}
+
+	for _, ref := range []string{"v1.2.0", "v1", "release/stable", sha, ""} {
+		wantRef := ref
+		if wantRef == "" {
+			wantRef = sha
+		}
+		tests = append(tests, testCase{
+			name: "remote workflow ref " + ref,
+			spec: &WorkflowSpec{
+				RepoSpec:     RepoSpec{RepoSlug: "owner/repo", Version: ref},
+				WorkflowPath: ".github/workflows/my-workflow.md",
+				WorkflowName: "my-workflow",
+			},
+			sourceInfo: &FetchedWorkflow{
+				Content:    simpleContent,
+				CommitSHA:  sha,
+				SourcePath: ".github/workflows/my-workflow.md",
+			},
+			wantContains: "source: owner/repo/.github/workflows/my-workflow.md@" + wantRef,
+		})
 	}
 
 	for _, tt := range tests {
@@ -1041,7 +1069,7 @@ func TestAddWorkflowWithTracking_UsesActualFetchedPath(t *testing.T) {
 
 	// The source: field must use the full path, not the short-form WorkflowPath
 	assert.Contains(t, string(written),
-		"source: owner/repo/.github/workflows/my-workflow.md@abc123def456789012345678901234567890abcd",
+		"source: owner/repo/.github/workflows/my-workflow.md@main",
 		"source field should use the actual fetched path so gh aw update can find the file")
 	assert.NotContains(t, string(written),
 		"source: owner/repo/my-workflow.md",

@@ -290,11 +290,13 @@ func (c *Compiler) MergeSafeOutputs(topSafeOutputs *SafeOutputsConfig, importedS
 	// Track types defined in imported configs for conflict detection
 	importedDefinedTypes := make(map[string]struct {
 	})
+	importedCreatePullRequestDefaults := make(map[string]any)
 
 	// Collect all imported configs. This includes configs with only meta fields (like allowed-domains,
 	// staged, env, github-token, max-patch-size, runs-on) as well as those defining safe output types.
 	// Meta fields can be imported even when no safe output types are defined.
 	var importedConfigs []map[string]any
+	var importedAuthorizationConfigs []*SafeOutputsConfig
 	// Collect protected-files exclude lists from type-conflicting imports so they can be
 	// merged as a set even when the importing config already defines the same handler type.
 	// These are keyed by handler type name (e.g. "create-pull-request").
@@ -306,10 +308,25 @@ func (c *Compiler) MergeSafeOutputs(topSafeOutputs *SafeOutputsConfig, importedS
 		}
 
 		var config map[string]any
-		if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
+		configBytes := []byte(configJSON)
+		if err := json.Unmarshal(configBytes, &config); err != nil {
 			importsLog.Printf("Skipping malformed safe-outputs config: %v", err)
 			continue
 		}
+		if err := validateSafeOutputAuthorizationAliases(config); err != nil {
+			return nil, err
+		}
+		// Native extraction preprocesses templatable fields in place. Keep its
+		// authority snapshot separate from the map parsed for the ordinary merge.
+		var authorizationConfig map[string]any
+		if err := json.Unmarshal(configBytes, &authorizationConfig); err != nil {
+			return nil, fmt.Errorf("cannot preserve imported safe-output authorization: %w", err)
+		}
+		importedConfig := c.extractSafeOutputsConfig(map[string]any{"safe-outputs": authorizationConfig})
+		if err := validateTokenBrokerGitHubConfig(&WorkflowData{SafeOutputs: importedConfig}); err != nil {
+			return nil, err
+		}
+		importedAuthorizationConfigs = append(importedAuthorizationConfigs, importedConfig)
 		config = normalizeMissingReportKeys(config)
 
 		// Check for conflicts and remove types already defined in top-level config
@@ -319,6 +336,24 @@ func (c *Compiler) MergeSafeOutputs(topSafeOutputs *SafeOutputsConfig, importedS
 		for _, key := range typeKeys {
 			if _, exists := config[key]; exists {
 				if setutil.Contains(topDefinedTypes, key) {
+					if key == "create-pull-request" {
+						localConfig, ok := topRawSafeOutputs[key].(map[string]any)
+						if !ok || localConfig == nil {
+							localConfig = map[string]any{}
+						}
+						if importedConfig, ok := config[key].(map[string]any); ok {
+							for _, field := range []string{"expires", "draft"} {
+								if _, defined := localConfig[field]; defined {
+									continue
+								}
+								if value, defined := importedConfig[field]; defined {
+									if _, captured := importedCreatePullRequestDefaults[field]; !captured {
+										importedCreatePullRequestDefaults[field] = value
+									}
+								}
+							}
+						}
+					}
 					// Main workflow overrides imported definition — extract protected-files
 					// exclude lists before removing the type entry.
 					if handlerCfg, ok := config[key].(map[string]any); ok {
@@ -361,22 +396,60 @@ func (c *Compiler) MergeSafeOutputs(topSafeOutputs *SafeOutputsConfig, importedS
 	if result == nil {
 		result = &SafeOutputsConfig{}
 	}
+	// Preserve required authorities before ordinary import override semantics
+	// remove handler configurations shadowed by the main workflow.
+	for _, imported := range importedAuthorizationConfigs {
+		if imported != nil {
+			if err := mergeSafeOutputAuthorizations(result, imported); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// Track explicit settings so later imports cannot replace disables with defaults.
+	explicitSafeOutputs := make(map[string]any)
+	maps.Copy(explicitSafeOutputs, topRawSafeOutputs)
 
 	// Merge each imported config
 	for _, config := range importedConfigs {
 		var err error
-		result, err = mergeSafeOutputConfig(result, config, topRawSafeOutputs, c)
+		result, err = mergeSafeOutputConfig(result, config, explicitSafeOutputs, topRawSafeOutputs, c)
 		if err != nil {
 			return nil, err
+		}
+		maps.Copy(explicitSafeOutputs, config)
+		// Imported require-agent-success values are OR-combined; only the main workflow can override them.
+		if _, defined := topRawSafeOutputs["require-agent-success"]; !defined {
+			delete(explicitSafeOutputs, "require-agent-success")
+		}
+	}
+
+	if len(importedCreatePullRequestDefaults) > 0 && result.CreatePullRequests != nil {
+		importedConfig := c.extractSafeOutputsConfig(map[string]any{
+			"safe-outputs": map[string]any{
+				"create-pull-request": importedCreatePullRequestDefaults,
+			},
+		})
+		if importedConfig != nil && importedConfig.CreatePullRequests != nil {
+			localConfig, ok := topRawSafeOutputs["create-pull-request"].(map[string]any)
+			if !ok || localConfig == nil {
+				localConfig = map[string]any{}
+			}
+			if _, defined := localConfig["expires"]; !defined {
+				result.CreatePullRequests.Expires = importedConfig.CreatePullRequests.Expires
+			}
+			if _, defined := localConfig["draft"]; !defined {
+				result.CreatePullRequests.Draft = importedConfig.CreatePullRequests.Draft
+			}
 		}
 	}
 
 	// Recompute the implicit report-incomplete create-issue default now that imports are
 	// merged. The default is originally computed from only the main workflow's own
-	// safe-outputs block, before Linear (or other) handlers supplied by an import are
+	// safe-outputs block, before handlers supplied by an import are
 	// visible. Without recomputing here, a main workflow that declares only global fields
-	// (e.g. linear-token) could inherit an implicit `create-issue: true` default meant for
-	// a GitHub-only configuration, even though the merged result is Linear-only.
+	// could inherit an implicit `create-issue: true` default meant for
+	// a GitHub-only configuration, even though the merged result is connector-only.
 	if result.ReportIncomplete != nil && result.ReportIncomplete.Implicit {
 		recomputed := defaultReportIncompleteCreateIssue(result)
 		result.ReportIncomplete.CreateIssue = &recomputed
@@ -404,6 +477,15 @@ func (c *Compiler) MergeSafeOutputs(topSafeOutputs *SafeOutputsConfig, importedS
 				importsLog.Printf("Merged %d accumulated protected-files exclude(s) into push-to-pull-request-branch", len(excludeFiles))
 			}
 		}
+		if result.MergePullRequest != nil {
+			if excludeFiles, ok := accumulatedExclude["merge-pull-request"]; ok && len(excludeFiles) > 0 {
+				result.MergePullRequest.ProtectedFilesExclude = sliceutil.MergeUnique(
+					result.MergePullRequest.ProtectedFilesExclude,
+					excludeFiles...,
+				)
+				importsLog.Printf("Merged %d accumulated protected-files exclude(s) into merge-pull-request", len(excludeFiles))
+			}
+		}
 	}
 
 	importsLog.Printf("Successfully merged safe-outputs from imports")
@@ -424,20 +506,38 @@ func hasSafeOutputType(config *SafeOutputsConfig, key string) bool {
 	return hasSafeOutputFieldSet(config, handler.StructField)
 }
 
-func mergeAutoDefaultedSafeOutput[T any](result **T, imported *T, config, topRawSafeOutputs map[string]any, key string) {
+func mergeAutoDefaultedSafeOutput[T any](result **T, imported *T, config, explicitSafeOutputs map[string]any, key string) {
 	_, hasImported := config[key]
-	_, hasMain := topRawSafeOutputs[key]
-	if (hasImported || (*result == nil && !hasMain)) && imported != nil {
+	_, hasExplicit := explicitSafeOutputs[key]
+	if hasImported || (*result == nil && !hasExplicit && imported != nil) {
 		*result = imported
 	}
+}
+
+// preserveImportedSystemHandlers keeps mandatory system handlers enabled while
+// honoring false as a request to disable their issue-producing side effects.
+func preserveImportedSystemHandlers(config map[string]any) map[string]any {
+	config = maps.Clone(config)
+	for key, field := range map[string]string{
+		"report-missing-tool": "create-issue",
+		"report-missing-data": "create-issue",
+		"noop":                "report-as-issue",
+		"report-incomplete":   "create-issue",
+	} {
+		if disabled, ok := config[key].(bool); ok && !disabled {
+			config[key] = map[string]any{field: false}
+		}
+	}
+	return config
 }
 
 // mergeSafeOutputConfig merges a single imported config map into the result SafeOutputsConfig
 //
 //nolint:largefunc // Existing meta-field merge flow remains centralized for consistent import semantics.
-func mergeSafeOutputConfig(result *SafeOutputsConfig, config, topRawSafeOutputs map[string]any, c *Compiler) (*SafeOutputsConfig, error) {
+func mergeSafeOutputConfig(result *SafeOutputsConfig, config, explicitSafeOutputs, topRawSafeOutputs map[string]any, c *Compiler) (*SafeOutputsConfig, error) {
 	config = normalizeMissingReportKeys(config)
-	topRawSafeOutputs = normalizeMissingReportKeys(topRawSafeOutputs)
+	config = preserveImportedSystemHandlers(config)
+	explicitSafeOutputs = normalizeMissingReportKeys(explicitSafeOutputs)
 	importsLog.Printf("Merging imported safe-output config: key_count=%d", len(config))
 	// Create a frontmatter-like structure for extractSafeOutputsConfig
 	frontmatter := map[string]any{
@@ -449,6 +549,9 @@ func mergeSafeOutputConfig(result *SafeOutputsConfig, config, topRawSafeOutputs 
 	if importedConfig == nil {
 		importsLog.Print("Imported safe-output config extracted no fields, skipping merge")
 		return result, nil
+	}
+	if err := mergeSafeOutputAuthorizations(result, importedConfig); err != nil {
+		return nil, err
 	}
 	if importedConfig.CreateIssuesDisabled {
 		result.CreateIssuesDisabled = true
@@ -493,18 +596,14 @@ func mergeSafeOutputConfig(result *SafeOutputsConfig, config, topRawSafeOutputs 
 			importedConfig.PushToPullRequestBranch.ProtectedFilesExclude...,
 		)
 	}
-	// missing-tool, missing-data, noop, and report-incomplete are auto-defaulted by
-	// extractSafeOutputsConfig whenever any safe-outputs are present, even when the user
-	// has not explicitly configured those types. This means result.X can be non-nil (the
-	// auto-default) even though the main workflow never explicitly set it. We therefore use
-	// the presence of the key in the raw imported config map as the authoritative signal:
-	// if the import explicitly carries the key, its value wins over any auto-default in result.
-	// The nil fallback applies only when the main workflow did not explicitly configure
-	// the type (an explicit false also produces nil in the parsed result).
-	mergeAutoDefaultedSafeOutput(&result.MissingTool, importedConfig.MissingTool, config, topRawSafeOutputs, "report-missing-tool")
-	mergeAutoDefaultedSafeOutput(&result.MissingData, importedConfig.MissingData, config, topRawSafeOutputs, "report-missing-data")
-	mergeAutoDefaultedSafeOutput(&result.NoOp, importedConfig.NoOp, config, topRawSafeOutputs, "noop")
-	mergeAutoDefaultedSafeOutput(&result.ReportIncomplete, importedConfig.ReportIncomplete, config, topRawSafeOutputs, "report-incomplete")
+	// System handlers are mandatory. Imported `false` values are normalized to enabled
+	// handlers with issue creation disabled before extraction. Use the raw key's presence
+	// to let an explicit import replace an auto-default without allowing later imports to
+	// replace it with implicit defaults.
+	mergeAutoDefaultedSafeOutput(&result.MissingTool, importedConfig.MissingTool, config, explicitSafeOutputs, "report-missing-tool")
+	mergeAutoDefaultedSafeOutput(&result.MissingData, importedConfig.MissingData, config, explicitSafeOutputs, "report-missing-data")
+	mergeAutoDefaultedSafeOutput(&result.NoOp, importedConfig.NoOp, config, explicitSafeOutputs, "noop")
+	mergeAutoDefaultedSafeOutput(&result.ReportIncomplete, importedConfig.ReportIncomplete, config, explicitSafeOutputs, "report-incomplete")
 	// ThreatDetection is also auto-defaulted by extractSafeOutputsConfig; apply the same
 	// pattern — the import's explicit threat-detection key takes precedence over the result's
 	// auto-default empty struct (which is not user-authored). If the main workflow explicitly
@@ -515,6 +614,15 @@ func mergeSafeOutputConfig(result *SafeOutputsConfig, config, topRawSafeOutputs 
 	}
 
 	// Merge meta-configuration fields (only set if empty/zero in result)
+	if _, supplied := config["token-broker"]; supplied {
+		if _, defined := explicitSafeOutputs["token-broker"]; !defined &&
+			result.GitHubApp == nil && result.GitHubToken == "" {
+			result.TokenBroker = importedConfig.TokenBroker
+		}
+	}
+	if _, defined := explicitSafeOutputs["require-agent-success"]; !defined {
+		result.RequireAgentSuccess = result.RequireAgentSuccess || importedConfig.RequireAgentSuccess
+	}
 	if !result.Steer && importedConfig.Steer {
 		result.Steer = true
 	}
@@ -530,13 +638,10 @@ func mergeSafeOutputConfig(result *SafeOutputsConfig, config, topRawSafeOutputs 
 	if len(result.Env) == 0 && len(importedConfig.Env) > 0 {
 		result.Env = importedConfig.Env
 	}
-	if result.GitHubToken == "" && importedConfig.GitHubToken != "" {
+	if !result.TokenBroker && result.GitHubToken == "" && importedConfig.GitHubToken != "" {
 		result.GitHubToken = importedConfig.GitHubToken
 	}
-	if result.LinearToken == "" && importedConfig.LinearToken != "" {
-		result.LinearToken = importedConfig.LinearToken
-	}
-	if result.GitHubApp == nil && importedConfig.GitHubApp != nil {
+	if !result.TokenBroker && result.GitHubApp == nil && importedConfig.GitHubApp != nil {
 		result.GitHubApp = importedConfig.GitHubApp
 	}
 	if result.MaximumPatchSize == 0 && importedConfig.MaximumPatchSize > 0 {

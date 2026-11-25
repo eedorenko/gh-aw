@@ -1,15 +1,56 @@
 package cli
 
 import (
+	"path"
 	"path/filepath"
 	"strconv"
+	"strings"
 
+	"github.com/github/gh-aw/pkg/parser"
 	"github.com/github/gh-aw/pkg/workflow"
 )
 
+func healthFleetIntentionalFailure(workflowPath string, collection *HealthCollection) bool {
+	if collection == nil || !validHealthFleetPath(workflowPath) || !validHealthBlobSHA(collection.pinnedBranchSHA) {
+		return false
+	}
+	enableHealthLocalGit(WorkflowRun{}, collection)
+	if collection.localGit == nil {
+		return false
+	}
+	snapshot := healthWorkflowFiles(collection.scanBranch, collection)
+	if snapshot.err != nil {
+		return false
+	}
+	source := strings.TrimSuffix(workflowPath, ".lock.yml") + ".md"
+	sha := snapshot.files[path.Clean(source)]
+	if sha == "" {
+		return false
+	}
+	content, err := collection.localGit.blob(sha)
+	if err != nil {
+		return false
+	}
+	result, err := parser.ExtractFrontmatterFromContent(string(content))
+	if err != nil || result == nil {
+		return false
+	}
+	features, ok := result.Frontmatter["features"].(map[string]any)
+	if !ok {
+		return false
+	}
+	value, ok := features["intentional-failure"].(bool)
+	return ok && value
+}
+
 // Reuse logs clustering without downloading artifacts or retaining full cached analyses.
 func buildHealthFailureClusters(runs []WorkflowRun, config HealthConfig) ([]FailureCluster, *FailureInvestigation) {
-	runs = currentHealthRuns(runs, healthRevisionStatuses(runs, config.collection))
+	failures := healthFailureRecords(currentHealthRuns(runs, healthRevisionStatuses(runs, config.collection)), config)
+	clusters := annotateFailureClusters(failures)
+	return clusters, buildFailureInvestigation(failures, clusters)
+}
+
+func healthFailureRecords(runs []WorkflowRun, config HealthConfig) []RunData {
 	var failures []RunData
 	intentional := make(map[string]bool)
 	for _, run := range runs {
@@ -40,8 +81,7 @@ func buildHealthFailureClusters(runs []WorkflowRun, config HealthConfig) ([]Fail
 		}
 		failures = append(failures, data)
 	}
-	clusters := annotateFailureClusters(failures)
-	return clusters, buildFailureInvestigation(failures, clusters)
+	return failures
 }
 
 func enrichHealthFailureFromCache(data *RunData, run WorkflowRun, config HealthConfig) {
@@ -60,6 +100,12 @@ func enrichHealthFailureFromCache(data *RunData, run WorkflowRun, config HealthC
 }
 
 func loadHealthRunSummary(run WorkflowRun, config HealthConfig) (*RunSummary, string) {
+	summary, dir, _ := loadHealthRunSummaryWithSessionCompatibility(run, config)
+	return summary, dir
+}
+
+// Raw-session-only caches remain usable, but rejected summaries cannot authenticate sessions.
+func loadHealthRunSummaryWithSessionCompatibility(run WorkflowRun, config HealthConfig) (*RunSummary, string, bool) {
 	root := config.LogsDir
 	if root == "" {
 		root = defaultLogsOutputDir
@@ -68,12 +114,12 @@ func loadHealthRunSummary(run WorkflowRun, config HealthConfig) (*RunSummary, st
 	key := healthRunAttempt{id: run.DatabaseID, attempt: run.Attempt}
 	if config.collection != nil {
 		if summary, checked := config.collection.cacheSummaries[key]; checked {
-			return summary, dir
+			return summary, dir, summary != nil || config.collection.cacheSessionCompatibility[key]
 		}
 		if checkHealthTimeBudget(config.collection) != nil {
 			recordHealthCacheEvidence(run, nil, config.collection.Reason, config.collection)
 			config.collection.cacheSummaries[key] = nil
-			return nil, dir
+			return nil, dir, false
 		}
 	}
 	summary, reason := readHealthCache(dir)
@@ -82,7 +128,7 @@ func loadHealthRunSummary(run WorkflowRun, config HealthConfig) (*RunSummary, st
 		if config.collection != nil {
 			config.collection.cacheSummaries[key] = nil
 		}
-		return nil, dir // Cache loader logs missing or invalid evidence.
+		return nil, dir, reason == "missing" // Cache loader logs missing or invalid evidence.
 	}
 	cached := summary.Run
 	if summary.RunID != run.DatabaseID || cached.DatabaseID != run.DatabaseID ||
@@ -94,7 +140,7 @@ func loadHealthRunSummary(run WorkflowRun, config HealthConfig) (*RunSummary, st
 		if config.collection != nil {
 			config.collection.cacheSummaries[key] = nil
 		}
-		return nil, dir
+		return nil, dir, false
 	}
 	status := "compatible"
 	producer := summary
@@ -110,5 +156,5 @@ func loadHealthRunSummary(run WorkflowRun, config HealthConfig) (*RunSummary, st
 	if config.collection != nil {
 		config.collection.cacheSummaries[key] = summary
 	}
-	return summary, dir
+	return summary, dir, true
 }

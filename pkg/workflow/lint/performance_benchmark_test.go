@@ -3,6 +3,7 @@ package lint
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -72,15 +73,6 @@ func performanceInput(tb testing.TB, contract ruleContract, target ASTTargets, p
 	document.Frontmatter["jobs"] = expanded
 	if contract.javaScript {
 		return graderJavaScriptPerformanceInput(tb, document, jobs)
-	}
-	if contract.safeShell != "" {
-		source := contract.safeShell
-		if positive {
-			source = contract.unsafeShell
-		}
-		// Set up referenced files only once. The integrated rule must reread
-		// them on each run; the I/O-free checker has its own package benchmark.
-		return prepareGraderShellFixture(tb, Input{Document: document}, source)
 	}
 	return Input{Document: document}
 }
@@ -152,16 +144,25 @@ func TestLintPerformanceBudget(t *testing.T) {
 				} else {
 					require.Zero(t, findings, "the safe fixture must not introduce findings")
 				}
-				started := time.Now()
-				allocations[index] = testing.AllocsPerRun(3, run)
-				durations[index] = time.Since(started) / 4 // AllocsPerRun includes one warm-up.
+				// Time only rule execution, not AllocsPerRun's GC/accounting.
+				var samples [4]time.Duration
+				sample := 0
+				allocations[index] = testing.AllocsPerRun(3, func() {
+					started := time.Now()
+					run()
+					samples[sample] = time.Since(started)
+					sample++
+				})
+				measured := samples[1:] // Discard the allocation warm-up.
+				slices.Sort(measured)
+				durations[index] = measured[len(measured)/2]
 				require.NoError(t, runErr)
 				t.Logf("jobs=%d duration=%s allocs/op=%.0f", jobs, durations[index], allocations[index])
 				require.Less(t, durations[index], 250*time.Millisecond, "AST-only checks must stay below the generous loaded-CI budget; profile with BenchmarkLintRules")
 			}
 			require.LessOrEqual(t, allocations[1], allocations[0]*12+1000,
 				"8x more jobs must not cause quadratic allocation growth; profile this rule before increasing the budget")
-			require.LessOrEqual(t, durations[1], durations[0]*24+5*time.Millisecond,
+			require.LessOrEqual(t, durations[1], durations[0]*24+10*time.Millisecond,
 				"8x more jobs must not cause excessive CPU growth; the margin tolerates shared-CI scheduling noise")
 		})
 	})

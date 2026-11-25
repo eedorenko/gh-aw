@@ -36,7 +36,7 @@ network:
     - go
 runtimes:
   go:
-    version: "1.27.3"
+    version: "1.27.4"
 evals:
   - id: native_mcp_prs
     question: Does the output show exactly two merged PR titles and numbers retrieved through native GitHub MCP rather than a CLI substitute?
@@ -53,7 +53,7 @@ safe-outputs:
     expires: 2h
     close-older-issues: true
     close-older-key: "smoke-cursor"
-    labels: [automation, testing]
+    labels: [automation, testing, "backlog:smoke-tests"]
   add-labels:
     allowed: [smoke-cursor]
   messages:

@@ -85,6 +85,21 @@ func TestNoOpValidationConfig(t *testing.T) {
 	}
 }
 
+func TestCreateIssueArtifactsValidationConfig(t *testing.T) {
+	jsonStr, err := GetValidationConfigJSONWithDataSchema([]string{"create_issue"}, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed map[string]TypeValidationConfig
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	artifacts, ok := parsed["create_issue"].Fields["artifacts"]
+	if !ok || artifacts.Type != "array" || artifacts.Required || artifacts.ItemSanitize {
+		t.Fatalf("artifacts validation = %+v, want an optional array preserved for handler validation", artifacts)
+	}
+}
+
 func TestApproveWorkflowRunValidationConfig(t *testing.T) {
 	config, ok := ValidationConfig["approve_workflow_run"]
 	if !ok {
@@ -112,15 +127,6 @@ func TestApproveWorkflowRunValidationConfig(t *testing.T) {
 	}
 	if runID := parsedConfig.Fields["run_id"]; !runID.Required || !runID.PositiveInteger {
 		t.Errorf("approve_workflow_run generated run_id = %+v, want required positive integer", runID)
-	}
-}
-
-func TestJiraCreateIssueValidationPreservesTemporaryID(t *testing.T) {
-	config := ValidationConfig["jira_create_issue"]
-	temporaryID := config.Fields["temporary_id"]
-
-	if !temporaryID.Required || !temporaryID.TemporaryID || temporaryID.Pattern != "^#aw_[A-Za-z0-9_]{3,12}$" {
-		t.Errorf("jira_create_issue temporary_id = %+v, want required temporary ID", temporaryID)
 	}
 }
 
@@ -505,8 +511,11 @@ func TestUpdateIssueValidationConfig(t *testing.T) {
 		t.Fatal("update_issue not found in ValidationConfig")
 	}
 
-	if config.CustomValidation != "requiresOneOf:status,title,body,labels,assignees,milestone" {
-		t.Errorf("update_issue customValidation = %q, want %q", config.CustomValidation, "requiresOneOf:status,title,body,labels,assignees,milestone")
+	if config.CustomValidation != "requiresOneOf:status,title,body,labels,assignees,milestone,artifacts" {
+		t.Errorf("update_issue customValidation = %q, want %q", config.CustomValidation, "requiresOneOf:status,title,body,labels,assignees,milestone,artifacts")
+	}
+	if artifacts, ok := config.Fields["artifacts"]; !ok || artifacts.Type != "array" || artifacts.Sanitize {
+		t.Errorf("update_issue artifacts must be an unsanitized array, got %+v", artifacts)
 	}
 
 	if _, ok := config.Fields["labels"]; !ok {
@@ -580,7 +589,7 @@ func TestStripOnErrorOnlyOnOptionalFields(t *testing.T) {
 func TestValidationConfigConsistency(t *testing.T) {
 	// Verify that all types with customValidation have valid validation rules
 	validCustomValidations := map[string]bool{
-		"requiresOneOf:status,title,body,labels,assignees,milestone":            true,
+		"requiresOneOf:status,title,body,labels,assignees,milestone,artifacts":  true,
 		"requiresOneOf:summary,description":                                     true,
 		"requiresOneOf:title,body":                                              true,
 		"requiresOneOf:title,body,update_branch":                                true,

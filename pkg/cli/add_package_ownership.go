@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,7 +18,6 @@ import (
 	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/workflow"
-	"github.com/github/gh-aw/pkg/workflow/gradershell"
 )
 
 var addPackageOwnershipLog = logger.New("cli:add_package_ownership")
@@ -104,7 +104,10 @@ func packageSourceForSpec(spec *WorkflowSpec, sourceInfo *FetchedWorkflow) strin
 		return ""
 	}
 	ref := spec.Version
-	if sourceInfo != nil && sourceInfo.CommitSHA != "" {
+	if spec.VersionInferred {
+		ref = ""
+	}
+	if ref == "" && sourceInfo != nil && sourceInfo.CommitSHA != "" {
 		ref = sourceInfo.CommitSHA
 	}
 	return manifestSourceWithRef(&RepoSpec{
@@ -123,6 +126,9 @@ func buildPackageOwnershipRecord(gitRoot, packageSource string, workflows []*Res
 		Installer:      "gh-aw " + GetVersion(),
 	}
 	for _, resolved := range workflows {
+		if resolved.SourceInfo != nil && IsCommitSHA(resolved.SourceInfo.CommitSHA) {
+			record.ResolvedCommit = resolved.SourceInfo.CommitSHA
+		}
 		destination, err := packageManagedDestination(resolved, opts)
 		if err != nil {
 			return nil, err
@@ -253,7 +259,7 @@ func readPackageOwnershipRecords(gitRoot string) ([]packageOwnershipRecord, erro
 	return records, nil
 }
 
-func syncManifestManagedResources(ctx context.Context, repoSpec *RepoSpec, pkg *resolvedRepositoryPackage, ref string, opts UpdateWorkflowsOptions) error { //nolint:largefunc
+func syncManifestManagedResources(ctx context.Context, repoSpec *RepoSpec, pkg *resolvedRepositoryPackage, ref, sourceRef string, opts UpdateWorkflowsOptions) error { //nolint:largefunc
 	if pkg == nil || repoSpec == nil {
 		return nil
 	}
@@ -271,7 +277,7 @@ func syncManifestManagedResources(ctx context.Context, repoSpec *RepoSpec, pkg *
 	record := packageOwnershipRecord{
 		SchemaVersion:  packageOwnershipSchemaVersion,
 		Package:        packageBase,
-		Source:         manifestSourceWithRef(repoSpec, ref),
+		Source:         manifestSourceWithRef(repoSpec, sourceRef),
 		ResolvedCommit: ref,
 		Installer:      "gh-aw " + GetVersion(),
 	}
@@ -328,16 +334,25 @@ func syncManifestManagedResources(ctx context.Context, repoSpec *RepoSpec, pkg *
 		mode    os.FileMode
 	}
 	var rollbacks []fileRollback
-	rollbackChanges := func() {
+	rollbackChanges := func() error {
 		addPackageOwnershipLog.Printf("Rolling back %d file change(s) for package=%s", len(rollbacks), packageBase)
+		var rollbackErr error
 		for _, rollback := range slices.Backward(rollbacks) {
 			if rollback.existed {
-				_ = os.MkdirAll(filepath.Dir(rollback.path), constants.DirPermPublic)
-				_ = os.WriteFile(rollback.path, rollback.content, rollback.mode)
+				if err := os.MkdirAll(filepath.Dir(rollback.path), constants.DirPermPublic); err != nil {
+					rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore package resource directory %s: %w", rollback.path, err))
+					continue
+				}
+				if err := os.WriteFile(rollback.path, rollback.content, rollback.mode); err != nil {
+					rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore package resource %s: %w", rollback.path, err))
+				}
 				continue
 			}
-			_ = os.Remove(rollback.path)
+			if err := os.Remove(rollback.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("remove rolled back package resource %s: %w", rollback.path, err))
+			}
 		}
+		return rollbackErr
 	}
 
 	for _, download := range downloads {
@@ -347,18 +362,18 @@ func syncManifestManagedResources(ctx context.Context, repoSpec *RepoSpec, pkg *
 			rollback.mode = stat.Mode().Perm()
 			content, readErr := os.ReadFile(download.destPath)
 			if readErr != nil {
-				rollbackChanges()
-				return fmt.Errorf("failed to read existing package resource %s: %w", download.destination, readErr)
+				return errors.Join(
+					fmt.Errorf("failed to read existing package resource %s: %w", download.destination, readErr),
+					rollbackChanges(),
+				)
 			}
 			rollback.content = content
 		}
 		if err := os.MkdirAll(filepath.Dir(download.destPath), constants.DirPermPublic); err != nil {
-			rollbackChanges()
-			return fmt.Errorf("failed to create package resource directory: %w", err)
+			return errors.Join(fmt.Errorf("failed to create package resource directory: %w", err), rollbackChanges())
 		}
 		if err := os.WriteFile(download.destPath, download.content, constants.FilePermPublic); err != nil {
-			rollbackChanges()
-			return fmt.Errorf("failed to write package resource %s: %w", download.destination, err)
+			return errors.Join(fmt.Errorf("failed to write package resource %s: %w", download.destination, err), rollbackChanges())
 		}
 		rollbacks = append(rollbacks, rollback)
 	}
@@ -388,15 +403,16 @@ func syncManifestManagedResources(ctx context.Context, repoSpec *RepoSpec, pkg *
 			rollback.mode = stat.Mode().Perm()
 			content, readErr := os.ReadFile(path)
 			if readErr != nil {
-				rollbackChanges()
-				return fmt.Errorf("failed to read stale package resource %s before removal: %w", destination, readErr)
+				return errors.Join(
+					fmt.Errorf("failed to read stale package resource %s before removal: %w", destination, readErr),
+					rollbackChanges(),
+				)
 			}
 			rollback.content = content
 		}
 		rollbacks = append(rollbacks, rollback)
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			rollbackChanges()
-			return fmt.Errorf("failed to remove stale package resource %s: %w", destination, err)
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return errors.Join(fmt.Errorf("failed to remove stale package resource %s: %w", destination, err), rollbackChanges())
 		}
 		staleRemoved = append(staleRemoved, destination)
 	}
@@ -449,7 +465,7 @@ func refreshManifestManagedOwnership(repoSpec *RepoSpec, pkg *resolvedRepository
 		SchemaVersion:  packageOwnershipSchemaVersion,
 		Package:        packageBase,
 		Source:         manifestSourceWithRef(repoSpec, ref),
-		ResolvedCommit: ref,
+		ResolvedCommit: pkg.ResolvedRef,
 		Installer:      "gh-aw " + GetVersion(),
 	}
 	record.Files, err = readExistingPackageOwnershipFiles(gitRoot, recordPath)
@@ -509,7 +525,7 @@ func refreshManifestResourceOwnership(gitRoot string, record *packageOwnershipRe
 
 func readExistingPackageOwnershipFiles(gitRoot, recordPath string) ([]packageOwnershipFileEntry, error) {
 	existing, err := readPackageOwnershipRecord(recordPath)
-	if os.IsNotExist(err) {
+	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
@@ -585,8 +601,7 @@ func isPackageResourceDestination(destination string) bool {
 	return strings.EqualFold(destination, constants.GithubDir+"CODEOWNERS") ||
 		strings.HasPrefix(destination, constants.GithubDir+"ISSUE_TEMPLATE/") ||
 		strings.HasPrefix(destination, constants.GithubDir+"aw/") ||
-		isSharedWorkflowScriptDestination(destination) ||
-		gradershell.ValidRunPath(destination)
+		isSharedWorkflowScriptDestination(destination)
 }
 
 func isSharedWorkflowScriptDestination(destination string) bool {
@@ -606,12 +621,18 @@ func removePackageOwnedFilesIfUnused(packageBase string) error {
 		return nil
 	}
 	recordPath := packageOwnershipRecordPath(gitRoot, packageBase)
+	if err := fileutil.ValidatePathWithinBase(gitRoot, recordPath); err != nil {
+		return fmt.Errorf("invalid package ownership record path %q: %w", recordPath, err)
+	}
 	record, err := readPackageOwnershipRecord(recordPath)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
-		return err
+		return fmt.Errorf("failed to read package ownership record %q: %w", recordPath, err)
+	}
+	if err := validatePackageOwnershipRemoval(gitRoot, packageBase, record); err != nil {
+		return fmt.Errorf("invalid package ownership record %q: %w", recordPath, err)
 	}
 	var kept []packageOwnershipFileEntry
 	for _, entry := range record.Files {
@@ -644,6 +665,37 @@ func removePackageOwnedFilesIfUnused(packageBase string) error {
 	}
 	data = append(data, '\n')
 	return os.WriteFile(recordPath, data, constants.FilePermPublic)
+}
+
+// Validate the whole record before cleanup so an invalid later entry cannot cause partial deletion.
+func validatePackageOwnershipRemoval(gitRoot, packageBase string, record *packageOwnershipRecord) error {
+	if record.SchemaVersion != packageOwnershipSchemaVersion {
+		return fmt.Errorf("unsupported schema version %d; expected %d", record.SchemaVersion, packageOwnershipSchemaVersion)
+	}
+	if record.Package != packageBase {
+		return fmt.Errorf("package %q does not match %q", record.Package, packageBase)
+	}
+	if record.Files == nil {
+		return errors.New("files must be an array")
+	}
+	for _, entry := range record.Files {
+		destination, err := cleanManifestRelativePath(entry.Destination)
+		if err != nil {
+			return fmt.Errorf("invalid destination %q: %w", entry.Destination, err)
+		}
+		if strings.ContainsRune(destination, '\x00') {
+			return fmt.Errorf("invalid destination %q: path contains a null character", entry.Destination)
+		}
+		path := filepath.Join(gitRoot, filepath.FromSlash(destination))
+		if err := fileutil.ValidatePathWithinBase(gitRoot, path); err != nil {
+			return fmt.Errorf("invalid destination %q: %w", entry.Destination, err)
+		}
+		digest, err := hex.DecodeString(entry.SHA256)
+		if err != nil || len(digest) != sha256.Size {
+			return fmt.Errorf("invalid SHA256 for destination %q: expected a 64-character hexadecimal digest", entry.Destination)
+		}
+	}
+	return nil
 }
 
 func isMarkdownOwnedWorkflowDestination(destination string) bool {

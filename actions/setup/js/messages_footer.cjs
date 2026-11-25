@@ -18,7 +18,7 @@ const { reduceModelNameToIdentifier } = require("./model_aliases.cjs");
 const { getDetectionWarningMessage } = require("./messages_run_status.cjs");
 const { getEffectiveDetectionConclusion } = require("./threat_detection_warning.cjs");
 const { getEffectiveModelLabel, resolveEffectiveModel, validateModelIdentifier } = require("./model_attribution.cjs");
-const { currentClaimHandle, claimIdentity, currentClaimFooterLinks } = require("./work_queue_claim_scope.cjs");
+const { currentClaimHandle, claimIdentity } = require("./work_queue_claim_scope.cjs");
 const reportAST = require("./report_ast.cjs");
 const { parseReportMarkdown } = require("./report_markdown.cjs");
 
@@ -32,16 +32,6 @@ function buildWorkQueueClaimFooter() {
   const handle = currentClaimHandle();
   if (!handle) return [];
   const { work_id, claim_id } = claimIdentity(handle);
-  const links = currentClaimFooterLinks();
-  if (links?.work_created || links?.claim_finished) {
-    const children = [];
-    if (links.work_created) children.push({ type: "link", url: links.work_created, children: [{ type: "text", value: "Work created", agentTainted: false }] });
-    if (links.claim_finished) {
-      if (children.length) children.push({ type: "text", value: " · " });
-      children.push({ type: "link", url: links.claim_finished, children: [{ type: "text", value: "Claim finished", agentTainted: false }] });
-    }
-    return [{ type: "quote_line", children }];
-  }
   return [
     {
       type: "quote_line",
@@ -65,7 +55,7 @@ function footerHistoryLink(url) {
     children: url
       ? [
           { type: "text", value: " · ", agentTainted: false },
-          { type: "link", url, children: [{ type: "text", value: "◷", agentTainted: false }], agentTainted: false },
+          { type: "link", url, children: [{ type: "text", value: "history", agentTainted: false }], agentTainted: false },
         ]
       : [],
   };
@@ -280,7 +270,7 @@ function getAICFromEnv() {
  * @property {number|string} [triggeringNumber] - Issue, PR, or discussion number that triggered this workflow
  * @property {"issue"|"PR"|"discussion"} [triggeringType] - Triggering item type used in the default footer
  * @property {string} [historyUrl] - GitHub search URL for items created by this workflow (for the history link)
- * @property {string} [historyLink] - Pre-formatted markdown history link (e.g. " · [◷](url)"), or "" if unavailable
+ * @property {string} [historyLink] - Pre-formatted markdown history link (e.g. " · [history](url)"), or "" if unavailable
  * @property {number|string} [aiCredits] - Total AI Credits cost for the run (1 AIC == 0.01 USD)
  * @property {string} [emoji] - Optional emoji representing the workflow (from frontmatter)
  * @property {string} [slashCommand] - Slash command name (without leading slash) for the run-again hint, when applicable
@@ -409,7 +399,7 @@ function getFooterMessageParts(ctx) {
   }
   // Append history link when available
   if (ctx.historyUrl) {
-    children.push({ type: "text", value: " · ", agentTainted: false }, { type: "link", url: ctx.historyUrl, children: [{ type: "text", value: "◷", agentTainted: false }], agentTainted: false });
+    children.push({ type: "text", value: " · ", agentTainted: false }, { type: "link", url: ctx.historyUrl, children: [{ type: "text", value: "history", agentTainted: false }], agentTainted: false });
   }
   return [{ type: "quote_line", children }, ...getFooterHints()];
 }
@@ -639,7 +629,7 @@ function getFooterAgentFailureIssueTemplate(ctx) {
     template = "> Generated from [{workflow_name}]({run_url}){failure_metrics_suffix}";
     // Append history link when available
     if (ctx.historyUrl) {
-      template += " · [◷]({history_url})";
+      template += " · [history]({history_url})";
     }
   }
 
@@ -745,7 +735,7 @@ function getFooterAgentFailureCommentTemplate(ctx) {
     }
     // Append history link when available
     if (ctx.historyUrl) {
-      defaultFooter += " · [◷]({history_url})";
+      defaultFooter += " · [history]({history_url})";
     }
     footer = defaultFooter;
   }

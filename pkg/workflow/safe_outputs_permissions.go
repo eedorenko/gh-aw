@@ -88,14 +88,6 @@ func getPushFallbackAsPullRequest(config *PushToPullRequestBranchConfig) bool {
 	return *config.FallbackAsPullRequest
 }
 
-// getCheckBranchProtection returns the effective check-branch-protection setting (defaults to true).
-func getCheckBranchProtection(config *PushToPullRequestBranchConfig) bool {
-	if config == nil || config.CheckBranchProtection == nil {
-		return true // Default: check is enabled
-	}
-	return *config.CheckBranchProtection
-}
-
 // ComputePermissionsForSafeOutputs computes the minimal required permissions
 // based on the configured safe-outputs. This function is used by both the
 // consolidated safe outputs job and the conclusion job to ensure they only
@@ -112,7 +104,7 @@ func ComputePermissionsForSafeOutputs(safeOutputs *SafeOutputsConfig) *Permissio
 // safeOutputsGlobalAppTokenMinted reports whether the consolidated safe_outputs job
 // mints the global "safe-outputs-app-token" step. The step is skipped when no enabled
 // handler consumes GitHub permissions from the global app (for example when staged
-// handlers need no reads, or in a Linear-only configuration), so token expressions that
+// handlers need no reads, or in a connector-only configuration), so token expressions that
 // reference the step must fall back to a regular token in that case.
 //
 // This must stay in sync with buildPreambleTokenSteps, which uses the same condition
@@ -159,6 +151,17 @@ func computePermissionsForSafeOutputs(safeOutputs *SafeOutputsConfig, excludePer
 		if handler.PermissionBuilder == nil {
 			continue
 		}
+		// Broker policy, not GITHUB_TOKEN job permissions, authorizes GitHub effects.
+		// Copilot task endpoints still use their independent credential source.
+		if !excludePerHandlerApps && safeOutputs.TokenBroker &&
+			handler.Key != "assign-to-agent" && handler.Key != "create-agent-session" {
+			// Explicit handler tokens can still be GITHUB_TOKEN, including expressions
+			// that fall back to it. Preserve their existing permission requirements.
+			if getHandlerGitHubApp(safeOutputs, handler.StructField) != nil ||
+				getHandlerGitHubToken(safeOutputs, handler.StructField) == "" {
+				continue
+			}
+		}
 		if excludePerHandlerApps && handler.StructField != "" {
 			if getHandlerGitHubApp(safeOutputs, handler.StructField) != nil ||
 				getHandlerGitHubToken(safeOutputs, handler.StructField) != "" {
@@ -187,6 +190,15 @@ func computePermissionsForSafeOutputs(safeOutputs *SafeOutputsConfig, excludePer
 	if dispatchRepositoryPermissions := computeDispatchRepositoryPermissions(safeOutputs, excludePerHandlerApps); dispatchRepositoryPermissions != nil {
 		permissions.Merge(dispatchRepositoryPermissions)
 	}
+	if routePermissions := computeRequestContinuationRoutePermissions(safeOutputs, excludePerHandlerApps); routePermissions != nil {
+		permissions.Merge(routePermissions)
+	}
+	if safeOutputs.workQueueApprovalReads {
+		// Dispatchers read approval Issues through the own-repository dependency client.
+		if level, exists := permissions.Get(PermissionIssues); !exists || level == PermissionNone {
+			permissions.Set(PermissionIssues, PermissionRead)
+		}
+	}
 
 	// NoOp and MissingTool don't require write permissions beyond what's already included
 	// They only need to comment if add-comment is already configured
@@ -199,7 +211,7 @@ func computePermissionsForSafeOutputs(safeOutputs *SafeOutputsConfig, excludePer
 	} else if safeOutputs.IDToken != nil && *safeOutputs.IDToken == "write" {
 		safeOutputsPermissionsLog.Print("id-token: write explicitly requested")
 		permissions.Set(PermissionIdToken, PermissionWrite)
-	} else if stepsRequireIDToken(safeOutputs.Steps) {
+	} else if stepsRequireIDToken(safeOutputs.Steps) || safeOutputsAuthorizationNeedsOIDC(safeOutputs) {
 		safeOutputsPermissionsLog.Print("Auto-detected OIDC/vault action in steps; adding id-token: write")
 		permissions.Set(PermissionIdToken, PermissionWrite)
 	}
@@ -327,6 +339,9 @@ func computeDispatchRepositoryPermissions(safeOutputs *SafeOutputsConfig, exclud
 		// which calls createAuthenticatedGitHubClient(toolConfig)), so it must not also
 		// contribute contents: write to the global safe-outputs App mint (GP5b rule 1).
 		if excludePerToolApps && (tool.GitHubApp != nil || tool.GitHubToken != "") {
+			continue
+		}
+		if !excludePerToolApps && safeOutputs.TokenBroker && (tool.GitHubApp != nil || tool.GitHubToken == "") {
 			continue
 		}
 		if permissions == nil {

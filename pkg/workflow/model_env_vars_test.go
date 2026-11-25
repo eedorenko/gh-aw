@@ -3,11 +3,19 @@
 package workflow
 
 import (
+	"encoding/json"
+	"maps"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/workflow/actionslanguageservice"
 	"github.com/github/gh-aw/pkg/workflow/compilerenv"
+	"github.com/goccy/go-yaml"
+	"github.com/stretchr/testify/require"
 )
 
 // TestModelEnvVarInjectionForAgentJob tests that agent jobs get the correct model environment variable
@@ -469,6 +477,7 @@ func TestExpressionModelUsesEnvVar(t *testing.T) {
 		expectedModelEnvVar  string
 		expectedModelEnvVal  string
 		expectedFallbackVal  string
+		additionalModelEnv   []string
 		expectShellExpansion bool // whether command should use ${VAR:+ --model "$VAR"}
 	}{
 		{
@@ -516,6 +525,27 @@ func TestExpressionModelUsesEnvVar(t *testing.T) {
 			expectedFallbackVal:  "${{ vars." + constants.EnvVarModelAgentCodex + " || vars." + compilerenv.DefaultModelCodex + " || '' }}",
 			expectShellExpansion: true, // Codex has no native model env var, uses shell expansion
 		},
+		{
+			name:                "Gemini agent passes expression model through its native env",
+			engine:              "gemini",
+			model:               "${{ inputs.model }}",
+			expectedModelEnvVar: constants.GeminiCLIModelEnvVar,
+			expectedModelEnvVal: "${{ inputs.model }}",
+		},
+		{
+			name:                "Agy agent passes expression model through its native env",
+			engine:              "agy",
+			model:               "${{ inputs.model }}",
+			expectedModelEnvVar: "GH_AW_AGY_MODEL",
+			expectedModelEnvVal: "${{ inputs.model }}",
+		},
+		{
+			name:                "Pi agent passes expression model through its runtime env",
+			engine:              "pi",
+			model:               "copilot/${{ inputs.model }}",
+			expectedModelEnvVar: "GH_AW_PI_MODEL",
+			expectedModelEnvVal: "copilot/${{ inputs.model }}",
+		},
 	}
 
 	for _, tt := range tests {
@@ -549,10 +579,25 @@ func TestExpressionModelUsesEnvVar(t *testing.T) {
 			}
 			stepsContent := stepsStr.String()
 
-			// The expression must NOT appear directly in the shell command run: block
-			// (it should be in the env: block only)
-			if strings.Contains(stepsContent, "--model ${{") || strings.Contains(stepsContent, "--model \"${{") {
-				t.Errorf("Model expression should not be embedded directly in shell command in steps:\n%s", stepsContent)
+			var commandContent strings.Builder
+			for _, step := range steps {
+				inRunBlock := false
+				for _, line := range step {
+					switch strings.TrimSpace(line) {
+					case "run: |":
+						inRunBlock = true
+					case "env:":
+						inRunBlock = false
+					default:
+						if inRunBlock {
+							commandContent.WriteString(line)
+							commandContent.WriteString("\n")
+						}
+					}
+				}
+			}
+			if strings.Contains(commandContent.String(), tt.model) {
+				t.Errorf("Model expression should not be embedded directly in shell commands:\n%s", commandContent.String())
 			}
 
 			// The env var must be set to the expression value
@@ -560,9 +605,16 @@ func TestExpressionModelUsesEnvVar(t *testing.T) {
 			if !strings.Contains(stepsContent, expectedModelEnvLine) {
 				t.Errorf("Expected env line '%s' not found in steps:\n%s", expectedModelEnvLine, stepsContent)
 			}
-			expectedFallbackEnvLine := constants.EnvVarModelFallback + ": " + tt.expectedFallbackVal
-			if !strings.Contains(stepsContent, expectedFallbackEnvLine) {
-				t.Errorf("Expected fallback env line '%s' not found in steps:\n%s", expectedFallbackEnvLine, stepsContent)
+			if tt.expectedFallbackVal != "" {
+				expectedFallbackEnvLine := constants.EnvVarModelFallback + ": " + tt.expectedFallbackVal
+				if !strings.Contains(stepsContent, expectedFallbackEnvLine) {
+					t.Errorf("Expected fallback env line '%s' not found in steps:\n%s", expectedFallbackEnvLine, stepsContent)
+				}
+			}
+			for _, expectedEnvLine := range tt.additionalModelEnv {
+				if !strings.Contains(stepsContent, expectedEnvLine) {
+					t.Errorf("Expected model env line '%s' not found in steps:\n%s", expectedEnvLine, stepsContent)
+				}
 			}
 
 			// Check shell expansion expectation
@@ -698,5 +750,204 @@ func TestCodexModelFlagPositionAfterExec(t *testing.T) {
 		t.Errorf("'codex exec' must appear before the model flag '%s' in the generated command.\n"+
 			"This indicates the model flag is placed before 'exec', causing Codex to ignore it.\n"+
 			"Got:\n%s", modelPattern, stepsContent)
+	}
+}
+
+type testExpressionValue struct {
+	value     string
+	isBoolean bool
+}
+
+func (v testExpressionValue) isTruthy() bool {
+	if v.isBoolean {
+		return v.value == "true"
+	}
+	return v.value != ""
+}
+
+// evaluateTestExpression evaluates the subset of Actions expressions the model
+// routing guards use: string literals, context references, groups, ==, !=, &&, ||.
+func evaluateTestExpression(t *testing.T, expr *actionslanguageservice.Expression, contexts map[string]string) testExpressionValue {
+	t.Helper()
+	switch expr.Kind {
+	case "literal":
+		value, _ := expr.Token.Value.(string)
+		return testExpressionValue{value: value}
+	case "group":
+		return evaluateTestExpression(t, expr.Child(0), contexts)
+	case "context", "index":
+		path, ok := actionslanguageservice.Reference(expr)
+		require.True(t, ok, "unsupported reference")
+		return testExpressionValue{value: contexts[strings.Join(path, ".")]}
+	case "binary":
+		left := evaluateTestExpression(t, expr.Child(0), contexts)
+		right := evaluateTestExpression(t, expr.Child(1), contexts)
+		equal := strings.EqualFold(left.value, right.value)
+		if expr.Token.Kind == "!=" {
+			equal = !equal
+		}
+		value := "false"
+		if equal {
+			value = "true"
+		}
+		return testExpressionValue{value: value, isBoolean: true}
+	case "logical":
+		var value testExpressionValue
+		for _, child := range expr.Children {
+			value = evaluateTestExpression(t, child, contexts)
+			if (expr.Token.Kind == "&&") == !value.isTruthy() {
+				return value
+			}
+		}
+		return value
+	}
+	t.Fatalf("unsupported expression kind %q", expr.Kind)
+	return testExpressionValue{}
+}
+
+func evaluateTestCondition(t *testing.T, expr string, contexts map[string]string) bool {
+	t.Helper()
+	parsed, err := actionslanguageservice.ParseSyntax(expr)
+	require.NoError(t, err)
+	return evaluateTestExpression(t, parsed, contexts).isTruthy()
+}
+
+// evaluateTestTemplate substitutes every ${{ }} interpolation in value.
+func evaluateTestTemplate(t *testing.T, value string, contexts map[string]string) string {
+	t.Helper()
+	for {
+		start := strings.Index(value, "${{")
+		if start < 0 {
+			return value
+		}
+		end := strings.Index(value[start:], "}}")
+		require.Positive(t, end)
+		expr, err := actionslanguageservice.ParseSyntax(strings.TrimSpace(value[start+3 : start+end]))
+		require.NoError(t, err)
+		value = value[:start] + evaluateTestExpression(t, expr, contexts).value + value[start+end+2:]
+	}
+}
+
+// TestDefaultModelRoutingActivationHonorsModelVariables runs the generated
+// activation decision step with stubbed Actions variables and evaluates the
+// downstream guarded model env, routing flag, conversation-step condition, and
+// AWF config branch, proving the runtime precedence is resolved before AWF starts.
+func TestDefaultModelRoutingActivationHonorsModelVariables(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash is required")
+	}
+	compiled := compileDefaultRoutingSource(t, "---\non: workflow_dispatch\npermissions:\n  contents: read\nengine: copilot\n---\nReport.\n")
+	require.NoError(t, compiled.err)
+
+	type step struct {
+		Name string            `yaml:"name"`
+		ID   string            `yaml:"id"`
+		If   string            `yaml:"if"`
+		Run  string            `yaml:"run"`
+		Env  map[string]string `yaml:"env"`
+	}
+	var lock struct {
+		Jobs map[string]struct {
+			Outputs map[string]string `yaml:"outputs"`
+			Steps   []step            `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(compiled.lock), &lock))
+	var decision, info, conversation, execution *step
+	for i, s := range lock.Jobs["activation"].Steps {
+		switch {
+		case s.ID == modelRoutingDecisionStepID:
+			decision = &lock.Jobs["activation"].Steps[i]
+		case s.Env["GH_AW_INFO_MODEL_CONFIG"] != "":
+			info = &lock.Jobs["activation"].Steps[i]
+		}
+	}
+	for i, s := range lock.Jobs["agent"].Steps {
+		switch {
+		case s.Name == "Prepare model-routing conversation":
+			conversation = &lock.Jobs["agent"].Steps[i]
+		case strings.Contains(s.Run, `awf --config "${RUNNER_TEMP}/gh-aw/awf-config.json"`):
+			execution = &lock.Jobs["agent"].Steps[i]
+		}
+	}
+	require.NotNil(t, decision, "activation decision step")
+	require.NotNil(t, info, "aw_info step")
+	require.NotNil(t, conversation, "conversation step")
+	require.NotNil(t, execution, "AWF execution step")
+	require.Equal(t, "${{ steps."+modelRoutingDecisionStepID+".outputs."+modelRoutingDecisionOutput+" }}", lock.Jobs["activation"].Outputs[modelRoutingDecisionOutput])
+
+	configStart := strings.Index(execution.Run, `if [ "${GH_AW_MODEL_ROUTING:-}" = "1" ]; then`)
+	require.GreaterOrEqual(t, configStart, 0)
+	configEnd := strings.Index(execution.Run[configStart:], "\nfi\n")
+	require.Positive(t, configEnd)
+	configScript := execution.Run[configStart : configStart+configEnd+4]
+
+	for _, tc := range []struct {
+		name, agentVar, defaultVar string
+		wantRouting                bool
+		wantModel                  string
+	}{
+		{name: "neither variable", wantRouting: true},
+		{name: "agent variable", agentVar: "gpt-5.6-luna", wantModel: "gpt-5.6-luna"},
+		{name: "default variable", defaultVar: "claude-sonnet-5.5", wantModel: "claude-sonnet-5.5"},
+		{name: "both variables, agent wins", agentVar: "gpt-5.6-luna", defaultVar: "claude-sonnet-5.5", wantModel: "gpt-5.6-luna"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vars := map[string]string{
+				"vars." + constants.EnvVarModelAgentCopilot: tc.agentVar,
+				"vars." + compilerenv.DefaultModelCopilot:   tc.defaultVar,
+			}
+			dir := t.TempDir()
+			outputFile := filepath.Join(dir, "output")
+			runnerTemp := filepath.Join(dir, "runner")
+			actionsDir := filepath.Join(runnerTemp, "gh-aw", "actions")
+			require.NoError(t, os.MkdirAll(actionsDir, 0o755))
+			routingScript, err := os.ReadFile("../../actions/setup/sh/resolve_model_routing.sh")
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(actionsDir, "resolve_model_routing.sh"), routingScript, 0o755))
+			cmd := exec.Command("bash", "-e", "-c", decision.Run)
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "GITHUB_OUTPUT=" + outputFile, "RUNNER_TEMP=" + runnerTemp}
+			for key, value := range decision.Env {
+				cmd.Env = append(cmd.Env, key+"="+evaluateTestTemplate(t, value, vars))
+			}
+			out, err := cmd.CombinedOutput()
+			require.NoError(t, err, string(out))
+			wantDiagnostic := "Model routing enabled: goal cost, mode auto"
+			if tc.agentVar != "" {
+				wantDiagnostic = "Model routing disabled: vars." + constants.EnvVarModelAgentCopilot + " selects the model"
+			} else if tc.defaultVar != "" {
+				wantDiagnostic = "Model routing disabled: vars." + compilerenv.DefaultModelCopilot + " selects the model"
+			}
+			require.Contains(t, string(out), wantDiagnostic)
+			outputs, err := os.ReadFile(outputFile)
+			require.NoError(t, err)
+			decisionValue := strings.TrimPrefix(strings.TrimSpace(string(outputs)), modelRoutingDecisionOutput+"=")
+			require.Equal(t, map[bool]string{true: "true", false: "false"}[tc.wantRouting], decisionValue)
+
+			activationContexts := map[string]string{"steps." + modelRoutingDecisionStepID + ".outputs." + modelRoutingDecisionOutput: decisionValue}
+			var modelConfig map[string]any
+			require.NoError(t, json.Unmarshal([]byte(evaluateTestTemplate(t, info.Env["GH_AW_INFO_MODEL_CONFIG"], activationContexts)), &modelConfig))
+			require.Equal(t, tc.wantRouting, modelConfig["routing"].(map[string]any)["enabled"])
+
+			downstream := map[string]string{"needs.activation.outputs." + modelRoutingDecisionOutput: decisionValue}
+			maps.Copy(downstream, vars)
+			require.Equal(t, tc.wantRouting, evaluateTestCondition(t, conversation.If, downstream), "conversation step runs only when routed")
+			require.Equal(t, tc.wantModel, evaluateTestTemplate(t, execution.Env["COPILOT_MODEL"], downstream))
+			routingFlag := evaluateTestTemplate(t, execution.Env["GH_AW_MODEL_ROUTING"], downstream)
+			require.Equal(t, tc.wantRouting, routingFlag == "1")
+
+			cmd = exec.Command("bash", "-e", "-c", configScript)
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "RUNNER_TEMP=" + runnerTemp, "GH_AW_MODEL_ROUTING=" + routingFlag, "GH_AW_MAX_AI_CREDITS=0"}
+			out, err = cmd.CombinedOutput()
+			require.NoError(t, err, string(out))
+			configJSON, err := os.ReadFile(filepath.Join(runnerTemp, "gh-aw", "awf-config.json"))
+			require.NoError(t, err)
+			var awfConfig map[string]any
+			require.NoError(t, json.Unmarshal(configJSON, &awfConfig))
+			_, routed := awfConfig["apiProxy"].(map[string]any)["routing"]
+			require.Equal(t, tc.wantRouting, routed, "AWF config routing must follow the activation decision")
+			_, experimental := awfConfig["experimental"]
+			require.Equal(t, tc.wantRouting, experimental)
+		})
 	}
 }

@@ -11,10 +11,10 @@ permissions:
   issues: read
 
 
+model: router/economy
 engine:
   id: codex
-  model-provider: openai
-model: openai/gpt-6-sol
+  model-provider: github
 strict: true
 network:
   allowed:

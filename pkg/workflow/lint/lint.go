@@ -50,8 +50,17 @@ type Input struct {
 	// Document optionally supplies authored AW fields, including the prompt.
 	// Either AST may be supplied independently. Workflow is never a projection
 	// of AW frontmatter; when both are supplied it is the compiled graph.
-	Document   *aw.Document
-	JavaScript *taint.JavaScriptOptions
+	Document *aw.Document
+	// AuthoredJobs contains resolved custom job declarations, including imports,
+	// when linting a compiled workflow.
+	AuthoredJobs map[string]any
+	// ResolvedTools supplies compiler-resolved tool declarations, including imports.
+	// Standalone AW lint uses authored tools instead.
+	ResolvedTools map[string]any
+	// ResolvedRoles supplies the compiler's effective actor-admission roles.
+	// Standalone AW lint uses on.roles and its trusted defaults instead.
+	ResolvedRoles []string
+	JavaScript    *taint.JavaScriptOptions
 	// AllowActionRefs permits well-formed mutable references as warnings.
 	// Malformed references remain errors regardless of this compiler allowance.
 	AllowActionRefs bool
@@ -63,6 +72,9 @@ type Input struct {
 }
 
 type Diagnostic struct {
+	// Source identifies the AST owning this finding. Zero uses the rule's
+	// primary available AST; mixed-source checks set it for individual findings.
+	Source       ASTTargets        `json:"-"`
 	RuleID       string            `json:"rule_id"`
 	ThreatRuleID string            `json:"threat_rule_id,omitempty"`
 	Severity     Severity          `json:"severity"`
@@ -85,15 +97,20 @@ type Rule struct {
 	// ThreatRuleID optionally identifies the corresponding compiler threat
 	// specification rule; a mapping does not imply full rule conformance.
 	ThreatRuleID string
-	Description  string
-	Severity     Severity
+	// FindingThreatRuleIDs lists compiler threat IDs that individual findings
+	// may select when one rule covers several threats. Other finding values
+	// are replaced by ThreatRuleID, so the registry still owns all mappings.
+	FindingThreatRuleIDs []string
+	Description          string
+	Severity             Severity
 	// Zero preserves the Actions-only contract of existing extension rules.
 	Targets ASTTargets
 	Check   func(context.Context, Input) ([]Diagnostic, error)
 }
 
 type Runner struct {
-	rules []Rule
+	rules      []Rule
+	registered map[string]struct{}
 }
 
 var ruleIDPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(-[a-z0-9]+)*$`)
@@ -111,6 +128,11 @@ func New(rules ...Rule) (*Runner, error) {
 		if rule.ThreatRuleID != "" && !threatRuleIDPattern.MatchString(rule.ThreatRuleID) {
 			return nil, fmt.Errorf("lint rule %q requires a compiler threat ID in CTR-NNN form", rule.ID)
 		}
+		for _, id := range rule.FindingThreatRuleIDs {
+			if !threatRuleIDPattern.MatchString(id) {
+				return nil, fmt.Errorf("lint rule %q requires a compiler threat ID in CTR-NNN form", rule.ID)
+			}
+		}
 		if rule.Targets & ^(ActionsAST|AWAST) != 0 {
 			return nil, errors.New("lint rule targets must be Actions or AW ASTs")
 		}
@@ -119,18 +141,28 @@ func New(rules ...Rule) (*Runner, error) {
 		}
 		seen[rule.ID] = struct{}{}
 	}
-	return &Runner{rules: slices.Clone(rules)}, nil
+	return &Runner{rules: cloneRules(rules), registered: seen}, nil
 }
 
 func (r *Runner) Rules() []Rule {
-	return slices.Clone(r.rules)
+	return cloneRules(r.rules)
+}
+
+func cloneRules(rules []Rule) []Rule {
+	cloned := slices.Clone(rules)
+	for index := range cloned {
+		cloned[index].FindingThreatRuleIDs = slices.Clone(cloned[index].FindingThreatRuleIDs)
+	}
+	return cloned
 }
 
 // Select rejects unknown IDs rather than silently skipping a requested check.
 // An empty selection runs every registered rule.
 func (r *Runner) Select(ids ...string) (*Runner, error) {
 	if len(ids) == 0 {
-		return New(r.rules...)
+		for _, rule := range r.rules {
+			ids = append(ids, rule.ID)
+		}
 	}
 	var selected []Rule
 	seen := make(map[string]struct{})
@@ -151,7 +183,11 @@ func (r *Runner) Select(ids ...string) (*Runner, error) {
 			return nil, fmt.Errorf("unknown workflow lint rule %q", id)
 		}
 	}
-	return New(selected...)
+	result, err := New(selected...)
+	if err == nil {
+		result.registered = r.suppressionRuleIDs()
+	}
+	return result, err
 }
 
 // Run returns diagnostics even when another rule fails. Tooling failures are
@@ -161,7 +197,8 @@ func (r *Runner) Run(ctx context.Context, input Input) ([]Diagnostic, error) {
 		return nil, errors.New("workflow lint requires an Actions or AW AST")
 	}
 	var diagnostics []Diagnostic
-	var failures []error
+	suppressions, suppressionErr := r.commentSuppressions(input)
+	failures := []error{suppressionErr}
 	region := trace.StartRegion(ctx, "workflow:lint")
 	defer region.End()
 	checked := 0
@@ -189,8 +226,19 @@ func (r *Runner) Run(ctx context.Context, input Input) ([]Diagnostic, error) {
 			failures = append(failures, fmt.Errorf("lint rule %s: %w", rule.ID, err))
 		}
 		for _, diagnostic := range findings {
+			if diagnostic.Source == 0 {
+				diagnostic.Source = AWAST
+				if input.Workflow != nil && targets&ActionsAST != 0 {
+					diagnostic.Source = ActionsAST
+				}
+			}
+			if suppressions.contains(rule.ID, diagnostic) {
+				continue
+			}
 			diagnostic.RuleID = rule.ID
-			diagnostic.ThreatRuleID = rule.ThreatRuleID
+			if !slices.Contains(rule.FindingThreatRuleIDs, diagnostic.ThreatRuleID) {
+				diagnostic.ThreatRuleID = rule.ThreatRuleID
+			}
 			if diagnostic.Severity == "" {
 				diagnostic.Severity = rule.Severity
 			}
@@ -222,11 +270,13 @@ func Default() *Runner {
 	return &Runner{rules: []Rule{
 		SecretLeakRule(),
 		OTLPSecretLeakRule(),
+		OverprovisionedSecretsRule(),
 		ActionPinRule(),
 		JobTimeoutRule(),
 		NeedsConsistencyRule(),
 		StepReferenceRule(),
 		TemplateInjectionRule(),
+		DangerousTriggersRule(),
 		WorkflowRunScopeRule(),
 		PermissionScopeRule(),
 		VersionCheckRule(),
@@ -239,14 +289,17 @@ func Default() *Runner {
 		ToolScopeRule(),
 		SandboxConfigRule(),
 		ImageArgumentRule(),
+		UnpinnedImagesRule(),
+		EnvironmentFileInjectionRule(),
 		CheckoutModeRule(),
 		ForkAssociationRule(),
 		PullRequestTargetRolesRule(),
+		UntrustedRolesDetectionRule(),
 		SafeOutputShellExpansionRule(),
+		SafeOutputCredentialsRule(),
 		FirewallSSLBumpRule(),
 		CustomJobDetectionRule(),
 		GraderFileIORule(),
-		GraderShellFileWriteRule(),
 		PullRequestTargetCheckoutRule(),
 		PromptExpressionRule(),
 		GatewayDispatchLiteralsRule(),
@@ -257,5 +310,9 @@ func Default() *Runner {
 		BashCasePatternRule(),
 		PrivilegedCheckoutRule(),
 		ArtifactExecutionRule(),
+		BotConditionsRule(),
+		UnsoundContainsRule(),
+		InsecureCommandsRule(),
+		RemoteScriptExecutionRule(),
 	}}
 }

@@ -62,6 +62,10 @@ type CheckoutConfig struct {
 	// Ref (branch, tag, or SHA) to checkout. Defaults to the ref that triggered the workflow.
 	Ref string `json:"ref,omitempty"`
 
+	// DataOnly acknowledges that host steps consume this checkout only as data.
+	// It suppresses the checkout-ref warning without changing runtime behavior.
+	DataOnly bool `json:"-"`
+
 	// Path within GITHUB_WORKSPACE to place the checkout. Defaults to the workspace root.
 	Path string `json:"path,omitempty"`
 
@@ -151,6 +155,7 @@ type checkoutKey struct {
 type resolvedCheckout struct {
 	key               checkoutKey
 	ref               string           // last non-empty ref wins
+	dataOnly          bool             // every merged entry must explicitly acknowledge data-only use
 	token             string           // last non-empty github-token wins
 	githubApp         *GitHubAppConfig // GitHub App config (first non-nil wins)
 	safeOutputApp     *GitHubAppConfig // safe_outputs-only GitHub App config (first non-nil wins)
@@ -214,6 +219,8 @@ type CheckoutManager struct {
 	// http.extraheader injection is required. Empty means "fall back to the
 	// actions/checkout default token".
 	pushToken string
+	// defaultPushToken, when set, overrides pushToken for the default workspace checkout only.
+	defaultPushToken string
 	// dynamicPushToken may reference same-job app-token outputs. Runtime checkouts
 	// retain it directly instead of relying on the static git-credential setup step.
 	dynamicPushToken string
@@ -301,6 +308,13 @@ func (cm *CheckoutManager) SetPushToken(token string) {
 	cm.pushToken = token
 }
 
+// SetDefaultPushToken overrides the persisted credential of the default workspace
+// checkout without changing the credential of additional checkouts.
+func (cm *CheckoutManager) SetDefaultPushToken(token string) {
+	checkoutManagerLog.Printf("Setting defaultPushToken: present=%t", token != "")
+	cm.defaultPushToken = token
+}
+
 // SetDynamicPushToken overrides the fallback push credential for runtime checkouts
 // without changing the static checkout token or entries with their own auth.
 func (cm *CheckoutManager) SetDynamicPushToken(token string) {
@@ -343,6 +357,7 @@ func (cm *CheckoutManager) add(cfg *CheckoutConfig) {
 		// once either github-token or github-app is set for an entry, the other method is not added
 		// even if a later config provides it — this preserves the main workflow's auth choice).
 		entry := cm.ordered[idx]
+		entry.dataOnly = entry.dataOnly && cfg.DataOnly
 		entry.maxRepos = min(entry.maxRepos, maxRepos)
 		entry.allowPrivateRepos = entry.allowPrivateRepos && allowPrivateRepos
 		entry.fetchDepth = deeperFetchDepth(entry.fetchDepth, cfg.FetchDepth)
@@ -381,6 +396,7 @@ func (cm *CheckoutManager) add(cfg *CheckoutConfig) {
 		entry := &resolvedCheckout{
 			key:               key,
 			ref:               cfg.Ref,
+			dataOnly:          cfg.DataOnly,
 			token:             cfg.GitHubToken,
 			githubApp:         cfg.GitHubApp,
 			safeOutputApp:     cfg.SafeOutputGitHubApp,
@@ -527,11 +543,15 @@ func resolveCheckoutPermissions(data *WorkflowData) *Permissions {
 }
 
 // GetCurrentRepository returns the repository slug for the checkout marked
-// current:true. Returns an empty string when no current checkout is configured
-// or when the current checkout targets the workflow repository.
+// current:true, including the .wiki suffix for wiki checkouts. Returns an empty
+// string when no current checkout is configured or when a non-wiki current
+// checkout targets the workflow repository.
 func (cm *CheckoutManager) GetCurrentRepository() string {
 	for _, entry := range cm.ordered {
 		if entry.current {
+			if entry.key.wiki {
+				return wikiRepository(entry.key.repository)
+			}
 			return entry.key.repository
 		}
 	}

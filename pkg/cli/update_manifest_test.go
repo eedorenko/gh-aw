@@ -19,6 +19,57 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestUpdateManifestWorkflowGroup_ReleaseCooldownSkipsPackageSync(t *testing.T) {
+	dir := testutil.TempDir(t, "manifest-release-cooldown-*")
+	require.NoError(t, os.Mkdir(filepath.Join(dir, ".git"), 0o755))
+	t.Chdir(dir)
+	resourcePath := filepath.Join(dir, ".github", "workflows", "action.yml")
+	require.NoError(t, os.MkdirAll(filepath.Dir(resourcePath), 0o755))
+	const resourceContent = "name: installed action\n"
+	require.NoError(t, os.WriteFile(resourcePath, []byte(resourceContent), 0o644))
+
+	originalResolve := resolveLatestRefFn
+	originalDownload := downloadPackageFileFromGitHubForHost
+	t.Cleanup(func() {
+		resolveLatestRefFn = originalResolve
+		downloadPackageFileFromGitHubForHost = originalDownload
+	})
+
+	deps := mockWorkflowUpdateDeps(func(_ context.Context, repo string) ([]byte, error) {
+		assert.Equal(t, "owner/repo", repo)
+		return []byte("v1.2.0\nv1.1.0"), nil
+	})
+	var checkedTags []string
+	deps.checkCoolDown = func(_ context.Context, _, tag string, cd time.Duration) coolDownCheckResult {
+		assert.Equal(t, 7*24*time.Hour, cd)
+		checkedTags = append(checkedTags, tag)
+		return coolDownCheckResult{InCoolDown: true}
+	}
+	resolveLatestRefFn = func(ctx context.Context, repo, currentRef string, allowMajor, verbose bool, coolDown time.Duration) (latestRefResolution, error) {
+		assert.Equal(t, "v1", currentRef)
+		return resolveLatestRefWithDeps(ctx, deps, repo, currentRef, allowMajor, verbose, coolDown)
+	}
+	var downloads []string
+	downloadPackageFileFromGitHubForHost = func(_ context.Context, _, _, path, _, _ string) ([]byte, error) {
+		downloads = append(downloads, path)
+		return nil, fmt.Errorf("unexpected package download during cooldown: %s", path)
+	}
+
+	successes, failures := updateManifestWorkflowGroup(context.Background(), "owner/repo@v1", nil,
+		UpdateWorkflowsOptions{CoolDown: 7 * 24 * time.Hour, Force: true})
+	require.Empty(t, failures)
+	assert.Empty(t, successes)
+	assert.Equal(t, []string{"v1.2.0", "v1.1.0"}, checkedTags)
+	assert.Empty(t, downloads, "blocked releases must not download even the current package manifest")
+	content, err := os.ReadFile(resourcePath)
+	require.NoError(t, err)
+	assert.Equal(t, resourceContent, string(content))
+	entries, err := os.ReadDir(filepath.Dir(resourcePath))
+	require.NoError(t, err)
+	assert.Len(t, entries, 1, "blocked package sync must not install resources")
+	assert.NoFileExists(t, packageOwnershipRecordPath(dir, "owner/repo"))
+}
+
 func TestReconcileManifestManagedAssets_AddsPackageOwnedAssets(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "manifest-assets-*")
 	require.NoError(t, os.Mkdir(filepath.Join(tmpDir, ".git"), 0o755))
@@ -396,7 +447,32 @@ func TestResolveManifestAssetEngine(t *testing.T) {
 	assert.Equal(t, "copilot", overrideEngine)
 }
 
-func TestUpdateManifestManagedWorkflowPreservesFrontmatterConflicts(t *testing.T) {
+func TestRollbackPackageAssetsReportsFailuresAndContinues(t *testing.T) {
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "blocker")
+	require.NoError(t, os.WriteFile(blocker, []byte("not a directory"), 0o600))
+	nonemptyDir := filepath.Join(dir, "nonempty")
+	require.NoError(t, os.Mkdir(nonemptyDir, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(nonemptyDir, "child"), nil, 0o600))
+	restored := filepath.Join(dir, "restored")
+
+	output := testutil.CaptureStderr(t, func() {
+		rollbackPackageAssets([]packageAssetRollback{
+			{path: restored, existed: true, content: []byte("original"), mode: 0o600},
+			{path: nonemptyDir},
+			{path: nonemptyDir, existed: true, content: []byte("original"), mode: 0o600},
+			{path: filepath.Join(blocker, "nested", "asset"), existed: true},
+		})
+	})
+	assert.Contains(t, output, "Unable to restore package asset "+nonemptyDir)
+	assert.Contains(t, output, "Unable to restore package asset "+filepath.Join(blocker, "nested", "asset"))
+	assert.Contains(t, output, "Unable to remove package asset "+nonemptyDir)
+	content, err := os.ReadFile(restored)
+	require.NoError(t, err)
+	assert.Equal(t, "original", string(content))
+}
+
+func TestUpdateManifestManagedWorkflowConflictHandling(t *testing.T) {
 	originalDownload := downloadWorkflowContentFn
 	t.Cleanup(func() { downloadWorkflowContentFn = originalDownload })
 	downloadWorkflowContentFn = func(_ context.Context, repo, path, ref string, _ bool) ([]byte, error) {
@@ -413,29 +489,160 @@ func TestUpdateManifestManagedWorkflowPreservesFrontmatterConflicts(t *testing.T
 		}
 	}
 
-	tmpDir := testutil.TempDir(t, "manifest-conflict-*")
-	workflowPath := filepath.Join(tmpDir, "conflict.md")
-	current := "---\ntools:\n  bash: [\"echo local\"]\nsource: owner/repo@v1.0.0\n---\n\n# Workflow\n"
-	require.NoError(t, os.WriteFile(workflowPath, []byte(current), 0o644))
+	tests := []struct {
+		name                string
+		noCompile           bool
+		wantSkippedConflict bool
+	}{
+		{name: "writes conflict markers without compilation", noCompile: true},
+		{name: "preserves workflow when compiling", wantSkippedConflict: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := testutil.TempDir(t, "manifest-conflict-*")
+			workflowPath := filepath.Join(tmpDir, "conflict.md")
+			original := "---\ntools:\n  bash: [\"echo local\"]\nsource: owner/repo@v1.0.0\n---\n\n# Workflow\n"
+			require.NoError(t, os.WriteFile(workflowPath, []byte(original), 0o644))
 
-	err := updateManifestManagedWorkflow(context.Background(), manifestManagedWorkflowUpdate{
-		wf:             &workflowWithSource{Name: "conflict", Path: workflowPath},
-		repo:           "owner/repo",
-		currentPath:    "workflows/conflict.md",
-		latestPath:     "workflows/conflict.md",
-		currentRef:     "v1.0.0",
-		latestRef:      "v2.0.0",
-		manifestSource: "owner/repo@v2.0.0",
-	}, UpdateWorkflowsOptions{
-		NoCompile:              true,
-		DisableSecurityScanner: true,
+			err := updateManifestManagedWorkflow(context.Background(), manifestManagedWorkflowUpdate{
+				wf:             &workflowWithSource{Name: "conflict", Path: workflowPath},
+				repo:           "owner/repo",
+				currentPath:    "workflows/conflict.md",
+				latestPath:     "workflows/conflict.md",
+				currentRef:     "v1.0.0",
+				latestRef:      "v2.0.0",
+				manifestSource: "owner/repo@v2.0.0",
+			}, UpdateWorkflowsOptions{
+				NoCompile:              tt.noCompile,
+				DisableSecurityScanner: true,
+			})
+
+			updated, readErr := os.ReadFile(workflowPath)
+			require.NoError(t, readErr)
+			if tt.wantSkippedConflict {
+				require.ErrorIs(t, err, errManifestWorkflowConflictSkipped)
+				assert.Equal(t, original, string(updated))
+				assert.NotContains(t, string(updated), "<<<<<<<")
+				return
+			}
+
+			require.ErrorIs(t, err, errManifestWorkflowConflictSkipped)
+			assert.Contains(t, string(updated), "<<<<<<< current (local changes)")
+			assert.Contains(t, string(updated), "source: owner/repo@v2.0.0")
+		})
+	}
+}
+
+func TestUpdateManifestWorkflowGroup_ConflictSkipNotReportedAsUpdated(t *testing.T) {
+	var includeHealthy bool
+	originalResolveLatestRef := resolveLatestRefFn
+	originalDownloadPackage := downloadPackageFileFromGitHubForHost
+	originalDefaultBranch := getRepositoryPackageDefaultBranch
+	originalDownloadWorkflow := downloadWorkflowContentFn
+	originalDirSubdirs := listPackageDirSubdirsForHost
+	originalDirFiles := listPackageDirFilesForHost
+	t.Cleanup(func() {
+		resolveLatestRefFn = originalResolveLatestRef
+		downloadPackageFileFromGitHubForHost = originalDownloadPackage
+		getRepositoryPackageDefaultBranch = originalDefaultBranch
+		downloadWorkflowContentFn = originalDownloadWorkflow
+		listPackageDirSubdirsForHost = originalDirSubdirs
+		listPackageDirFilesForHost = originalDirFiles
 	})
-	require.NoError(t, err, "frontmatter conflict markers should not be parsed as YAML")
 
-	updated, err := os.ReadFile(workflowPath)
-	require.NoError(t, err)
-	assert.Contains(t, string(updated), "<<<<<<< current (local changes)")
-	assert.Contains(t, string(updated), "source: owner/repo@v2.0.0")
+	resolveLatestRefFn = func(_ context.Context, _, _ string, _, _ bool, _ time.Duration) (latestRefResolution, error) {
+		return latestRefResolution{Ref: "v2.0.0"}, nil
+	}
+	getRepositoryPackageDefaultBranch = func(_ context.Context, _, _ string) (string, error) {
+		return "main", nil
+	}
+	downloadPackageFileFromGitHubForHost = func(_ context.Context, owner, repo, path, ref, _ string) ([]byte, error) {
+		if owner != "owner" || repo != "repo" {
+			return nil, fmt.Errorf("unexpected package source %s/%s", owner, repo)
+		}
+		switch path {
+		case "aw.yml":
+			manifest := "name: Test Package\nfiles:\n  - workflows/conflict.md\n"
+			if includeHealthy {
+				manifest += "  - workflows/healthy.md\n"
+			}
+			return []byte(manifest), nil
+		case "README.md":
+			return []byte("# Test Package\n"), nil
+		case "workflows/conflict.md", "workflows/healthy.md":
+			return []byte("---\ntools:\n  bash: [\"echo upstream\"]\n---\n\n# Workflow\n"), nil
+		default:
+			return nil, createRepositoryPackageNotFoundError(path)
+		}
+	}
+	downloadWorkflowContentFn = func(_ context.Context, repo, path, ref string, _ bool) ([]byte, error) {
+		if repo != "owner/repo" || (path != "workflows/conflict.md" && path != "workflows/healthy.md") {
+			return nil, fmt.Errorf("unexpected workflow download %s/%s@%s", repo, path, ref)
+		}
+		switch ref {
+		case "v1.0.0":
+			return []byte("---\ntools:\n  bash: [\"echo base\"]\n---\n\n# Workflow\n"), nil
+		case "v2.0.0":
+			return []byte("---\ntools:\n  bash: [\"echo upstream\"]\n---\n\n# Workflow\n"), nil
+		default:
+			return nil, fmt.Errorf("unexpected workflow ref %s", ref)
+		}
+	}
+	listPackageDirSubdirsForHost = func(_ context.Context, _, _, _, dirPath, _ string) ([]string, error) {
+		return nil, createRepositoryPackageNotFoundError(dirPath)
+	}
+	listPackageDirFilesForHost = func(_ context.Context, _, _, _, dirPath, _ string) ([]string, error) {
+		return nil, createRepositoryPackageNotFoundError(dirPath)
+	}
+
+	for _, noCompile := range []bool{false, true} {
+		t.Run(fmt.Sprintf("noCompile=%t", noCompile), func(t *testing.T) {
+			includeHealthy = noCompile
+			tmpDir := testutil.TempDir(t, "manifest-conflict-group-*")
+			require.NoError(t, os.Mkdir(filepath.Join(tmpDir, ".git"), 0o755))
+			t.Chdir(tmpDir)
+			workflowPath := filepath.Join(tmpDir, "conflict.md")
+			original := "---\ntools:\n  bash: [\"echo local\"]\nsource: owner/repo@v1.0.0\n---\n\n# Workflow\n"
+			require.NoError(t, os.WriteFile(workflowPath, []byte(original), 0o644))
+			grouped := []*workflowWithSource{
+				{Name: "conflict", Path: workflowPath, SourceSpec: "owner/repo@v1.0.0"},
+			}
+			// In --no-compile mode a clean sibling must still update, without
+			// marking the entire conflicted package revision as installed.
+			if noCompile {
+				healthyPath := filepath.Join(tmpDir, "healthy.md")
+				healthy := strings.Replace(original, "echo local", "echo base", 1)
+				require.NoError(t, os.WriteFile(healthyPath, []byte(healthy), 0o644))
+				grouped = append(grouped, &workflowWithSource{Name: "healthy", Path: healthyPath, SourceSpec: "owner/repo@v1.0.0"})
+			}
+
+			successes, failures := updateManifestWorkflowGroup(context.Background(), "owner/repo@v1.0.0", grouped, UpdateWorkflowsOptions{
+				WorkflowsDir:           tmpDir,
+				DisableSecurityScanner: true,
+				NoCompile:              noCompile,
+			})
+
+			require.Len(t, failures, 1)
+			assert.Equal(t, "conflict", failures[0].Name)
+			assert.Contains(t, failures[0].Error, "conflicts")
+			updated, err := os.ReadFile(workflowPath)
+			require.NoError(t, err)
+			if noCompile {
+				assert.Contains(t, string(updated), "<<<<<<< current (local changes)")
+				assert.Equal(t, []string{"healthy"}, successes)
+				healthy, readErr := os.ReadFile(filepath.Join(tmpDir, "healthy.md"))
+				require.NoError(t, readErr)
+				assert.Contains(t, string(healthy), "echo upstream")
+				assert.Contains(t, string(healthy), "source: owner/repo@v2.0.0")
+				assert.NotContains(t, string(healthy), "<<<<<<<")
+			} else {
+				assert.Empty(t, successes)
+				assert.Equal(t, original, string(updated))
+			}
+			_, err = os.Stat(packageOwnershipRecordPath(tmpDir, "owner/repo"))
+			assert.True(t, os.IsNotExist(err), "conflicted package ownership should not be refreshed")
+		})
+	}
 }
 
 func TestUpdateManifestWorkflowGroup_AddsUpdatesRemoves(t *testing.T) {

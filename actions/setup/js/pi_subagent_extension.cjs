@@ -10,6 +10,7 @@ const { spawn } = require("node:child_process");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { sanitizeProviderErrorMessage } = require("./pi_provider_error.cjs");
 const { readWorkflowSkillArgs } = require("./pi_workflow_skills.cjs");
+const { resolvePiExecutable } = require("./pi_runtime.cjs");
 const maxPendingRecordLength = 16 * 1024 * 1024; // UTF-16 code units, including the record terminator.
 
 function getErrorCode(error) {
@@ -36,8 +37,8 @@ function subagentArgs(agent, promptPath) {
   return args;
 }
 
-/** @param {any} agent @param {string} task @param {any} ctx @param {AbortSignal|undefined} signal @param {typeof spawn} [launch] */
-async function runPiSubagent(agent, task, ctx, signal, launch = spawn) {
+/** @param {any} agent @param {string} task @param {any} ctx @param {AbortSignal|undefined} signal @param {typeof spawn} [launch] @param {string} [executable] */
+async function runPiSubagent(agent, task, ctx, signal, launch = spawn, executable) {
   if (signal?.aborted) throw new Error("Pi sub-agent was aborted before dispatch");
   const minutes = Number(process.env.GH_AW_TIMEOUT_MINUTES || "30");
   if (!Number.isFinite(minutes) || minutes <= 0) throw new Error("GH_AW_TIMEOUT_MINUTES must be positive");
@@ -73,7 +74,7 @@ async function runPiSubagent(agent, task, ctx, signal, launch = spawn) {
       JSON.stringify({ type: "gh_aw_subagent_dispatch", timestamp: new Date().toISOString(), invocation_id: invocationId, agent: agent.name, requested_model: agent.declaredModel || agent.modelId, resolved_model: agent.modelId }) + "\n"
     );
     return await new Promise((resolve, reject) => {
-      const child = launch(process.env.GH_AW_PI_COMMAND || "pi", subagentArgs(agent, promptPath), {
+      const child = launch(executable || resolvePiExecutable(), subagentArgs(agent, promptPath), {
         cwd: ctx.cwd,
         shell: false,
         stdio: ["pipe", "pipe", "pipe"],
@@ -201,17 +202,28 @@ function piSubagentExtension(pi) {
   }
   if (!Array.isArray(agents)) throw new Error("Invalid Pi sub-agent manifest");
   if (agents.length === 0) return;
+  const executable = resolvePiExecutable();
   pi.registerTool({
     name: "subagent",
     label: "Sub-agent",
-    description: `Delegate a task to a declared agent in an isolated Pi session. Available agents: ${agents.map(agent => `${agent.name}: ${agent.description}`).join("; ")}`,
+    description: `Delegate a task to a declared agent in an isolated Pi session. Available agents: ${agents.map(agent => agent.name).join("; ")}`,
     parameters: { type: "object", properties: { agent: { type: "string", enum: agents.map(agent => agent.name) }, task: { type: "string", minLength: 1 } }, required: ["agent", "task"], additionalProperties: false },
     async execute(_id, params, signal, _onUpdate, ctx) {
-      if (!params || typeof params !== "object" || Array.isArray(params) || typeof params.agent !== "string" || typeof params.task !== "string" || !params.task.trim())
+      if (
+        !params ||
+        typeof params !== "object" ||
+        Array.isArray(params) ||
+        Object.keys(params).length !== 2 ||
+        !Object.hasOwn(params, "agent") ||
+        !Object.hasOwn(params, "task") ||
+        typeof params.agent !== "string" ||
+        typeof params.task !== "string" ||
+        !params.task.trim()
+      )
         throw new Error("Choose a declared Pi sub-agent and provide a non-empty task");
       const agent = agents.find(candidate => candidate.name === params.agent);
       if (!agent) throw new Error("Choose a declared Pi sub-agent and provide a non-empty task");
-      return runPiSubagent(agent, params.task, ctx, signal);
+      return runPiSubagent(agent, params.task, ctx, signal, spawn, executable);
     },
   });
 }

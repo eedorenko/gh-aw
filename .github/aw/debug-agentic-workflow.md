@@ -71,11 +71,24 @@ provision secrets, escalate credentials, or retry dispatch.
 
 2. **Preflight MCP startup.** Read declarations/imports, credential references, startup commands/destinations without resolving secrets. Follow the [agentic security-review instructions](debug-security-review.md) before executing changed code or starting servers, including local reproductions. Trusted compile-only dry runs may produce evidence before final review, under that reference's snapshot/restore rules; they do not authorize workflow or MCP execution. Before `gh aw mcp list WORKFLOW`, `gh aw mcp list-tools WORKFLOW --server NAME` or `gh aw mcp inspect WORKFLOW --server NAME`, account for startup/connections. Require isolated scoped test bindings, reviewed startup effects and metadata-only calls; otherwise use cached schemas. Do not mutate ambient credentials.
 
-3. **Reproduce one boundary.** Choose compilation/prompt/MCP/agent/safe outputs. Run the real component with existing edge test doubles, minimal inputs, output assertions, disposable files and a timeout. Mock missing context/APIs/credentials. Never contact production or disable the firewall; leave OIDC, approvals, hosted tokens and runners unverified.
+3. **Reproduce one boundary.** Choose compilation/prompt/MCP/agent/safe outputs. For browser/tool-denial failures, inspect [browser readiness](playwright.md#browser-decision-and-readiness). Use real components with existing edge test doubles, minimal inputs, assertions, disposable files and a timeout. Mock missing context/APIs/credentials. Never contact production or disable the firewall; leave OIDC, approvals, hosted tokens and runners unverified.
 
 4. **Fix and gate.** Add a minimal fix/regression. Use trusted compile-only validation to obtain the diagnostic lock and check results under the [compilation guide](debug-compilation.md); this may precede final review, not review of changed executable code or startup effects. Review current source and emitted locks together under the [agentic security-review instructions](debug-security-review.md) before execution or upload. Unsupported `--dry-run`, missing required checks or failed compilation blocks live testing, not local diagnosis. Existing/generated locks need a successful gate for current hashes. Never downgrade required checks, add ad hoc suppressions beyond the documented dry-run filter, substitute `strict: true`, use `--approve`, or commit to erase warnings.
 
 5. **Constrain credentials.** Recommend, not require, a protected test environment and rotated, restricted development credentials. Inspect environments; provision only with authorization and revoke replaced credentials at their issuer. Never copy/rotate production secrets. Authorized repository/organization/enterprise shared secrets remain job-scoped, not automatically OS-exported; test environments do not isolate them. Keep production/dispatch credentials out of harnesses.
+
+## Evidence and completion contract
+
+Follow [evidence collection](#collect-existing-evidence) before diagnosis:
+preserve supplied host/repository/job/step URLs; scope bare IDs explicitly.
+Separate command failures from workflow failures and absent evidence from zero
+findings. For model/endpoint/version failures use
+[model triage](#model-and-engine-misconfiguration); for other signatures use the
+playbook linked above. Report mode, cause/uncertainty, patch, regression evidence
+and unmet gates. Keep static, fixture and live results distinct; never claim an
+active loop completed from compilation alone.
+
+<!-- instruction-prefix-end -->
 
 ## Test Workflow Changes from a Branch
 

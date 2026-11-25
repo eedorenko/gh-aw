@@ -14,7 +14,11 @@ permissions:
   pull-requests: read
   discussions: read
   security-events: read
-engine: claude
+  copilot-requests: write
+model: router/economy
+engine:
+  id: claude
+  model-provider: github
 strict: true
 tools:
   cli-proxy: true

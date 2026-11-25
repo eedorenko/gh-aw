@@ -35,12 +35,10 @@ runtimes:
 
 # AI engine configuration
 max-turns: 90  # Reduce from avg 115 turns
+model: router/economy
 engine:
   id: pi
   model-provider: github
-  model-routing:
-    goal: cost
-    mode: economy
 # Shared instructions
 imports:
   - uses: shared/daily-pr-base.md
@@ -77,9 +75,7 @@ tools:
 
 # Safe outputs configuration
 safe-outputs:
-  steer: true
   create-pull-request:
-    expires: 2d
     title-prefix: "[docs] "
     labels: [documentation, automation, doc-unbloat]
     reviewers: [copilot]

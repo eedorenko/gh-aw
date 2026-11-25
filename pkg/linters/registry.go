@@ -6,6 +6,7 @@ import (
 	"github.com/github/gh-aw/pkg/linters/appendbytestring"
 	"github.com/github/gh-aw/pkg/linters/appendoneelement"
 	"github.com/github/gh-aw/pkg/linters/blankassigncomma"
+	"github.com/github/gh-aw/pkg/linters/blankassignedcleanuperror"
 	"github.com/github/gh-aw/pkg/linters/bufferresetbeforereuse"
 	"github.com/github/gh-aw/pkg/linters/bufioscannererunchecked"
 	"github.com/github/gh-aw/pkg/linters/bytesbufferstring"
@@ -18,11 +19,14 @@ import (
 	deferrerrorunchecked "github.com/github/gh-aw/pkg/linters/deferred-error-unchecked"
 	"github.com/github/gh-aw/pkg/linters/errorfwrapv"
 	"github.com/github/gh-aw/pkg/linters/errormessage"
+	"github.com/github/gh-aw/pkg/linters/errorsnewerrorstring"
 	"github.com/github/gh-aw/pkg/linters/errortypeassertion"
 	"github.com/github/gh-aw/pkg/linters/errstringmatch"
 	"github.com/github/gh-aw/pkg/linters/excessivefuncparams"
+	"github.com/github/gh-aw/pkg/linters/execcommandoutputerrdiscard"
 	"github.com/github/gh-aw/pkg/linters/execcommandwithoutcontext"
 	"github.com/github/gh-aw/pkg/linters/fileclosenotdeferred"
+	"github.com/github/gh-aw/pkg/linters/filepathwalkpreferwalkdir"
 	"github.com/github/gh-aw/pkg/linters/fmterrorfnoverbs"
 	"github.com/github/gh-aw/pkg/linters/formatintitoa"
 	"github.com/github/gh-aw/pkg/linters/fprintferrorunchecked"
@@ -32,11 +36,16 @@ import (
 	"github.com/github/gh-aw/pkg/linters/goroutinemissingrecover"
 	"github.com/github/gh-aw/pkg/linters/goroutineresourceleak"
 	"github.com/github/gh-aw/pkg/linters/hardcodedfilepath"
+	"github.com/github/gh-aw/pkg/linters/hasprefixdotdotpathescape"
+	"github.com/github/gh-aw/pkg/linters/httpclientnotimeout"
 	"github.com/github/gh-aw/pkg/linters/httpnoctx"
 	"github.com/github/gh-aw/pkg/linters/httprespbodyclose"
 	"github.com/github/gh-aw/pkg/linters/httpstatuscode"
+	"github.com/github/gh-aw/pkg/linters/ignoredlocalerror"
 	"github.com/github/gh-aw/pkg/linters/ioutildeprecated"
+	"github.com/github/gh-aw/pkg/linters/jsondecodertrailingdataunchecked"
 	"github.com/github/gh-aw/pkg/linters/jsonmarshalignoredeerror"
+	"github.com/github/gh-aw/pkg/linters/jsonunmarshalbytesconversion"
 	"github.com/github/gh-aw/pkg/linters/largefunc"
 	"github.com/github/gh-aw/pkg/linters/lenstringsplit"
 	"github.com/github/gh-aw/pkg/linters/lenstringzero"
@@ -46,13 +55,16 @@ import (
 	"github.com/github/gh-aw/pkg/linters/mapclearloop"
 	"github.com/github/gh-aw/pkg/linters/mapdeletecheck"
 	"github.com/github/gh-aw/pkg/linters/nilctxpassed"
+	osstatignoredeerrorderef "github.com/github/gh-aw/pkg/linters/os-stat-ignored-error-deref"
 	"github.com/github/gh-aw/pkg/linters/osexitinlibrary"
 	"github.com/github/gh-aw/pkg/linters/osgetenvlibrary"
 	"github.com/github/gh-aw/pkg/linters/osisnotexist"
 	"github.com/github/gh-aw/pkg/linters/osopenreadallpreferreadfile"
+	"github.com/github/gh-aw/pkg/linters/osremoveuncheckedcleanup"
 	"github.com/github/gh-aw/pkg/linters/ossetenvlibrary"
 	"github.com/github/gh-aw/pkg/linters/packagelevelmutableslicemap"
 	panicinlibrarycode "github.com/github/gh-aw/pkg/linters/panic-in-library-code"
+	"github.com/github/gh-aw/pkg/linters/prefercutprefix"
 	"github.com/github/gh-aw/pkg/linters/rawloginlib"
 	"github.com/github/gh-aw/pkg/linters/readerstringconv"
 	reflectdeepequalusage "github.com/github/gh-aw/pkg/linters/reflect-deepequal-usage"
@@ -60,7 +72,10 @@ import (
 	"github.com/github/gh-aw/pkg/linters/regexpdynamicpattern"
 	"github.com/github/gh-aw/pkg/linters/seenmapbool"
 	"github.com/github/gh-aw/pkg/linters/slicemakezerolength"
+	"github.com/github/gh-aw/pkg/linters/sortbasicslices"
 	"github.com/github/gh-aw/pkg/linters/sortslice"
+	"github.com/github/gh-aw/pkg/linters/splitindexzero"
+	splitlinesonnewline "github.com/github/gh-aw/pkg/linters/splitlines-on-newline"
 	"github.com/github/gh-aw/pkg/linters/sprintfbool"
 	"github.com/github/gh-aw/pkg/linters/sprintferrdot"
 	"github.com/github/gh-aw/pkg/linters/sprintferrorsnew"
@@ -74,6 +89,7 @@ import (
 	"github.com/github/gh-aw/pkg/linters/stringsindexcontains"
 	"github.com/github/gh-aw/pkg/linters/stringsindexhasprefix"
 	"github.com/github/gh-aw/pkg/linters/stringsjoinone"
+	"github.com/github/gh-aw/pkg/linters/stringssplitfirst"
 	"github.com/github/gh-aw/pkg/linters/timeafterleak"
 	"github.com/github/gh-aw/pkg/linters/timenowsub"
 	"github.com/github/gh-aw/pkg/linters/timesleepnocontext"
@@ -89,6 +105,7 @@ import (
 	"github.com/github/gh-aw/pkg/linters/walkfuncerrshadow"
 	"github.com/github/gh-aw/pkg/linters/wgdonenotdeferred"
 	"github.com/github/gh-aw/pkg/linters/writebytestring"
+	"github.com/github/gh-aw/pkg/linters/writefilepublicpermsensitive"
 )
 
 // All returns all registered custom analysis linters.
@@ -104,6 +121,7 @@ var allAnalyzers = []*analysis.Analyzer{
 	appendbytestring.Analyzer,
 	appendoneelement.Analyzer,
 	blankassigncomma.Analyzer,
+	blankassignedcleanuperror.Analyzer,
 	bufferresetbeforereuse.Analyzer,
 	bufioscannererunchecked.Analyzer,
 	bytesbufferstring.Analyzer,
@@ -119,9 +137,12 @@ var allAnalyzers = []*analysis.Analyzer{
 	fprintlnsprintf.Analyzer,
 	errstringmatch.Analyzer,
 	errorfwrapv.Analyzer,
+	errorsnewerrorstring.Analyzer,
+	execcommandoutputerrdiscard.Analyzer,
 	execcommandwithoutcontext.Analyzer,
 	excessivefuncparams.Analyzer,
 	fileclosenotdeferred.Analyzer,
+	filepathwalkpreferwalkdir.Analyzer,
 	fmterrorfnoverbs.Analyzer,
 	formatintitoa.Analyzer,
 	fprintferrorunchecked.Analyzer,
@@ -130,10 +151,13 @@ var allAnalyzers = []*analysis.Analyzer{
 	goroutineresourceleak.Analyzer,
 	goroutinemissingrecover.Analyzer,
 	hardcodedfilepath.Analyzer,
+	hasprefixdotdotpathescape.Analyzer,
+	httpclientnotimeout.Analyzer,
 	httpnoctx.Analyzer,
 	httprespbodyclose.Analyzer,
 	ioutildeprecated.Analyzer,
 	httpstatuscode.Analyzer,
+	ignoredlocalerror.Analyzer,
 	largefunc.Analyzer,
 	logfatallibrary.Analyzer,
 	manualmutexunlock.Analyzer,
@@ -145,9 +169,12 @@ var allAnalyzers = []*analysis.Analyzer{
 	osgetenvlibrary.Analyzer,
 	osisnotexist.Analyzer,
 	osopenreadallpreferreadfile.Analyzer,
+	osremoveuncheckedcleanup.Analyzer,
+	osstatignoredeerrorderef.Analyzer,
 	ossetenvlibrary.Analyzer,
 	packagelevelmutableslicemap.Analyzer,
 	panicinlibrarycode.Analyzer,
+	prefercutprefix.Analyzer,
 	rawloginlib.Analyzer,
 	readerstringconv.Analyzer,
 	reflectdeepequalusage.Analyzer,
@@ -156,7 +183,10 @@ var allAnalyzers = []*analysis.Analyzer{
 	ssljson.Analyzer,
 	seenmapbool.Analyzer,
 	slicemakezerolength.Analyzer,
+	sortbasicslices.Analyzer,
 	sortslice.Analyzer,
+	splitindexzero.Analyzer,
+	splitlinesonnewline.Analyzer,
 	sprintferrdot.Analyzer,
 	sprintferrorsnew.Analyzer,
 	sprintfbool.Analyzer,
@@ -168,8 +198,11 @@ var allAnalyzers = []*analysis.Analyzer{
 	stringsindexcontains.Analyzer,
 	stringsindexhasprefix.Analyzer,
 	stringsjoinone.Analyzer,
+	stringssplitfirst.Analyzer,
 	stringscountcontains.Analyzer,
+	jsondecodertrailingdataunchecked.Analyzer,
 	jsonmarshalignoredeerror.Analyzer,
+	jsonunmarshalbytesconversion.Analyzer,
 	lenstringzero.Analyzer,
 	lenstringsplit.Analyzer,
 	timeafterleak.Analyzer,
@@ -187,4 +220,5 @@ var allAnalyzers = []*analysis.Analyzer{
 	walkfuncerrshadow.Analyzer,
 	wgdonenotdeferred.Analyzer,
 	writebytestring.Analyzer,
+	writefilepublicpermsensitive.Analyzer,
 }

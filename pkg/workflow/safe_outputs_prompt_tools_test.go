@@ -3,6 +3,7 @@
 package workflow
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -11,6 +12,73 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestBuildSafeOutputsSectionsSecurityAdvisories(t *testing.T) {
+	for _, tool := range []string{"create_security_advisory", "add_security_advisory_comment"} {
+		for _, tt := range []struct {
+			name    string
+			enabled bool
+			max     *string
+			budget  string
+		}{
+			{name: "disabled"},
+			{name: "default budget", enabled: true},
+			{name: "single call", enabled: true, max: strPtr("1")},
+			{name: "multiple calls", enabled: true, max: strPtr("3"), budget: "(max:3)"},
+			{name: "dynamic budget", enabled: true, max: strPtr("${{ inputs.limit }}"), budget: "(max:__GH_AW_INPUTS_LIMIT__)"},
+		} {
+			t.Run(tool+"/"+tt.name, func(t *testing.T) {
+				config := &SafeOutputsConfig{NoOp: &NoOpConfig{}}
+				if tt.enabled {
+					base := BaseSafeOutputConfig{Max: tt.max}
+					if tool == "create_security_advisory" {
+						config.CreateSecurityAdvisory = &CreateSecurityAdvisoryConfig{BaseSafeOutputConfig: base}
+					} else {
+						config.AddSecurityAdvisoryComment = &AddSecurityAdvisoryCommentConfig{BaseSafeOutputConfig: base}
+					}
+				}
+				sections := buildSafeOutputsSections(config, nil, nil)
+				require.NotEmpty(t, sections)
+				if !tt.enabled {
+					assert.NotContains(t, sections[0].Content, tool)
+					return
+				}
+				assert.Equal(t, "<safe-output-tools>\nTools: "+tool+tt.budget+", noop", sections[0].Content)
+				if tt.name == "dynamic budget" {
+					assert.Equal(t, "${{ inputs.limit }}", sections[0].EnvVars["GH_AW_INPUTS_LIMIT"])
+				}
+			})
+		}
+	}
+}
+
+func TestBuildSafeOutputsSectionsReportIncomplete(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		config   *ReportIncompleteConfig
+		expected string
+	}{
+		{name: "disabled"},
+		{name: "default budget", config: &ReportIncompleteConfig{}, expected: "report_incomplete"},
+		{name: "single report", config: &ReportIncompleteConfig{BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")}}, expected: "report_incomplete"},
+		{name: "multiple reports", config: &ReportIncompleteConfig{BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("3")}}, expected: "report_incomplete(max:3)"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &SafeOutputsConfig{NoOp: &NoOpConfig{}, ReportIncomplete: tt.config}
+			sections := buildSafeOutputsSections(config, nil, nil)
+			require.NotEmpty(t, sections)
+			manifestTools := collectSafeOutputsManifestTools(&WorkflowData{SafeOutputs: config})
+			assert.Equal(t, tt.config != nil, slices.Contains(manifestTools, "report_incomplete"))
+			_, enabled := computeEnabledToolNames(&WorkflowData{SafeOutputs: config})["report_incomplete"]
+			assert.Equal(t, tt.config != nil, enabled)
+			if tt.expected == "" {
+				assert.NotContains(t, sections[0].Content, "report_incomplete")
+			} else {
+				assert.Equal(t, "<safe-output-tools>\nTools: "+tt.expected+", noop", sections[0].Content)
+			}
+		})
+	}
+}
 
 func TestBuildSafeOutputsSectionsCodeCoverage(t *testing.T) {
 	for _, tt := range []struct {
@@ -138,25 +206,11 @@ func TestBuildSafeOutputsSectionsCustomTools(t *testing.T) {
 			expectedTools: []string{"add_comment", "create_issue", "noop", "deploy", "notify"},
 		},
 		{
-			name: "external issue tools appear in tools list",
+			name: "noop does not implicitly enable external issue tools",
 			safeOutputs: &SafeOutputsConfig{
-				LinearCreateIssue: &LinearCreateIssueConfig{},
-				LinearAddComment:  &LinearTargetConfig{},
-				LinearUpdateIssue: &LinearUpdateIssueConfig{},
-				JiraCreateIssue:   &JiraSafeOutputConfig{},
-				JiraUpdateIssue:   &JiraSafeOutputConfig{},
-				JiraAddComment:    &JiraSafeOutputConfig{},
-				JiraAddLabel:      &JiraSafeOutputConfig{},
-				NoOp:              &NoOpConfig{},
+				NoOp: &NoOpConfig{},
 			},
 			expectedTools: []string{
-				"linear_create_issue",
-				"linear_add_comment",
-				"linear_update_issue",
-				"jira_create_issue",
-				"jira_update_issue",
-				"jira_add_comment",
-				"jira_add_label",
 				"noop",
 			},
 		},
@@ -461,6 +515,10 @@ func TestBuildSafeOutputsSectionsLedgerTools(t *testing.T) {
 				data := &WorkflowData{SafeOutputs: safeOutputs, LedgerConfig: config}
 				names := extractToolNamesFromSections(t, NewCompiler().collectPromptSections(data))
 				require.Subset(t, names, tt.expected)
+				assert.ElementsMatch(t, names, collectSafeOutputsManifestTools(data))
+				for _, tool := range tt.expected {
+					assert.True(t, promptToolAvailable(data, promptToolRequirement{server: "safeoutputs", tool: tool}, EngineCapabilities{}))
+				}
 			}
 		})
 	}

@@ -119,7 +119,7 @@ jobs:
     runs-on: ubuntu-slim
     # Closing expired resources requires write access to this resource type only.
     permissions:
-      discussions: write
+      discussions: write # Create or update discussions and comments.
     steps:
       - name: Checkout actions folder
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -150,7 +150,7 @@ jobs:
     runs-on: ubuntu-slim
     # Closing expired resources requires write access to this resource type only.
     permissions:
-      issues: write
+      issues: write # Create or update issues and comments.
     steps:
       - name: Checkout actions folder
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -181,7 +181,7 @@ jobs:
     runs-on: ubuntu-slim
     # Closing expired resources requires write access to this resource type only.
     permissions:
-      pull-requests: write
+      pull-requests: write # Create or update pull requests and review comments.
     steps:
       - name: Checkout actions folder
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -213,8 +213,8 @@ jobs:
     runs-on: ubuntu-slim
     # Reading workflow runs and closing issues requires these permissions.
     permissions:
-      actions: read
-      issues: write
+      actions: read # Read workflow runs and artifacts for workflow context.
+      issues: write # Create or update issues and comments.
       contents: read
     steps:
       - name: Checkout actions folder
@@ -247,7 +247,7 @@ jobs:
     runs-on: ubuntu-slim
     # Removing obsolete Actions caches requires actions: write.
     permissions:
-      actions: write
+      actions: write # Create or update workflow runs and artifacts.
     steps:
       - name: Checkout actions folder
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -279,9 +279,9 @@ jobs:
     runs-on: ubuntu-slim
     # Updates, upgrades, and workflow enable/disable operations need repository write access.
     permissions:
-      actions: write
-      contents: write
-      pull-requests: write
+      actions: write # Create or update workflow runs and artifacts.
+      contents: write # Create or update repository contents.
+      pull-requests: write # Create or update pull requests and review comments.
     outputs:
       operation: ${{ steps.record.outputs.operation }}
     steps:
@@ -308,7 +308,7 @@ jobs:
             await main();
 
       - name: Setup Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: true
@@ -344,8 +344,8 @@ jobs:
     runs-on: ubuntu-slim
     # Branch updates may write commits and update pull requests.
     permissions:
-      contents: write
-      pull-requests: write
+      contents: write # Create or update repository contents.
+      pull-requests: write # Create or update pull requests and review comments.
     steps:
       - name: Checkout actions folder
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -392,11 +392,11 @@ jobs:
     runs-on: ubuntu-slim
     # Replay can create or update any supported safe-output resource.
     permissions:
-      actions: read
-      contents: write
-      discussions: write
-      issues: write
-      pull-requests: write
+      actions: read # Read workflow runs and artifacts for workflow context.
+      contents: write # Create or update repository contents.
+      discussions: write # Create or update discussions and comments.
+      issues: write # Create or update issues and comments.
+      pull-requests: write # Create or update pull requests and review comments.
     outputs:
       run_url: ${{ steps.record.outputs.run_url }}
     steps:
@@ -455,7 +455,7 @@ jobs:
     # Creating repository labels uses the issues API.
     permissions:
       contents: read
-      issues: write
+      issues: write # Create or update issues and comments.
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -480,7 +480,7 @@ jobs:
             await main();
 
       - name: Setup Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: true
@@ -509,9 +509,9 @@ jobs:
     timeout-minutes: 120
     # Read workflow logs and create the resulting report issue.
     permissions:
-      actions: read
+      actions: read # Read workflow runs and artifacts for workflow context.
       contents: read
-      issues: write
+      issues: write # Create or update issues and comments.
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -536,7 +536,7 @@ jobs:
             await main();
 
       - name: Setup Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: true
@@ -611,7 +611,7 @@ jobs:
               repo: context.repo.repo,
               title: '[aw] agentic status report',
               body,
-              labels: ['agentic-workflows'],
+              labels: [process.env.GH_AW_ISSUE_LABEL || 'agentic-workflows'],
             });
             core.info('Created issue #' + createdIssue.data.number + ': ' + createdIssue.data.html_url);
 
@@ -622,9 +622,9 @@ jobs:
     timeout-minutes: 60
     # Read workflow logs and create the resulting report issue.
     permissions:
-      actions: read
+      actions: read # Read workflow runs and artifacts for workflow context.
       contents: read
-      issues: write
+      issues: write # Create or update issues and comments.
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -649,7 +649,7 @@ jobs:
             await main();
 
       - name: Setup Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: true
@@ -730,7 +730,7 @@ jobs:
     runs-on: ubuntu-slim
     # Closing no-repro issues requires issues: write.
     permissions:
-      issues: write
+      issues: write # Create or update issues and comments.
     steps:
       - name: Checkout actions folder
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -776,7 +776,7 @@ jobs:
     # Read workflow sources and file issues for validation findings.
     permissions:
       contents: read
-      issues: write
+      issues: write # Create or update issues and comments.
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -801,7 +801,7 @@ jobs:
             await main();
 
       - name: Setup Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: true
@@ -829,9 +829,9 @@ jobs:
     runs-on: ubuntu-slim
     # Label requests disable workflow runs and update the requesting issue.
     permissions:
-      actions: write
+      actions: write # Create or update workflow runs and artifacts.
       contents: read
-      issues: write
+      issues: write # Create or update issues and comments.
     steps:
       - name: Checkout actions folder
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -878,11 +878,11 @@ jobs:
     runs-on: ubuntu-slim
     # Applying safe outputs can update each supported repository resource.
     permissions:
-      actions: read
-      contents: write
-      discussions: write
-      issues: write
-      pull-requests: write
+      actions: read # Read workflow runs and artifacts for workflow context.
+      contents: write # Create or update repository contents.
+      discussions: write # Create or update discussions and comments.
+      issues: write # Create or update issues and comments.
+      pull-requests: write # Create or update pull requests and review comments.
     steps:
       - name: Checkout actions folder
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -937,7 +937,7 @@ jobs:
     # Detect drift by reading sources and open a tracking issue when necessary.
     permissions:
       contents: read
-      issues: write
+      issues: write # Create or update issues and comments.
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -945,7 +945,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: true
@@ -1045,7 +1045,7 @@ jobs:
     permissions:
       contents: read
     outputs:
-      plan_created: ${{ steps.plan_0.outputs.plan_created == 'true' || steps.plan_1.outputs.plan_created == 'true' || steps.plan_2.outputs.plan_created == 'true' || steps.plan_3.outputs.plan_created == 'true' || steps.plan_4.outputs.plan_created == 'true' || steps.plan_5.outputs.plan_created == 'true' || steps.plan_6.outputs.plan_created == 'true' }}
+      plan_created: ${{ steps.plan_0.outputs.plan_created == 'true' || steps.plan_1.outputs.plan_created == 'true' || steps.plan_2.outputs.plan_created == 'true' || steps.plan_3.outputs.plan_created == 'true' || steps.plan_4.outputs.plan_created == 'true' || steps.plan_5.outputs.plan_created == 'true' || steps.plan_6.outputs.plan_created == 'true' || steps.plan_7.outputs.plan_created == 'true' }}
       plans_uploaded: ${{ steps.upload_plans.outcome == 'success' }}
       plan_0_created: ${{ steps.plan_0.outputs.plan_created }}
       plan_1_created: ${{ steps.plan_1.outputs.plan_created }}
@@ -1054,6 +1054,7 @@ jobs:
       plan_4_created: ${{ steps.plan_4.outputs.plan_created }}
       plan_5_created: ${{ steps.plan_5.outputs.plan_created }}
       plan_6_created: ${{ steps.plan_6.outputs.plan_created }}
+      plan_7_created: ${{ steps.plan_7.outputs.plan_created }}
     steps:
       - name: Checkout actions folder
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1545,11 +1546,46 @@ jobs:
             const { main } = require(path.join(actionsDir, 'ledger_compaction_plan.cjs'));
             await main();
 
+      - name: Plan ledger compaction (git-simulator-lessons, untrusted, read-only)
+        if: ${{ inputs.operation != 'compact_ledger' || inputs.ledger == '' || inputs.ledger == 'git-simulator-lessons' }}
+        continue-on-error: true
+        timeout-minutes: 15
+        id: plan_6
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_AW_LEDGER_COMPACTION_CONFIG: |-
+            {
+              "branch_name": "ledgers/git-simulator-lessons",
+              "compaction": {
+                "schedule": "daily",
+                "min_segments": 32,
+                "max_segments": 128
+              },
+              "key": "",
+              "max_patch_kb": 16,
+              "max_record_kb": 4,
+              "max_segment_kb": 100,
+              "name": "git-simulator-lessons",
+              "schema": null,
+              "type": "notes"
+            }
+          GH_AW_LEDGER_COMPACTION_TRIGGER: ${{ inputs.operation == 'compact_ledger' && 'requested' || 'scheduled' }}
+          GH_AW_LEDGER_COMPACTION_PLAN_FILE: ${{ runner.temp }}/gh-aw/ledger-compaction/plan-6.json
+        with:
+          script: |
+            const path = require('path');
+            const actionsDir = path.join(process.env.RUNNER_TEMP, 'gh-aw', 'actions');
+            const { setupGlobals } = require(path.join(actionsDir, 'setup_globals.cjs'));
+            setupGlobals(core, github, context, exec, io, getOctokit);
+            const { main } = require(path.join(actionsDir, 'ledger_compaction_plan.cjs'));
+            await main();
+
       - name: Plan ledger compaction (smoke, untrusted, read-only)
         if: ${{ inputs.operation != 'compact_ledger' || inputs.ledger == '' || inputs.ledger == 'smoke' }}
         continue-on-error: true
         timeout-minutes: 15
-        id: plan_6
+        id: plan_7
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1593,7 +1629,7 @@ jobs:
               "type": "table"
             }
           GH_AW_LEDGER_COMPACTION_TRIGGER: ${{ inputs.operation == 'compact_ledger' && 'requested' || 'scheduled' }}
-          GH_AW_LEDGER_COMPACTION_PLAN_FILE: ${{ runner.temp }}/gh-aw/ledger-compaction/plan-6.json
+          GH_AW_LEDGER_COMPACTION_PLAN_FILE: ${{ runner.temp }}/gh-aw/ledger-compaction/plan-7.json
         with:
           script: |
             const path = require('path');
@@ -1604,7 +1640,7 @@ jobs:
             await main();
 
       - name: Upload ledger compaction plans
-        if: ${{ steps.plan_0.outputs.plan_created == 'true' || steps.plan_1.outputs.plan_created == 'true' || steps.plan_2.outputs.plan_created == 'true' || steps.plan_3.outputs.plan_created == 'true' || steps.plan_4.outputs.plan_created == 'true' || steps.plan_5.outputs.plan_created == 'true' || steps.plan_6.outputs.plan_created == 'true' }}
+        if: ${{ steps.plan_0.outputs.plan_created == 'true' || steps.plan_1.outputs.plan_created == 'true' || steps.plan_2.outputs.plan_created == 'true' || steps.plan_3.outputs.plan_created == 'true' || steps.plan_4.outputs.plan_created == 'true' || steps.plan_5.outputs.plan_created == 'true' || steps.plan_6.outputs.plan_created == 'true' || steps.plan_7.outputs.plan_created == 'true' }}
         id: upload_plans
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -1613,7 +1649,7 @@ jobs:
           retention-days: ${{ vars.GH_AW_DEFAULT_ARTIFACT_RETENTION_DAYS || '1' }}
           if-no-files-found: error
       - name: Report ledger compaction planning failures
-        if: ${{ steps.plan_0.outcome == 'failure' || steps.plan_1.outcome == 'failure' || steps.plan_2.outcome == 'failure' || steps.plan_3.outcome == 'failure' || steps.plan_4.outcome == 'failure' || steps.plan_5.outcome == 'failure' || steps.plan_6.outcome == 'failure' }}
+        if: ${{ steps.plan_0.outcome == 'failure' || steps.plan_1.outcome == 'failure' || steps.plan_2.outcome == 'failure' || steps.plan_3.outcome == 'failure' || steps.plan_4.outcome == 'failure' || steps.plan_5.outcome == 'failure' || steps.plan_6.outcome == 'failure' || steps.plan_7.outcome == 'failure' }}
         run: exit 1
 
   ledger_compaction_apply:
@@ -1623,7 +1659,7 @@ jobs:
     runs-on: ubuntu-slim
     # Applying a validated plan commits updated ledger content.
     permissions:
-      contents: write
+      contents: write # Create or update repository contents.
     steps:
       - name: Checkout actions folder
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2121,9 +2157,44 @@ jobs:
             const { main } = require(path.join(actionsDir, 'ledger_compaction_apply.cjs'));
             await main();
 
-      - name: Validate and apply ledger compaction (smoke, trusted)
+      - name: Validate and apply ledger compaction (git-simulator-lessons, trusted)
         if: ${{ needs.ledger_compaction_plan.outputs.plan_6_created == 'true' }}
         id: apply_6
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_AW_LEDGER_COMPACTION_CONFIG: |-
+            {
+              "branch_name": "ledgers/git-simulator-lessons",
+              "compaction": {
+                "schedule": "daily",
+                "min_segments": 32,
+                "max_segments": 128
+              },
+              "key": "",
+              "max_patch_kb": 16,
+              "max_record_kb": 4,
+              "max_segment_kb": 100,
+              "name": "git-simulator-lessons",
+              "schema": null,
+              "type": "notes"
+            }
+          GH_AW_LEDGER_COMPACTION_TRIGGER: ${{ inputs.operation == 'compact_ledger' && 'requested' || 'scheduled' }}
+          GH_AW_LEDGER_COMPACTION_PLAN_FILE: ${{ runner.temp }}/gh-aw/ledger-compaction/plan-6.json
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const path = require('path');
+            const actionsDir = path.join(process.env.RUNNER_TEMP, 'gh-aw', 'actions');
+            const { setupGlobals } = require(path.join(actionsDir, 'setup_globals.cjs'));
+            setupGlobals(core, github, context, exec, io, getOctokit);
+            const { main } = require(path.join(actionsDir, 'ledger_compaction_apply.cjs'));
+            await main();
+
+      - name: Validate and apply ledger compaction (smoke, trusted)
+        if: ${{ needs.ledger_compaction_plan.outputs.plan_7_created == 'true' }}
+        id: apply_7
         continue-on-error: true
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
@@ -2168,7 +2239,7 @@ jobs:
               "type": "table"
             }
           GH_AW_LEDGER_COMPACTION_TRIGGER: ${{ inputs.operation == 'compact_ledger' && 'requested' || 'scheduled' }}
-          GH_AW_LEDGER_COMPACTION_PLAN_FILE: ${{ runner.temp }}/gh-aw/ledger-compaction/plan-6.json
+          GH_AW_LEDGER_COMPACTION_PLAN_FILE: ${{ runner.temp }}/gh-aw/ledger-compaction/plan-7.json
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -2179,17 +2250,17 @@ jobs:
             const { main } = require(path.join(actionsDir, 'ledger_compaction_apply.cjs'));
             await main();
       - name: Report ledger compaction application failures
-        if: ${{ steps.apply_0.outcome == 'failure' || steps.apply_1.outcome == 'failure' || steps.apply_2.outcome == 'failure' || steps.apply_3.outcome == 'failure' || steps.apply_4.outcome == 'failure' || steps.apply_5.outcome == 'failure' || steps.apply_6.outcome == 'failure' }}
+        if: ${{ steps.apply_0.outcome == 'failure' || steps.apply_1.outcome == 'failure' || steps.apply_2.outcome == 'failure' || steps.apply_3.outcome == 'failure' || steps.apply_4.outcome == 'failure' || steps.apply_5.outcome == 'failure' || steps.apply_6.outcome == 'failure' || steps.apply_7.outcome == 'failure' }}
         run: exit 1
 
   work_queue_compaction:
-    name: Reconcile and compact work queue
+    name: Reconcile and checkpoint work queue
     if: ${{ (!(github.event.repository.fork)) && github.event_name != 'push' && (github.event_name != 'workflow_dispatch' && github.event_name != 'workflow_call' || inputs.operation == '' || inputs.operation == 'none') }}
     runs-on: ubuntu-slim
     permissions:
-      actions: read
-      contents: write
-      issues: write
+      actions: read # Read workflow runs and artifacts for workflow context.
+      contents: write # Create or update repository contents.
+      issues: write # Create or update issues and comments.
     steps:
       - name: Checkout actions folder
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2204,22 +2275,15 @@ jobs:
         with:
           destination: ${{ runner.temp }}/gh-aw/actions
 
-      - name: Reconcile stranded workers and compact work queue
+      - name: Reconcile and checkpoint work queue
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          GH_AW_WORK_QUEUE_COMPACTION_PLAN_FILE: ${{ runner.temp }}/gh-aw/work-queue-compaction/plan.json
+          GH_AW_WORK_QUEUE_POLICY: "{\"version\":4,\"pending_limit\":30,\"issues\":{\"label\":\"work\",\"title_prefix\":\"[work queue]\",\"orphaned_after_days\":30},\"effect_scope\":\"${{ github.repository }}\",\"workers\":[\"artifacts-summary\",\"code-scanning-fixer-worker\",\"daily-compiler-quality\",\"daily-evals-report\",\"daily-firewall-report\",\"daily-issues-report\",\"daily-observability-report\",\"daily-regulatory\",\"daily-repo-chronicle\",\"daily-secrets-analysis\",\"daily-team-evolution-insights\",\"daily-token-consumption-report\",\"deep-report\",\"engine-conformance-agy\",\"engine-conformance-aider\",\"engine-conformance-claude\",\"engine-conformance-codex\",\"engine-conformance-copilot\",\"engine-conformance-crush\",\"engine-conformance-cursor\",\"engine-conformance-deepseek-harness\",\"engine-conformance-factory\",\"engine-conformance-gemini\",\"engine-conformance-goose\",\"engine-conformance-kiro\",\"engine-conformance-langgraph\",\"engine-conformance-mini-swe-agent\",\"engine-conformance-opencode\",\"engine-conformance-pi\",\"engine-conformance-pydantic-ai\",\"eslint-miner\",\"eslint-monster\",\"eslint-refiner\",\"repo-tree-map\",\"smoke-work-queue-worker\"],\"pools\":{\"code-scanning\":{\"concurrency\":3,\"per_account_limit\":0,\"max_attempts\":3},\"daily-reports\":{\"concurrency\":3,\"per_account_limit\":1,\"max_attempts\":3},\"default\":{\"concurrency\":3,\"per_account_limit\":0,\"max_attempts\":3},\"engine-conformance\":{\"concurrency\":3,\"per_account_limit\":1,\"max_attempts\":3},\"smoke-work-queue\":{\"concurrency\":3,\"per_account_limit\":0,\"max_attempts\":3}}}"
         with:
           script: |
             const path = require('path');
             const actionsDir = path.join(process.env.RUNNER_TEMP, 'gh-aw', 'actions');
             const { setupGlobals } = require(path.join(actionsDir, 'setup_globals.cjs'));
             setupGlobals(core, github, context, exec, io, getOctokit);
-            const { maintenance: reconcile } = require(path.join(actionsDir, 'reconcile_work_queue_run.cjs'));
-            const reconciliation = await reconcile({ projectIssues: true, deferIssueFailure: true });
-            const { main: plan } = require(path.join(actionsDir, 'work_queue_compaction_plan.cjs'));
-            const result = await plan();
-            if (result.status === 'planned') {
-              const { main: apply } = require(path.join(actionsDir, 'work_queue_compaction_apply.cjs'));
-              await apply();
-            }
-            if (reconciliation.issue_sync_pending?.length) core.setFailed('Work queue reconciliation and compaction completed; Issue synchronization remains pending. Recover the exact terminal requests with work-queue sync-issues --request-id.');
+            const { maintenance } = require(path.join(actionsDir, 'reconcile_work_queue_run.cjs'));
+            await maintenance({ projectIssues: true });

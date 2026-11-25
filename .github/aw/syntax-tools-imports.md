@@ -4,6 +4,20 @@ description: Cache, tool, import, and permission reference for GitHub Agentic Wo
 
 # Tools, Imports, and Permissions
 
+Before selecting tools, apply the
+[browser decision](playwright.md#browser-decision-and-readiness). Rendered-page
+validation requires the built-in CLI and scoped supporting lifecycle commands,
+not just a `playwright` declaration.
+
+Load the matching field reference before emitting configuration:
+[cache](#cache-configuration), [tools](#tool-configuration),
+[plugins](#agent-plugins-plugins), [network](#engine-network-permissions),
+[imports](#imports-field), and [permissions](#permission-patterns).
+Keep agent permissions read-only and use configured safe outputs for GitHub
+mutations; follow [workflow constraints](workflow-constraints.md).
+
+<!-- instruction-prefix-end -->
+
 ### Cache Configuration
 
 The `cache:` field supports the same syntax as the GitHub Actions `actions/cache` action:
@@ -73,6 +87,7 @@ The `tools:` field configures which tools the coding agent may use.
 - `args:` - Additional command-line arguments (local mode only)
 - `read-only:` - The GitHub MCP server always operates in read-only mode; this field is accepted but has no effect
 - `github-token:` - Custom GitHub token
+- `token-broker:` (experimental) - `true` (or an empty value) exchanges GitHub Actions OIDC for a broker-policy-scoped, read-only GitHub App token for this job; `false` disables it. Do not combine an enabled broker with `tools.github.github-token` or `tools.github.github-app`. The operator must deploy a broker and configure the `GH_AW_TOKEN_BROKER_URL` Actions secret; missing configuration or exchange failure stops the job. See [token broker configuration](https://github.github.com/gh-aw/reference/frontmatter/#token-broker-token-broker).
 - `lockdown:` - Enable lockdown mode to limit content surfaced from public repositories to items authored by users with push access (boolean, default: false)
 - `github-app:` - GitHub App configuration for token minting; when set, mints an installation access token at workflow start that overrides `github-token`
   - `client-id:` - GitHub App client ID (required, e.g., `${{ vars.APP_ID }}`). Use `app-id:` for legacy compatibility.
@@ -120,12 +135,11 @@ The `tools:` field configures which tools the coding agent may use.
   tools:
     bash: ["*"]
   ```
-- `playwright:` - Browser automation for visual regression, accessibility, and end-to-end testing. The built-in integration uses `playwright-cli <command>` in bash, and `localhost` reaches local servers directly. `mode: mcp` is removed; use a custom `mcp-servers` entry if MCP is required. Pin the CLI with `version:` and restrict network to `local` + `playwright`.
+- `playwright:` - Built-in CLI for rendered-page, visual, accessibility, and E2E checks. Omit `mode`; built-in MCP mode is unsupported. The compiler provisions CLI, skills, and Chromium. Same-sandbox loopback needs no `local` network entry. Follow the [browser readiness contract](playwright.md#browser-decision-and-readiness) for scoped network access and supporting lifecycle permissions.
 
   ```yaml
   tools:
     playwright:
-      version: "0.1.11"  # optional: @playwright/cli npm package version
   ```
 - `timeout:` - Per-operation timeout in seconds for all tool and MCP calls (integer or expression, default: 60 s for all engines).
 - `startup-timeout:` - Timeout in seconds for MCP server initialization (integer or expression, default: 120).
@@ -189,7 +203,7 @@ plugins:
 
 - Entries use `owner/repository[/path]@ref`; `ref` is required (branch, tag, or 40-char commit SHA).
 - The compiler resolves every branch/tag to a commit SHA at compile time; unresolvable refs fail compilation, so generated workflows never install from a moving ref.
-- Supported by `copilot`, `claude`, and `codex` (each installs plugins its own way — see [syntax-engine.md](syntax-engine.md)); `gemini` and `pi` reject `plugins:` at compile time. Imported engine definitions opt in via `engine.behaviors.plugins` (see [configure-agentic-engine.md](configure-agentic-engine.md)).
+- Supported by `copilot`, `claude`, and `codex` (each installs plugins its own way — see [syntax-engine.md](syntax-engine.md)); `gemini` and `pi` reject `plugins:` at compile time. Imported engine definitions opt in via `engine.behaviors.plugins` (see [custom declarative engines](custom-declarative-agentic-engine.md)).
 - Plugin object entries support per-entry `github-token` or `github-app` (mutually exclusive), so private plugin repositories are supported.
 - Merge behavior across imports: see the imports merge list above.
 

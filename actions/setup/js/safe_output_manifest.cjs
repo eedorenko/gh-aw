@@ -5,13 +5,12 @@ const fs = require("fs");
 const nodePath = require("path");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_SYSTEM } = require("./error_codes.cjs");
-const { buildSafeOutputOutcomes } = require("./safe_output_outcomes.cjs");
+const { buildSafeOutputExecutions } = require("./safe_output_execution.cjs");
 const { MANIFEST_FILE_PATH, TEMPORARY_ID_MAP_FILE_PATH, SAFE_OUTPUT_ERRORS_FILE_PATH } = require("./constants.cjs");
 const { redactBuiltInPatterns, redactSecrets, extractMCPGatewayTokens, MCP_GATEWAY_CONFIG_PATHS } = require("./redact_secrets.cjs");
 const { currentClaimHandle, claimArtifactPath, claimIdentity, assertClaimIdentity, assertClaimArtifactDirectory, assertClaimArtifactFile } = require("./work_queue_claim_scope.cjs");
 
-const CLAIM_DELIVERY_ERRORS_FILE_NAME = "claim-delivery-errors.json";
-const SAFE_OUTPUT_OUTCOMES_FILE_NAME = "safe-output-outcomes.jsonl";
+const SAFE_OUTPUT_EXECUTIONS_FILE_NAME = "safe-output-executions.jsonl";
 const MERGE_DECISIONS_FILE_NAME = "merge-pull-request-decisions.jsonl";
 const MERGE_PRODUCER_FAILURE_CODES = new Set(["required_check_producer_missing", "required_check_producer_mismatch", "required_check_producer_ambiguous"]);
 const MERGE_FAILURE_CODES = new Set([
@@ -29,6 +28,7 @@ const MERGE_FAILURE_CODES = new Set([
   "missing_required_labels",
   "title_prefix_mismatch",
   "branch_not_allowed",
+  "base_branch_not_allowed",
   "target_branch_protected",
   "target_branch_default",
   "target_branch_has_no_open_pr",
@@ -37,10 +37,13 @@ const MERGE_FAILURE_CODES = new Set([
   "pending_reviewers",
   "blocking_individual_review",
   "required_approval_missing",
+  "manual_review_caution",
+  "protected_files_modified",
   "blocking_review_state",
   "unresolved_review_threads",
   "merge_not_completed",
   "merge_operation_error",
+  "merge_outcome_indeterminate",
 ]);
 
 /** @param {unknown} value @param {(value: any) => boolean} valid @param {string} field */
@@ -53,6 +56,20 @@ function mergeAuditIdentity(value, valid, field) {
 /** @param {unknown} value */
 function isAuditTimestamp(value) {
   return typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
+}
+
+/** @param {any} value */
+function projectMergeAuthorization(value) {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value) || value.policy_version !== 1 || typeof value.policy_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.policy_sha256)) {
+    throw new Error(`${ERR_SYSTEM}: Invalid merge authorization evidence`);
+  }
+  const result = { policy_version: 1, policy_sha256: value.policy_sha256 };
+  for (const gate of ["required_checks", "independent_approval", "protected_files", "final_revalidation"]) {
+    if (!["passed", "failed", "not_required", "not_evaluated"].includes(value[gate])) throw new Error(`${ERR_SYSTEM}: Invalid merge authorization gate`);
+    result[gate] = value[gate];
+  }
+  return result;
 }
 
 /**
@@ -102,7 +119,9 @@ function writeMergePullRequestDecision(result, messageIndex, filePath = nodePath
       run_attempt: mergeAuditIdentity(process.env.GITHUB_RUN_ATTEMPT, isRunIdentity, "run_attempt"),
       messageIndex: mergeAuditIdentity(messageIndex, value => Number.isSafeInteger(value) && value >= 0, "messageIndex"),
       success: result.success === true,
-      merged: result.merged === true,
+      merged: result.operation_outcome === "indeterminate" ? null : result.merged === true,
+      ...(result.operation_outcome === "indeterminate" ? { operation_outcome: "indeterminate" } : {}),
+      ...(result.reconciled === true ? { reconciled: true } : {}),
       staged: result.staged === true,
       already_merged: result.alreadyMerged === true,
       failure_codes: failureReasons.map(reason => reason.code),
@@ -113,6 +132,8 @@ function writeMergePullRequestDecision(result, messageIndex, filePath = nodePath
         base_sha: mergeAuditIdentity(evidence.base_sha, isCommitSHA, "base_sha"),
         evaluated_at: mergeAuditIdentity(evidence.evaluated_at, isAuditTimestamp, "evaluated_at"),
         revalidated_at: mergeAuditIdentity(evidence.revalidated_at, isAuditTimestamp, "revalidated_at"),
+        reconciled_at: mergeAuditIdentity(evidence.reconciled_at, isAuditTimestamp, "reconciled_at"),
+        authorization: projectMergeAuthorization(evidence.authorization),
         check_producer_rejections: producerRejections.length > 0 ? producerRejections : undefined,
       },
     };
@@ -130,12 +151,12 @@ function writeMergePullRequestDecision(result, messageIndex, filePath = nodePath
 }
 
 /** @param {any[]} results @param {boolean} staged @param {string} [filePath] */
-function writeSafeOutputOutcomes(results, staged, filePath = nodePath.join(nodePath.dirname(MANIFEST_FILE_PATH), SAFE_OUTPUT_OUTCOMES_FILE_NAME)) {
+function writeSafeOutputExecutions(results, staged, filePath = nodePath.join(nodePath.dirname(MANIFEST_FILE_PATH), SAFE_OUTPUT_EXECUTIONS_FILE_NAME)) {
   try {
     const destination = scopedArtifactFile(filePath);
     fs.mkdirSync(nodePath.dirname(destination), { recursive: true });
     const secretValues = collectArtifactSecretValues();
-    const entries = buildSafeOutputOutcomes(results, staged).map(entry => redactManifestValue(entry, secretValues));
+    const entries = buildSafeOutputExecutions(results, staged).map(entry => redactManifestValue(entry, secretValues));
     fs.appendFileSync(destination, entries.map(entry => JSON.stringify(entry)).join("\n") + (entries.length ? "\n" : ""), { mode: 0o600 });
   } catch (error) {
     throw new Error(`${ERR_SYSTEM}: Failed to persist safe-output application outcomes`, { cause: error });
@@ -221,12 +242,13 @@ const CREATE_ITEM_TYPES = new Set([
  * - report_missing_tool: records a missing tool capability (metadata only)
  * - report_missing_data: records missing required data (metadata only)
  * - report_incomplete: signals that the task could not be completed (metadata only)
+ * - request_continuation: records requested follow-up, not resumed work (metadata only)
  *
  * All other types — built-in handler types, custom safe job types, and
  * any future types — are logged automatically without needing to update this list.
  * @type {Set<string>}
  */
-const NOT_LOGGED_TYPES = new Set(["noop", "report_missing_tool", "report_missing_data", "report_incomplete"]);
+const NOT_LOGGED_TYPES = new Set(["noop", "report_missing_tool", "report_missing_data", "report_incomplete", "request_continuation"]);
 
 /**
  * @typedef {Object} ManifestEntry
@@ -404,7 +426,8 @@ function extractCreatedItemFromResult(type, result) {
   const url = result.url || result.projectUrl || result.html_url || result.pull_request_url || result.review_url || result.issue_url;
   const number = result.number ?? result.pull_request_number ?? result.prNumber ?? result.issue_number ?? result.itemNumber;
   const repo = result.repo || result._repo;
-  const provider = result.provider || result.metadata?.provider || (type.startsWith("jira_") ? "jira" : type.startsWith("linear_") ? "linear" : type.startsWith("ado_") ? "azure-devops" : "github");
+  const connector = typeof result.connector === "string" && result.connector ? result.connector : undefined;
+  const provider = result.provider || result.metadata?.provider || connector || "github";
   const id = result.id ?? result.commentId ?? result.comment_id ?? result.review_id ?? result.issue_id;
   const identifier = result.identifier ?? result.issue_key;
   // result.target may be a scalar provider-specific identifier (e.g. Linear issue key "ENG-123")
@@ -475,6 +498,17 @@ function writeTemporaryIdMapFile(temporaryIdMap, filePath = TEMPORARY_ID_MAP_FIL
   }
 }
 
+const DIAGNOSTIC_IDENTIFIER = /^[a-z0-9_.:-]{1,64}$/;
+
+function safeFailureDiagnostics(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) return false;
+  return Object.values(value).every(item => {
+    if (typeof item === "boolean" || Number.isSafeInteger(item)) return true;
+    if (typeof item === "string") return DIAGNOSTIC_IDENTIFIER.test(item);
+    return Array.isArray(item) && item.length <= 32 && item.every(entry => typeof entry === "string" && DIAGNOSTIC_IDENTIFIER.test(entry));
+  });
+}
+
 /**
  * Write a structured safe-output error report for artifact upload.
  *
@@ -487,7 +521,7 @@ function writeTemporaryIdMapFile(temporaryIdMap, filePath = TEMPORARY_ID_MAP_FIL
  * after redaction succeeds for Claim workers), so failures of the "Process
  * Safe Outputs" step remain diagnosable without uploading raw error text.
  *
- * @param {{status?: string, errorCode?: string, message?: string, failures?: Array<{type?: string, errorCode?: string, error?: string}>}} report - Failure diagnostics
+ * @param {{status?: string, errorCode?: string, message?: string, failures?: Array<{type?: string, errorCode?: string, error?: string, verifier?: string, diagnostics?: Record<string, boolean | number | string | string[]>}>}} report - Failure diagnostics
  * @param {string} [filePath] - Path to the output file (defaults to SAFE_OUTPUT_ERRORS_FILE_PATH)
  */
 function writeSafeOutputErrorReport(report, filePath = SAFE_OUTPUT_ERRORS_FILE_PATH) {
@@ -506,6 +540,8 @@ function writeSafeOutputErrorReport(report, filePath = SAFE_OUTPUT_ERRORS_FILE_P
           ...(f?.type ? { type: f.type } : {}),
           ...(f?.errorCode ? { errorCode: f.errorCode } : {}),
           ...(f?.error ? { error: f.error } : {}),
+          ...(typeof f?.verifier === "string" && /^[a-z0-9_.-]{1,64}$/.test(f.verifier) ? { verifier: f.verifier } : {}),
+          ...(safeFailureDiagnostics(f?.diagnostics) ? { diagnostics: f.diagnostics } : {}),
         }))
       : [],
   };
@@ -535,7 +571,6 @@ module.exports = {
   MANIFEST_FILE_PATH,
   TEMPORARY_ID_MAP_FILE_PATH,
   SAFE_OUTPUT_ERRORS_FILE_PATH,
-  CLAIM_DELIVERY_ERRORS_FILE_NAME,
   CREATE_ITEM_TYPES,
   NOT_LOGGED_TYPES,
   createManifestLogger,
@@ -543,6 +578,6 @@ module.exports = {
   extractCreatedItemFromResult,
   writeTemporaryIdMapFile,
   writeSafeOutputErrorReport,
-  writeSafeOutputOutcomes,
+  writeSafeOutputExecutions,
   writeMergePullRequestDecision,
 };

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync, existsSync, mkdirSync, rmSync } from "fs";
+import { readFileSync, existsSync, mkdirSync, rmSync, copyFileSync } from "fs";
 import { execFileSync } from "child_process";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -32,6 +32,52 @@ describe("setup action Windows support", () => {
 });
 
 describe("setup.sh Copilot runtime files", () => {
+  it("deploys JavaScript runtime files without native metadata or npm dependencies", () => {
+    const development = JSON.parse(readFileSync(resolve(__dirname, "package.json"), "utf8"));
+    expect(development.dependencies).toBeUndefined();
+    expect(setupShContent).not.toContain("markdown-metadata");
+    expect(setupShContent).not.toMatch(/\bgo\s+(?:build|install)\b/);
+    expect(setupShContent).not.toContain("npm ci");
+  });
+
+  it("reads JSON metadata from an isolated JavaScript-only runtime directory", () => {
+    const directory = resolve(__dirname, `.setup-metadata-${process.pid}`);
+    mkdirSync(directory);
+    try {
+      for (const file of collectTransitiveDeps(["markdown_metadata.cjs"])) {
+        const destination = resolve(directory, file);
+        mkdirSync(dirname(destination), { recursive: true });
+        copyFileSync(resolve(__dirname, file), destination);
+      }
+      const output = execFileSync(
+        process.execPath,
+        [
+          "-e",
+          `
+            const assert = require("node:assert/strict");
+            const { createHash } = require("node:crypto");
+            const { readMarkdownMetadata, installMarkdownMetadata } = require("./markdown_metadata.cjs");
+            const value = { model: "small", description: "Read files" };
+            const source = JSON.stringify(value);
+            assert.deepEqual(readMarkdownMetadata("agent", "---\\nmodel: __uncompiled_probe__\\n---\\nBody").value, {});
+            installMarkdownMetadata({
+              version: 2,
+              records: [{ sha256: createHash("sha256").update(source).digest("hex"), kind: "artifact", value }],
+            });
+            process.stdout.write(JSON.stringify(readMarkdownMetadata("agent", "---\\n" + source + "\\n---\\nBody").value));
+          `,
+        ],
+        { cwd: directory, encoding: "utf8" }
+      );
+      expect(JSON.parse(output)).toEqual({ model: "small", description: "Read files" });
+      expect(existsSync(resolve(directory, "node_modules"))).toBe(false);
+      expect(existsSync(resolve(directory, "markdown-metadata"))).toBe(false);
+      expect(existsSync(resolve(directory, "markdown-metadata.exe"))).toBe(false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("copies the shared routing effort dependency alongside Copilot runtime scripts", () => {
     expect(setupShContent).toContain('for file in "${JS_SOURCE_DIR}"/*.cjs; do');
     expect(setupShContent).toContain('cp "$file" "${DESTINATION}/${filename}"');
@@ -99,17 +145,25 @@ const safeOutputsFiles = parseSetupShArray("SAFE_OUTPUTS_FILES");
 // Its deps must also be covered by SAFE_OUTPUTS_FILES
 const safeOutputsRoots = [...safeOutputsFiles, "safe-outputs-mcp-server.cjs"];
 
-describe("work queue pool-install packaging", () => {
+describe("setup.sh bundled connector execution", () => {
+  it("deploys trusted connector content formatting and its dependencies", () => {
+    const listed = new Set([...safeOutputsFiles, "safe_outputs_tools.json"]);
+    for (const dependency of collectTransitiveDeps(["connector_content.cjs"])) {
+      expect(listed.has(dependency), dependency).toBe(true);
+    }
+  });
+
   it.each([
     ["MCP_SCRIPTS_FILES", mcpScriptsFiles],
     ["SAFE_OUTPUTS_FILES", safeOutputsFiles],
-  ])("deploys the pool-install module in %s", (_name, files) => {
-    expect(files).toContain("work_queue_pool_install.cjs");
-  });
-
-  it("embeds the pool-install module for standalone bundles", () => {
-    const sources = readFileSync(resolve(__dirname, "../session_parsers.go"), "utf8");
-    expect(sources).toMatch(/^\/\/go:embed .*js\/work_queue_pool_install\.cjs(?:\s|$)/m);
+  ])("deploys the connector host and its local dependencies in %s", (_name, files) => {
+    for (const file of ["connector_runtime.cjs", "connector_regex.cjs", "connector_effect_bindings.cjs"]) {
+      expect(files).toContain(file);
+      expect(existsSync(resolve(__dirname, file))).toBe(true);
+    }
+    for (const dependency of collectTransitiveDeps(["connector_runtime.cjs", "connector_effect_bindings.cjs"])) {
+      expect(files).toContain(dependency);
+    }
   });
 });
 
@@ -134,7 +188,7 @@ describe("setup.sh MCP_SCRIPTS_FILES", () => {
       // Run only the real MCP deployment block, not setup's runner-wide initialization.
       const deploymentBlock = setupShContent.slice(setupShContent.indexOf("# Copy mcp-scripts files"), setupShContent.indexOf("# Copy safe-outputs files"));
       execFileSync("bash", ["-ec", `create_dir() { mkdir -p "$1"; }\ndebug_log() { :; }\n${deploymentBlock}`], {
-        env: { ...process.env, GH_AW_ROOT: runnerRoot, JS_SOURCE_DIR: __dirname },
+        env: { ...process.env, GH_AW_ROOT: runnerRoot, JS_SOURCE_DIR: __dirname, DESTINATION: __dirname },
       });
       execFileSync(
         process.execPath,
@@ -149,16 +203,14 @@ describe("setup.sh MCP_SCRIPTS_FILES", () => {
             const manifest = require("./safe_output_manifest.cjs");
             const summary = require("./work_queue_summary_renderer.cjs");
             const native = require("./work_queue_native.cjs");
-            const delivery = require("./work_queue_native_creation_delivery.cjs");
-            const provisioning = require("./work_queue_provisioning.cjs");
+            const issues = require("./work_queue_issues.cjs");
             const { normalizeWebhookContext } = require("./webhook_context.cjs");
             const payload = { url: "https://api.github.com/orgs/org/projectsV2/1/items/123", type: ["edited"] };
             assert.equal(normalizeWebhookContext({ webhook: { event: "projects_v2_item", deliveries: [{ delivery_id: "d", payload }] } }).items[0].item_number, "123");
             assert.throws(() => normalizeWebhookContext({ webhook: { event: "projects_v2_item", deliveries: [{ delivery_id: "d", payload: { ...payload, body: "private" } }] } }), /accepts only/);
             assert.equal(typeof summary.renderWorkQueue, "function");
-            assert.equal(typeof native.authenticatePublisher, "function");
-            assert.equal(typeof delivery.captureDiscussionDelivery, "function");
-            assert.equal(typeof provisioning.verifiedDefaultReference, "function");
+            assert.equal(typeof native.postQueueDispatch, "function");
+            assert.equal(typeof issues.projectIssues, "function");
             const token = "ghp_" + "a".repeat(36);
             assert.equal(
               manifest.redactManifestValue(token + " fixture-custom-secret", ["fixture-custom-secret"]),
@@ -202,7 +254,7 @@ describe("setup.sh SAFE_OUTPUTS_FILES", () => {
     try {
       const deploymentBlock = setupShContent.slice(setupShContent.indexOf("# Copy safe-outputs files"), setupShContent.indexOf("# Copy configure_git_credentials.sh"));
       execFileSync("bash", ["-ec", `create_dir() { mkdir -p "$1"; }\ndebug_log() { :; }\n${deploymentBlock}`], {
-        env: { ...process.env, GH_AW_ROOT: runnerRoot, JS_SOURCE_DIR: __dirname },
+        env: { ...process.env, GH_AW_ROOT: runnerRoot, JS_SOURCE_DIR: __dirname, DESTINATION: __dirname },
       });
       execFileSync(
         process.execPath,
@@ -214,6 +266,10 @@ describe("setup.sh SAFE_OUTPUTS_FILES", () => {
             assert.equal(typeof require("./generate_git_bundle.cjs").generateGitBundle, "function");
             assert.equal(typeof require("./object_pack_fetch.cjs").fetchRecoveryObjects, "function");
             assert.equal(require("./object_pack_limits.cjs").getObjectPackLimits({}).maxObjects, 100000);
+            const { resolveIssueArtifactPaths } = require("./issue_artifacts.cjs");
+            assert.deepEqual(resolveIssueArtifactPaths([{ name: "Plan", body: "Artifact content" }]), [
+              { type: "generic", name: "Plan", body: "Artifact content" },
+            ]);
             const { createServer, registerTool } = require("./mcp_server_core.cjs");
             const { getExcludedFiles, getExcludedWorkflowFiles } = require("./workflow_file_exclusions.cjs");
             assert.deepEqual(getExcludedFiles({ exclude_lock_yml: true }), [".github/workflows/**.lock.yml"]);
@@ -222,20 +278,25 @@ describe("setup.sh SAFE_OUTPUTS_FILES", () => {
             registerTool(server, { name: "missing_tool", description: "", inputSchema: { type: "object", properties: {} } });
             assert.deepEqual(Object.keys(server.tools), ["report_missing_tool"]);
             const { getFooterMessage } = require("./messages_footer.cjs");
+            const { formatConnectorArguments } = require("./connector_content.cjs");
+            const plan = {
+              spec: { safeOutputs: { publish: { inputs: { text: { type: "string", sanitize: "body", maxLength: 2000 } } } } },
+              binding: { safeOutputs: ["publish"] },
+            };
+            const formatted = formatConnectorArguments(plan, "publish", { text: "Hello @everyone" });
+            assert.ok(formatted.text.includes("Generated by"));
+            assert.ok(formatted.text.includes("gh-aw-agentic-workflow"));
             const { withClaimExecution } = require("./work_queue_claim_scope.cjs");
             const native = require("./work_queue_native.cjs");
-            const delivery = require("./work_queue_native_creation_delivery.cjs");
-            const provisioning = require("./work_queue_provisioning.cjs");
+            const issues = require("./work_queue_issues.cjs");
             const { normalizeWebhookContext } = require("./webhook_context.cjs");
             const payload = { url: "https://api.github.com/orgs/org/projectsV2/1/items/123", type: ["edited"] };
             assert.equal(normalizeWebhookContext({ webhook: { event: "projects_v2_item", deliveries: [{ delivery_id: "d", payload }] } }).items[0].item_number, "123");
             assert.throws(() => normalizeWebhookContext({ webhook: { event: "projects_v2_item", deliveries: [{ delivery_id: "d", payload: { ...payload, body: "private" } }] } }), /accepts only/);
-            assert.equal(typeof native.authenticatePublisher, "function");
-            assert.equal(typeof delivery.captureDiscussionDelivery, "function");
-            assert.equal(typeof provisioning.verifiedDefaultReference, "function");
+            assert.equal(typeof native.postQueueDispatch, "function");
+            assert.equal(typeof issues.projectIssues, "function");
             const assignment = {
-              version: 3, dispatch_id: "dispatch", request_id: "request", commit_id: "commit",
-              policy_epoch: "policy", pool: "default", worker_profile: "default",
+              dispatch_id: "dispatch",
               claims: [{ handle: "h1", claim_id: "claim-one", work_id: "work-one", work: {}, result_refs: [] }],
             };
             const context = { workflowName: "Worker", runUrl: "https://github.com/owner/repo/actions/runs/123" };
@@ -265,17 +326,15 @@ describe("setup.sh SAFE_OUTPUTS_FILES", () => {
     expect(safeOutputsFiles).toContain("work_queue_logging.cjs");
   });
 
-  it("deploys checked transport and Issue binding dependencies with the queue runtime", () => {
-    expect(getDirectLocalRequires("work_queue_store.cjs")).toContain("work_queue_checked_transport.cjs");
-    expect(getDirectLocalRequires("work_queue_replay.cjs")).toContain("work_queue_issue_contract.cjs");
-    expect(safeOutputsFiles).toContain("work_queue_checked_transport.cjs");
-    expect(safeOutputsFiles).toContain("work_queue_issue_contract.cjs");
+  it("deploys Issue projection dependencies with the queue runtime", () => {
+    for (const file of ["work_queue_issues.cjs", "work_queue_issue_api.cjs", "work_queue_issue_messages.cjs"]) {
+      expect(safeOutputsFiles).toContain(file);
+    }
   });
 
-  it("deploys Claim authority and worker route provisioning dependencies", () => {
+  it("deploys Claim authority dependencies", () => {
     expect(getDirectLocalRequires("safe_outputs_handlers.cjs")).toContain("work_queue_claim_scope.cjs");
-    expect(getDirectLocalRequires("work_queue_provisioning.cjs")).toContain("work_queue_yaml.cjs");
-    for (const file of ["work_queue_claim_scope.cjs", "finish_work_queue_claim.cjs", "work_queue_resource_scope.cjs", "work_queue_effect_client.cjs", "work_queue_yaml.cjs"]) {
+    for (const file of ["work_queue_claim_scope.cjs", "finish_work_queue_claim.cjs", "work_queue_resource_scope.cjs", "work_queue_effect_client.cjs"]) {
       expect(safeOutputsFiles).toContain(file);
     }
   });

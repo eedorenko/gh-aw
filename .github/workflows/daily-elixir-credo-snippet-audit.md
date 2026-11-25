@@ -10,11 +10,14 @@ on:
 max-daily-ai-credits: 10000
 permissions:
   contents: read
+  copilot-requests: write
   issues: read
   pull-requests: read
 tracker-id: daily-elixir-credo-snippet-audit
+model: router/economy
 engine:
   id: claude
+  model-provider: github
 timeout-minutes: 45
 strict: true
 runtimes:

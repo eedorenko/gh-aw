@@ -46,6 +46,8 @@ These definitions are examples for integration authors, **not supported gh-aw en
 | [Factory Droid](https://factory.com/product/cli) | [factory.md](https://github.com/github/gh-aw/blob/main/.github/workflows/shared/factory.md) |
 | [Goose](https://github.com/aaif-goose/goose) | [goose.md](https://github.com/github/gh-aw/blob/main/.github/workflows/shared/goose.md) |
 | [Kiro](https://kiro.dev/) | [kiro.md](https://github.com/github/gh-aw/blob/main/.github/workflows/shared/kiro.md) |
+| [LangGraph](https://docs.langchain.com/oss/python/langgraph/quickstart) | [langgraph.md](https://github.com/github/gh-aw/blob/main/.github/workflows/shared/langgraph.md) |
+| [mini-SWE-agent](https://github.com/SWE-agent/mini-swe-agent) | [mini-swe-agent.md](https://github.com/github/gh-aw/blob/main/.github/workflows/shared/mini-swe-agent.md) |
 | [Pydantic AI](https://ai.pydantic.dev/) | [Publisher definition](https://github.com/pydantic/pydantic-ai/blob/main/src/pydantic_ai_harness/gh-aw/pydantic.md) |
 
 ### Sample-specific constraints
@@ -55,18 +57,161 @@ These definitions are examples for integration authors, **not supported gh-aw en
 | OpenCode | Installs OpenCode 2 from `@opencode/cli`, uses `--standalone`, native MCP with Code Mode disabled, and JSONL events. Copilot requires AWF; direct Anthropic/OpenAI BYOK is supported without it. Repository JSON/JSONC settings are overlaid; updates/sharing are disabled. V2 has no language servers, and V1 plugins require porting. Native npm plugins are not gh-aw Agent Plugins. |
 | DeepSeek Harness | Pins `dsh` v0.2.0-rc.2. Uses headless stdin prompts, a private per-run configuration patch, and CLI-proxy tools rather than native MCP. Copilot requires AWF; direct Anthropic/OpenAI credentials apply only without AWF. Per-command native bash restrictions are rejected. No native reasoning, tool, refusal, or token-accounting observations are inferred from stdout. |
 | Factory Droid | Pins `@factory/cli` 0.248.0 with lifecycle scripts disabled. Uses custom models through the AWF API proxy with placeholder credentials; real provider and Factory keys are excluded from the agent. Supports Copilot, Anthropic, and OpenAI inference, file-based prompts, high autonomy inside the sandbox, and native HTTP MCP. Native MCP retains the gateway session authorization in agent-readable `.factory/mcp.json`; this is not an upstream provider credential or a security boundary against the agent (see [gateway authentication](/gh-aw/reference/mcp-gateway/#71-authorization-header-format)). Removing it prevents authenticated MCP calls. No Factory API key is required. Factory-managed inference, direct-key execution, structured session parsing, gh-aw tool allowlists, max-turn enforcement, and Agent Plugins are unsupported. |
-| Goose | Pins CLI v1.53.0 with archive checksum verification. Uses OpenAI-compatible inference, native authenticated MCP, file-based prompts, and JSONL tool/usage events. Configuration/session state is temporary; keyring is disabled. No native gh-aw `web-fetch`; use MCP or shell. Copilot can use `copilot-requests: write` without a PAT. |
+| Goose | Pins CLI v1.53.0 with archive checksum verification. Uses OpenAI-compatible inference, native authenticated MCP, file-based prompts, and JSONL tool/usage events. Configuration/session state is temporary; keyring is disabled. `tools.web-fetch` uses the built-in MCP server. Copilot can use `copilot-requests: write` without a PAT. |
 | Kiro | Sample pins CLI 2.31.1 with the V2 harness; Powers plugins are not supported. |
+| LangGraph | Pins PyPI `langgraph` 1.2.23 with hash-locked LangChain OpenAI/Anthropic wheels on Python 3.12, installed through `installation.requirements`. Runs a Graph API tool-calling agent (`llm_call` and `tool_node`) with shell, file read, and file write tools over AWF-only Copilot, OpenAI/Codex, or Anthropic inference. A final answer without tool calls is required for success; `max-turns` bounds model calls. LangSmith tracing is disabled. Tools use CLI proxies, not native MCP. The redacted native trajectory is normalized into unified-session messages, tool calls/results, per-response usage, and observed exit status; native metadata does not prove shell success or billing. No native shell allowlists, edit disabling, checkpointers, or Agent Plugins. |
+| mini-SWE-agent | Pins PyPI 2.4.6 on Python 3.12. Uses the non-interactive Python API, text-based shell actions, file-based prompts, and AWF-only Copilot, OpenAI/Codex, or Anthropic inference. Native task submission is required for success; `max-turns` limits model calls. Tools use CLI proxies, not native MCP. The untrusted native trajectory is retained in the unified agent artifact only after secret redaction and recovery-envelope validation, including failed executions. No native shell allowlists, edit disabling, Agent Plugins, repository mini configuration, or structured session parser. |
 
 Read the pinned definition for its exact install and provider contract. Native events and accounting are retained only when observed; process exit zero alone does not prove task completion.
+
+### mini-SWE-agent package access
+
+The mini-SWE sample downloads hash-locked binary wheels in trusted `pre-agent-steps`,
+before AWF starts. Agent-time installation is isolated and offline; pip verifies
+the same hashes again. No dependencies are installed into the host user site.
+
+The shared import also declares `runtimes.python`, which explicitly grants the
+agent Python ecosystem access, including `pypi.org` and `files.pythonhosted.org`.
+Engine defaults do not grant this access. For registry-free execution, vendor
+the definition without `runtimes`, retain its bootstrap steps, and provide Python
+3.12 on a Linux x86-64 runner independently. Callers can opt back in with
+`network.allowed: [python]` or `runtimes.python`.
 
 ## Defining an engine
 
 A definition contains `engine.id`, metadata, and `engine.behaviors`. Its behaviors install the CLI, configure inference and MCP, invoke it headlessly, and expose logs for session reconstruction. Keep secrets outside the agent sandbox and fail explicitly when required credentials, endpoints, or restrictions cannot be honored.
 
+### Web fetch fallback
+
+`engine.behaviors.capabilities.web-fetch-fallback: true` opts an engine into the built-in `web_fetch` MCP tool when a workflow enables `tools.web-fetch`. The engine must support MCP and provide a `behaviors.mcp.config-adapter` that calls `addWebFetchMCPServer` from `convert_gateway_config_shared.cjs` and renders the supplied command as a local stdio server. The workflow must run the agent inside AWF.
+
+### Python package installation
+
+Python engines can declare a complete, hash-locked dependency list instead of
+custom install steps. Without `requirements`, `package-manager: pip` remains
+metadata for engines that install themselves. Every distribution, including transitive dependencies, needs an
+exact version and wheel SHA-256; `package-name` must appear at the engine
+version:
+
+```yaml wrap
+engine:
+  id: my-agent
+  version: "1.2.0"
+  behaviors:
+    installation:
+      package-manager: pip
+      package-name: my-agent
+      requirements:
+        - name: my-agent
+          version: "1.2.0"
+          sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        # ...one entry per transitive dependency
+```
+
+Before AWF starts, the compiler runs `pip install --require-hashes
+--only-binary=:all:` into `/tmp/gh-aw/agent/<engine-id>-python/site-packages`,
+rejecting missing, unpinned, or mismatched dependencies, then verifies the
+installed `package-name` version against the effective `engine.version`.
+Execution receives the directory as `GH_AW_PYTHON_PACKAGES`; prepend it to
+`sys.path` rather than setting `PYTHONPATH`. Wheel hashes are platform
+specific. Aider and LangGraph lock CPython 3.12 Linux x86-64 wheels and keep
+`runtimes.python` to provision that interpreter.
+
 Start from a sample with a matching transport rather than copying installation or configuration code into every workflow. Publish the definition with versioned changes and document its credentials, models, tool restrictions, supported platforms, and [unified session](/gh-aw/specs/unified-agent-session-specification/) coverage.
 
 See [imports](/gh-aw/reference/imports/) for resolution and pinning rules.
+
+### MCP CLI capabilities
+
+`engine.behaviors.capabilities.github-cli-proxy: true` includes the GitHub CLI
+bridge when a workflow enables `tools.cli-proxy`. CLI-mounted servers are then
+excluded from native MCP configuration. GitHub in `gh-proxy` mode remains separate.
+
+`engine.behaviors.capabilities.auto-mcp-cli: true` augments active CLI mounts with
+configured GitHub, work-queue and custom MCP servers, including when infrastructure
+tools activate the mount without `tools.cli-proxy`. Neither capability changes
+server credentials or permissions.
+
+### Secret environment overrides
+
+An imported definition declares supported environment variable names in
+`engine.behaviors.supported-env-var-keys`. In strict mode, these names are
+allowed to carry secret references in the consuming workflow's `engine.env`.
+The compiler checks those overrides after resolving imports and registering
+the engine, so the imported definition's allowlist applies.
+
+This does not permit arbitrary secret-bearing variables: undeclared keys in
+`engine.env` remain subject to strict-mode validation, and secret references in
+top-level `env` are still rejected. In strict mode, secret overrides require
+AWF v0.25.3 or newer to exclude them from the agent container. See
+[workflow environment variables](/gh-aw/reference/frontmatter/#environment-variables-env)
+for the restrictions on top-level `env`.
+
+### Durable execution
+
+> [!WARNING]
+> Durable execution is experimental, including for imported engines. Enabling
+> `engine.durable` emits a compile-time warning. Configuration and behavior may
+> change without deprecation.
+
+A workflow can opt into artifact-backed continuation using `engine.durable:
+{ retention-days: 7 }` alongside its custom `engine.id`. Compilation fails unless
+the definition declares `behaviors.durable`. Engines that implement the Go
+interface provide `GetDurableExecutionPlan` with the files to persist and the
+continuation execution steps.
+
+An engine does not need a native durable library. It can declare its session
+folder and provide a harness that continues the restored session:
+
+```aw wrap
+engine:
+  id: example-engine
+  behaviors:
+    durable:
+      files:
+        - /tmp/gh-aw/agent/example/sessions
+      execution:
+        command-name: example-engine
+        step-name: Continue example-engine session
+      harness-script: |
+        const resumed = process.env.GH_AW_DURABLE_RESUMED === "true";
+        // Invoke this engine's resume command when resumed, or start a new session.
+```
+
+Merge this fragment into the publisher's existing definition. Configure the
+agent to write its sessions to the declared directory. The harness must use its
+engine-specific continuation API or CLI flags when `GH_AW_DURABLE_RESUMED` is
+`true`; the parent run is available as `GH_AW_DURABLE_PARENT_RUN_ID`. No extra
+durable dependencies are needed for session-file continuation. This restores
+conversation state, not the native library's durable task or replay guarantees.
+
+`behaviors.durable.files` is required. Paths must be explicit, non-overlapping
+files or directories under `/tmp/gh-aw/agent/`, without globs or symlinks. gh-aw
+recursively snapshots only these paths and restores them before the harness
+runs. A native implementation can declare `$GH_AW_DURABLE_CHECKPOINT` to persist
+the compiler-managed checkpoint file instead.
+
+The `execution` object is required; `installation` and `harness-script` are
+optional. When a native implementation needs extra dependencies, each dependency
+uses the existing installation fields: `package-manager: npm`, a valid
+`package-name`, an exact literal `version`, and a `verify-command`. Durable
+dependencies are installed and verified in addition to the ordinary engine
+installation. The durable execution and harness replace the ordinary ones;
+workflow-level command, driver, and harness overrides are rejected.
+Durable and ordinary execution must use the same `protected-session-capture`
+setting so capture verification and publication remain consistent.
+
+The harness also receives `GH_AW_DURABLE_STORAGE=artifact`,
+`GH_AW_DURABLE_DIR`, and `GH_AW_DURABLE_CHECKPOINT`. Persist only session state,
+never credentials or runtime authentication. gh-aw restores and publishes the artifact and applies
+the configured retention period. The engine is responsible for checkpoint
+compatibility, replay safety, fresh credential binding, telemetry, and unified
+session events. See [Durable runs](/gh-aw/reference/engines/#durable-runs)
+for parent selection, retention, and continuation limitations.
+
+Artifact files include an integrity-checked UTF-8 projection so host secret
+redaction also examines binary session state. If redaction changes a snapshot,
+publication fails instead of uploading credentials or a corrupted session.
 
 ### Protected session capture
 

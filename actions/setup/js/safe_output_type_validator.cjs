@@ -19,6 +19,7 @@ const { isBlankOptionalField, normalizeBlankOptionalFields } = require("./option
 const { normalizeSafeOutputName, normalizeSafeOutputConfig } = require("./safe_output_names.cjs");
 const { parseReportMarkdown } = require("./report_markdown.cjs");
 const { renderReport } = require("./report_ast.cjs");
+const { isDependencyUnsupportedType, validateSubmissionMetadata } = require("./safe_output_submission.cjs");
 
 /**
  * Default max body length for GitHub content
@@ -41,7 +42,8 @@ const ISSUE_INTENT_RATIONALE_MAX_LENGTH = 280;
  *   deferMentions?: boolean,
  *   normalizeIssueClosingKeywords?: boolean,
  *   dataEnabled?: boolean,
- *   dataSchema?: any
+ *   dataSchema?: any,
+ *   collapseData?: boolean
  * }} ValidateOptions
  */
 
@@ -56,6 +58,29 @@ const ISSUE_CLOSING_REFERENCE_BACKTICK_PATTERN = new RegExp(`(\\b(?:${ISSUE_CLOS
 const NORMALIZE_CLOSER_BODY_TYPES = new Set(["create_issue", "add_comment", "create_pull_request"]);
 const ISSUE_INTENT_LABEL_TYPES = new Set(["add_labels", "remove_labels", "update_issue"]);
 const STRUCTURED_DATA_LABEL = "Structured data:";
+
+/**
+ * Normalize legacy JSON-array and comma-separated create_issue label strings.
+ * @param {string} value
+ * @returns {string[]}
+ */
+function normalizeCreateIssueLabels(value) {
+  const trimmedValue = value.trim();
+  if (trimmedValue.startsWith("[")) {
+    try {
+      const parsedValue = JSON.parse(trimmedValue);
+      if (Array.isArray(parsedValue)) {
+        return parsedValue.filter(item => typeof item === "string");
+      }
+    } catch {
+      // Invalid JSON is intentionally ignored; fall back to legacy comma-separated parsing.
+    }
+  }
+  return value
+    .split(",")
+    .map(item => item.trim())
+    .filter(Boolean);
+}
 
 /**
  * Remove markdown backticks around recognized issue-closing keyword references.
@@ -622,25 +647,7 @@ function validateField(value, fieldName, validation, itemType, lineNum, options)
     // Backward compatibility: create_issue agents sometimes provide labels as a JSON array
     // or comma-separated string. Normalize either form before strict array validation.
     if (itemType === "create_issue" && fieldName === "labels" && typeof value === "string") {
-      const trimmedValue = value.trim();
-      if (trimmedValue.startsWith("[")) {
-        try {
-          const parsedValue = JSON.parse(trimmedValue);
-          if (Array.isArray(parsedValue)) {
-            // Filter out non-string entries from the JSON-parsed array.
-            value = parsedValue.filter(item => typeof item === "string");
-          }
-          // Non-array JSON values (objects, primitives) fall through to comma-separated parsing.
-        } catch {
-          // Invalid JSON — ignored, fall back to comma-separated parsing below.
-        }
-      }
-      if (typeof value === "string") {
-        value = value
-          .split(",")
-          .map(item => item.trim())
-          .filter(Boolean);
-      }
+      value = normalizeCreateIssueLabels(value);
     }
 
     if (!Array.isArray(value)) {
@@ -777,7 +784,12 @@ function executeCustomValidation(item, customValidation, lineNum, itemType) {
  * @returns {{isValid: boolean, normalizedItem?: Object, error?: string}}
  */
 function validateItem(item, itemType, lineNum, options) {
+  const metadataError = validateSubmissionMetadata(item);
+  if (metadataError) return { isValid: false, error: `Line ${lineNum}: ${metadataError}` };
   itemType = normalizeSafeOutputName(itemType);
+  if ((item["depends-on"] !== undefined || item.depends_on !== undefined) && isDependencyUnsupportedType(itemType)) {
+    return { isValid: false, error: `Line ${lineNum}: depends-on is not supported for ${itemType}, which executes outside the safe-output handler manager.` };
+  }
   const validationConfig = loadValidationConfig();
   const typeConfig = validationConfig[itemType];
 
@@ -795,6 +807,9 @@ function validateItem(item, itemType, lineNum, options) {
   // agent-controlled, so forwarding undeclared fields would let consumers act
   // on values that were never validated.
   const normalizedItem = { type: item.type };
+  if (item.output_id !== undefined) normalizedItem.output_id = item.output_id;
+  const dependency = item["depends-on"] !== undefined ? item["depends-on"] : item.depends_on;
+  if (dependency !== undefined) normalizedItem["depends-on"] = dependency;
   const errors = [];
 
   // Run custom validation first if defined
@@ -898,7 +913,7 @@ function validateItem(item, itemType, lineNum, options) {
       const children = parseReportMarkdown(normalizedItem.body || "", { minimumHeadingLevel: 2, allowMetadata: false, allowedMentions: options?.allowedAliases || [], deferMentions: options?.deferMentions, agentTainted: true });
       /** @type {import("./report_ast.cjs").ReportBlock} */
       const dataBlock = { type: "structured_data", data: JSON.parse(dataJSON), agentTainted: true };
-      if (typeConfig.collapseData === true) children.push({ type: "details", summary: "Structured data", agentTainted: false, children: [dataBlock] });
+      if ((options?.collapseData ?? typeConfig.collapseData) === true) children.push({ type: "details", summary: "Structured data", agentTainted: false, children: [dataBlock] });
       else children.push({ type: "paragraph", agentTainted: false, children: [{ type: "text", value: STRUCTURED_DATA_LABEL, agentTainted: false }] }, dataBlock);
       normalizedItem.body = renderReport({ type: "report", title: "Safe output", children }).body.trimEnd();
     }
@@ -945,6 +960,7 @@ module.exports = {
   validateOptionalPositiveIntegerOrAuto,
   validateIssueOrPRNumber,
   validateIssueNumberOrTemporaryId,
+  normalizeCreateIssueLabels,
 
   // Configuration accessors
   loadValidationConfig,

@@ -3,6 +3,8 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { fileURLToPath } from "url";
+const { prepareMarkdownFixtures } = require("../../../scripts/markdown_metadata_test_adapter.cjs");
+const { readMarkdownMetadata } = require("./markdown_metadata.cjs");
 const { ERR_CONFIG } = require("./error_codes.cjs");
 const __filename = fileURLToPath(import.meta.url),
   __dirname = path.dirname(__filename),
@@ -16,6 +18,14 @@ if (!interpolateVariablesMatch) throw new Error("Could not extract interpolateVa
 const interpolateVariables = eval(`(${interpolateVariablesMatch[0]})`),
   { renderMarkdownTemplate } = require("./render_template.cjs");
 describe("interpolate_prompt", () => {
+  it("resolves both compiler placeholder forms in one pass", () => {
+    const payload = "__GH_AW_EXPR_OTHER__ ${GH_AW_EXPR_OTHER}";
+    const result = interpolateVariables("First: __GH_AW_EXPR_VALUE__\nSecond: ${GH_AW_EXPR_VALUE}\nOther: __GH_AW_EXPR_OTHER__", {
+      GH_AW_EXPR_VALUE: payload,
+      GH_AW_EXPR_OTHER: "evaluated",
+    });
+    expect(result).toBe(`First: ${payload}\nSecond: ${payload}\nOther: evaluated`);
+  });
   (describe("interpolateVariables", () => {
     (it("should interpolate single variable", () => {
       const result = interpolateVariables("Repository: ${GH_AW_EXPR_TEST123}", { GH_AW_EXPR_TEST123: "github/test-repo" });
@@ -214,9 +224,8 @@ describe("interpolate_prompt", () => {
           const discussionExpr = "github.event.discussion.number || (github.aw.context.item_type == 'discussion' && github.aw.context.item_number)";
           const pullRequestExpr = "github.event.pull_request.number || (github.aw.context.item_type == 'pull_request' && github.aw.context.item_number)";
           const commentExpr = "github.event.comment.id || github.aw.context.comment_id";
-          const renderWithValues = (conditionValues, expressionValues) => {
-            const withEvaluatedConditions = githubContextTemplate.replace(/{{#if\s+([^}]+)}}/g, (_, conditionExpr) => `{{#if ${conditionValues[conditionExpr.trim()] || ""}}}`);
-            const withEvaluatedExpressions = withEvaluatedConditions.replace(/\${{\s*(.*?)\s*}}/g, (_, expression) => expressionValues[expression.trim()] || "");
+          const renderWithValues = expressionValues => {
+            const withEvaluatedExpressions = githubContextTemplate.replace(/\${{\s*(.*?)\s*}}/g, (_, expression) => expressionValues[expression.trim()] || "");
             return renderMarkdownTemplate(withEvaluatedExpressions);
           };
           const workflowDispatchValues = {
@@ -229,7 +238,7 @@ describe("interpolate_prompt", () => {
             [commentExpr]: "999",
             "github.run_id": "111",
           };
-          const workflowDispatchRendered = renderWithValues(workflowDispatchValues, workflowDispatchValues);
+          const workflowDispatchRendered = renderWithValues(workflowDispatchValues);
           expect(workflowDispatchRendered).toContain("- **issue-number**: #456");
           expect(workflowDispatchRendered).toContain("- **comment-id**: 999");
           expect(workflowDispatchRendered).not.toContain("discussion-number");
@@ -244,11 +253,30 @@ describe("interpolate_prompt", () => {
             [commentExpr]: "31415",
             "github.run_id": "222",
           };
-          const repositoryDispatchRendered = renderWithValues(repositoryDispatchValues, repositoryDispatchValues);
+          const repositoryDispatchRendered = renderWithValues(repositoryDispatchValues);
           expect(repositoryDispatchRendered).toContain("- **pull-request-number**: #789");
           expect(repositoryDispatchRendered).toContain("- **comment-id**: 31415");
           expect(repositoryDispatchRendered).not.toContain("issue-number");
           expect(repositoryDispatchRendered).not.toContain("discussion-number");
+          const discussionRendered = renderWithValues({
+            ...repositoryDispatchValues,
+            [discussionExpr]: "321",
+            [pullRequestExpr]: "false",
+            [commentExpr]: "",
+          });
+          expect(discussionRendered).toContain("- **discussion-number**: #321");
+          expect(discussionRendered).not.toContain("pull-request-number");
+          expect(discussionRendered).not.toContain("comment-id");
+          for (const missingValue of ["", "false", "0", "null"]) {
+            const rendered = renderWithValues({
+              ...repositoryDispatchValues,
+              [issueExpr]: missingValue,
+              [discussionExpr]: missingValue,
+              [pullRequestExpr]: missingValue,
+              [commentExpr]: missingValue,
+            });
+            expect(rendered).toBe("<github-context>\n- **actor**: octocat\n- **repository**: github/gh-aw\n- **workspace**: /home/runner/work/gh-aw/gh-aw\n- **workflow-run-id**: 222\n</github-context>\n");
+          }
         }));
     }),
     describe("main function integration", () => {
@@ -295,6 +323,46 @@ describe("interpolate_prompt", () => {
               if (!(k in originalEnv)) delete process.env[k];
             }),
             Object.assign(process.env, originalEnv));
+        }),
+        it.each([
+          ["workflow dispatch", "false", "false", "false", "", ""],
+          ["empty context", "", "", "", "", ""],
+          ["issue event", "42", "false", "false", "123", "- **issue-number**: #42\n- **comment-id**: 123\n"],
+          ["discussion event", "false", "56", "false", "", "- **discussion-number**: #56\n"],
+          ["routed pull request", "false", "false", "78", "456", "- **pull-request-number**: #78\n- **comment-id**: 456\n"],
+        ])("renders compiled GitHub context through the Actions runtime: %s", async (_name, issue, discussion, pullRequest, comment, expectedRouting) => {
+          const template = fs.readFileSync(path.join(__dirname, "../../../pkg/workflow/prompts/github_context_prompt.md"), "utf8");
+          const values = {
+            "github.actor": "octocat",
+            "github.repository": "github/gh-aw",
+            "github.workspace": "/home/runner/work/gh-aw/gh-aw",
+            "github.event.issue.number || (github.aw.context.item_type == 'issue' && github.aw.context.item_number)": issue,
+            "github.event.discussion.number || (github.aw.context.item_type == 'discussion' && github.aw.context.item_number)": discussion,
+            "github.event.pull_request.number || (github.aw.context.item_type == 'pull_request' && github.aw.context.item_number)": pullRequest,
+            "github.event.comment.id || github.aw.context.comment_id": comment,
+            "github.run_id": "41739470047",
+          };
+          const bindings = new Map();
+          const substitutions = {};
+          const compiled = template.replace(/\${{\s*(.*?)\s*}}/g, (_, expression) => {
+            const key = bindings.get(expression) || `GH_AW_GITHUB_CONTEXT_${bindings.size}`;
+            bindings.set(expression, key);
+            process.env[key] = values[expression];
+            substitutions[key] = values[expression];
+            return `__${key}__`;
+          });
+          fs.writeFileSync(promptPath, compiled);
+          fs.writeFileSync(path.join(tmpDir, "system.txt"), compiled);
+          fs.writeFileSync(path.join(tmpDir, "user.txt"), "Workflow task\n");
+          fs.writeFileSync(promptPath, compiled + "Workflow task\n");
+          await main();
+          expect(core.setFailed).not.toHaveBeenCalled();
+          const substitutePlaceholders = require("./substitute_placeholders.cjs");
+          await substitutePlaceholders({ file: promptPath, substitutions });
+          const expected = "<github-context>\n- **actor**: octocat\n- **repository**: github/gh-aw\n- **workspace**: /home/runner/work/gh-aw/gh-aw\n" + expectedRouting + "- **workflow-run-id**: 41739470047\n</github-context>\n";
+          expect(fs.readFileSync(path.join(tmpDir, "system.txt"), "utf8")).toBe(expected);
+          expect(fs.readFileSync(path.join(tmpDir, "user.txt"), "utf8")).toBe("Workflow task\n");
+          expect(fs.readFileSync(promptPath, "utf8")).toBe(expected + "Workflow task\n");
         }),
         it.each(smokeStrategies)("renders only the assigned %s instructions from the sub-agent smoke", async (variant, instruction) => {
           const workflow = fs.readFileSync(path.join(__dirname, "../../../.github/workflows/smoke-copilot-sub-agents.md"), "utf8");
@@ -559,6 +627,7 @@ describe("inline sub-agent experiment model expansion", () => {
   let tmpDir, promptPath, originalEnv;
 
   beforeEach(() => {
+    prepareMarkdownFixtures(...["${{ experiments.subagent_model }}", "__GH_AW_EXPERIMENTS_SUBAGENT_MODEL__", "claude-haiku-4.5"].map(agentBlock));
     originalEnv = { ...process.env };
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "interpolate-subagent-test-"));
     promptPath = path.join(tmpDir, "prompt.txt");
@@ -619,11 +688,11 @@ describe("inline sub-agent experiment model expansion", () => {
     ])("writes_selected_experiment_model_before_agent_file_write: %s with assignment %s", async (reference, variant) => {
       process.env.GH_AW_EXPERIMENTS_SUBAGENT_MODEL = variant;
       const written = await forms[form](reference);
-      expect(written.startsWith(`---\nmodel: ${variant}\n`)).toBe(true);
+      expect(readMarkdownMetadata("agent", written).value.model).toBe(variant);
       expect(written).not.toContain("${{");
       expect(written).not.toContain("experiments.");
       expect(written).not.toContain("__GH_AW_");
-      expect(written).toContain("description: Summarizes the content of a file in a few concise sentences");
+      expect(readMarkdownMetadata("agent", written).value).toMatchObject({ name: "file-summarizer", description: "file-summarizer" });
       expect(written).toContain("You are a file summarization assistant.");
       expect(fs.readFileSync(promptPath, "utf8")).not.toContain("file summarization assistant");
     });
@@ -634,15 +703,16 @@ describe("inline sub-agent experiment model expansion", () => {
       for (const variant of ["small", "large"]) {
         process.env.GH_AW_EXPERIMENTS_SUBAGENT_MODEL = variant;
         const written = await forms[form]("${{ experiments.subagent_model }}");
-        models.push(/^model: (.*)$/m.exec(written)?.[1] ?? "");
+        models.push(readMarkdownMetadata("agent", written).value.model);
       }
       expect(models).toEqual(["small", "large"]);
     });
 
-    it("preserves_plain_subagent_model_and_frontmatter", async () => {
+    it("preserves_plain_subagent_model_without_authored_description", async () => {
       process.env.GH_AW_EXPERIMENTS_SUBAGENT_MODEL = "large";
       const written = await forms[form]("claude-haiku-4.5");
-      expect(written).toBe("---\nmodel: claude-haiku-4.5\ndescription: Summarizes the content of a file in a few concise sentences\n---\nYou are a file summarization assistant.\n");
+      expect(readMarkdownMetadata("agent", written).value).toEqual({ name: "file-summarizer", description: "file-summarizer", model: "claude-haiku-4.5" });
+      expect(written).toContain("\nYou are a file summarization assistant.\n");
     });
 
     it("fails activation instead of writing an unresolved experiment model", async () => {
@@ -670,7 +740,7 @@ describe("inline sub-agent experiment model expansion", () => {
       if (variant) {
         process.env.GH_AW_EXPERIMENTS_SUBAGENT_MODEL = variant;
         const written = await runAndReadAgent(prompt);
-        expect(written).toContain(`---\r\nmodel: ${variant}\r\n`);
+        expect(readMarkdownMetadata("agent", written).value.model).toBe(variant);
         expect(written).not.toContain("${{");
       } else {
         delete process.env.GH_AW_EXPERIMENTS_SUBAGENT_MODEL;

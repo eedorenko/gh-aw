@@ -38,6 +38,8 @@ Container digest resolution uses registry metadata only (`docker buildx imagetoo
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `lock_file_logo` | boolean | `true` | Include the ASCII logo in generated workflow headers, including companion workflows. Set to `false` to omit only the logo. |
+| `issue_label` | string | `"agentic-workflows"` | Label used to create and find gh-aw's own issues, including detection trackers, failure issues, and maintenance reports. |
+| `adaptive_routing` | `"observe"` or `false` | `false` | Record every eligible routed workflow's runs in its [adaptive routing](/gh-aw/reference/adaptive-routing/) history. Workflows that cannot take part are skipped; a workflow's own `adaptive-routing` value, or one from an import, wins. |
 
 ```json title=".github/workflows/aw.json"
 {
@@ -46,6 +48,8 @@ Container digest resolution uses registry metadata only (`docker buildx imagetoo
 ```
 
 `gh aw compile --no-logo` disables the logo for a single invocation, even when `lock_file_logo` is `true`. Omitting the flag does not override `lock_file_logo: false`. Metadata, manifests, the “DO NOT EDIT” notice, and regeneration instructions are unchanged.
+
+For repositories with prefixed routing labels, set `"issue_label": "area:agentic-workflows"`. The value must be a nonblank label name of at most 50 characters, without control characters or GitHub Actions expressions. Recompile workflows after changing it. Existing issues must carry the configured label to be found by label-based lookups and cleanup; gh-aw does not relabel them automatically. Per-output `labels` remain additive. Command labels such as `agentic-workflows:disable` are unchanged.
 
 ## Compilation Phases
 
@@ -326,7 +330,7 @@ Pre-activation runs gating checks sequentially before any AI execution. Any fail
 
 The optional `--actionlint`, `--zizmor`, and `--poutine` scanners prefer local
 binaries on `PATH` when their versions meet the pinned Docker image versions
-(actionlint ≥ 1.7.12, zizmor ≥ 1.31.1, poutine ≥ 1.1.6). Missing, older, or
+(actionlint ≥ 1.7.12, zizmor ≥ 1.33.1, poutine ≥ 1.1.6). Missing, older, or
 unrecognized versions fall back to Docker. Local actionlint uses shellcheck and
 pyflakes from `PATH` when those integrations are enabled; it does not install them.
 
@@ -485,13 +489,23 @@ Staging overrides in custom publishing steps cannot reactivate these jobs.
 Reusable output contracts and required self-hosted runner policies are preserved
 without retaining the original executable target or matrix-dependent runner.
 
-Dry-run rejects authored host steps (`steps`, `pre-steps`, `pre-agent-steps`,
-`post-steps`, `on.steps`, safe-output and threat-detection steps, secret-masking
+Authored `steps` and `post-steps` are accepted but their code and credentials are
+omitted from dry-run locks before job construction and token wiring. They cannot
+execute on separate dispatch; omitted setup and cleanup reduce live-test coverage.
+Agent and compiler-owned steps still execute when the lock is dispatched under
+separate authorization.
+
+Dry-run rejects other authored host steps (`pre-steps`, `pre-agent-steps`,
+`on.steps`, safe-output and threat-detection steps, secret-masking
 steps, and unsafe built-in job overrides), custom MCP servers, `mcp-scripts`,
-custom safe-output scripts/actions, enabled Bash graders, and authored
+custom safe-output scripts/actions, and authored
 `id-token: write` permissions, including safe-output and imported declarations.
 Compiler-generated pull-request stack gates remain available. Remove unsupported
 declarations in a separate diagnostic workflow; there is no unsafe override.
+
+Compiler-generated connector safe-output handlers are accepted. They force staged
+execution and omit connector write credentials, including when an operation sets
+`staged: false`. Authored safe-output scripts remain unsupported.
 
 Agent shell commands, custom engine execution, custom credentials, and
 compiler-managed OIDC integrations still require review. Dry-run is not an
@@ -509,6 +523,7 @@ be treated as approved artifacts.
 Compilation prints its limited effect scope before checks and a scanner-coverage
 summary afterward. With `--json`, the existing result array gains a batch-scoped
 `workflow: "dry-run"` entry containing `dry_run.gate`, forced `required_flags`,
+`disabled_effects` identifying omitted `steps` and `post-steps`,
 and a `scanners` map. Each scanner has `requested` and `status` fields:
 
 | Status | Meaning |

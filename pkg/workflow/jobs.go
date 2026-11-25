@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
@@ -22,6 +22,7 @@ const runtimeFeaturesEnvVarExpression = "${{ vars.GH_AW_RUNTIME_FEATURES }}"
 const pushExperimentsStateJobName = string(constants.PushExperimentsStateJobName)
 const pushEvalsStateJobName = string(constants.PushEvalsStateJobName)
 const pushRepoMemoryJobName = string(constants.PushRepoMemoryJobName)
+const pushRoutingHistoryJobName = string(constants.PushRoutingHistoryJobName)
 const pushLedgerChangesJobName = string(constants.PushLedgerChangesJobName)
 const updateCacheMemoryJobName = string(constants.UpdateCacheMemoryJobName)
 
@@ -39,8 +40,10 @@ var runtimeFeaturesBuiltInJobNames = map[string]struct{}{
 	string(constants.GradersJobName):             {},
 	string(constants.UnlockJobName):              {},
 	pushExperimentsStateJobName:                  {},
+	string(constants.ReportExperimentsJobName):   {},
 	pushEvalsStateJobName:                        {},
 	pushRepoMemoryJobName:                        {},
+	pushRoutingHistoryJobName:                    {},
 	pushLedgerChangesJobName:                     {},
 	updateCacheMemoryJobName:                     {},
 	updateDriveMemoryJobName:                     {},
@@ -69,6 +72,7 @@ type Job struct {
 	Needs                      []string          // Job dependencies (needs clause)
 	Outputs                    map[string]string // YAML-ready scalar snippets, emitted verbatim by WriteJobsYAML
 	actionsCondition           bool
+	experimentsBrokerReporter  bool
 	// Actions contributes typed steps after Steps, and typed conditions,
 	// environment values, and output bindings. It is lowered after all job
 	// augmentation so output references can derive dependencies centrally.
@@ -112,7 +116,7 @@ func (jm *JobManager) AddJob(job *Job) error {
 	jm.jobs[job.Name] = job
 	jm.jobOrder = append(jm.jobOrder, job.Name)
 	// Keep jobOrder sorted alphabetically after each addition
-	sort.Strings(jm.jobOrder)
+	slices.Sort(jm.jobOrder)
 	return nil
 }
 
@@ -215,10 +219,11 @@ func (jm *JobManager) WriteJobsYAML(b *strings.Builder) {
 	// jobOrder is kept sorted alphabetically by AddJob
 	for _, jobName := range jm.jobOrder {
 		job := jm.jobs[jobName]
-		if strings.TrimSpace(strings.TrimPrefix(job.RunsOn, "runs-on:")) == "windows-latest" {
+		if strings.TrimSpace(strings.TrimPrefix(job.RunsOn, "runs-on:")) == "windows-latest" &&
+			(job.Name != string(constants.ReportExperimentsJobName) || job.experimentsBrokerReporter) {
 			var jobYAML strings.Builder
 			jm.renderJobTo(&jobYAML, job)
-			b.WriteString(renderStepForRunner(jobYAML.String(), job.RunsOn))
+			b.WriteString(renderStepForRunner(jobYAML.String(), job.RunsOn, job.Name))
 			continue
 		}
 		jm.renderJobTo(b, job)
@@ -247,7 +252,7 @@ func (jm *JobManager) renderJobTo(b *strings.Builder, job *Job) {
 			// Sort needs for consistent output
 			sortedNeeds := make([]string, len(job.Needs))
 			copy(sortedNeeds, job.Needs)
-			sort.Strings(sortedNeeds)
+			slices.Sort(sortedNeeds)
 			for _, dep := range sortedNeeds {
 				fmt.Fprintf(b, "      - %s\n", dep) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 			}
@@ -464,6 +469,9 @@ func buildRenderedJobEnv(job *Job) map[string]string {
 
 func shouldInjectRuntimeFeaturesEnv(job *Job) bool {
 	if job == nil || job.Uses != "" {
+		return false
+	}
+	if job.Name == string(constants.ReportExperimentsJobName) && !job.experimentsBrokerReporter {
 		return false
 	}
 	_, ok := runtimeFeaturesBuiltInJobNames[job.Name]

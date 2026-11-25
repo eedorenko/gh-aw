@@ -28,7 +28,7 @@ func TestCustomSecretMaskingStepIDs(t *testing.T) {
 	compiler := NewCompiler()
 	compiler.stepOrderTracker = NewStepOrderTracker()
 	var generated strings.Builder
-	compiler.generateTrackedSecretRedactionStep(&generated, "", data)
+	compiler.generateTrackedSecretRedactionStep(&generated, "", data, false)
 	for _, id := range ids {
 		assert.Contains(t, generated.String(), "id: "+id+"\n")
 		assert.Contains(t, secretRedactionSuccessCondition(data), "steps."+id+".outcome == 'success'")
@@ -133,30 +133,34 @@ sandbox:
 					redactionIDs := append([]string{"redact_secrets"}, tc.hookIDs...)
 					redactionIDs = append(redactionIDs, "validate_recovery_envelopes", "validate_final_recovery_envelopes")
 					outcomes := map[string]string{}
-					var expectedCondition strings.Builder
-					expectedCondition.WriteString("always()")
 					for _, id := range redactionIDs {
-						expectedCondition.WriteString(" && steps.")
-						expectedCondition.WriteString(id)
-						expectedCondition.WriteString(".outcome == 'success'")
 						outcomes["steps."+id+".outcome"] = "success"
 					}
 					seen := map[string]bool{}
 					uploadCount := 0
 					for _, step := range steps {
 						seen[step.ID] = true
-						if step.Name != "Upload agent artifacts" && step.Name != "Upload agent output fallback artifact" {
+						if step.Name != "Upload agent artifacts" && step.Name != "Upload agent output fallback artifact" && step.Name != "Append agent step summary" {
 							continue
 						}
 						uploadCount++
-						for _, id := range redactionIDs {
+						requiredIDs := redactionIDs
+						if step.Name == "Append agent step summary" {
+							requiredIDs = redactionIDs[:len(redactionIDs)-2]
+						}
+						var expectedCondition strings.Builder
+						expectedCondition.WriteString("always()")
+						for _, id := range requiredIDs {
 							require.True(t, seen[id], "redactor %s must precede %s", id, step.Name)
+							expectedCondition.WriteString(" && steps.")
+							expectedCondition.WriteString(id)
+							expectedCondition.WriteString(".outcome == 'success'")
 						}
 						require.Equal(t, expectedCondition.String(), step.If, step.Name)
 						condition, err := ParseExpression(step.If)
 						require.NoError(t, err)
 						assert.True(t, evaluateRedactionUploadGate(t, condition, outcomes), "all successful redactors permit upload independently of the agent outcome")
-						for _, id := range redactionIDs {
+						for _, id := range requiredIDs {
 							for _, outcome := range []string{"failure", "skipped", "cancelled", ""} {
 								outcomes["steps."+id+".outcome"] = outcome
 								assert.False(t, evaluateRedactionUploadGate(t, condition, outcomes), "%s must not upload when %s outcome is %q", step.Name, id, outcome)
@@ -164,7 +168,7 @@ sandbox:
 							outcomes["steps."+id+".outcome"] = "success"
 						}
 					}
-					assert.Equal(t, 2, uploadCount)
+					assert.Equal(t, 3, uploadCount)
 				})
 			}
 		})
@@ -199,11 +203,11 @@ func TestCustomSecretMaskingWorkQueueUploadGates(t *testing.T) {
 	}}
 	compiler := NewCompiler()
 	compiler.stepOrderTracker = NewStepOrderTracker()
-	adapter := strings.Join(compiler.finishWorkQueuePreparedAdapterSteps(data, "test", 0, nil), "")
+	adapter := strings.Join(compiler.finishWorkQueuePreparedAdapterSteps(data, "test", nil), "")
 	assert.Contains(t, adapter, "steps.claim_adapter_context.outputs.active == 'true' && steps.redact_secrets.outcome == 'success' && steps.custom_mask.outcome == 'success'")
 	assert.Contains(t, adapter, "id: validate_recovery_envelopes\n")
 	assert.Contains(t, adapter, "steps.validate_recovery_envelopes.outcome == 'success'")
-	manifest := strings.Join(buildSafeOutputItemsManifestUploadStep("", compiler.getActionPin, true, data), "")
+	manifest := strings.Join(buildSafeOutputManifestUploadStep("", compiler.getActionPin, true, data, true), "")
 	assert.Contains(t, manifest, "if: always() && steps.redact_secrets.outcome == 'success' && steps.custom_mask.outcome == 'success'")
 	assert.Contains(t, manifest, "steps.validate_recovery_envelopes.outcome == 'success'")
 }

@@ -254,31 +254,22 @@ func (c *Compiler) validateUniversalLLMConsumerModel(frontmatter map[string]any,
 
 // validateCopilotWebToolsSupport uses the resolved engine configuration so imported
 // SDK settings are honored. Native web tools are unavailable in offline BYOK mode.
-func (c *Compiler) validateCopilotWebToolsSupport(engine CodingAgentEngine, engineConfig *EngineConfig, tools map[string]any) error {
-	if engine.GetID() != string(constants.CopilotEngine) {
+func (c *Compiler) validateCopilotWebToolsSupport(engine CodingAgentEngine, data *WorkflowData) error {
+	claudeOnCopilot := engine.GetID() == string(constants.ClaudeEngine) && claudeUsesCopilotInference(data)
+	if engine.GetID() != string(constants.CopilotEngine) && !claudeOnCopilot {
 		return nil
 	}
 
-	collector := NewErrorCollector(c.failFast)
-	for _, tool := range []string{"web-fetch", "web-search"} {
-		if !isCopilotToolValueEnabled(tools, tool) || (tool == "web-fetch" && engineConfig != nil && engineConfig.CopilotSDK) {
-			continue
-		}
-		suggestion := fmt.Sprintf("Remove tools.%s and configure an MCP server instead, or use a supported engine, for example:\n\nengine: codex", tool)
-		if tool == "web-fetch" {
-			suggestion += "\n\nFor Copilot's proxy-aware custom fetch tool, enable SDK mode:\n\nengine:\n  id: copilot\n  copilot-sdk: true"
-		}
-		err := NewValidationError(
-			"tools."+tool,
-			tool,
-			fmt.Sprintf("Copilot's native '%s' tool is unavailable because offline BYOK mode disables web tools (COPILOT_OFFLINE=true)", tool),
-			suggestion,
-		)
-		if returnErr := collector.Add(err); returnErr != nil {
-			return returnErr
-		}
+	if !isCopilotToolValueEnabled(data.Tools, "web-search") {
+		return nil
 	}
-	return collector.FormattedError("Copilot web tools")
+	message := "Copilot's native 'web-search' tool is unavailable because offline BYOK mode disables web tools (COPILOT_OFFLINE=true)"
+	suggestion := "Remove tools.web-search and configure an MCP server instead, or use a supported engine, for example:\n\nengine: codex"
+	if claudeOnCopilot {
+		message = "Claude's native 'web-search' tool is unavailable on GitHub Copilot inference because offline BYOK mode disables web tools (COPILOT_OFFLINE=true)"
+		suggestion = "Remove tools.web-search and configure an MCP search server instead, or use engine.model-provider: anthropic"
+	}
+	return NewValidationError("tools.web-search", "web-search", message, suggestion)
 }
 
 // validateWebSearchSupport validates that web-search tool is only used with engines that support this feature
@@ -348,11 +339,19 @@ func (c *Compiler) validateBashCommandAllowlistSupport(tools map[string]any, eng
 		agentValidationLog.Printf("Engine %s fully disables bash instead of enforcing an allowlist", engine.GetID())
 		return nil
 	}
+	if hasBashFullyDisabled(tools) {
+		return fmt.Errorf("engine '%s' cannot disable bash: tools.bash: false and tools.bash: [] cannot be enforced. "+
+			"Remove the tools.bash restriction or switch to an engine that supports disabling bash (copilot, claude, gemini, or codex)", engine.GetID())
+	}
 	agentValidationLog.Printf("Engine %s does not support bash command allowlist, emitting error", engine.GetID())
+	disableAdvice := ""
+	if capabilities.BashDisable {
+		disableAdvice = "'bash: false' to fully disable bash, "
+	}
 	return fmt.Errorf("engine '%s' does not support bash command allow-listing: tools.bash with specific commands is silently ignored at runtime for this engine. "+
-		"Use 'bash: [\"*\"]' to allow all commands, 'bash: false' to fully disable bash, or remove the tools.bash entry. "+
+		"Use 'bash: [\"*\"]' to allow all commands, %sor remove the tools.bash entry. "+
 		"To restrict bash commands to a specific allowlist, switch to an engine that supports this feature (copilot, claude, or gemini)",
-		engine.GetID())
+		engine.GetID(), disableAdvice)
 }
 
 // HasBashExplicitRestriction reports true when the tools map contains a bash configuration

@@ -14,10 +14,10 @@ permissions:
   pull-requests: read
   copilot-requests: write
 tracker-id: daily-code-metrics
+model: router/economy
 engine:
   id: copilot
   copilot-sdk: true
-model: copilot/auto
 sandbox:
   agent:
     id: awf
@@ -111,7 +111,7 @@ Analyze codebase daily: compute size, quality, health metrics. Track 7/30-day tr
 
 **Context**: Fresh clone (no git history). Fetch with `git fetch --unshallow` for churn metrics. Memory: `/tmp/gh-aw/repo-memory/default/`
 
-Before collecting metrics or drafting the discussion, use the `daily-metrics-and-report` skill for metric definitions, calculations, and the variant-specific report format.
+Before collecting metrics, calculating trends, drafting the discussion, or generating charts, use the `daily-metrics-and-report` skill for metric definitions, calculations, visualization, and the variant-specific report format.
 
 ## Data Storage
 
@@ -155,47 +155,9 @@ Store as JSON Lines in `/tmp/gh-aw/repo-memory/default/history.jsonl`:
 
 ## Update Memory
 
-Before writing `history.jsonl`, prune entries older than 90 days to keep the file bounded:
-
-```bash
-# Prune history.jsonl to 90-day retention window
-HISTORY=/tmp/gh-aw/repo-memory/default/history.jsonl
-CUTOFF=$(python3 -c "from datetime import date, timedelta; print((date.today() - timedelta(days=90)).isoformat())")
-if [ -f "$HISTORY" ]; then
-  tmp=$(mktemp)
-  while IFS= read -r line; do
-    # Lines with malformed JSON or missing date are silently dropped (treated as expired)
-    row_date=$(echo "$line" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('date',''))" 2>/dev/null)
-    if [ -n "$row_date" ] && [[ "$row_date" > "$CUTOFF" || "$row_date" = "$CUTOFF" ]]; then
-      echo "$line" >> "$tmp"
-    fi
-  done < "$HISTORY"
-  mv "$tmp" "$HISTORY"
-fi
-```
+Before writing `history.jsonl`, run `python3 .github/scripts/prune_daily_code_metrics_memory.py` from the repository root. It retains valid entries from the last 90 days and drops malformed or undated rows.
 
 Append today's entry after pruning, then push via `push_repo_memory`.
-
-## Data Visualization with Python
-
-{{#if experiments.output_format == 'full_detail' }}
-Generate **6 high-quality charts** to visualize code metrics and trends using Python, matplotlib, and seaborn. All charts must be uploaded as assets and embedded in the discussion report.
-{{#else}}
-Generate **2 high-quality charts** focusing on the most actionable signals:
-{{/if}}
-
-### Required Charts
-
-Read `/tmp/gh-aw/agent/chart-specs.md` for the variant-appropriate list of required charts (pre-written by the setup step). All charts save to `/tmp/gh-aw/python/charts/<filename>`.
-
-### Python Script
-
-Use `figsize=(12, 7)` (see `python-dataviz.md` for full chart setup and upload pattern). Create a script that:
-
-1. Reads variant from `GH_AW_EXPERIMENTS_OUTPUT_FORMAT`
-2. Loads historical data from `/tmp/gh-aw/repo-memory/default/history.jsonl` and current metrics from `/tmp/gh-aw/python/data/current_metrics.json`
-3. Generates the required charts for the selected variant, saves to `/tmp/gh-aw/python/charts/`
-4. Uploads each chart via the `upload asset` safe-output tool and embeds the returned URLs in the discussion report
 
 ## Trend Calculation
 
@@ -217,10 +179,28 @@ For each metric: current value, 7-day % change, 30-day % change, trend indicator
 - Embed charts in discussion report with analysis
 - Store metrics to repo memory, create discussion report with visualizations
 
+<!-- instruction-prefix-end -->
+
 ## skill: `daily-metrics-and-report`
 ---
 description: Metric definitions, calculation rules, quality scoring, and discussion format for daily code metrics.
 ---
+
+## Data Visualization with Python
+
+{{#if experiments.output_format == 'full_detail' }}
+Generate **6 high-quality charts** to visualize code metrics and trends using Python, matplotlib, and seaborn. Upload all charts as assets and embed them in the discussion report.
+{{#else}}
+Generate **2 high-quality charts** focused on the most actionable signals.
+{{/if}}
+
+### Required Charts
+
+Read `/tmp/gh-aw/agent/chart-specs.md` for the variant-appropriate charts (written by the setup step). Save all charts to `/tmp/gh-aw/python/charts/<filename>`.
+
+### Python Script
+
+Use `figsize=(12, 7)` (see `python-dataviz.md` for chart setup and upload pattern). Create a script that reads the variant from `GH_AW_EXPERIMENTS_OUTPUT_FORMAT`, loads historical data from `/tmp/gh-aw/repo-memory/default/history.jsonl` and current metrics from `/tmp/gh-aw/python/data/current_metrics.json`, generates the required charts, uploads each through the `upload asset` safe-output tool, and embeds returned URLs in the report.
 
 ### Metrics to Collect
 
@@ -242,63 +222,38 @@ Weighted average: test coverage (30%), code organization (25%), documentation (2
 
 **Title**: `Daily Code Metrics Report - YYYY-MM-DD`
 
-Read `GH_AW_EXPERIMENTS_OUTPUT_FORMAT` and use only its matching template below: `executive_summary`, `ste`, or `full_detail`. If it is unset, use `full_detail`. Ignore the other templates and their conditional tags.
+Read `GH_AW_EXPERIMENTS_OUTPUT_FORMAT`; if unset, use `full_detail`. Use the shared template below and apply only the matching variant rules:
+
+- `executive_summary`: include the key metrics, two required charts, and three recommendations. Omit full-detail tables.
+- `ste`: use the same structure as `executive_summary` and Simplified Technical English: sentences of at most 20 words, one fact per sentence, active voice, familiar words, and acronyms spelled out on first use.
+- `full_detail`: include all six required charts with analysis, six category tables, a quality-score breakdown, and 3–5 recommendations inside the details block.
 
 ```markdown
-{{#if experiments.output_format == 'executive_summary' }}
 ### Summary
 
 **X items found** — [brief description]
 
 **Key metrics today**: LOC: X,XXX | Quality score: XX/100 | Test ratio: X.XX | Active files (7d): XXX
 
-### 📊 Key Visualizations
+For `full_detail`, briefly summarize key findings, quality score, notable trends, and concerns requiring attention.
 
-![Quality Score](URL_FROM_UPLOAD_ASSET)
+### 📊 Visualizations
 
-![Historical Trends](URL_FROM_UPLOAD_ASSET)
+Embed the required charts with one brief analysis sentence each.
+
+For `full_detail` only, include this block:
+
+<details>
+<summary><b>View Full Details</b></summary>
+
+Include compact tables for Size, Quality, Tests, source and generated Churn, and Workflows/Docs; add a weighted Quality Score breakdown and 3–5 actionable recommendations.
+
+</details>
+
+For `executive_summary` and `ste`, include:
 
 ### 💡 Top Recommendations
 - [Recommendation 1]
 - [Recommendation 2]
 - [Recommendation 3]
-
-*For full metric tables, switch to `full_detail` variant.*
-{{#elseif experiments.output_format == 'ste' }}
-Use Simplified Technical English: sentences of at most 20 words, one fact per sentence, active voice, familiar words, and acronyms spelled out on first use.
-
-### Summary
-
-**X items found** — [brief description]
-
-**Key metrics today**: LOC: X,XXX | Quality score: XX/100 | Test ratio: X.XX | Active files (7d): XXX
-
-### 📊 Key Visualizations
-
-![Quality Score](URL_FROM_UPLOAD_ASSET)
-
-![Historical Trends](URL_FROM_UPLOAD_ASSET)
-
-### 💡 Top Recommendations
-- [Recommendation 1: one short sentence]
-- [Recommendation 2: one short sentence]
-- [Recommendation 3: one short sentence]
-{{else}}
-### Summary
-
-**X items found** — [brief description]
-
-Briefly summarize key findings, quality score, notable trends, and concerns requiring attention.
-
-### 📊 Visualizations
-
-Embed all 6 charts (LOC by Language, Top Directories, Quality Score, Test Coverage, Code Churn, Historical Trends) with a brief analysis sentence each.
-
-<details>
-<summary><b>View Full Details</b></summary>
-
-Include one compact table per category (Size, Quality, Tests, Churn-source, Churn-generated, Workflows/Docs), a weighted Quality Score breakdown, and 3–5 actionable recommendations.
-
-</details>
-{{/if}}
 ```

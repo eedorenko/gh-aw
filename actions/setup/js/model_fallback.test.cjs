@@ -2,7 +2,39 @@ import { describe, it, expect } from "vitest";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-const { injectModelFlagAfterExec, normalizeCodexModel, normalizeCodexModelArgs, normalizeClaudeModelArgs } = require("./model_fallback.cjs");
+const { injectModelFlagAfterExec, normalizeCodexModel, normalizeCodexModelArgs, normalizeClaudeModel, normalizeClaudeModelArgs } = require("./model_fallback.cjs");
+
+describe("Claude model IDs", () => {
+  it.each(["claude-sonnet-4.6", "claude-opus-5.5", "claude-sonnet-5"])("normalizes the model %s without a catalog", model => {
+    expect(normalizeClaudeModel(model.replaceAll(".", "-"), "github", {})).toBe(model);
+    expect(normalizeClaudeModel(model, "github", {})).toBe(model);
+  });
+
+  it("uses advertised Claude IDs rather than assuming punctuation for custom versions", () => {
+    const reflectData = { endpoints: [{ provider: "copilot", configured: true, models: ["claude-sonnet-5.5-preview"] }] };
+    expect(normalizeClaudeModel("claude-sonnet-5-5-preview?effort=high", "github", {}, { reflectData })).toBe("claude-sonnet-5.5-preview?effort=high");
+  });
+
+  it.each(["github", "copilot", "github-copilot", "github_models", " COPILOT "])("maps Anthropic IDs for provider %s", provider => {
+    expect(normalizeClaudeModel("claude-opus-5-5", provider, {})).toBe("claude-opus-5.5");
+    expect(normalizeClaudeModel("copilot/claude-opus-5-5", provider, {})).toBe("claude-opus-5.5");
+    expect(normalizeClaudeModelArgs(["--model", "claude-opus-5-5"], provider, {})).toEqual(["--model", "claude-opus-5.5"]);
+    expect(normalizeClaudeModelArgs(["--model=claude-opus-5-5"], provider, {})).toEqual(["--model=claude-opus-5.5"]);
+  });
+
+  it.each([
+    ["claude-opus-5-5", "anthropic", "claude-opus-5-5"],
+    ["copilot/claude-opus-5.5", "github", "claude-opus-5.5"],
+    ["claude-sonnet-5", "github", "claude-sonnet-5"],
+    ["claude-opus-99-12", "github", "claude-opus-99.12"],
+    ["claude-sonnet-4-20250514", "github", "claude-sonnet-4-20250514"],
+    ["claude-opus-5-5?effort=high", "github", "claude-opus-5.5?effort=high"],
+    ["claude-opus-5-5-20261104", "github", "claude-opus-5-5-20261104"],
+    ["anthropic/custom-model", "github", "anthropic/custom-model"],
+  ])("normalizes %s only when appropriate for %s", (model, provider, expected) => {
+    expect(normalizeClaudeModel(model, provider, {})).toBe(expected);
+  });
+});
 
 describe("Claude model arguments", () => {
   const autoReflect = {
@@ -37,6 +69,15 @@ describe("Claude model arguments", () => {
   it.each(["auto", "copilot/auto"])("rejects %s before startup when Copilot advertises no Claude models", model => {
     expect(() => normalizeClaudeModelArgs(["--model", model], "github", {}, { reflectData: { endpoints: [{ provider: "copilot", configured: true, models: ["gpt-6.1-sol", "auto"] }] } })).toThrow("requires an advertised Claude");
     expect(() => normalizeClaudeModelArgs(["--model", model], "github", {})).toThrow("requires an advertised Claude");
+  });
+
+  it("skips Claude models AWF marks as not automatically selectable", () => {
+    const models = ["claude-sonnet-5", "claude-opus-5.5"];
+    const routing_models = [
+      { model_id: "claude-sonnet-5", automatic_selection_eligible: false, automatic_selection_reason: "model_picker_disabled" },
+      { model_id: "claude-opus-5.5", automatic_selection_eligible: true },
+    ];
+    expect(normalizeClaudeModelArgs(["--model", "auto"], "github", {}, { reflectData: { endpoints: [{ provider: "copilot", configured: true, models, routing_models }] } })).toEqual(["--model", "claude-opus-5.5"]);
   });
 
   it.each(["github", "copilot", "github-copilot", "github_models", " COPILOT "])("normalizes repository-variable models for provider %s", provider => {

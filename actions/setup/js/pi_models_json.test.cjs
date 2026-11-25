@@ -13,10 +13,17 @@ const scratchRunnerTemp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-models-json-
 process.env.RUNNER_TEMP = scratchRunnerTemp;
 
 const piModelsJson = await import("./pi_models_json.cjs");
+const { prepareMarkdownFixtures } = await import("../../../scripts/markdown_metadata_test_adapter.cjs");
 const loadSDK = async () => ({ ModelRuntime: { create: async () => ({ getModel: () => undefined }) } });
 const { resolveProviderEndpointFromReflect } = await import("./awf_reflect.cjs");
 const { MODEL_NOT_SUPPORTED_PATTERN } = await import("./agent_error_patterns.cjs");
 const reflectFixtures = await import("./fixtures/model_resolution_reflect.cjs");
+
+function writeAgentFixture(file, metadata, body) {
+  const content = `---\n${JSON.stringify(metadata)}\n---\n${body}`;
+  prepareMarkdownFixtures(content);
+  fs.writeFileSync(file, content);
+}
 
 afterAll(() => {
   if (originalRunnerTemp === undefined) {
@@ -668,7 +675,7 @@ describe("pi_models_json.cjs", () => {
   describe("shared model resolution (recorded /reflect from run 38945917145)", () => {
     function configure(model, aliases = reflectFixtures.builtinAliases()) {
       process.env.GH_AW_PI_MODEL = model;
-      process.env.GH_AW_PI_MODEL_ID = model.slice(model.indexOf("/") + 1);
+      delete process.env.GH_AW_PI_MODEL_ID;
       process.env.GH_AW_PI_MODEL_ALIASES = JSON.stringify(aliases);
       process.env.GH_AW_PI_GATEWAY_SECRET_ENV = "COPILOT_GITHUB_TOKEN";
       process.env.GH_AW_PI_GATEWAY_FALLBACK_PORT = "10002";
@@ -687,6 +694,23 @@ describe("pi_models_json.cjs", () => {
       return { fetchReflect, promise: piModelsJson.main({ loadSDK, loadModelsJson: () => ({ providers: {} }), fetchReflect, ...extra }) };
     };
 
+    it.each(["anthropic/claude-sonnet-4", "moonshotai/kimi-k3"])("preserves the exact OpenRouter catalog ID %s through the OpenAI gateway", async modelId => {
+      configure(`openrouter/${modelId}`);
+      process.env.GH_AW_PI_NATIVE_PROVIDER = "openrouter";
+      process.env.GH_AW_LLM_PROVIDER = "openai";
+      process.env.GH_AW_PI_GATEWAY_SECRET_ENV = "OPENAI_API_KEY";
+      const reflectData = {
+        models_fetch_complete: true,
+        endpoints: [{ provider: "openai", configured: true, port: 10000, models: [modelId] }],
+      };
+      await run([reflectData]).promise;
+      const written = JSON.parse(fs.readFileSync(path.join(tmpDir, "models.json"), "utf8"));
+      expect(written.providers["aw-gateway"].baseUrl).toBe("http://api-proxy:10000");
+      expect(written.providers["aw-gateway"].models.map(model => model.id)).toEqual([modelId]);
+      expect(fs.readFileSync(process.env.GH_AW_PI_MODEL_FILE, "utf8")).toBe(modelId);
+      expect(() => piModelsJson.validatePiModelAvailability({ provider: "openai", modelId: modelId.slice(modelId.indexOf("/") + 1), reflectData })).toThrow("is not advertised");
+    });
+
     it("resolves copilot/opus to the newest live Opus", async () => {
       configure("copilot/opus");
       const { fetchReflect, promise } = run([reflectFixtures.ddgReflect()]);
@@ -702,6 +726,15 @@ describe("pi_models_json.cjs", () => {
       expect(lines).toHaveLength(1);
       expect(lines[0]).toContain("configured=copilot/opus resolved=claude-opus-5.5");
       expect(records()).toEqual([{ engine: "pi", role: "main", configured_model: "copilot/opus", resolved_model: "claude-opus-5.5", provider: "copilot", status: "resolved", cause: null }]);
+    });
+
+    it("escapes control characters in model resolution diagnostics", async () => {
+      configure("copilot/opus\n::add-mask::secret");
+      const { promise } = run([reflectFixtures.ddgReflect()]);
+      await promise.catch(() => {});
+      const output = stderrOutput.join("");
+      expect(output).not.toContain("\n::add-mask::secret");
+      expect(output).toContain("copilot/opus\\u000a::add-mask::secret");
     });
 
     it("fails closed with model_unavailable for a retired exact id", async () => {
@@ -729,7 +762,7 @@ describe("pi_models_json.cjs", () => {
         if (routing) process.env.GH_AW_MODEL_ROUTING = "1";
         const agentsDir = path.join(process.env.GH_AW_PI_STAGING_DIR, "agents");
         fs.mkdirSync(agentsDir, { recursive: true });
-        for (const [name, model] of subagents) fs.writeFileSync(path.join(agentsDir, `${name}.md`), JSON.stringify({ name, model }));
+        for (const [name, model] of subagents) writeAgentFixture(path.join(agentsDir, `${name}.md`), { name, model, description: `Report ${name}` }, name);
         // Directory order is filesystem-dependent; pin it to the declaration order.
         const order = subagents.map(([name]) => `${name}.md`);
         const readdirSync = fs.readdirSync;
@@ -742,10 +775,6 @@ describe("pi_models_json.cjs", () => {
           { provider: "github-copilot", id: "claude-haiku-4.5", api: "anthropic-messages" },
         ];
         const sdk = {
-          parseFrontmatter: content => {
-            const { name, model } = JSON.parse(content);
-            return { frontmatter: { name, description: `Report ${name}`, model }, body: name };
-          },
           ModelRuntime: { create: async () => ({ getModels: () => catalog, getModel: (_provider, id) => catalog.find(model => model.id === id) }) },
         };
         return run([piRoutedReflect()], { loadSDK: async () => sdk }).promise;
@@ -858,10 +887,9 @@ describe("pi_models_json.cjs", () => {
     it("incomplete discovery fails sub-agent aliases instead of using Pi's static model list", async () => {
       configure("copilot/claude-opus-5.5");
       fs.mkdirSync(path.join(process.env.GH_AW_PI_STAGING_DIR, "agents"), { recursive: true });
-      fs.writeFileSync(path.join(process.env.GH_AW_PI_STAGING_DIR, "agents/reader.md"), "Fixture");
+      writeAgentFixture(path.join(process.env.GH_AW_PI_STAGING_DIR, "agents/reader.md"), { description: "Read files", model: "haiku" }, "Read only.");
       const staticCatalog = [{ provider: "github-copilot", id: "claude-haiku-4.5" }];
       const sdk = {
-        parseFrontmatter: () => ({ frontmatter: { description: "Read files", model: "haiku" }, body: "Read only." }),
         ModelRuntime: { create: async () => ({ getModels: () => staticCatalog, getModel: () => undefined }) },
       };
       const { fetchReflect, promise } = run([reflectFixtures.incompleteDiscovery(), reflectFixtures.incompleteDiscovery()], { loadSDK: async () => sdk });
@@ -890,13 +918,12 @@ describe("pi_models_json.cjs", () => {
       process.env.AWF_REFLECT_ENABLED = "1";
       delete process.env.GH_AW_PI_MODELS_JSON_PATH;
       fs.mkdirSync(path.join(process.env.GH_AW_PI_STAGING_DIR, "agents"), { recursive: true });
-      fs.writeFileSync(path.join(process.env.GH_AW_PI_STAGING_DIR, "agents/reader.md"), "Fixture");
+      writeAgentFixture(path.join(process.env.GH_AW_PI_STAGING_DIR, "agents/reader.md"), { description: "Read files", model: "small" }, "Read only.");
       const catalog = [
         { provider: "github-copilot", id: "gpt-5.6-luna", api: "openai-responses", reasoning: true, input: ["text"], contextWindow: 128000, maxTokens: 32000 },
         { provider: "github-copilot", id: "claude-haiku-4.5", api: "openai-completions", reasoning: false, input: ["text"], contextWindow: 200000, maxTokens: 8192 },
       ];
       const sdk = {
-        parseFrontmatter: () => ({ frontmatter: { description: "Read files", model: "small" }, body: "Read only." }),
         ModelRuntime: { create: async () => ({ getModels: () => catalog, getModel: (_provider, id) => catalog.find(model => model.id === id) }) },
       };
       await piModelsJson.main({

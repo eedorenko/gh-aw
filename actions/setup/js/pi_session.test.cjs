@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { parsePiLog } from "./parse_pi_log.cjs";
 import { transformPiV3Entries, computePiV3Stats } from "./pi_session.cjs";
+import { piWorkflowStream } from "./fixtures/pi_workflow_stream.cjs";
 import { success, failure, childObservations } from "./fixtures/pi_ci_stream.cjs";
 import { normalizeAgentSession, selectSessionResult, sessionTokenTotal } from "./agent_session.cjs";
 import { mergeSessionSources } from "./unified_session.cjs";
@@ -11,6 +12,114 @@ const parse = records => parsePiLog(records.map(record => JSON.stringify(record)
 const byType = (events, type) => events.filter(event => event.type === type);
 
 describe("Pi CI stream regressions", () => {
+  // Synthetic content in the shape of Smoke Pi 42539928028 and
+  // Smoke Pi Sub Agents 39516073462; no captured payloads are published.
+  it.each([0, 1794184043729, "2026-11-09T00:27:23.729Z"])("retains the observed message clock %s through streaming reconciliation and publication", timestamp => {
+    const message = {
+      role: "assistant",
+      responseId: "sanitized-response",
+      model: "requested-model",
+      responseModel: "served-model",
+      timestamp,
+      content: [
+        { type: "thinking", thinking: "Sanitized reasoning." },
+        { type: "toolCall", id: "sanitized-tool", name: "lookup", arguments: { nested: [false, 0, null, "line\n\u00e9"] } },
+        { type: "text", text: "Sanitized answer.\n" },
+      ],
+      usage: { input: 10, output: 3 },
+    };
+    const records = [
+      { type: "turn_start" },
+      { type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "Sanitized reasoning." } },
+      { type: "message_update", assistantMessageEvent: { type: "toolcall_start", contentIndex: 1, id: "sanitized-tool", toolName: "lookup" } },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 2, delta: "Sanitized answer.\n" } },
+      { type: "message_end", message },
+      { type: "turn_end", message },
+      { type: "agent_end", messages: [message] },
+    ];
+    const original = structuredClone(records);
+    const events = parse(records).logEntries;
+    const messages = events.filter(event => event.data.messageId === message.responseId);
+    expect(messages.map(event => event.type)).toEqual(["assistant.reasoning", "tool.execution_start", "assistant.message"]);
+    expect(messages.every(event => event.timestamp === timestamp)).toBe(true);
+    const unified = mergeSessionSources([{ component: "agent", phase: "agent", path: "agent-session.jsonl", events }]);
+    for (const event of unified.filter(event => event.type !== "session.result")) {
+      expect(event.timestamp).toBe(timestamp);
+      expect(event.provenance.timestampMs).toBe(typeof timestamp === "number" ? timestamp : Date.parse(timestamp));
+      expect(event.data).toMatchObject({ messageId: message.responseId, model: "served-model" });
+      expect(event.data).not.toHaveProperty("messageMetadata");
+      expect(event).not.toHaveProperty("assistantMessageEvent");
+    }
+    expect(unified.find(event => event.type === "tool.execution_start").data.input).toEqual(message.content[1].arguments);
+    expect(selectSessionResult(events).usage).toMatchObject({ input_tokens: 10, output_tokens: 3 });
+    expect(records).toEqual(original);
+  });
+
+  it.each(["timestamp", "ts", "time", "created_at"])("preserves the source %s clock over embedded message clocks and never invents a missing clock", clock => {
+    const message = { role: "assistant", timestamp: 10, content: [{ type: "text", text: "Sanitized answer" }] };
+    const events = transformPiV3Entries([
+      { type: "message_update", [clock]: 5, assistantMessageEvent: { type: "text_delta", delta: "Sanitized answer" } },
+      { type: "message_end", timestamp: 20, message },
+    ]);
+    expect(events).toHaveLength(1);
+    expect(events[0][clock]).toBe(5);
+    if (clock !== "timestamp") expect(events[0]).not.toHaveProperty("timestamp");
+    expect(events[0].data.messageMetadata.timestamp).toBe(10);
+    const unified = mergeSessionSources([
+      { component: "agent", phase: "agent", path: "pi-streaming.jsonl", events },
+      { component: "other", phase: "agent", path: "other.jsonl", events: [{ type: "session.info", timestamp: 7, data: { content: "later" } }] },
+    ]);
+    expect(unified[0]).toMatchObject({ type: "assistant.message", provenance: { timestampMs: 5 } });
+    const [untimed] = transformPiV3Entries([{ type: "message_end", message: { ...message, timestamp: undefined } }]);
+    expect(untimed).not.toHaveProperty("timestamp");
+  });
+
+  it("recovers the sampled tool-result clock onto its single observed execution completion", () => {
+    const original = structuredClone(success);
+    const events = parse(success).logEntries;
+    expect(byType(events, "tool.execution_complete")).toMatchObject([{ timestamp: 3 }]);
+    expect(byType(events, "tool.execution_complete")).toHaveLength(1);
+    const unified = mergeSessionSources([{ component: "agent", phase: "agent", path: "pi-streaming.jsonl", events }]);
+    expect(byType(unified, "tool.execution_complete")).toMatchObject([{ timestamp: 3, provenance: { timestampMs: 3 } }]);
+    expect(success).toEqual(original);
+  });
+
+  it.each([false, true])("reconciles repeated tool-result clocks when the execution end arrives first=%s", endFirst => {
+    const end = { type: "tool_execution_end", toolCallId: "call", result: { content: "observed execution" }, isError: false };
+    const result = { type: "message_end", message: { role: "toolResult", toolCallId: "call", timestamp: 3, content: "snapshot" } };
+    const records = endFirst ? [end, result, result] : [result, result, end];
+    const [event] = transformPiV3Entries(records);
+    expect(transformPiV3Entries(records)).toHaveLength(1);
+    expect(event).toMatchObject({ timestamp: 3, data: { output: end.result, success: true } });
+  });
+
+  it.each(["timestamp", "ts", "time", "created_at"])("does not replace an execution completion's explicit %s clock with its result clock", clock => {
+    const events = transformPiV3Entries([
+      { type: "tool_execution_end", [clock]: 0, toolCallId: "call", result: { content: "observed execution" } },
+      { type: "message_end", message: { role: "toolResult", toolCallId: "call", timestamp: 3, content: "snapshot" } },
+    ]);
+    expect(events).toHaveLength(1);
+    expect(events[0][clock]).toBe(0);
+    if (clock !== "timestamp") expect(events[0]).not.toHaveProperty("timestamp");
+  });
+
+  it("retains child, tool-result and provider-error clocks without duplicating snapshots or parent usage", () => {
+    const child = { role: "assistant", responseId: "child-response", model: "fixture-model", timestamp: 3, content: [{ type: "text", text: "Child answer" }], usage: { input: 5, output: 2 } };
+    const records = [
+      { type: "gh_aw_subagent_dispatch", agent: "reader", invocation_id: "child", timestamp: 1 },
+      { type: "gh_aw_subagent_event", agent: "reader", invocation_id: "child", timestamp: 4, event: { type: "message_end", message: child } },
+      { type: "gh_aw_subagent_event", agent: "reader", invocation_id: "child", timestamp: 5, event: { type: "turn_end", message: child } },
+      { type: "message_end", message: { role: "toolResult", toolCallId: "tool", timestamp: 6, content: [{ type: "text", text: "result" }], isError: false } },
+      { type: "message_end", message: { role: "assistant", timestamp: 7, content: [], errorMessage: "Sanitized provider failure", usage: { input: 0, output: 0 } } },
+    ];
+    const events = parse(records).logEntries;
+    expect(byType(events, "assistant.message")).toMatchObject([{ agentId: "child", timestamp: 3 }]);
+    expect(byType(events, "tool.execution_complete")).toMatchObject([{ timestamp: 6 }]);
+    expect(byType(events, "session.error")).toMatchObject([{ timestamp: 7 }]);
+    expect(byType(events, "subagent.request")).toHaveLength(1);
+    expect(selectSessionResult(events).usage).toMatchObject({ input_tokens: 0, output_tokens: 0 });
+  });
+
   it("retains sampled child text and reasoning in their evidenced dispatch scope through unified projection", () => {
     const original = structuredClone(childObservations);
     const records = [...success, ...childObservations];
@@ -772,5 +881,79 @@ describe("Pi CI stream regressions", () => {
     const events = transformPiV3Entries(records);
     expect(byType(events, "assistant.message").map(e => e.data.content)).toEqual(["unchanged"]);
     expect(computePiV3Stats(records)).toMatchObject({ turns: 1, usage: { input_tokens: 2, output_tokens: 1 }, errors: [message.errorMessage] });
+  });
+
+  it("keeps multi-turn assistant messages and accounting separate when a proxy reuses responseId across turns", () => {
+    const { logEntries, markdown } = parse(piWorkflowStream);
+    expect(byType(logEntries, "assistant.message").map(event => event.data.content)).toEqual(["listed"]);
+    expect(byType(logEntries, "assistant.message")[0].data).not.toHaveProperty("nativeSnapshots");
+    expect(byType(logEntries, "tool.execution_start")[0].data).not.toHaveProperty("nativeSnapshots");
+    expect(markdown.match(/\blisted\b/g)).toEqual(["listed"]);
+    expect(selectSessionResult(logEntries)).toMatchObject({
+      sourceEngine: "pi",
+      numTurns: 2,
+      usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 },
+    });
+  });
+
+  it("projects session header createdAt onto session.init.timestamp only when no primary clock is present", () => {
+    const [fromTimestamp] = transformPiV3Entries([{ type: "session", version: 3, id: "v3-timed", timestamp: "2026-07-14T08:25:33.707Z", createdAt: "2026-07-14T09:00:00.000Z", cwd: "/repo" }]);
+    expect(fromTimestamp).toMatchObject({
+      type: "session.init",
+      timestamp: "2026-07-14T08:25:33.707Z",
+      data: { sourceEngine: "pi", sessionId: "v3-timed", cwd: "/repo" },
+    });
+
+    const [untimed] = transformPiV3Entries([{ type: "session", version: 3, id: "v3-untimed", cwd: "/repo" }]);
+    expect(untimed).toMatchObject({
+      type: "session.init",
+      data: { sourceEngine: "pi", sessionId: "v3-untimed", cwd: "/repo" },
+    });
+    expect(untimed).not.toHaveProperty("timestamp");
+
+    const [fromCreatedAt] = transformPiV3Entries([{ type: "session", version: 4, id: "v4-created-at", createdAt: "2026-11-12T02:45:30.124Z", cwd: "/repo" }]);
+    expect(fromCreatedAt).toMatchObject({
+      type: "session.init",
+      timestamp: "2026-11-12T02:45:30.124Z",
+      data: { sourceEngine: "pi", sessionId: "v4-created-at", cwd: "/repo" },
+    });
+  });
+
+  it("falls back to the open assistantState at agent_end when the trailing partial message has no responseId", () => {
+    const firstTurn = {
+      role: "assistant",
+      responseId: "turn-1",
+      model: "mock-model",
+      content: [{ type: "text", text: "first turn" }],
+      usage: { input: 3, output: 2 },
+    };
+    const followUp = { role: "user", content: [{ type: "text", text: "follow up" }] };
+    const trailingSnapshotWithoutId = {
+      role: "assistant",
+      model: "mock-model",
+      content: [{ type: "text", text: "partial second turn completed" }],
+      usage: { input: 4, output: 5 },
+    };
+    const records = [
+      { type: "turn_start" },
+      { type: "message_start", message: { ...firstTurn, usage: { input: 0, output: 0 } } },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "first turn" } },
+      { type: "message_end", message: firstTurn },
+      { type: "turn_end", message: firstTurn, toolResults: [] },
+      { type: "turn_start" },
+      { type: "message_end", message: followUp },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "partial second turn" } },
+      {
+        type: "agent_end",
+        messages: [{ ...firstTurn, stopReason: "stop" }, followUp, trailingSnapshotWithoutId],
+      },
+    ];
+    const { logEntries } = parse(records);
+    expect(byType(logEntries, "assistant.message").map(event => event.data.content)).toEqual(["first turn", "partial second turn completed"]);
+    expect(selectSessionResult(logEntries)).toMatchObject({
+      sourceEngine: "pi",
+      numTurns: 2,
+      usage: { input_tokens: 7, output_tokens: 7 },
+    });
   });
 });

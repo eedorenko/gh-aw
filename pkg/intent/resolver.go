@@ -30,8 +30,9 @@ const (
 )
 
 type IntentRecord struct {
-	Status AttributionStatus `json:"status"`
-	Source AttributionSource `json:"source"`
+	Status    AttributionStatus `json:"status"`
+	Source    AttributionSource `json:"source"`
+	IntentKey *string           `json:"intent_key,omitempty"`
 
 	RootNodeID string `json:"root_node_id,omitempty"`
 	RootType   string `json:"root_type,omitempty"`
@@ -48,6 +49,42 @@ type IntentRecord struct {
 
 	Rule            string `json:"rule,omitempty"`
 	ResolverVersion string `json:"resolver_version,omitempty"`
+}
+
+// ResolveRisk returns the explicit risk when set, otherwise derives it from the
+// record's domains and priority.
+func ResolveRisk(rec IntentRecord) string {
+	if rec.Risk != "" {
+		return rec.Risk
+	}
+
+	hasSecurity := false
+	hasProduction := false
+	hasInfrastructure := false
+	hasDocumentation := false
+	for _, domain := range rec.Domains {
+		switch domain {
+		case "security":
+			hasSecurity = true
+		case "production":
+			hasProduction = true
+		case "infrastructure":
+			hasInfrastructure = true
+		case "documentation":
+			hasDocumentation = true
+		}
+	}
+
+	if hasProduction || (hasSecurity && rec.Priority == "critical") {
+		return "high"
+	}
+	if hasInfrastructure {
+		return "medium"
+	}
+	if hasDocumentation {
+		return "low"
+	}
+	return "unknown"
 }
 
 type RootReference struct {
@@ -82,26 +119,25 @@ func (r Resolver) ResolvePullRequest(pr PullRequestData) IntentRecord {
 		return intent
 	}
 
-	switch len(pr.ClosingIssues) {
-	case 1:
-		resolverLog.Printf("ResolvePullRequest: attributing %s to single closing issue", pr.NodeID)
-		return r.fromRoot(pr.ClosingIssues[0], SourceClosingIssue, "single_closing_issue")
-	case 0:
-		if len(pr.Labels) > 0 {
-			resolverLog.Printf("ResolvePullRequest: no closing issue, falling back to %d PR label(s) for %s", len(pr.Labels), pr.NodeID)
-			return r.fromRoot(RootReference{
-				NodeID: pr.NodeID,
-				Type:   "artifact",
-				URL:    pr.URL,
-				Labels: pr.Labels,
-			}, SourceArtifactLabels, "pull_request_label_fallback")
+	if len(pr.ClosingIssues) > 0 {
+		if len(pr.ClosingIssues) == 1 {
+			resolverLog.Printf("ResolvePullRequest: attributing %s to single closing issue", pr.NodeID)
+			return r.fromRoot(pr.ClosingIssues[0], SourceClosingIssue, "single_closing_issue")
 		}
-		resolverLog.Printf("ResolvePullRequest: no intent source for %s, marking unlinked", pr.NodeID)
-		return r.unlinked("no_supported_intent_source")
-	default:
 		resolverLog.Printf("ResolvePullRequest: %d closing issues for %s, marking ambiguous", len(pr.ClosingIssues), pr.NodeID)
 		return r.ambiguous(SourceClosingIssue, "multiple_closing_issues")
 	}
+	if len(pr.Labels) > 0 {
+		resolverLog.Printf("ResolvePullRequest: no closing issue, falling back to %d PR label(s) for %s", len(pr.Labels), pr.NodeID)
+		return r.fromRoot(RootReference{
+			NodeID: pr.NodeID,
+			Type:   "artifact",
+			URL:    pr.URL,
+			Labels: pr.Labels,
+		}, SourceArtifactLabels, "pull_request_label_fallback")
+	}
+	resolverLog.Printf("ResolvePullRequest: no intent source for %s, marking unlinked", pr.NodeID)
+	return r.unlinked("no_supported_intent_source")
 }
 
 func (r Resolver) ResolveIssue(nodeID, url string, labels []string) IntentRecord {

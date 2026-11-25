@@ -95,6 +95,20 @@ test("save: empty or unset lists remove stale snapshot; reruns replace old conte
   assert.equal(f.read(".github/new.md"), "trusted");
 });
 
+test("save: SDK agents are staged separately from the execution checkout", t => {
+  const f = fixture(t);
+  f.write(".github/agents/reader.agent.md", "Base version.");
+  f.write(".github/agents/notes.md", "Not an SDK agent.");
+  const staged = path.join(f.base, "copilot-agents");
+  f.run("save", { env: { GH_AW_STAGE_COPILOT_SDK_AGENTS: "true" } });
+  f.write(".github/agents/reader.agent.md", "Checkout version.");
+  f.write(".github/agents/new.agent.md", "Checkout only.");
+  assert.deepEqual(fs.readdirSync(staged), ["reader.agent.md"]);
+  assert.equal(fs.readFileSync(path.join(staged, "reader.agent.md"), "utf8"), "Base version.");
+  f.run("save");
+  assert.equal(fs.existsSync(staged), false);
+});
+
 test("save: root instruction symlinks are materialized with trusted mode", t => {
   const f = fixture(t);
   f.write("INSTRUCTIONS.md", "trusted", 0o600);
@@ -137,6 +151,23 @@ test("save: external skill targets are materialized; internal links and modes su
   const execution = spawnSync(path.join(f.workspace, ".agents/scripts/link"), [], { encoding: "utf8" });
   assert.equal(execution.status, 0);
   assert.equal(execution.stdout.trim(), "ok");
+});
+
+test("save and restore: materializes skills linked outside agent folders", t => {
+  const f = fixture(t);
+  f.write("skills/mui-renovate-fix/SKILL.md", "trusted base skill");
+  fs.mkdirSync(path.join(f.workspace, ".agents/skills"), { recursive: true });
+  f.link(".agents/skills/mui-renovate-fix", "../../skills/mui-renovate-fix");
+  fs.mkdirSync(path.join(f.workspace, ".claude/skills"), { recursive: true });
+  f.link(".claude/skills/mui-renovate-fix", "../../.agents/skills/mui-renovate-fix");
+  f.run("save");
+  f.write("skills/mui-renovate-fix/SKILL.md", "untrusted PR skill");
+  f.run("restore");
+  for (const folder of [".agents", ".claude"]) {
+    const skill = `${folder}/skills/mui-renovate-fix`;
+    assert.equal(f.read(`${skill}/SKILL.md`), "trusted base skill");
+    assert.equal(fs.lstatSync(path.join(f.workspace, skill)).isSymbolicLink(), false);
+  }
 });
 
 test("save: invalid candidates fail closed in both lists", t => {

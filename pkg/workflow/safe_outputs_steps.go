@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
@@ -53,7 +54,7 @@ func (c *Compiler) buildCustomActionStep(data *WorkflowData, config GitHubScript
 	steps = append(steps, "        env:\n")
 	steps = append(steps, "          GH_AW_AGENT_OUTPUT: ${{ steps.setup-agent-output-env.outputs.GH_AW_AGENT_OUTPUT }}\n")
 	steps = append(steps, config.CustomEnvVars...)
-	c.addCustomSafeOutputEnvVars(&steps, data)
+	c.addSafeOutputEnvVars(&steps, data, false)
 
 	// With section for inputs (replaces github-token in actions/github-script)
 	steps = append(steps, "        with:\n")
@@ -88,6 +89,8 @@ func (c *Compiler) addCustomActionGitHubToken(steps *[]string, data *WorkflowDat
 	// Agent token mode: use full precedence chain for agent assignment
 	if config.UseCopilotCodingAgentToken {
 		token = getEffectiveCopilotCodingAgentGitHubToken(resolvedCustomToken)
+	} else if usesTokenBrokerSafeOutputs(data) && resolvedCustomToken == "" {
+		token = "${{ steps.safe-outputs-app-token.outputs.token }}"
 	} else if config.UseCopilotRequestsToken {
 		// Copilot mode: use getEffectiveCopilotRequestsToken with safe-outputs token precedence
 		token = getEffectiveCopilotRequestsToken(resolvedCustomToken)
@@ -111,6 +114,8 @@ type GitHubScriptStepConfig struct {
 	// Environment variables specific to this safe output type
 	// These are added after GH_AW_AGENT_OUTPUT
 	CustomEnvVars []string
+	// ProtectCustomEnvVars prevents safe-outputs.env from overriding compiler-owned step inputs.
+	ProtectCustomEnvVars bool
 
 	// JavaScript script constant to format and include (for inline mode)
 	Script string
@@ -121,6 +126,9 @@ type GitHubScriptStepConfig struct {
 
 	// CustomToken configuration (passed to addSafeOutputGitHubTokenForConfig or addSafeOutputCopilotGitHubTokenForConfig)
 	CustomToken string
+
+	// FallbackToGitHubToken keeps failure reporting available when App token minting fails.
+	FallbackToGitHubToken bool
 
 	// UseCopilotRequestsToken indicates whether to use the Copilot token preference chain
 	// custom token > COPILOT_GITHUB_TOKEN
@@ -190,11 +198,22 @@ func (c *Compiler) buildGitHubScriptStepCommon(data *WorkflowData, config GitHub
 	steps = append(steps, config.CustomEnvVars...)
 
 	// Add custom environment variables from safe-outputs.env
-	c.addCustomSafeOutputEnvVars(&steps, data)
+	var protectedEnv map[string]bool
+	if config.ProtectCustomEnvVars {
+		protectedEnv = map[string]bool{"GH_AW_AGENT_OUTPUT": true}
+		for _, entry := range config.CustomEnvVars {
+			key, _, _ := strings.Cut(strings.TrimSpace(entry), ":")
+			protectedEnv[key] = true
+		}
+	}
+	c.addSafeOutputEnvVars(&steps, data, false, protectedEnv)
 
 	// With section for github-token
 	steps = append(steps, "        with:\n")
-	if config.UseCopilotCodingAgentToken {
+	if config.FallbackToGitHubToken && data.SafeOutputs != nil && data.SafeOutputs.GitHubApp != nil {
+		token := resolveSafeOutputGitHubTokenForConfig(data, config.CustomToken, resolveSafeOutputGitHubToken, true)
+		steps = append(steps, fmt.Sprintf("          github-token: %s\n", combineTokenExpressions(token, "${{ github.token }}")))
+	} else if config.UseCopilotCodingAgentToken {
 		c.addSafeOutputAgentGitHubTokenForConfig(&steps, data, config.CustomToken)
 	} else if config.UseCopilotRequestsToken {
 		c.addSafeOutputCopilotGitHubTokenForConfig(&steps, data, config.CustomToken)
@@ -235,6 +254,15 @@ func buildAgentOutputDownloadSteps(prefix string, pinAction func(string) string)
 		EnvVarName:       "GH_AW_AGENT_OUTPUT",
 		StepName:         "Download agent output artifact",
 		StepID:           "download-agent-output",
+	}, pinAction)
+}
+
+func buildWorkflowInfoDownloadSteps(prefix string, pinAction func(string) string) []string {
+	return buildArtifactDownloadSteps(ArtifactDownloadConfig{
+		ArtifactName: prefix + constants.InfoArtifactName.String(),
+		DownloadPath: constants.TmpGhAwDirSlash,
+		StepName:     "Download workflow metadata",
+		IfCondition:  "always()",
 	}, pinAction)
 }
 

@@ -30,15 +30,19 @@ func generateFindings(processedRun ProcessedRun, metrics MetricsData, errors []V
 	auditReportLog.Printf("Generating findings: errors=%d, conclusion=%s", len(errors), processedRun.Run.Conclusion)
 	findings := appendFailureAndTimeoutFindings(nil, processedRun, metrics, errors)
 	findings = append(findings, generateModelAvailabilityFindings(processedRun.Run)...)
-	findings = append(findings, generateThreatDetectionFindings(processedRun)...)
+	detectionFindings := generateThreatDetectionFindings(processedRun)
+	findings = append(findings, detectionFindings...)
 	findings = append(findings, generateEngineStepFailureFindings(processedRun)...)
+	findings = append(findings, generateSafeOutputsBlockedFindings(processedRun)...)
 	findings = append(findings, generatePerformanceFindings(metrics)...)
 	findings = append(findings, generateErrorVolumeFindings(errors)...)
 	findings = append(findings, generateToolingFindings(processedRun)...)
 	findings = append(findings, generateFirewallFindings(processedRun)...)
 	findings = append(findings, generateSubagentModelFindings(processedRun.TokenUsage)...)
 	findings = append(findings, generateSubagentModelUnavailableFindings(processedRun.Run.LogsPath)...)
-	findings = append(findings, generateSuccessFindings(processedRun.Run, metrics, errors)...)
+	if len(detectionFindings) == 0 {
+		findings = append(findings, generateSuccessFindings(processedRun.Run, metrics, errors)...)
+	}
 	for i := range findings {
 		findings[i].PlaybookURL = auditFindingPlaybookURL(findings[i].Code)
 	}
@@ -62,9 +66,21 @@ func generateRecommendations(processedRun ProcessedRun, metrics MetricsData, fin
 	hasCriticalFindings, hasHighCostFindings, hasManyTurns := analyzeRecommendationInputs(findings)
 	recommendations = appendFailureRecommendations(recommendations, processedRun.Run, hasCriticalFindings)
 	recommendations = appendModelAvailabilityRecommendations(recommendations, findings)
+	for _, finding := range findings {
+		if finding.Code == AuditFindingDetectionJobFailed || finding.Code == AuditFindingThreatDetected {
+			recommendations = append(recommendations, Recommendation{
+				Priority: "high",
+				Action:   "Review threat detection results and resolve detection errors before trusting agent output",
+				Reason:   "Actions success does not establish successful threat detection",
+				Example:  "Inspect the detection job logs with 'gh aw audit <run-id>'",
+			})
+			break
+		}
+	}
 	recommendations = appendCostRecommendations(recommendations, hasHighCostFindings)
 	recommendations = appendIterationRecommendations(recommendations, hasManyTurns)
 	recommendations = appendToolingRecommendations(recommendations, processedRun)
+	recommendations = appendSafeOutputsBlockedRecommendations(recommendations, findings)
 	if metrics.SubagentFailureCount > 0 {
 		recommendations = append(recommendations, Recommendation{
 			Priority: "high",

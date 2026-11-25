@@ -4,6 +4,8 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
+import { readLockFileHeaders } from "./lock_file_headers.cjs";
 
 const require = createRequire(import.meta.url);
 const { buildCopilotSDKPermissionHandler } = require("./copilot_sdk_permissions.cjs");
@@ -18,7 +20,6 @@ const lock = readFileSync(new URL("../../../.github/workflows/daily-squid-image-
 const safeOutputsConfigLine = lock.match(/^\s+GH_AW_SAFE_OUTPUTS_CONFIG: (".+")$/m);
 const handlerConfigLine = lock.match(/^\s+GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG: (".+")$/m);
 const compiledCloseConfig = JSON.parse(JSON.parse(handlerConfigLine[1])).close_issue;
-const commands = [...source.matchAll(/```bash\n([\s\S]*?)\n```/g)].flatMap(match => match[1].trim().split("\n"));
 const configLine = lock.match(/^\s+GH_AW_COPILOT_SDK_TOOL_CONFIG: '(.+)'$/m);
 const config = parseCopilotSDKToolConfig(configLine?.[1]);
 const onPermission = buildCopilotSDKPermissionHandler(config.permissions, () => {
@@ -36,9 +37,10 @@ const stepScript = name =>
     .split(/  - name:|post-steps:/)[0]
     .split("    run: |\n")[1]
     .replace(/^      /gm, "");
+const indexScript = stepScript("Index scan logs with fixed queries");
 
 describe("daily container image scan analysis", () => {
-  it.each(["ghcr.io/github/gh-aw-node", "node:lts-alpine"])("uses the same immutable %s pin in the compiler caches and every compiled manifest", image => {
+  it.each(["ghcr.io/github/gh-aw-node", "node:lts-alpine"])("uses the same immutable %s pin in the compiler caches and every compiled manifest", async image => {
     const cachePaths = ["../../../.github/aw/actions-lock.json", "../../../pkg/actionpins/data/action_pins.json", "../../../pkg/workflow/data/action_pins.json"];
     const pins = cachePaths.map(path => JSON.parse(readFileSync(new URL(path, import.meta.url), "utf8")).containers[image].pinned_image);
     expect(pins[0]).toMatch(/@sha256:[a-f0-9]{64}$/);
@@ -53,7 +55,7 @@ describe("daily container image scan analysis", () => {
     let references = 0;
     for (const file of readdirSync(workflowDir).filter(file => file.endsWith(".lock.yml"))) {
       const compiled = readFileSync(new URL(file, workflowDir), "utf8");
-      const manifest = JSON.parse(compiled.match(/^# gh-aw-manifest: (.+)$/m)[1]);
+      const { manifest } = await readLockFileHeaders(Readable.from([compiled]));
       for (const container of manifest.containers ?? []) {
         if (container.image === image) {
           expect(container.pinned_image, file).toBe(pins[0]);
@@ -64,11 +66,16 @@ describe("daily container image scan analysis", () => {
     expect(references).toBeGreaterThan(0);
   });
 
-  it("requires fixed brotli and undici versions in the vendored Node rebuild", () => {
+  it("requires fixed brotli, zlib, libexpat, and undici versions in the vendored Node rebuild", () => {
     const dockerfile = readFileSync(new URL("./Dockerfile.safe-outputs-mcp", import.meta.url), "utf8");
     expect(dockerfile).toContain('apk add --no-cache git "brotli-libs>=1.2.1-r0"');
     expect(dockerfile).toContain('"undici@^6.29.1"');
+    const install = dockerfile.match(/&& apk add --no-cache ([^\n]+)/);
+    expect(install).not.toBeNull();
+    expect(install[1]).toContain('"zlib>=1.4-r0"');
+    expect(install[1]).toContain('"libexpat>=2.10.0-r0"');
     expect(dockerfile).toContain("RUN apk upgrade --no-cache");
+    expect(dockerfile).not.toMatch(/apk (add|upgrade)[^\n]*(?:\|\| true|--force-broken-world)/);
   });
 
   it("classifies the locally built Node image as vendored without promising automatic release upgrades", () => {
@@ -244,6 +251,8 @@ fi
   });
 
   it.each([
+    ["ghcr.io/github/gh-aw-node:1:1: error: [Critical] CVE-2026-4738: zlib@1.3.2-r1 (fix: 1.4-r0)", 1],
+    ["ghcr.io/github/gh-aw-node:1:1: error: [High] CVE-2026-113351: libexpat@2.9.0-r0 (fix: 2.10.0-r0)", 1],
     ["ghcr.io/github/gh-aw-node:1:1: error: [Critical] CVE-2026-111497: brotli-libs@1.2.0-r1 (fix: 1.2.1-r0)", 1],
     ["ghcr.io/github/gh-aw-node:1:1: error: [High] CVE-2026-92392: libcurl@8.22.0-r0 (fix: 8.23.0-r0)", 1],
     ["ghcr.io/github/gh-aw-node@sha256:abc:1:1: warning: [High] CVE-2026-1234: pkg@1 (fix: 2)", 1],
@@ -286,9 +295,9 @@ fi
         "ghcr.io/github/gh-aw-node-other:v1:1:1: error: [Critical] CVE-2026-7777: package@1",
         `Running grype on ${vendored}`,
         ...["Low", "Negligible", "Unknown"].map(severity => `${vendored}:1:1: info: [${severity}] CVE-2026-8888: package@1`),
-        ...vendoredFindings.map(finding => `${vendored}:1:1: ${finding}`),
         ...Array(10000).fill(`${vendored}:1:1: info: [Low] CVE-2026-9999: package@1`),
         `syft scanned ${vendored}`,
+        ...vendoredFindings.map(finding => `${vendored}:1:1: ${finding}`),
       ];
       const fixture = join(directory, "compile-output.txt");
       const log = `${lines.join("\n")}\n`;
@@ -304,27 +313,57 @@ fi
     }
   });
 
-  it("documents paginated native reads and shell commands allowed by the compiled SDK contract", () => {
-    expect(source).toContain("native `grep`");
-    expect(source).toContain("native `view` with\n`view_range`");
-    expect(source).toContain("Read every\nfinding, including lower severities, license results, and scanner errors");
-    expect(source).toContain("Do not retry with another unapproved command");
-    expect(onPermission({ kind: "read", path: scanLog })).toEqual({ kind: "approve-once" });
-    expect(onPermission({ kind: "read", path: candidateLog })).toEqual({ kind: "approve-once" });
-    expect(onPermission({ kind: "shell", fullCommandText: `cat ${candidateLog}` })).toEqual({ kind: "approve-once" });
-    expect(commands).toHaveLength(2);
-    for (const command of commands) {
-      expect(command).toContain(scanLog);
-      expect(onPermission({ kind: "shell", fullCommandText: command })).toEqual({ kind: "approve-once" });
+  it("gates a late unterminated vendored Critical after earlier non-critical findings", () => {
+    const directory = mkdtempSync(join(tmpdir(), "image-late-gate-"));
+    try {
+      const vendored = "ghcr.io/github/gh-aw-node@sha256:committed";
+      const lines = [
+        `${vendored}:1:1: warning: [High] CVE-2026-1111: openssl@1`,
+        `${vendored}:1:1: warning: [Medium] CVE-2026-2222: zlib@1 (fix: 2)`,
+        "ghcr.io/github/gh-aw-node-other:v1:1:1: error: [Critical] CVE-2026-7777: package@1",
+        ...Array(20000).fill(`${vendored}:1:1: info: [Low] CVE-2026-9999: package@1 progress`),
+        `${vendored}:1:1: error: [Critical] CVE-2026-4444: openssl@1`,
+      ];
+      const fixture = join(directory, "compile-output.txt");
+      const log = lines.join("\n");
+      expect(Buffer.byteLength(log)).toBeGreaterThan(500000);
+      writeFileSync(fixture, log);
+      const result = spawnSync("bash", ["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", gate.replaceAll(scanLog, fixture)], { encoding: "utf8", timeout: 10000 });
+      expect(result.error).toBeUndefined();
+      expect(result.signal).toBeNull();
+      expect(result.status, result.stdout + result.stderr).toBe(1);
+      expect(result.stdout.match(/::error::/g)).toHaveLength(1);
+      expect(result.stdout).toContain("Critical vulnerabilities");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 
-  it.each(["cd", "cut", "sed", "awk", "python", "python3", "jq"])("keeps %s and unrestricted shell access denied", command => {
+  it("documents paginated native reads and runs fixed indexes before the shell-disabled agent", () => {
+    expect(source).toContain("Use native file inspection");
+    expect(source).toContain("use `view_range` to read successive ranges from each\noriginal log through its end");
+    expect(source).toContain("Read every finding, including lower severities,\nlicense results, and scanner errors");
+    expect(source).toContain("Bash is disabled for the\nagent");
+    expect(source).toContain("Do not retry with another unapproved command");
+    expect(config.capabilities.bash).toBe(false);
+    expect(config.explicitlyDisabledTools).toContain("bash");
+    expect(config.permissions.allowedTools.some(tool => tool === "*" || tool === "bash" || tool.startsWith("shell"))).toBe(false);
+    for (const file of ["compile-output.txt", "candidate-output.txt", "compile-markers.txt", "candidate-markers.txt", "compile-finding-counts.txt"]) {
+      expect(onPermission({ kind: "read", path: join(scanLog, "..", file) })).toEqual({ kind: "approve-once" });
+    }
+    expect(onPermission({ kind: "shell", fullCommandText: indexScript }).kind).toBe("reject");
+    const compiledIndex = lock.match(/name: Index scan logs with fixed queries\n\s+run: (".+")/);
+    expect(compiledIndex).not.toBeNull();
+    expect(JSON.parse(compiledIndex[1]).trim()).toBe(indexScript.trim());
+    expect(lock.indexOf("name: Index scan logs with fixed queries")).toBeLessThan(lock.indexOf("name: Execute GitHub Copilot CLI"));
+  });
+
+  it.each(["cd", "cut", "sed", "awk", "python", "python3", "jq", "grep", "cat", "wc", "sort", "uniq"])("keeps %s and unrestricted shell access denied", command => {
     expect(config.permissions.allowedTools).not.toContain("shell");
     expect(onPermission({ kind: "shell", fullCommandText: `${command} ${scanLog}` }).kind).toBe("reject");
   });
 
-  it("summarizes all severities from a large log without merging image tags", () => {
+  it("indexes large committed and candidate logs without merging image tags or findings", () => {
     const directory = mkdtempSync(join(tmpdir(), "image-scan-"));
     try {
       const fixture = join(directory, "compile-output.txt");
@@ -332,32 +371,65 @@ fi
       const severities = ["Critical", "High", "Medium", "Low", "Negligible", "Unknown"];
       const findings = severities.map(severity => `${image}:v1:1:1: warning: [${severity}] CVE-2026-1234: package@1.0`);
       findings.push(findings[0], `${image}:v2:1:1: error: [Critical] CVE-2026-5678: package@2.0`);
-      const lines = [...Array(10000).fill("Compilation progress without image findings.".repeat(2)), ...findings];
+      const lines = [
+        ...Array(10000).fill("Compilation progress without image findings.".repeat(2)),
+        `Running (grype) on ${image}:v1`,
+        ...findings,
+        `${image}:v1:1:1: error: license policy violation: package@1`,
+        "Scanner error: registry unavailable",
+        `syft scanned ${image}:v1`,
+      ];
       const log = `${lines.join("\n")}\n`;
       expect(Buffer.byteLength(log)).toBeGreaterThan(500000);
       writeFileSync(fixture, log);
+      const candidate = `Running (grype) on ${image}:candidate\n${image}:candidate:1:1: error: [Critical] CVE-2026-9999: package@3.0\nsyft scanned ${image}:candidate`;
+      writeFileSync(join(directory, "candidate-output.txt"), candidate);
 
-      const results = commands.map(command => {
-        const result = spawnSync("bash", ["-c", command.replaceAll(scanLog, JSON.stringify(fixture))], {
-          encoding: "utf8",
-          env: { PATH: process.env.PATH },
-          timeout: 10000,
-        });
-        expect(result.error).toBeUndefined();
-        expect(result.status, result.stderr).toBe(0);
-        return result.stdout.trim();
+      const result = spawnSync("bash", ["--noprofile", "--norc", "-c", indexScript.replaceAll("/tmp/gh-aw/agent/image-scan", directory)], {
+        encoding: "utf8",
+        env: { PATH: process.env.PATH },
+        timeout: 10000,
       });
-      expect(Number.parseInt(results[0], 10)).toBe(lines.length);
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      expect(readFileSync(join(directory, "compile-markers.txt"), "utf8")).toBe(`10001:Running (grype) on ${image}:v1\n${lines.length}:syft scanned ${image}:v1\n`);
+      expect(readFileSync(join(directory, "candidate-markers.txt"), "utf8")).toBe(`1:Running (grype) on ${image}:candidate\n3:syft scanned ${image}:candidate\n`);
       const counts = Object.fromEntries(
-        results[1].split("\n").map(line => {
-          const [, count, finding] = line.match(/^\s*(\d+) (.+)$/);
-          return [finding, Number(count)];
-        })
+        readFileSync(join(directory, "compile-finding-counts.txt"), "utf8")
+          .trim()
+          .split("\n")
+          .map(line => {
+            const [, count, finding] = line.match(/^\s*(\d+) (.+)$/);
+            return [finding, Number(count)];
+          })
       );
       expect(counts).toEqual({
         ...Object.fromEntries(severities.map(severity => [`${image}:v1:1:1: warning: [${severity}]`, severity === "Critical" ? 2 : 1])),
         [`${image}:v2:1:1: error: [Critical]`]: 1,
       });
+      expect(readFileSync(fixture, "utf8")).toBe(log);
+      expect(readFileSync(join(directory, "candidate-output.txt"), "utf8")).toBe(candidate);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("records operational failures in every index when scan logs are missing", () => {
+    const directory = mkdtempSync(join(tmpdir(), "image-missing-index-"));
+    try {
+      const result = spawnSync("bash", ["--noprofile", "--norc", "-c", indexScript.replaceAll("/tmp/gh-aw/agent/image-scan", directory)], {
+        encoding: "utf8",
+        timeout: 10000,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      for (const [index, log] of [
+        ["compile-markers.txt", "compile-output.txt"],
+        ["candidate-markers.txt", "candidate-output.txt"],
+        ["compile-finding-counts.txt", "compile-output.txt"],
+      ]) {
+        expect(readFileSync(join(directory, index), "utf8")).toBe(`ERROR: Scan output not found: ${join(directory, log)}\n`);
+      }
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

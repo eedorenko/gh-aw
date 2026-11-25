@@ -280,7 +280,7 @@ jobs:
 	}
 	activationJobNameIdx := indexInNonCommentLinesInSection(activationSection, "job-name: ${{ github.job }}")
 	activationPreStepIdx := indexInNonCommentLinesInSection(activationSection, "- name: Activation run pre-step")
-	activationCheckoutIdx := indexInNonCommentLinesInSection(activationSection, "- name: Checkout .github and .agents folders")
+	activationCheckoutIdx := indexInNonCommentLinesInSection(activationSection, "- name: Checkout base repository snapshot")
 	if activationJobNameIdx == -1 || activationPreStepIdx == -1 || activationCheckoutIdx == -1 {
 		t.Fatalf("Expected setup body, pre-step, and repository checkout in activation section:\n%s", activationSection)
 	}
@@ -484,7 +484,7 @@ func TestInsertPreStepsAfterSetupBeforeCheckout(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := insertPreStepsAtEarliestBoundary(tt.steps, tt.preSteps)
+			got := insertPreStepsAtEarliestBoundary(tt.steps, tt.preSteps, false)
 			if !slices.Equal(got, tt.want) {
 				t.Fatalf("insertPreStepsAtEarliestBoundary() mismatch\nwant:\n%q\ngot:\n%q", tt.want, got)
 			}

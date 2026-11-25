@@ -135,16 +135,16 @@ func (c *Compiler) buildActivationPermissions(ctx *activationJobBuildContext) (s
 }
 
 func (c *Compiler) buildActivationBasePermissions(ctx *activationJobBuildContext) map[PermissionScope]PermissionLevel {
-	// Admission OIDC is isolated in the endpoint-gated admission job.
 	permsMap := map[PermissionScope]PermissionLevel{
 		PermissionContents: PermissionRead,
 	}
-	if isWorkQueueWorker(ctx.data) {
-		permsMap[PermissionContents] = PermissionWrite
+	// Preserve existing activation permissions outside broker mode. Broker previews
+	// use only the local picker and must not receive broker OIDC credentials.
+	if ctx.data.ExperimentsStorage != ExperimentsStorageBroker || usesExperimentsBroker(ctx.data) || ctx.data.AdmissionEnabled || usesTokenBrokerSafeOutputs(ctx.data) {
+		permsMap[PermissionIdToken] = PermissionWrite
 	}
-	if workQueueIssuesConfig(ctx.data) != nil && isWorkQueueParticipant(ctx.data) {
+	if workQueueRequiresAssignment(ctx.data) {
 		permsMap[PermissionContents] = PermissionWrite
-		permsMap[PermissionIssues] = PermissionWrite
 	}
 	if isWorkQueueEnabled(ctx.data) || !ctx.data.StaleCheckDisabled || hasMaxDailyAICGuardrail(ctx.data) {
 		permsMap[PermissionActions] = PermissionRead

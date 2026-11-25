@@ -8,15 +8,17 @@ const { execFileSync } = require("node:child_process");
 const { writeSecureOutput } = require("./convert_gateway_config_shared.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { INLINE_SKILL_MANIFEST, resolveWorkflowSkillPaths, writeWorkflowSkillArgs } = require("./pi_workflow_skills.cjs");
+const { openPiDurableSession } = require("./durable_native_session.cjs");
 
 const DEFAULT_AGENT_DIR = "/tmp/gh-aw/pi-agent-dir";
 const DEFAULT_SESSION_DIR = "/tmp/gh-aw/agent/pi-sessions";
 
 /** @param {string} [command] @param {typeof execFileSync} [execute] @param {string} [minimumVersion] */
 function verifyPiVersion(command = process.env.GH_AW_PI_COMMAND || "pi", execute = execFileSync, minimumVersion = "1.0.0") {
+  const executable = resolvePiExecutable(command);
   let version;
   try {
-    version = execute(command, ["--version"], { encoding: "utf8", timeout: 10000, maxBuffer: 4096 }).trim();
+    version = execute(executable, ["--version"], { encoding: "utf8", timeout: 10000, maxBuffer: 4096 }).trim();
   } catch (error) {
     throw new Error(`Cannot verify installed Pi version: ${getErrorMessage(error)}`, { cause: error });
   }
@@ -26,11 +28,33 @@ function verifyPiVersion(command = process.env.GH_AW_PI_COMMAND || "pi", execute
   if (!match || comparison < 0 || (comparison === 0 && match[4])) {
     throw new Error(`Pi v${minimumVersion} or newer is required${minimumVersion === "1.3.0" ? " for effort=max" : ""}; installed version is ${version}`);
   }
+  return executable;
 }
 
 /** @param {string|null|undefined} effort */
 function verifyPiThinkingEffort(effort) {
   if (effort === "max") verifyPiVersion(undefined, undefined, "1.3.0");
+}
+
+/** @param {string} [command] */
+function resolvePiExecutable(command = process.env.GH_AW_PI_COMMAND || "pi") {
+  const candidates =
+    path.isAbsolute(command) || command.includes(path.sep)
+      ? [path.resolve(command)]
+      : (process.env.PATH || "")
+          .split(path.delimiter)
+          .filter(Boolean)
+          .map(directory => path.join(directory, command));
+  for (const candidate of candidates) {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return fs.realpathSync(candidate);
+    } catch (error) {
+      const code = error instanceof Error && "code" in error ? String(error.code) : "";
+      if (!["EACCES", "ELOOP", "ENOENT", "ENOTDIR", "EPERM"].includes(code)) throw error;
+    }
+  }
+  throw new Error(`Cannot resolve Pi executable "${command}"`);
 }
 
 /** @param {string} [raw] @returns {Record<string, any>} */
@@ -116,6 +140,7 @@ function applyResolvedPiModel() {
 }
 
 function preparePiRuntime(config = parsePiConfig()) {
+  const durableSession = openPiDurableSession();
   const agentDir = process.env.PI_CODING_AGENT_DIR || DEFAULT_AGENT_DIR;
   const routingSelection = readPiModelRoutingSelection(agentDir);
   if (!routingSelection) applyResolvedPiModel();
@@ -129,9 +154,10 @@ function preparePiRuntime(config = parsePiConfig()) {
   const settings = {
     ...installedSettings,
     defaultTools: [...new Set([...(Array.isArray(installedSettings.defaultTools) ? installedSettings.defaultTools : []), "+codemode", "+tool_search"])],
-    sessionDir: DEFAULT_SESSION_DIR,
+    sessionDir: durableSession?.directory || DEFAULT_SESSION_DIR,
     enableInstallTelemetry: false,
     ...config.settings,
+    ...(durableSession ? { sessionDir: durableSession.directory } : {}),
     retry: {
       enabled: true,
       maxRetries: 2,
@@ -177,7 +203,7 @@ function preparePiRuntime(config = parsePiConfig()) {
   // Bare mode disables skill discovery; explicitly load only the inline skills activation staged.
   const skillPaths = process.env.GH_AW_PI_BARE === "true" ? resolveWorkflowSkillPaths(agentDir) : [];
   writeWorkflowSkillArgs(agentDir, skillPaths);
-  return { agentDir, settings, config, routingSelection, skillPaths };
+  return { agentDir, settings, config, routingSelection, skillPaths, durableSession };
 }
 
 /** @param {string} agentDir */
@@ -261,6 +287,7 @@ module.exports = {
   parsePiConfig,
   loadPiSDK,
   resolvePiModelWithoutAWF,
+  resolvePiExecutable,
   resolvePiPackageFile,
   nativePiProvider,
   preparePiRuntime,

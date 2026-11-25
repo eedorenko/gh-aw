@@ -144,10 +144,7 @@ func (c *Compiler) buildUploadAssetsJob(data *WorkflowData, mainJobName string, 
 	// Step 1: Checkout repository
 	preSteps = buildCheckoutRepository(preSteps, c, "", "")
 
-	// Step 2: Configure Git credentials
-	preSteps = append(preSteps, c.generateGitConfigurationSteps()...)
-
-	// Step 3: Download assets artifact if it exists.
+	// Step 2: Download assets artifact if it exists.
 	// In workflow_call context, use the per-invocation prefix from the agent job to match the uploaded artifact name.
 	assetsArtifactPrefix := artifactPrefixExprForAgentDownstreamJob(data)
 	preSteps = append(preSteps, "      - name: Download assets\n")
@@ -172,6 +169,15 @@ func (c *Compiler) buildUploadAssetsJob(data *WorkflowData, mainJobName string, 
 	customEnvVars = append(customEnvVars, fmt.Sprintf("          GH_AW_ASSETS_BRANCH: %q\n", data.SafeOutputs.UploadAssets.BranchName))
 	customEnvVars = append(customEnvVars, fmt.Sprintf("          GH_AW_ASSETS_MAX_SIZE_KB: %d\n", data.SafeOutputs.UploadAssets.MaxSizeKB))
 	customEnvVars = append(customEnvVars, fmt.Sprintf("          GH_AW_ASSETS_ALLOWED_EXTS: %q\n", strings.Join(data.SafeOutputs.UploadAssets.AllowedExts, ",")))
+	if data.SafeOutputs.AuthorizationRequirements["upload_asset"] != nil {
+		gateConfig, err := authorizationGateConfig(data.SafeOutputs, "upload_asset", "standalone", data.SafeOutputs.UploadAssets, data.SafeOutputs.UploadAssets.Staged, "")
+		if err != nil {
+			return nil, err
+		}
+		customEnvVars = append(customEnvVars, fmt.Sprintf("          GH_AW_SAFE_OUTPUT_AUTHORIZATION_GATE: %q\n",
+			gateConfig))
+		customEnvVars = append(customEnvVars, fmt.Sprintf("          GH_AW_AUTHORIZATION_ARTIFACT_ROOT: %q\n", constants.TmpGhAwAssetsDir))
+	}
 
 	// Add standard environment variables (metadata + staged/target repo)
 	customEnvVars = append(customEnvVars, c.buildStandardSafeOutputEnvVars(data, "")...) // No target repo for upload assets
@@ -225,6 +231,7 @@ func (c *Compiler) buildUploadAssetsJob(data *WorkflowData, mainJobName string, 
 		PreSteps:      preSteps,
 		PostSteps:     postSteps,
 		Token:         data.SafeOutputs.UploadAssets.GitHubToken,
+		GitHubApp:     data.SafeOutputs.UploadAssets.GitHubApp,
 		Needs:         needs,
 	})
 }
@@ -246,9 +253,9 @@ func generateSafeOutputsAssetsArtifactUpload(builder *strings.Builder, data *Wor
 	builder.WriteString("      # Upload safe-outputs assets for upload_assets job\n")
 	builder.WriteString("      - name: Upload Safe Outputs Assets\n")
 	builder.WriteString("        if: always() && " + secretRedactionSuccessCondition(data) + "\n")
-	fmt.Fprintf(builder, "        uses: %s\n", pinAction("actions/upload-artifact"))
+	builder.WriteString("        uses: " + pinAction("actions/upload-artifact") + "\n")
 	builder.WriteString("        with:\n")
-	fmt.Fprintf(builder, "          name: %ssafe-outputs-assets\n", prefix)
+	builder.WriteString("          name: " + prefix + "safe-outputs-assets\n")
 	builder.WriteString("          path: ${{ runner.temp }}/gh-aw/safeoutputs/assets/\n")
 	builder.WriteString("          retention-days: 1\n")
 	builder.WriteString("          if-no-files-found: ignore\n")

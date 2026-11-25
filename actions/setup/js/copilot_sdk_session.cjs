@@ -3,7 +3,7 @@
 /**
  * Copilot SDK Session Runner
  *
- * Runs a single Copilot agentic session using the @github/copilot-sdk.
+ * Runs a single Copilot agentic session using the @microsoft/copilot-sdk.
  * Serializes all SDK session events to a JSONL file so that
  * unified_session.cjs can collect them for the unified session step summary.
  *
@@ -25,9 +25,10 @@
 "use strict";
 
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { TMP_GH_AW_PATH } = require("./constants.cjs");
 const fs = require("fs");
 const path = require("path");
-const os = require("os");
+const { openDurableSession } = require("./durable_native_session.cjs");
 const { isDeepStrictEqual } = require("node:util");
 const { buildCopilotSDKPermissionHandler, getEnvPositiveIntOrDefault, parseMaxToolDenialsLimit, MAX_TOOL_DENIALS_DEFAULT } = require("./copilot_sdk_permissions.cjs");
 const { buildCopilotSDKSessionToolConfig } = require("./copilot_sdk_tool_config.cjs");
@@ -35,9 +36,10 @@ const { buildCopilotSDKToolCallBudget } = require("./copilot_sdk_tool_budget.cjs
 const { resolveModelWithFallback } = require("./model_fallback.cjs");
 const { COPILOT_WORKFLOW_EVENT_TYPES } = require("./copilot_workflow_events.cjs");
 const { copilotSessionContext, getCopilotMessageRefusal } = require("./copilot_session.cjs");
-const { loadCopilotSDKCustomAgents } = require("./extract_inline_sub_agents.cjs");
+const { defaultCopilotSDKAgentsBaseDir, loadCopilotSDKCustomAgents } = require("./extract_inline_sub_agents.cjs");
 const { qualifyModelForMultiProvider, parseMultiProviderJson } = require("./copilot_sdk_multi_provider.cjs");
 const { COPILOT_MODEL_VERIFICATION_EXIT_CODE, createCopilotSDKModelObserver, copilotSessionStateDirectories } = require("./copilot_model_selection.cjs");
+const { WORKFLOW_TOOL_PERMISSION_DENIED_EXIT_CODE } = require("./permission_denied_helpers.cjs");
 
 const CAPTURED_EPHEMERAL_EVENTS = new Set([...COPILOT_WORKFLOW_EVENT_TYPES, "assistant.usage", "assistant.message_delta", "assistant.reasoning_delta", "model.call_failure", "model.call_final_result", "model.call_finished"]);
 
@@ -127,7 +129,7 @@ function parseSubagentModelsJson(value) {
 }
 
 /**
- * Run a Copilot agentic session using the @github/copilot-sdk.
+ * Run a Copilot agentic session using the @microsoft/copilot-sdk.
  *
  * Connects to the already-running headless Copilot CLI server at sdkUri, creates
  * a session, sends the prompt, waits for the session to go idle, and returns a
@@ -145,24 +147,25 @@ function parseSubagentModelsJson(value) {
  *   model?: string,
  *   reasoningEffort?: string,
  *   connectionToken?: string,
- *   providers?: import("@github/copilot-sdk").NamedProviderConfig[],
- *   models?: import("@github/copilot-sdk").ProviderModelConfig[],
+ *   providers?: import("@microsoft/copilot-sdk").NamedProviderConfig[],
+ *   models?: import("@microsoft/copilot-sdk").ProviderModelConfig[],
  *   maxToolDenials?: number | string,
  *   permissionConfig?: {
  *     allowAllTools?: boolean,
  *     allowedTools?: string[],
  *   },
  *   toolConfig?: import("./copilot_sdk_tool_config.cjs").CopilotSDKToolConfig,
- *   mcpServers?: Record<string, import("@github/copilot-sdk").MCPServerConfig>,
+ *   mcpServers?: Record<string, import("@microsoft/copilot-sdk").MCPServerConfig>,
+ *   mcpOnly?: boolean,
  *   webFetchOptions?: {fetchImpl?: typeof fetch, timeoutMs?: number, maxRedirects?: number},
  *   coreLogger?: import("./copilot_sdk_permissions.cjs").CopilotSDKCoreLogger,
  *   sdkModule?: {
- *     CopilotClient: typeof import("@github/copilot-sdk").CopilotClient,
- *     RuntimeConnection: typeof import("@github/copilot-sdk").RuntimeConnection,
- *     approveAll: typeof import("@github/copilot-sdk").approveAll,
- *     ToolSet?: typeof import("@github/copilot-sdk").ToolSet,
- *     BuiltInTools?: typeof import("@github/copilot-sdk").BuiltInTools,
- *     defineTool?: typeof import("@github/copilot-sdk").defineTool,
+ *     CopilotClient: typeof import("@microsoft/copilot-sdk").CopilotClient,
+ *     RuntimeConnection: typeof import("@microsoft/copilot-sdk").RuntimeConnection,
+ *     approveAll: typeof import("@microsoft/copilot-sdk").approveAll,
+ *     ToolSet?: typeof import("@microsoft/copilot-sdk").ToolSet,
+ *     BuiltInTools?: typeof import("@microsoft/copilot-sdk").BuiltInTools,
+ *     defineTool?: typeof import("@microsoft/copilot-sdk").defineTool,
  *   },
  *   sessionStateBaseDir?: string,
  *   workingDirectory?: string,
@@ -200,18 +203,19 @@ async function runCopilotSDKSession({
   permissionConfig,
   toolConfig,
   mcpServers,
+  mcpOnly = false,
   webFetchOptions,
   coreLogger,
   sdkModule,
   sessionStateBaseDir,
   workingDirectory = resolveCopilotSDKWorkingDirectory(),
-  agentsBaseDir = path.join(os.tmpdir(), "gh-aw"),
+  agentsBaseDir = defaultCopilotSDKAgentsBaseDir(),
   bare = isCopilotSDKBareMode(process.env.GH_AW_COPILOT_SDK_SERVER_ARGS, logger),
   verification,
 }) {
   // Lazy-require to avoid loading the SDK when it is not needed.
   // The SDK is large and has side-effects on import (worker threads, etc.).
-  const sdk = sdkModule ?? require("@github/copilot-sdk");
+  const sdk = sdkModule ?? require("@microsoft/copilot-sdk");
   const { CopilotClient, RuntimeConnection, approveAll } = sdk;
 
   const startTime = Date.now();
@@ -231,31 +235,35 @@ async function runCopilotSDKSession({
   // Session state directory — mirrors the source path used by unified_session.cjs.
   // /tmp/gh-aw/sandbox/agent/logs/copilot-session-state/{sessionId}/events.jsonl
   // GH_AW_SESSION_STATE_BASE_DIR may be set in tests to redirect writes to an isolated directory.
-  const defaultSessionStateBase = path.join(os.tmpdir(), "gh-aw", "sandbox", "agent", "logs", "copilot-session-state");
+  // Pinned to /tmp/gh-aw (the shared host handoff dir), never os.tmpdir(): TMPDIR may
+  // point at a host-private runtime dir that is not shared with or writable in the sandbox.
+  const defaultSessionStateBase = path.join(TMP_GH_AW_PATH, "sandbox", "agent", "logs", "copilot-session-state");
   const sessionStateBase = sessionStateBaseDir ?? process.env.GH_AW_SESSION_STATE_BASE_DIR ?? defaultSessionStateBase;
 
-  /** @type {ReadonlyArray<NonNullable<import("@github/copilot-sdk").CopilotClientOptions["logLevel"]>>} */
+  /** @typedef {NonNullable<NonNullable<import("@microsoft/copilot-sdk").CopilotClientOptions["observability"]>["logLevel"]>} SDKLogLevel */
+  /** @type {ReadonlyArray<SDKLogLevel>} */
   const VALID_LOG_LEVELS = ["none", "error", "warning", "info", "debug", "all"];
   const rawLogLevel = process.env.COPILOT_SDK_LOG_LEVEL ?? "";
   /**
    * @param {string} value
-   * @returns {value is NonNullable<import("@github/copilot-sdk").CopilotClientOptions["logLevel"]>}
+   * @returns {value is SDKLogLevel}
    */
   const isValidLogLevel = value => {
     /** @type {readonly string[]} */
     const validLogLevels = VALID_LOG_LEVELS;
     return validLogLevels.includes(value);
   };
-  /** @type {import("@github/copilot-sdk").CopilotClientOptions["logLevel"]} */
   const logLevel = isValidLogLevel(rawLogLevel) ? rawLogLevel : "warning";
 
-  const connection = RuntimeConnection.forUri(sdkUri, {
-    connectionToken,
-  });
+  const endpoint = new URL(sdkUri);
+  const port = endpoint.port || (endpoint.protocol === "http:" ? "80" : "");
+  if (!port || !["http:", "tcp:"].includes(endpoint.protocol)) {
+    throw new Error("COPILOT_SDK_URI must identify a plaintext HTTP endpoint or a TCP endpoint with an explicit port");
+  }
   const client = new CopilotClient({
-    connection,
-    workingDirectory,
-    logLevel,
+    mode: "coding-agent",
+    runtime: RuntimeConnection.forTcp(endpoint.hostname.replace(/^\[|\]$/g, ""), Number(port), { connectionToken }),
+    observability: { logLevel },
   });
   /** @type {any} */
   let session = null;
@@ -263,6 +271,7 @@ async function runCopilotSDKSession({
   let eventsStream = null;
   let clientStarted = false;
   let toolDenialCount = 0;
+  let workflowToolPermissionDenied = false;
   let assistantTurnCount = 0;
   let contentFiltered = false;
   /** @type {any} */
@@ -341,6 +350,7 @@ async function runCopilotSDKSession({
    * @param {string} reason
    */
   function recordToolDenial(reason) {
+    workflowToolPermissionDenied = true;
     toolDenialCount += 1;
     log(`tool denial ${toolDenialCount}/${maxToolDenialsLimit}: ${reason}`);
     if (catastrophicToolDenialsTriggered || toolDenialCount < maxToolDenialsLimit) {
@@ -379,13 +389,14 @@ async function runCopilotSDKSession({
 
     /**
      * Build the session on-permission handler from configuration input.
-     * @type {import("@github/copilot-sdk").PermissionHandler}
+     * @type {import("@microsoft/copilot-sdk").PermissionHandler}
      */
     const onPermissionRequest = buildCopilotSDKPermissionHandler(permissionConfig, approveAll, {
       coreLogger,
       logger: log,
       onDenied: requestSummary => recordToolDenial(`permission denied: ${requestSummary}`),
       workspaceRoot: workingDirectory,
+      mcpOnly,
     });
     const toolCallBudget = buildCopilotSDKToolCallBudget(toolConfig?.maxToolCalls, event => {
       writeDriverEvent(event.exhausted ? "guard.tool_call_budget_exceeded" : "guard.tool_call_budget_debit", event);
@@ -407,7 +418,7 @@ async function runCopilotSDKSession({
     // the harness could not resolve is absent from the map and inherits the session model.
     const resolvedSubagentModels = parseSubagentModelsJson(process.env.GH_AW_COPILOT_SDK_SUBAGENT_MODELS);
     const unavailableModels = [];
-    const customAgents = loadCopilotSDKCustomAgents(workingDirectory, agentsBaseDir, log).map(agent => {
+    const customAgents = (mcpOnly ? [] : loadCopilotSDKCustomAgents(agentsBaseDir, log)).map(agent => {
       if (!agent.model || agent.model.trim().toLowerCase() === "inherited") return { ...agent, model: sessionModel || undefined };
       if (Object.prototype.hasOwnProperty.call(resolvedSubagentModels, agent.name)) {
         const resolved = resolvedSubagentModels[agent.name];
@@ -422,10 +433,14 @@ async function runCopilotSDKSession({
       return { ...agent, model: sessionModel || undefined };
     });
     // The harness supplies the requested model (`auto` on routed runs); the session model is the expectation.
+    const durableSession = openDurableSession("copilot");
+    const restoredSessionId = durableSession?.id;
+    const durableSessionId = durableSession?.copilotSession();
     const modelObserver = createCopilotSDKModelObserver({
       configuredModel: process.env.GH_AW_COPILOT_CONFIGURED_MODEL || "",
       expectedModel: sessionModel || "",
       providerConfig,
+      sessionId: restoredSessionId,
       sessionDirs: [...new Set([sessionStateBase, ...copilotSessionStateDirectories()])],
       logger: log,
     });
@@ -434,25 +449,26 @@ async function runCopilotSDKSession({
     const skillsStat = fs.lstatSync(skillsDirectory, { throwIfNoEntry: false });
     if (skillsStat && !skillsStat.isDirectory()) throw new Error(`Staged Copilot skills must be a directory: ${skillsDirectory}`);
     const skillDirectories = skillsStat ? [skillsDirectory] : [];
-    /** @type {import("@github/copilot-sdk").SessionConfig} */
+    /** @type {import("@microsoft/copilot-sdk").CreateSessionOptions} */
     const sessionConfig = {
       model: sessionModel || undefined,
-      ...(sdkReasoningEffort ? { reasoningEffort: sdkReasoningEffort } : {}),
-      providers,
-      models: providerModels,
+      inference: { reasoningEffort: sdkReasoningEffort, providers, models: providerModels },
       workingDirectory,
-      skipCustomInstructions: bare,
-      customAgents,
+      instructions: { skipCustomInstructions: bare },
+      agents: { definitions: customAgents },
       enableConfigDiscovery: false,
-      skillDirectories,
-      ...(skillDirectories.length ? { enableSkills: true } : {}),
-      ...(mcpServers === undefined ? {} : { mcpServers }),
-      onPermissionRequest,
-      ...(toolCallBudget ? { hooks: { onPreToolUse: toolCallBudget.onPreToolUse } } : {}),
-      ...buildCopilotSDKSessionToolConfig(toolConfig, sdk, webFetchOptions),
+      skills: { directories: skillDirectories, ...(skillDirectories.length ? { enabled: true } : {}) },
+      ...(mcpServers === undefined ? {} : { mcp: { servers: mcpServers } }),
+      permissions: { onRequest: onPermissionRequest },
+      ...(toolCallBudget ? { hooks: { handlers: { onPreToolUse: toolCallBudget.onPreToolUse } } } : {}),
+      tools: buildCopilotSDKSessionToolConfig(toolConfig, sdk, { ...webFetchOptions, mcpOnly }),
     };
     log(`creating session with model="${sessionConfig.model || "(none)"}" providers=${providers?.length ?? 0} models=${providerModels?.length ?? 0}`);
-    session = await client.createSession(sessionConfig);
+    session = restoredSessionId
+      ? await client.resumeSession(restoredSessionId, { ...sessionConfig, allowTranscriptRecovery: false })
+      : await client.createSession({ ...sessionConfig, ...(durableSessionId ? { sessionId: durableSessionId } : {}) });
+    durableSession?.save(session.sessionId);
+    durableSession?.started(session.sessionId);
     log(`session created: sessionId=${session.sessionId}`);
     verification.sessionId = session.sessionId;
     modelObserver.setSessionId(session.sessionId);
@@ -655,7 +671,7 @@ async function runCopilotSDKSession({
     // Preserve any output collected before the error so the harness can use it
     // for retry decisions and diagnostics.
     return {
-      exitCode: 1,
+      exitCode: workflowToolPermissionDenied ? WORKFLOW_TOOL_PERMISSION_DENIED_EXIT_CODE : 1,
       output: hasOutput ? output : failure.message,
       hasOutput,
       durationMs,

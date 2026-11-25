@@ -23,6 +23,55 @@ interface BaseSafeOutputItem {
   integrity?: string;
 }
 
+type IssueArtifactType = "generic" | "link" | "plan" | "embedded_html";
+
+interface AddSecurityAdvisoryCommentItem extends BaseSafeOutputItem {
+  type: "add_security_advisory_comment";
+  ghsa_id: string;
+  body: string;
+}
+
+interface CreateSecurityAdvisoryItem extends BaseSafeOutputItem {
+  type: "create_security_advisory";
+  summary: string;
+  description: string;
+  severity?: "critical" | "high" | "medium" | "low";
+  cwe_ids?: string[];
+  vulnerabilities: Array<{
+    package: {
+      ecosystem: "rubygems" | "npm" | "pip" | "maven" | "nuget" | "composer" | "go" | "rust" | "erlang" | "actions" | "pub" | "other" | "swift";
+      name?: string | null;
+    };
+    vulnerable_version_range?: string | null;
+    patched_versions?: string | null;
+    vulnerable_functions?: string[] | null;
+  }>;
+}
+
+interface IssueArtifactMetadata {
+  /** Artifact format; defaults to "generic" when omitted. */
+  type?: IssueArtifactType;
+  name: string;
+}
+
+type IssueArtifactBodyInput = IssueArtifactMetadata & { body: string; path?: never };
+
+/** MCP paths are absolute workspace or /tmp/gh-aw/agent files; sensitive publication sources are denied. */
+type IssueArtifactInput = IssueArtifactBodyInput | (IssueArtifactMetadata & { path: string; body?: never });
+
+interface IssueArtifact extends IssueArtifactMetadata {
+  /** Validated artifact format with the default applied. */
+  type: IssueArtifactType;
+  body: string;
+}
+
+interface CreatedIssueArtifact {
+  /** Per-issue artifact number returned by GitHub. */
+  number: number;
+  /** Artifact page URL, when returned by GitHub. */
+  url: string | undefined;
+}
+
 /**
  * JSONL item for creating a GitHub issue
  */
@@ -32,6 +81,8 @@ interface CreateIssueItem extends BaseSafeOutputItem {
   title: string;
   /** Issue body content */
   body: string;
+  /** Optional artifacts to attach after creating the issue. */
+  artifacts?: IssueArtifactBodyInput[];
   /** Optional labels to add to the issue */
   labels?: string[];
   /** Optional issue fields to set after creating the issue */
@@ -284,6 +335,8 @@ interface AddReviewerItem extends BaseSafeOutputItem {
  */
 interface UpdateIssueItem extends BaseSafeOutputItem {
   type: "update_issue";
+  /** Optional artifacts to create or update by name on the target issue. */
+  artifacts?: IssueArtifactBodyInput[];
   /** Optional new issue status */
   status?: "open" | "closed";
   /** Optional new issue title */
@@ -518,7 +571,16 @@ interface ResolvePullRequestReviewThreadItem extends BaseSafeOutputItem {
 /**
  * Union type of all possible safe output items
  */
+/** Metadata only; not a completed task or proof of resumed work. */
+interface RequestContinuationItem extends BaseSafeOutputItem {
+  type: "request_continuation";
+  message: string;
+}
+
 type SafeOutputItem =
+  | RequestContinuationItem
+  | AddSecurityAdvisoryCommentItem
+  | CreateSecurityAdvisoryItem
   | CreateIssueItem
   | CreateDiscussionItem
   | UpdateDiscussionItem
@@ -565,8 +627,16 @@ interface SafeOutputItems {
 
 // === Export JSONL types ===
 export {
+  AddSecurityAdvisoryCommentItem,
+  CreateSecurityAdvisoryItem,
   // JSONL item types
   BaseSafeOutputItem,
+  RequestContinuationItem,
+  IssueArtifactType,
+  IssueArtifactInput,
+  IssueArtifactBodyInput,
+  IssueArtifact,
+  CreatedIssueArtifact,
   CreateIssueItem,
   CreateDiscussionItem,
   UpdateDiscussionItem,

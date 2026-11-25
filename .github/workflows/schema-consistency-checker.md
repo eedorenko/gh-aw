@@ -4,15 +4,25 @@ description: Detects inconsistencies between JSON schema, implementation code, a
 on:
   schedule: daily
   workflow_dispatch:
+    inputs:
+      level:
+        description: Routing level for a manual run
+        type: choice
+        options: [router/economy, router/balanced, router/robust]
+        default: router/economy
+concurrency:
+  job-discriminator: ${{ github.run_id }}
 permissions:
   contents: read
   discussions: read
   issues: read
   pull-requests: read
-model: openai/gpt-6.1-sol
+  copilot-requests: write
 engine:
   id: codex
-  model-provider: openai
+  model-provider: github
+  # Scheduled runs have no inputs and keep economy.
+  model: ${{ inputs.level || 'router/economy' }}
 max-ai-credits: 1500
 tools:
   cli-proxy: true
@@ -34,7 +44,7 @@ imports:
       expires: 1d
   - shared/otlp.md
 pre-agent-steps:
-  - name: Precompute schema analysis data
+  - name: Pre-compute schema analysis data
     run: |
       set -e
       mkdir -p /tmp/gh-aw/agent

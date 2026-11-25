@@ -24,7 +24,8 @@ Actions expressions use the native `actionslanguageservice` grammar and quote-aw
 | `ImportError` | struct | Structured error for import resolution failures |
 | `ImportCycleError` | struct | Structured error for circular import chains |
 | `FormattedParserError` | struct | Pre-formatted parser error with display-ready message |
-| `ImportsResult` | struct | Result of `ProcessImportsFromFrontmatterWithSource` |
+| `ImportsResult` | struct | Result of `ProcessImportsFromFrontmatterWithSource`, including connector registrations |
+| `ConnectorImport` | struct | Import source and its connector registrations after input substitution |
 | `ImportInputDefinition` | struct | Input definition from an imported workflow fragment |
 | `ImportSpec` | struct | Resolved import specification (path, ref, optional flag) |
 | `GitHubURLType` | string alias | Classifies a GitHub URL (`tree`, `blob`, `raw`, `run`, `pr`, etc.) |
@@ -40,6 +41,7 @@ Actions expressions use the native `actionslanguageservice` grammar and quote-aw
 | `FileReader` | func type | `func(filePath string) ([]byte, error)` — abstraction for file reading |
 | `InlineSubAgent` | struct | A single inline sub-agent definition extracted via the `## agent: \`name\`` syntax |
 | `InlineSkill` | struct | A single inline skill definition extracted via the `## skill: \`name\`` syntax |
+| `MarkdownMetadataBlock` | struct | Authored document or inline agent/skill metadata frontmatter, including its source and parse error |
 | `BodyLevelImport` | struct | A `{{#runtime-import}}` directive found in the markdown body, with `Path` (workspace-root-relative) and `Optional` flag |
 | `PromptImportEntry` | struct | A single import contribution to prompt assembly; either a runtime-import path or inlined markdown |
 | `ValidationError` | struct | Input validation error embedding `validationerror.Payload`; detectable via `errors.As(err, &validationerror.ValidationError)` |
@@ -56,6 +58,9 @@ Actions expressions use the native `actionslanguageservice` grammar and quote-aw
 | `ExtractMarkdownSection` | `func(content, sectionName string) (string, error)` | Extracts a named `##` section from markdown |
 | `ExtractWorkflowNameFromMarkdownBody` | `func(markdownBody, virtualPath string) (string, error)` | Derives the workflow name from the first `#` heading |
 | `ExtractWorkflowNameFromContent` | `func(content, virtualPath string) (string, error)` | Combines frontmatter extraction and name derivation |
+| `ExtractMarkdownMetadataBlocks` | `func(content string) []MarkdownMetadataBlock` | Extracts document-level and inline agent/skill metadata blocks, stopping at each first closing fence |
+| `CompileMarkdownMetadata` | `func(source string) (any, error)` | Parses bounded YAML metadata into JSON-compatible values without runtime YAML parsing |
+| `CompileAgentMetadata` | `func(source string) (any, error)` | Compiles agent metadata and retains only the supported `name`, `model`, and `tools` fields when the value is a mapping |
 
 #### Import Processing
 
@@ -64,6 +69,7 @@ Actions expressions use the native `actionslanguageservice` grammar and quote-aw
 | `ProcessImportsFromFrontmatterWithSource` | `func(frontmatter map[string]any, baseDir string, cache *ImportCache, ...) (*ImportsResult, error)` | Resolves all `@import` directives in frontmatter, merging imported configs |
 | `ParseImportDirective` | `func(line string) *ImportDirectiveMatch` | Parses a single `@import` or `@include` line |
 | `NewImportCache` | `func(repoRoot string) *ImportCache` | Creates a new import cache rooted at the repository |
+| `(*ImportCache).SetReadOnly` | `func(readOnly bool)` | Prevents cache writes and downloads while allowing existing cached content to be read |
 | `(*ImportCache).ReadFile` | `func(path string) ([]byte, error)` | Reads a cache path through confined directory handles; rejects symlinks and non-regular files |
 | `ExpandIncludesWithManifest` | `func(content, baseDir string, extractTools bool) (string, []string, error)` | Expands `@include` directives in markdown body and returns included file paths |
 | `ExpandIncludesForEngines` | `func(content, baseDir string) ([]string, error)` | Returns engine names referenced via `@include` |
@@ -77,6 +83,19 @@ truncating existing link targets. Use `ImportCache.ReadFile` or the parser's
 lookup and must not be read with an unconfined filesystem reader. On WebAssembly
 and Plan 9, confined disk caching is unavailable; browser virtual-file reads
 remain unchanged.
+
+#### Connector Imports
+
+Connector registrations are retained in `ImportsResult.Connectors` after import
+schema and `with` input substitution. Imported connectors register services but
+do not select capabilities on behalf of the consuming workflow. Connector
+triggers are recognized only when a registration declares an `on` list.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `HasConnectorTriggers` | `func(frontmatter map[string]any) bool` | Reports whether a connector registration declares trigger events. |
+| `GetSafeOutputFieldKeys` | `func() ([]string, error)` | Returns sorted safe-output operation and metadata field names reserved by the built-in grammar. |
+| `RemoveConnectorDocumentation` | `func(content string) string` | Removes valid connector authoring documentation from a workflow body while retaining newlines; call before input substitution. Invalid or unrelated comments remain. |
 
 #### GitHub URL Parsing
 
@@ -114,10 +133,9 @@ remain unchanged.
 |----------|-----------|-------------|
 | `ExtractMCPConfigurations` | `func(frontmatter map[string]any, serverFilter string) ([]RegistryMCPServerConfig, error)` | Extracts all MCP server configurations from frontmatter |
 | `ParseMCPConfig` | `func(toolName string, mcpSection any, toolConfig map[string]any) (RegistryMCPServerConfig, error)` | Parses a single MCP server entry |
+| `ParseMCPAuthConfig` | `func(value any, toolName string) (*types.MCPAuthConfig, error)` | Parses and validates HTTP MCP authentication fields, including direct GitHub OIDC and Azure OIDC configuration. |
 | `IsMCPType` | `func(typeStr string) bool` | Validates an MCP transport type string |
 | `IsSimpleSecretExpression` | `func(value string) bool` | Reports whether `value` is a direct `${{ secrets.NAME }}` GitHub Actions reference without additional expression operators |
-| `ParseLinearToolsets` | `func(value any) ([]string, error)` | Validates and expands `tools.linear.toolsets` (a name or array of names) into the corresponding sorted, deduplicated MCP tool names; `"all"` expands to `["*"]` |
-| `ValidateLinearAllowedForToolsets` | `func(allowed, toolsetTools []string) error` | Checks that every `tools.linear.allowed` glob pattern matches at least one tool in the configured toolsets (the `"*"` toolset accepts any pattern) |
 
 #### Schedule Parsing
 
@@ -223,6 +241,18 @@ Inline skills are secondary skill definitions embedded in the same markdown file
 | `ReconstructWorkflowFile` | `func(frontmatterYAML, markdownContent string) (string, error)` | Reconstructs a complete workflow file string from frontmatter YAML and markdown content |
 | `EnsureToolsSection` | `func(frontmatter map[string]any) map[string]any` | Ensures `tools` exists and is a map in frontmatter |
 | `QuoteCronExpressions` | `func(yamlContent string) string` | Ensures schedule cron values in YAML are quoted |
+
+#### Additional Exported Functions
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `ActionPinSourceVersions` | `func(content []byte) map[string]string` | Collects inline version labels for SHA-pinned action references in YAML. |
+| `LegacyModelRoutingWarning` | `func(frontmatter map[string]any) string` | Describes the authored main-agent model-routing declaration, excluding synthesized router settings. |
+| `ImportCache.ResolvedLocalFiles` | `func() []string` | Returns canonical filenames resolved in local-only mode, independently of display paths and section selectors. |
+| `ImportCache.SetLocalOnlyRoot` | `func(root string)` | Enables local-only import resolution, rejecting remote dependencies and local imports outside the configured root. |
+| `ExtractSubAgentModels` | `func(body string) []SubAgentModel` | Reads model declarations from inline sub-agent frontmatter; malformed frontmatter is handled as an advisory. |
+| `ParseMCPCACertFile` | `func(config map[string]any, serverType, name string) (string, error)` | Validates and returns an optional per-server CA certificate path from MCP configuration. |
+| `ValidateMCPCACertFile` | `func(value string) error` | Validates an author-controlled CA certificate path before it is used by generated shell content. |
 
 ### Constants / Variables
 
@@ -379,7 +409,7 @@ This appendix is generated from the current non-test Go source files in this pac
 | `import_cache.go` | `(*ImportCache).Set` | `func (*ImportCache).Set(owner, repo, path, sha string, content []byte) (string, error)` | Set stores a new cache entry by saving the content to the cache directory sha parameter should be the resolved commit SHA |
 | `import_error.go` | `(*ImportCycleError).Error` | `func (*ImportCycleError).Error() string` | Implements the `error` interface for `ImportCycleError`. |
 | `import_error.go` | `(*FormattedParserError).Error` | `func (*FormattedParserError).Error() string` | Implements the `error` interface for `FormattedParserError`, returning the pre-formatted message. |
-| `import_error.go` | `(*FormattedParserError).Unwrap` | `func (*FormattedParserError).Unwrap() error` | Exported function or method declared in `import_error.go`. |
+| `import_error.go` | `(*FormattedParserError).Unwrap` | `func (*FormattedParserError).Unwrap() error` | Returns the optional underlying cause for error-chain inspection with `errors.Is` and `errors.As`. |
 | `validation_error.go` | `(*ValidationError).Error` | `func (*ValidationError).Error() string` | Implements the `error` interface for `ValidationError`, formatting field/reason/suggestion into a message. |
 | `schema_validation.go` | `IsImportSafeSharedWorkflowOn` | `func IsImportSafeSharedWorkflowOn(onValue any) bool` | IsImportSafeSharedWorkflowOn validates whether an imported `on:` block is restricted to safe shared-workflow triggers. |
 
@@ -387,7 +417,7 @@ This appendix is generated from the current non-test Go source files in this pac
 
 ## Source Synchronization
 
-Reviewed against recent source updates on 2026-07-24; no additional public-contract deltas were identified beyond the sections above. Re-verified on 2026-08-14; no public-contract changes since the last review (only internal schema-suggestions refactoring landed). Re-verified on 2026-08-29; no public-contract deltas since the last review. Re-verified on 2026-09-03; no public-contract deltas since the last review. Re-verified on 2026-09-08; added `ParseLinearToolsets`, `ValidateLinearAllowedForToolsets`, and `IsSimpleSecretExpression` (Linear toolset support and secret-expression validation) to the MCP Configuration public API table, which were previously undocumented. Re-verified on 2026-09-13; no public-contract deltas since the last review. Re-verified on 2026-09-23; added the previously undocumented `ValidationError` type and `NewValidationError` constructor to the Public API section, added the three exported `Error() string` methods (`*ImportCycleError`, `*FormattedParserError`, `*ValidationError`) to the export-coverage appendix, and removed duplicate appendix rows for `ParseLinearToolsets`/`ValidateLinearAllowedForToolsets`/`IsSimpleSecretExpression` that were already documented above; corrected the export-coverage summary counts to match current source (26 types, 107 functions/methods, 22 additional appendix symbols). Re-verified on 2026-09-28; no public-contract deltas since the last review.
+Reviewed against recent source updates on 2026-07-24; no additional public-contract deltas were identified beyond the sections above. Re-verified on 2026-08-14; no public-contract changes since the last review (only internal schema-suggestions refactoring landed). Re-verified on 2026-08-29; no public-contract deltas since the last review. Re-verified on 2026-09-03; no public-contract deltas since the last review. Re-verified on 2026-09-08; documented Linear toolset support and secret-expression validation. Re-verified on 2026-09-13; no public-contract changes since the last review. Re-verified on 2026-09-23; added the `ValidationError` type and `NewValidationError` constructor to the Public API section, added the exported `Error() string` methods (`*ImportCycleError`, `*FormattedParserError`, `*ValidationError`) to the export-coverage appendix, and corrected the export-coverage summary counts to match current source (26 types, 107 functions/methods, 22 additional appendix symbols). Re-verified on 2026-09-28; no public-contract deltas since the last review. Re-verified on 2026-11-10; documented `MarkdownMetadataBlock`, metadata extraction/compilation functions, and `ImportCache.SetReadOnly`. Re-verified on 2026-11-12; removed obsolete MCP API entries not defined by the package.
 
 ---
 

@@ -44,9 +44,11 @@ func NewCopilotEngine() *CopilotEngine {
 			capabilities: EngineCapabilities{
 				ToolsAllowlist:       true,
 				MCP:                  true,
+				AutoMCPCLI:           true,
 				MaxTurns:             true,  // AWF max-turns is supported for Copilot runs
 				MaxContinuations:     true,  // Copilot CLI supports --autopilot with --max-autopilot-continues
 				WebSearch:            false, // Offline BYOK mode disables native web tools
+				WebFetchFallback:     true,  // Both CLI and SDK run in BYOK mode
 				BareMode:             true,  // Copilot CLI supports --no-custom-instructions
 				BashCommandAllowlist: true,  // Copilot enforces tools.bash allowlist via --allow-tool shell(cmd)
 				Plugins:              true,  // Copilot CLI supports Agent Plugins
@@ -193,6 +195,9 @@ func (e *CopilotEngine) GetFirewallLogsCollectionStep(workflowData *WorkflowData
 	// This ensures session files are in /tmp/gh-aw/ where secret redaction can scan them
 	sessionCopyStep := generateCopilotSessionFileCopyStep()
 	steps = append(steps, sessionCopyStep)
+	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Durable != nil {
+		steps = append(steps, durableSessionStep(workflowData, "trim-copilot"))
+	}
 
 	return steps
 }

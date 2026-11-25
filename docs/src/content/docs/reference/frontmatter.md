@@ -49,9 +49,48 @@ An optional emoji to represent the workflow visually, for example in listings an
 emoji: "🤖"
 ```
 
+### Invocation Skip Questions
+
+> [!WARNING]
+> `skip-if-decision` is experimental. Nonempty lists emit a compile-time
+> warning; configuration and behavior may change without deprecation.
+
+An optional top-level `skip-if-decision` list of up to 64 questions evaluated inside AWF before each otherwise eligible agent invocation, including initial execution, retries, resumes, and continuations. The gate applies to all built-in engines and declarative engines, including command-based, custom-harness, and durable execution paths. Nonempty lists are incompatible with declarative `protected-session-capture`; compilation rejects this combination to preserve recorder isolation and verified session ingestion.
+
+Questions and referenced files are screened for known credential patterns and
+configured secret values before transmission. A match withholds that question
+as `unknown` with `sensitive_content_blocked`. Screening is heuristic; do not
+reference confidential files merely because they are inside an allowed path.
+Structured file evidence is still model-readable untrusted data, not an
+instruction-isolation boundary.
+
+```aw wrap
+skip-if-decision:
+  - Is there no actionable work remaining in @context/task.md?
+  - Has @reports/progress.md established that further execution is unnecessary?
+```
+
+Each question returns `deny` when its skip condition is established, `allow` when execution is recommended, or `unknown` when it abstains. Any `deny` skips the invocation; otherwise, any `allow` or all `unknown` preserves the execution path selected by the deterministic harness. An absent or empty list preserves existing behavior. Decisions cannot override retry limits, budgets, deadlines, or nonrecoverable failures.
+
+Questions share one Decisions request through the existing AWF API proxy, using `gpt-6-luna-decisions` on a configured Copilot provider, or `gpt-6-luna` when only OpenAI is configured. No direct-provider fallback or additional credentials are used. Unavailable models or APIs, timeouts, malformed responses, and file-read failures abstain without decision retries. Decision requests remain subject to the proxy's model and budget policies and its existing usage accounting.
+
+Runtime `@file` references resolve relative to `engine.cwd`, or the workspace when unset. They are read afresh before each invocation using the existing guarded regular-file reader: only workspace and `/tmp/gh-aw/agent` paths are eligible; symlinks, hardlinks, sensitive paths, and oversized context are rejected. Each question's imports have a 512 KiB ceiling including question text, evidence metadata, and JSON escaping; each read receives the remaining budget.
+
+The entire serialized Decisions request is capped at 400,000 UTF-8 bytes,
+approximately 100,000 tokens at four bytes per token. This is a byte-based
+estimate, not tokenizer-exact accounting, and includes request framing,
+questions, choices, and escaped evidence. Questions that would exceed the
+remaining budget become `unknown`; smaller questions can still be evaluated.
+Unreadable context also makes only its question `unknown`. Paths use letters,
+digits, `_`, `.`, `/`, and `-`; Actions expressions are not supported in questions.
+
+Decision metadata is retained in the existing harness retry artifact and as typed `harness.decision` events in the agent's unified session. Events contain one-based question indices, outcomes, sanitized error codes, latency, the proposed attempt, and `avoidedInvocation`; they never retain file contents or raw provider diagnostics. `gh aw audit --json` exposes this history under `retries.decisions` and counts avoided invocations separately from retries. A denied invocation records a noop if no terminal safe-output exists. The gate does not apply to threat detection or evals.
+
 ### Labels (`labels:`)
 
 Optional array of strings for categorizing workflows by purpose, team, or functionality. Labels appear in `gh aw status` output as `[automation ci diagnostics]` (or a JSON array in `--json` mode) and can be filtered with `gh aw status --label automation`.
+
+Each label name is limited to 50 characters. The compiler rejects longer names, including static labels configured for safe outputs.
 
 ```yaml wrap
 labels: ["automation", "ci", "diagnostics"]
@@ -93,7 +132,7 @@ if: github.event_name == 'push'
 ### Token Broker (`token-broker:`)
 
 > [!WARNING]
-> Token broker authentication is experimental. Configuration and behavior may change without deprecation. Compiling a workflow that enables either capability emits a warning.
+> Token broker authentication is experimental. Configuration and behavior may change without deprecation. Compiling a workflow that enables a broker capability emits a warning.
 
 An optional object that independently enables OIDC-authenticated Copilot credential exchange.
 
@@ -102,7 +141,23 @@ token-broker:
   copilot-task: true
 ```
 
-Select `copilot-request`, `copilot-task`, or both independently. Brokered request authentication is supported in threat-detection and evals jobs; main agent inference remains blocked pending renewable AWF credential support. Request exchanges include the selected LLM inference provider ID. Jobs using brokered credentials run an unconditional post-step to invalidate credentials for that job. `copilot-request` cannot be combined with `permissions.copilot-requests: write`. The endpoint comes from the `GH_AW_TOKEN_BROKER_URL` Actions variable or secret at runtime, not from workflow source or the compiler environment. Missing configuration or failed credential exchange blocks the affected operation instead of falling back to existing credentials. See [enterprise token broker configuration](/gh-aw/reference/enterprise-configuration/#oidc-token-broker).
+Select `copilot-request`, `copilot-task`, or both independently. Brokered request authentication is supported in threat-detection and evals jobs; main agent inference remains blocked pending renewable AWF credential support. Request exchanges include the selected LLM inference provider ID. Jobs using brokered credentials run an unconditional post-step to invalidate credentials for that job. `copilot-request` cannot be combined with `permissions.copilot-requests: write`. The endpoint comes from the `GH_AW_TOKEN_BROKER_URL` Actions secret at runtime, not from workflow source or the compiler environment. Missing configuration or failed credential exchange blocks the affected operation instead of falling back to existing credentials. See [enterprise token broker configuration](/gh-aw/reference/enterprise-configuration/#oidc-token-broker).
+
+For GitHub API authentication, add `token-broker:` under `tools.github`, `safe-outputs`, or both. An empty value means `true`; explicit `false` disables the broker for that section.
+
+```aw
+tools:
+  github:
+    token-broker:
+safe-outputs:
+  token-broker:
+  add-comment:
+```
+
+These settings independently request the `github-app` broker capability; neither requires a top-level `token-broker` setting. Do not combine a section's enabled `token-broker` with its `github-app` or `github-token`. A top-level `github-app` does not override the section's broker selection. GitHub tool authentication requires an enabled agent sandbox with AWF environment-exclusion support to keep OIDC bootstrap credentials out of the agent. The broker controls installation, repository scope, permissions, and lifetime through deployment policy, not caller-supplied scopes; GitHub tool credentials must be read-only. Each consuming job exchanges its own credential and invalidates it during cleanup. GitHub consumers receive a fixed token for that job; this does not provide automatic renewal for long-running operations.
+
+> [!CAUTION]
+> Custom steps, jobs, and actions in a brokered job run with that job's full credential authority. This includes `pre-steps`, `steps`, `pre-agent-steps`, `post-steps`, `jobs`, and `safe-outputs.steps`. `safe-outputs.jobs` do not inherit broker authentication; they use their own configured credentials. These steps can read the brokered token. They can also use the job-wide `id-token: write` permission to request their own credentials from the broker. Cleanup only limits use after the job ends. Review this code whenever it changes. Pin third-party actions to full commit SHAs. Never let agent output or untrusted input choose code, actions, refs, or target repositories. Keep code that does not need credentials in separate jobs without `id-token: write`. See [security considerations](/gh-aw/specs/token-broker-specification/#appendix-c-security-and-privacy-considerations-normative).
 
 ### Imports (`imports:`)
 
@@ -238,9 +293,28 @@ engine:
 
 See [Harness Retry and Post-result Watchdog Policy](/gh-aw/reference/engines/#harness-retry-and-post-result-watchdog-policy) for defaults, units, and the equivalent `GH_AW_HARNESS_*` environment variables.
 
-### Model Routing (`engine.model-routing:`)
+<span id="model-routing-model-router-enginemodel-routing"></span>
 
-Enables experimental per-run model and reasoning-effort selection for the Copilot, Claude, Codex, and pi engines when they use GitHub Copilot inference, with the AWF firewall. Requires `goal` (`cost` or `cost-speed`) and `mode` (`economy`, `balanced`, `robust`, or `auto`). The optional `allowed-models` list takes exact model names and limits the router's candidates for the main agent; it is not a request policy. Put patterns such as `gpt-*` in [`models.allowed` or `models.blocked`](/gh-aw/reference/glossary/#model-policy-modelsallowed-modelsblocked) instead. Overrides the fixed `engine.model` and effort settings. See [Model Routing](/gh-aw/reference/model-routing/) for value meanings, requirements, sub-agent constraints, known limitations, and logs.
+### Model Routing
+
+Set the top-level `model` to `router` to let each task determine the routing level, or choose `router/economy`, `router/balanced`, or `router/robust` for a fixed level:
+
+```aw wrap
+model: router/economy
+```
+
+To narrow the main agent's choices without restricting sub-agents, add a [shortlist](/gh-aw/reference/model-routing/#a-shortlist-of-models) alongside a literal router value. To opt out of [default routing](/gh-aw/reference/model-routing/#default-routing-for-workflows-without-a-model) without pinning a model, omit `model` and set top-level `model-routing: false`.
+
+### Adaptive Routing (`adaptive-routing:`)
+
+Set `adaptive-routing: observe` on a routed workflow that enables `tools.repo-memory` to record each run's model and effort, whether it completed its task, and what it cost, on the `memory/adaptive-routing/<workflow>` branch. The workflow keeps running the router's ordinary pick. `false` turns it off, including a repository default from `aw.json`. See [Adaptive Routing](/gh-aw/reference/adaptive-routing/).
+
+```aw wrap
+model: router
+tools:
+  repo-memory: true
+adaptive-routing: observe
+```
 
 ### Engine Driver (`engine.driver:`)
 
@@ -277,6 +351,10 @@ network:
     - python               # Python/PyPI ecosystem
     - "api.example.com"    # Custom domain
 ```
+
+### AWF Version (`sandbox.agent.version`)
+
+Selects a pinned AWF release. Installation verifies the release's checksum manifest against a trusted SHA256 pin, then verifies the downloaded bundle or binary. This applies to AWF v0.29.5 and later as well as earlier releases; installation does not query GitHub release attestations. Default AWF installation on GitHub Enterprise Cloud (`*.ghe.com`) requires no additional github.com token or version override. See [AWF checksum pins](/gh-aw/reference/sandbox/#release-integrity-sandboxagentchecksums-sha256) for custom versions.
 
 ### Tools (`tools:`)
 
@@ -402,6 +480,8 @@ safe-outputs:
 
 `report-failed-jobs` also accepts a GitHub Actions expression that resolves to a boolean. When omitted, it defaults to `true`.
 
+Failed custom prerequisites can be reported even when their failure skips the agent, provided activation succeeded and the run was not cancelled or stopped by the AI Credits API quota guardrail. The failed prerequisite still blocks agent execution; intentionally skipped or cancelled prerequisites do not trigger this reporting path.
+
 Custom safe-output jobs are defined under `safe-outputs.jobs:`. They run after the agent completes and can expose a custom safe-output tool to the agent. The optional `output` field is the success message returned to the agent:
 
 ```yaml wrap
@@ -455,7 +535,15 @@ timeout-minutes: 30                  # Agentic step timeout, defaults to 20 minu
 | `ubuntu-24.04` / `ubuntu-22.04` | ✅ Supported. |
 | `ubuntu-24.04-arm` | ✅ Supported. Linux ARM64 runner. |
 | `macos-*` | ❌ Not supported. Docker is unavailable on macOS runners (no nested virtualization). See [FAQ](/gh-aw/reference/faq/). |
-| `windows-*` | ❌ Not supported. AWF requires Linux. |
+| `windows-latest` | Framework Bash steps execute in Ubuntu WSL; see [Windows runner execution](#windows-runner-execution). |
+
+#### Windows runner execution
+
+For the literal `runs-on: windows-latest`, the compiler wraps POSIX steps in built-in framework jobs, including the agent job, with PowerShell launchers that execute Bash in Ubuntu WSL. Native Windows Actions remain on the host. Unrelated custom jobs and other Windows runner labels do not receive this adapter.
+
+The runner must provide working WSL2. Generated setup selects or installs Ubuntu, installs Linux tools and Docker, and installs the Linux Node.js version selected by `actions/setup-node`. Setup fails if WSL2 or the required runtime cannot be initialized. Workspace, runner temporary paths, and GitHub command files are mapped into WSL; `/tmp/gh-aw` is shared through the runner's temporary directory for artifact collection.
+
+This adapter provides a Linux execution environment for framework commands; it does not make the agent a native Windows process. Linux remains the recommended runner, and this compiler behavior does not establish end-to-end availability for every Windows configuration.
 
 ### Workflow Concurrency Control (`concurrency:`)
 
@@ -473,7 +561,7 @@ env:
 Environment variables can be defined at multiple scopes (workflow, job, step, engine, safe-outputs, etc.) with clear precedence rules. See [Environment Variables](/gh-aw/reference/environment-variables/) for complete documentation on all 13 env scopes and precedence order.
 
 > [!WARNING]
-> Do not use `${{ secrets.* }}` expressions in the workflow-level `env:` section. Environment variables defined here are passed directly to the agent container, which means secret values would be visible to the AI model. In strict mode, this is a compilation error. In non-strict mode, it emits a warning.
+> Do not use credential expressions such as `${{ secrets.* }}`, `${{ github.token }}`, or `${{ toJSON(github.*) }}` in the workflow-level `env:` section. Environment variables defined here are passed directly to the agent container, which means secret values would be visible to the AI model. In strict mode, this is a compilation error. In non-strict mode, it emits a warning.
 >
 > Use engine-specific secret configuration instead of the `env:` section to pass secrets securely.
 
@@ -507,14 +595,14 @@ max-turn-cache-misses: 5
 
 ### AI Credits Guardrail (`max-ai-credits:`)
 
-Sets the AWF AI Credits budget used for cost enforcement. It is enabled by default and defaults to `1000` (`1k`) when omitted. Steering (budget-warning messages at 80%, 90%, 95%, and 99% of the budget) is enabled by default. Use plain integers or `K`/`M` suffixes such as `100000K` or `100M`. Set to a negative value to disable both budget enforcement and steering.
+Sets the AWF AI Credits budget used for cost enforcement. It is enabled by default and defaults to `1000` (`1k`) when omitted. Budget notices are on by default: AWF warns the agent at 80%, 90%, 95%, and 99% of the budget. With AWF releases after v0.29.11, each conversation in the run, sub-agents included, gets the latest notice once rather than every notice; the notice states how much budget or time is left, then says what to do, and a further notice comes when about five requests' worth of credits, or about five minutes, remain. Use plain integers or `K`/`M` suffixes such as `5K`. AWF clamps any budget above its hard cap, which is 10,000 AI credits by default (the runner operator can change it with `AWF_AI_CREDITS_HARD_CAP`; gh-aw does not set it). Set to a negative value to disable budget enforcement. With AWF releases after v0.29.11, notices continue against the agent deadline and AWF's hard cap; set [`sandbox.agent.token-steering: false`](/gh-aw/reference/sandbox/#token-steering-sandboxagenttoken-steering) to turn them off.
 
 ```yaml wrap
 max-ai-credits: 500
 ```
 
 ```yaml wrap
-# Disable budget enforcement and steering
+# Disable budget enforcement (with AWF releases after v0.29.11, notices continue unless token-steering is false)
 max-ai-credits: -1
 ```
 
@@ -611,7 +699,17 @@ Specifies the environment for deployment protection rules and environment-specif
 environment: production
 ```
 
-The activation job inherits this environment, including its deployment protection rules. If [`on.manual-approval`](/gh-aw/reference/triggers/#manual-approval-gates-manual-approval) is configured, its environment takes precedence for the activation job.
+The activation job inherits this environment, including its deployment protection rules. If [`on.manual-approval`](/gh-aw/reference/triggers/#manual-approval-gates-manual-approval) is configured, its environment name takes precedence for the activation job; settings such as `deployment` and `url` from an object environment are retained.
+
+The object form accepts `name`, optional `url`, and optional `deployment` (a boolean or GitHub Actions expression, such as `${{ github.ref_name == 'main' }}`). For environments that only gate secrets, set `deployment: false` to retain environment secrets and protection rules—including branch policies, required reviewers, and wait timers—without creating deployment records:
+
+```aw wrap
+environment:
+  name: protected-secrets
+  deployment: false
+```
+
+Omitting `deployment` preserves GitHub Actions' default deployment behavior. The CLI `--environment` override replaces the entire environment block with a literal name, including any `deployment` setting.
 
 See [GitHub Actions environment docs](https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment).
 
@@ -682,7 +780,7 @@ Each runtime takes a required `version` string plus optional `action-repo` and `
 |---------|----------------|---------------------|
 | `node` | 24 | `actions/setup-node@v7` |
 | `python` | 3.12 | `actions/setup-python@v5` |
-| `go` | Root `go.mod`, or 1.26 if absent | `actions/setup-go@v7` |
+| `go` | Root `go.mod`, or 1.27.4 if absent | `actions/setup-go@v7` |
 | `uv` | latest | `astral-sh/setup-uv@v5` |
 | `bun` | 1.1 | `oven-sh/setup-bun@v2` |
 | `deno` | 2.x | `denoland/setup-deno@v2` |
@@ -697,7 +795,7 @@ Override one or more runtimes, optionally with a custom setup action:
 ```yaml wrap
 runtimes:
   node:
-    version: "24"
+    version: "24.22.1"
   python:
     version: "3.12"
     action-repo: "actions/setup-python"
@@ -706,11 +804,15 @@ runtimes:
 
 Omitted runtimes use the defaults above. Runtimes from imported shared workflows are merged with your workflow's configuration.
 
+`runtimes.node.version` also controls Node.js setup in npm-based engine installation steps. An exact version such as `"24.22.1"` is used by both shared runtime setup and those engine installation steps, including when the setting comes from an import.
+
 When Go is required and `runtimes.go.version` is omitted, the generated setup step uses `go-version-file: go.mod` if the repository root contains that file and the workflow checks out the same repository at workspace root before setup without an explicit ref. Sparse checkouts qualify when they retain root files (cone mode) or include `go.mod` (non-cone mode). Unverified checkout refs, repositories, or layouts use the default version. An explicit `runtimes.go.version` takes precedence.
 
 ### `run-install-scripts`
 
 Controls whether npm pre/post-install scripts are allowed during package installation. Configure this under `runtimes.node.run-install-scripts`. The default is `false`.
+
+The shared npm installer disables lifecycle scripts for global installs through step-level `NPM_CONFIG_IGNORE_SCRIPTS: 'true'`; local installs retain `--ignore-scripts`. This keeps exact-version global commands compatible with dependency-pinning scanners without changing version pins or release-age cooldowns.
 
 ```yaml wrap
 runtimes:
@@ -723,6 +825,8 @@ Enabling this increases supply chain risk because install hooks from dependencie
 ### Source Tracking (`source:`)
 
 Tracks workflow origin in format `owner/repo/path@ref`. Automatically populated when using `gh aw add` to install workflows from external repositories. Optional for manually created workflows.
+
+Explicit refs are preserved so updates follow the requested branch or compatible releases. The optional `source-sha` field records the installed 40-character commit SHA separately. `gh aw add` and `gh aw update` manage this field and use it as the base for three-way merges; it does not change the tracking ref.
 
 ```yaml wrap
 source: "githubnext/agentics/workflows/ci-doctor.md@v1.0.0"

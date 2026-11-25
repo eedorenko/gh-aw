@@ -1,7 +1,7 @@
 "use strict";
 
 const { normalizeReflectProviderName, REFLECT_PROVIDER_ALIASES } = require("./awf_reflect.cjs");
-const { buildCatalogFromReflect, selectLatestGlobMatch, splitModelIdentifier } = require("./resolve_model_alias.cjs");
+const { buildCatalogFromReflect, filterAutomaticallySelectable, selectLatestGlobMatch, splitModelIdentifier } = require("./resolve_model_alias.cjs");
 
 const MODEL_FALLBACK_ENV_VAR = "GH_AW_MODEL_FALLBACK";
 
@@ -93,7 +93,7 @@ function resolveClaudeAutoModel(model, provider, options = {}) {
     throw new Error(`Claude auto model selection is not supported for provider '${provider}'`);
   }
   const endpoints = options.reflectData?.endpoints?.filter(endpoint => endpoint?.configured === true && REFLECT_PROVIDER_ALIASES.github.has(normalizeReflectProviderName(endpoint.provider))) || [];
-  const catalog = buildCatalogFromReflect({ endpoints });
+  const catalog = buildCatalogFromReflect(filterAutomaticallySelectable({ endpoints }));
   // Claude's Messages API cannot use Copilot's general-purpose auto picker.
   for (const family of ["sonnet", "opus", "haiku"]) {
     const selected = selectLatestGlobMatch(`claude-*${family}*`, catalog);
@@ -114,11 +114,17 @@ function resolveClaudeAutoModel(model, provider, options = {}) {
  */
 function normalizeClaudeModel(model, provider, env, options = {}) {
   const match = /^copilot\/(.+)$/i.exec(model.trim());
-  if (!match) return resolveClaudeAutoModel(model.trim(), provider, options);
-  if (!REFLECT_PROVIDER_ALIASES.github.has(normalizeReflectProviderName(provider)) && env.GH_AW_LLM_PROVIDER_EXPLICIT !== "1") {
+  const copilotProvider = REFLECT_PROVIDER_ALIASES.github.has(normalizeReflectProviderName(provider));
+  if (match && !copilotProvider && env.GH_AW_LLM_PROVIDER_EXPLICIT !== "1") {
     throw new Error("A copilot/ Claude model requires engine.model-provider: github when the model is selected dynamically; configure the provider and its credentials before running Claude");
   }
-  return resolveClaudeAutoModel(match[1], provider, options);
+  const resolved = resolveClaudeAutoModel(match ? match[1] : model.trim(), provider, options);
+  if (!copilotProvider) return resolved;
+  const { base } = splitModelIdentifier(resolved);
+  const endpoints = options.reflectData?.endpoints?.filter(endpoint => endpoint?.configured === true && REFLECT_PROVIDER_ALIASES.github.has(normalizeReflectProviderName(endpoint.provider))) || [];
+  const catalog = buildCatalogFromReflect({ endpoints });
+  const mapped = catalog.find(id => id.startsWith("claude-") && id.replaceAll(".", "-") === base) || base.replace(/^(claude-[a-z]+-\d+)-(\d{1,2})$/, "$1.$2");
+  return mapped + resolved.slice(base.length);
 }
 
 /**

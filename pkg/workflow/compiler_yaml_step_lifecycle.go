@@ -41,7 +41,7 @@ func writeStepsSection(yaml *strings.Builder, stepsYAML string) {
 	// YAML comments are stripped during parse/marshal, so they must be re-injected here
 	// before the indentation-normalization pass below rewrites each line.
 	stepsYAML = injectZizmorUnverifiedCreatorAnnotations(stepsYAML)
-	lines := strings.Split(stepsYAML, "\n")
+	lines := strings.Split(strings.ReplaceAll(stepsYAML, "\r\n", "\n"), "\n") //nolint:splitlinesonnewline // Normalize CRLF before indentation rewriting.
 	var blockScalarState yamlBlockScalarState
 	for _, line := range lines[1:] { // skip the "pre-steps:" / "pre-agent-steps:" / "post-steps:" header line
 		// Update block-scalar state using the original source line (before the
@@ -158,13 +158,27 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 	yaml.WriteString("        env:\n")
 	writeFormattedYAML(yaml, "          GH_AW_INFO_ENGINE_ID: \"%s\"\n", engineID)
 	writeFormattedYAML(yaml, "          GH_AW_INFO_ENGINE_NAME: \"%s\"\n", engine.GetDisplayName())
+	if provider := resolveBYOKGenAIProviderName(data); provider != "" {
+		writeFormattedYAML(yaml, "          GH_AW_INFO_GENAI_PROVIDER: \"%s\"\n", provider)
+	}
+	if endpoint := resolveBYOKGenAIEndpoint(data); endpoint != "" {
+		writeFormattedYAML(yaml, "          GH_AW_INFO_GENAI_ENDPOINT: %q\n", endpoint)
+	}
 	if modelConfigured {
 		// data.Model may reference an experiment variant as needs.activation.outputs.<name>
 		// (rewritten from engine.model: ${{ experiments.<name> }} for jobs downstream of
-		// activation). This step runs inside the activation job itself, so it must read the
-		// pick-experiment step's output directly rather than via the needs context.
-		infoModel := RewriteActivationOutputsToLocalStepOutputs(data.Model, data.Experiments)
+		// activation), or the activation job's resolved model expression. This step runs
+		// inside the activation job itself, so it must read the step outputs directly
+		// rather than via the needs context.
+		infoModel := activationModelExpression(data)
 		writeFormattedYAML(yaml, "          GH_AW_INFO_MODEL: \"%s\"\n", infoModel)
+		// When the model expression resolves empty, the harness uses GH_AW_MODEL_FALLBACK.
+		// Publish the same fallback so activation checks the model the harness will use.
+		if containsExpression(data.Model) && !isModelRoutingUnconditional(data) {
+			if fallback := mainAgentModelFallbackExpression(engineID); fallback != "" {
+				writeFormattedYAML(yaml, "          GH_AW_INFO_MODEL_FALLBACK: %s\n", fallback)
+			}
+		}
 	} else {
 		// Use the engine's default model as fallback when neither explicit model nor
 		// model variable is configured, so the run details show "agent" rather than "(none)".
@@ -186,9 +200,10 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 	if IsReleasedVersion(c.version) {
 		writeFormattedYAML(yaml, "          GH_AW_INFO_CLI_VERSION: \"%s\"\n", c.version)
 	}
-	writeFormattedYAML(yaml, "          GH_AW_INFO_WORKFLOW_NAME: \"%s\"\n", data.Name)
+	writeFormattedYAML(yaml, "          GH_AW_INFO_WORKFLOW_NAME: %q\n", data.Name)
 	// Unlike github.workflow_ref, job.workflow_ref identifies the executing reusable workflow.
 	yaml.WriteString("          GH_AW_INFO_WORKFLOW_ID: ${{ job.workflow_ref }}\n")
+	yaml.WriteString("          GH_AW_INFO_WORKFLOW_SHA: ${{ job.workflow_sha }}\n")
 	writeFormattedYAML(yaml, "          GH_AW_INFO_EXPERIMENTAL: \"%t\"\n", engine.IsExperimental())
 	writeFormattedYAML(yaml, "          GH_AW_INFO_SUPPORTS_TOOLS_ALLOWLIST: \"%t\"\n", engine.GetCapabilities().ToolsAllowlist)
 	writeFormattedYAML(yaml, "          GH_AW_INFO_STAGED: \"%s\"\n", stagedValue)
@@ -205,7 +220,17 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 		writeFormattedYAML(yaml, "          GH_AW_INFO_ENGINE_HARNESS: \"%s\"\n", harness)
 	}
 	if modelConfigJSON, budget := buildAwInfoModelConfig(data); modelConfigJSON != "" {
-		writeFormattedYAML(yaml, "          GH_AW_INFO_MODEL_CONFIG: '%s'\n", strings.ReplaceAll(modelConfigJSON, "'", "''"))
+		modelConfigValue := modelConfigJSON
+		if isModelRoutingDynamic(data) {
+			// The activation job records the routing mode its decision step chose.
+			modelConfigValue = dynamicRoutingAwInfoModelConfig(data)
+		} else if isModelRoutingRuntimeGuarded(data) {
+			// The activation job records routing only when it applies to this run.
+			plainModelConfigJSON, _ := buildAwInfoModelConfig(withoutModelRouting(data))
+			modelConfigValue = fmt.Sprintf("${{ %s && '%s' || '%s' }}", modelRoutingActiveInActivation,
+				strings.ReplaceAll(modelConfigJSON, "'", "''"), strings.ReplaceAll(plainModelConfigJSON, "'", "''"))
+		}
+		writeFormattedYAML(yaml, "          GH_AW_INFO_MODEL_CONFIG: '%s'\n", strings.ReplaceAll(modelConfigValue, "'", "''"))
 		if budget != "" {
 			if containsExpression(budget) {
 				writeFormattedYAML(yaml, "          GH_AW_INFO_MAX_AI_CREDITS: %s\n", budget)
@@ -250,8 +275,7 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 			}
 		}
 	}
-	// Embed the `models` overlay from frontmatter so the activation job can merge it with
-	// the built-in models.json and write the combined catalog to /tmp/gh-aw/models.json.
+	// Pass explicit frontmatter model overlays to activation and AWF.
 	if len(data.ModelCosts) > 0 {
 		if modelCostsJSON, err := json.Marshal(data.ModelCosts); err == nil {
 			// Escape single quotes for YAML single-quoted scalar safety

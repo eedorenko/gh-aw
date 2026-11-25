@@ -47,9 +47,19 @@ const { PROXY_ENV_NAMES, STEP_NAME_START_MCP_GATEWAY } = require("./constants.cj
 const { redactCliProxyDiagnostics } = require("./redact_cli_proxy_diagnostics.cjs");
 const { prepareMCPServerCAs } = require("./mcp_server_ca.cjs");
 const { ERR_CONFIG, ERR_SYSTEM } = require("./error_codes.cjs");
+const { main: validateDockerLease, OWNER_LABEL } = require("./docker_lease.cjs");
 
 function codedError(message, code = ERR_SYSTEM, options) {
   return new Error(`${code}: ${message}`, options);
+}
+
+function addInvocationLabel(args, env = process.env) {
+  if (env.RUNNER_ENVIRONMENT !== "self-hosted") return args;
+  const owner = env.GH_AW_DOCKER_OWNER;
+  if (!/^[a-f0-9]{64}$/.test(owner || "")) {
+    throw codedError("A validated shared-daemon lease is required before starting the MCP gateway", ERR_CONFIG);
+  }
+  return [args[0], "--label", `${OWNER_LABEL}=${owner}`, ...args.slice(1)];
 }
 
 function setFailed(message) {
@@ -929,6 +939,15 @@ async function main() {
   const runnerTemp = process.env.RUNNER_TEMP;
   const githubOutput = process.env.GITHUB_OUTPUT;
 
+  if (process.env.RUNNER_ENVIRONMENT === "self-hosted") {
+    try {
+      await validateDockerLease("assert", process.env, "awmg-mcpg");
+    } catch (err) {
+      setFailed(getErrorMessage(err));
+      return;
+    }
+  }
+
   // -----------------------------------------------------------------------
   // Validate required env vars
   // -----------------------------------------------------------------------
@@ -1137,6 +1156,7 @@ async function main() {
     if (!cmd) {
       throw codedError("MCP_GATEWAY_DOCKER_COMMAND did not contain an executable command", ERR_CONFIG);
     }
+    args = addInvocationLabel(args);
     const gatewayEnv = { ...process.env };
     // Insert before all existing flags and the image, never into the command string.
     args.splice(1, 0, ...caMountArgs);
@@ -1434,7 +1454,7 @@ async function main() {
     core.info(`Using ${engineType} converter...`);
     const converterPath = path.join(runnerTemp || "", "gh-aw/actions", converterFile);
     try {
-      execFileSync("node", [converterPath], { stdio: "inherit", env: process.env, timeout: CONFIG_CONVERTER_TIMEOUT_MS });
+      execFileSync(process.env.GH_AW_NODE || process.execPath || "node", [converterPath], { stdio: "inherit", env: process.env, timeout: CONFIG_CONVERTER_TIMEOUT_MS });
     } catch (err) {
       stopGatewayProcess(gatewayPid);
       setFailed(getErrorMessage(err));
@@ -1487,13 +1507,6 @@ async function main() {
         throw codedError(`Failed to copy file ${outputPath} to ${copilotConfigFile}: ${getErrorMessage(err)}`, ERR_SYSTEM, { cause: err });
       }
     }
-    let copilotConfigContent;
-    try {
-      copilotConfigContent = fs.readFileSync(copilotConfigFile, "utf8");
-    } catch (err) {
-      throw codedError(`Failed to read file ${copilotConfigFile}: ${getErrorMessage(err)}`, ERR_SYSTEM, { cause: err });
-    }
-    core.info(copilotConfigContent);
   }
   printTiming(configConvertStart, "Configuration conversion");
   core.info("");
@@ -1631,7 +1644,7 @@ if (require.main === module) {
  * @param {number | undefined} [uid]
  * @param {number | undefined} [gid]
  */
-function applyBuiltinMCPRunnerIdentity(config, uid = process.getuid?.(), gid = process.getgid?.()) {
+function applyBuiltinMCPRunnerIdentity(config, uid = process.geteuid?.(), gid = process.getegid?.()) {
   const servers = config.mcpServers;
   if (!servers || typeof servers !== "object") return;
   for (const [name, server] of Object.entries(servers)) {
@@ -1642,8 +1655,9 @@ function applyBuiltinMCPRunnerIdentity(config, uid = process.getuid?.(), gid = p
       throw codedError(`Invalid ${name} container arguments`, ERR_CONFIG);
     }
     // Docker parses any suffix after -u as a username or UID, including -uroot.
-    if (args.some(arg => arg === "--user" || arg === "-u" || arg.startsWith("--user=") || (arg.startsWith("-u") && !arg.startsWith("--")))) continue;
-    if (!Number.isSafeInteger(uid) || !Number.isSafeInteger(gid) || uid === undefined || gid === undefined || uid < 0 || gid < 0) {
+    const hasExplicitUser = args.some(arg => arg === "--user" || arg === "-u" || arg.startsWith("--user=") || (arg.startsWith("-u") && !arg.startsWith("--")));
+    if (hasExplicitUser && name !== "agenticworkflows") continue;
+    if (!hasExplicitUser && (!Number.isSafeInteger(uid) || !Number.isSafeInteger(gid) || uid === undefined || gid === undefined || uid < 0 || gid < 0)) {
       throw codedError(`Runner identity is required for the ${name} container`, ERR_CONFIG);
     }
     const env = "env" in server ? server.env : {};
@@ -1651,15 +1665,21 @@ function applyBuiltinMCPRunnerIdentity(config, uid = process.getuid?.(), gid = p
       throw codedError(`Invalid ${name} container environment`, ERR_CONFIG);
     }
     Object.assign(server, {
-      args: [...args, "--user", `${uid}:${gid}`],
+      ...(hasExplicitUser ? {} : { args: [...args, "--user", `${uid}:${gid}`] }),
       // /tmp is private to this backend container; /root is not writable as the runner.
-      env: { HOME: "/tmp", ...env },
+      env: {
+        ...(hasExplicitUser ? {} : { HOME: "/tmp" }),
+        ...env,
+        // Use the same bind mount as the agent for the logs file_path handoff.
+        ...(name === "agenticworkflows" ? { GH_AW_MCP_LOGS_REPORT_DIR: "/tmp/gh-aw" } : {}),
+      },
     });
   }
 }
 
 module.exports = {
   resolveMCPConfigExpressions,
+  addInvocationLabel,
   applyBuiltinMCPRunnerIdentity,
   applyOTLPIgnoreIfMissing,
   clearGatewayStartupMarker,

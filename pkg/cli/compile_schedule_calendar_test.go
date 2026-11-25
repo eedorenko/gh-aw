@@ -79,6 +79,7 @@ func TestParseCronField_StepBoundaries(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			vals, err := parseCronField(tt.field, 0, tt.max)
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, vals)
@@ -216,6 +217,7 @@ func TestBuildScheduleGrid_StepBoundaries(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			hours, days, err := parseCronSchedule(tt.cron)
 			require.NoError(t, err)
 			assert.Equal(t, tt.hours, hours)
@@ -311,6 +313,9 @@ func TestRenderScheduleCalendarCell_NoANSIWhenNoColor(t *testing.T) {
 }
 
 func TestRenderScheduleCalendarCell_UsesANSIInColorTerminal(t *testing.T) {
+	t.Setenv("ACCESSIBLE", "")
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("TERM", "xterm-256color")
 	// This test intentionally avoids t.Parallel because it temporarily overrides
 	// a shared style token; running in parallel could race with other tests that
 	// read styles.ScheduleCalendarCritical.

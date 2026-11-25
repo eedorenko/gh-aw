@@ -31,6 +31,7 @@ func TestCommandGroupAssignments(t *testing.T) {
 		// Development Commands
 		{name: "compile command in development group", commandName: "compile", expectedGroup: "development", shouldHaveGroup: true},
 		{name: "validate command in development group", commandName: "validate", expectedGroup: "development", shouldHaveGroup: true},
+		{name: "connectors command in development group", commandName: "connectors", expectedGroup: "development", shouldHaveGroup: true},
 		{name: "mcp command in development group", commandName: "mcp", expectedGroup: "development", shouldHaveGroup: true},
 		{name: "fix command in development group", commandName: "fix", expectedGroup: "development", shouldHaveGroup: true},
 		{name: "format command in development group", commandName: "format", expectedGroup: "development", shouldHaveGroup: true},
@@ -53,6 +54,7 @@ func TestCommandGroupAssignments(t *testing.T) {
 		// section when explicitly shown (for example in full help/test contexts).
 		{name: "view command in analysis group", commandName: "view", expectedGroup: "analysis", shouldHaveGroup: true},
 		{name: "experiments command in analysis group", commandName: "experiments", expectedGroup: "analysis", shouldHaveGroup: true},
+		{name: "value command in analysis group", commandName: "value", expectedGroup: "analysis", shouldHaveGroup: true},
 
 		// Utilities
 		{name: "mcp-server command in utilities group", commandName: "mcp-server", expectedGroup: "utilities", shouldHaveGroup: true},

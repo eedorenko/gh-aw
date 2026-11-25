@@ -13,15 +13,16 @@ const { parsePositiveCompactNumber } = require("./numeric_limits.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { createRateLimitAwareGithub } = require("./github_rate_limit_logger.cjs");
 const { scanDailyAIC } = require("./daily_aic_scan.cjs");
-const { API_READ_OPERATIONS, createAPIBudget, retryNotBefore, safeResponseHeaders, isQuotaError, getAPIReadFailure } = require("./daily_aic_api_budget.cjs");
+const { DAILY_AIC_QUOTA_BLOCKED_ENV, API_READ_OPERATIONS, createAPIBudget, retryNotBefore, safeResponseHeaders, isQuotaError, getAPIReadFailure, getErrorStatus } = require("./daily_aic_api_budget.cjs");
+const { GITHUB_API_QUOTA_EXHAUSTED, getGitHubAPIQuotaExhaustion, formatGitHubAPIQuotaDetails, writeGitHubAPIQuotaSummary } = require("./github_api_quota.cjs");
 const { getGitHubAPIDiagnostic } = require("./github_api_diagnostics.cjs");
-const { loadBillableJobs, allBillableJobsNotStarted, allBillableJobsSkipped, sumCoveredComponents } = require("./daily_aic_component_coverage.cjs");
+const { loadBillableJobs, allBillableJobsNotStarted, allBillableJobsSkipped, invocationUsageArtifactName, sumCoveredComponents } = require("./daily_aic_component_coverage.cjs");
 const { readLedgerEntries, readLedgerCoverageStart, WINDOW_MS } = require("./daily_aic_repo_memory_ledger.cjs");
 
 const PRIMARY_GUARDRAIL_ARTIFACT_NAMES = ["usage"];
 const MAX_WORKFLOW_RUN_PAGES = 10;
 const RATE_LIMIT_RESERVE = 100;
-const REQUEST_OVERHEAD_BUDGET = MAX_WORKFLOW_RUN_PAGES + 4;
+const REQUEST_OVERHEAD_BUDGET = 2 * MAX_WORKFLOW_RUN_PAGES + 4;
 const ESTIMATED_API_OPERATIONS_PER_RUN = 2;
 const INTEGER_FORMATTER = new Intl.NumberFormat("en-US");
 const MAX_LEGACY_AGENT_LOG_BYTES = 10 * 1024 * 1024;
@@ -240,7 +241,7 @@ function inspectLegacyAgentLog(logText) {
   };
 }
 
-async function inspectLegacyAgentArtifact(artifactClient, artifacts, downloadRoot, token, owner, repo, run, components) {
+async function inspectLegacyAgentArtifact(artifactClient, artifacts, downloadRoot, token, owner, repo, run, components, usageArtifactName) {
   const job = components.get("agent");
   const noEvidence = { artifactInspected: false, preHarnessFailure: false, sampleReplay: false };
   if (!job) return noEvidence;
@@ -254,7 +255,7 @@ async function inspectLegacyAgentArtifact(artifactClient, artifacts, downloadRoo
     }
   }
 
-  const artifact = artifacts.find(item => item?.name === "agent");
+  const artifact = artifacts.find(item => item?.name === usageArtifactName.slice(0, -"usage".length) + "agent");
   const createdAt = artifact?.createdAt?.getTime();
   const startedAt = Date.parse(job.started_at);
   const completedAt = Date.parse(job.completed_at);
@@ -300,33 +301,37 @@ async function inspectLegacyAgentArtifact(artifactClient, artifacts, downloadRoo
  * @returns {Promise<number>}
  */
 async function getRunAIC(artifactClient, runId, token, owner, repo, run, inspection) {
-  const { components, priorJobs } = run ? await loadBillableJobs(inspection, owner, repo, run) : { components: null, priorJobs: null };
-  if (components && allBillableJobsNotStarted(components)) {
+  const invocations = run ? await loadBillableJobs(inspection, owner, repo, run) : null;
+  const executed = invocations?.filter(({ components }) => !allBillableJobsNotStarted(components));
+  if (invocations && executed?.length === 0) {
     inspection.accountingReason = "confirmed_zero";
-    for (const [component, job] of components) {
-      core.info(
-        `[daily-workflow-aic] Computed component AIC: ${JSON.stringify({
-          runId,
-          component,
-          jobId: job.id,
-          runAttempt: job.run_attempt,
-          conclusion: job.conclusion,
-          aic: 0,
-          reason: job.conclusion === "skipped" ? "job_skipped" : "runner_not_assigned",
-        })}`
-      );
+    for (const { components, label } of invocations) {
+      for (const [component, job] of components) {
+        core.info(
+          `[daily-workflow-aic] Computed component AIC: ${JSON.stringify({
+            runId,
+            component,
+            invocation: label,
+            jobId: job.id,
+            runAttempt: job.run_attempt,
+            conclusion: job.conclusion,
+            aic: 0,
+            reason: job.conclusion === "skipped" ? "job_skipped" : "runner_not_assigned",
+          })}`
+        );
+      }
     }
     logDailyGuardrail("Computed run AIC", {
       runId,
       aic: 0,
-      reason: components.size === 0 ? "no_billable_jobs" : allBillableJobsSkipped(components) ? "all_billable_jobs_skipped" : "all_billable_jobs_not_started",
+      reason: invocations.length === 0 ? "no_billable_jobs" : invocations.every(({ components }) => allBillableJobsSkipped(components)) ? "all_billable_jobs_skipped" : "all_billable_jobs_not_started",
     });
     return 0;
   }
   let artifacts;
   try {
     ({ artifacts } = await artifactClient.listArtifacts({
-      latest: true,
+      latest: false,
       findBy: {
         token,
         workflowRunId: runId,
@@ -338,6 +343,9 @@ async function getRunAIC(artifactClient, runId, token, owner, repo, run, inspect
     logDailyGuardrail("Artifact discovery failed", { runId, operation: "listArtifacts", error: getErrorMessage(error), hint: "Check Actions read permissions, artifact retention, and GitHub API availability." });
     throw error;
   }
+  // Artifact IDs do not follow upload order across reruns. Use creation time
+  // for the usage archive and its producers, then verify their job timestamps.
+  artifacts = artifacts.toSorted((a, b) => (b?.createdAt?.getTime() || 0) - (a?.createdAt?.getTime() || 0));
   const artifactSummaries = artifacts.map(item => ({ id: item?.id ?? null, name: item?.name || "", expired: !!item?.expired }));
   logDailyGuardrail("Listed workflow artifacts", {
     runId,
@@ -345,7 +353,36 @@ async function getRunAIC(artifactClient, runId, token, owner, repo, run, inspect
     artifacts: artifactSummaries,
   });
 
-  const artifact = artifacts.find(item => item?.name && matchesGuardrailArtifactName(item.name));
+  if (!invocations) {
+    const artifact = artifacts.find(item => item?.name && matchesGuardrailArtifactName(item.name));
+    return readUsageArtifactAIC(artifactClient, artifact, artifacts, runId, token, owner, repo, null, null, artifactSummaries);
+  }
+
+  let total = 0;
+  const usedArtifacts = new Set();
+  // An old hash-based artifact has no invocation identity. Only use that
+  // format with a single recognized invocation, never to fill a missing call.
+  const legacyArtifact = invocations.length === 1 ? artifacts.find(item => item?.name && !/^call-[1-9]\d*-usage$/.test(item.name) && matchesGuardrailArtifactName(item.name)) : null;
+  for (const invocation of executed || []) {
+    try {
+      const name = invocationUsageArtifactName(invocation);
+      const artifact = (name && artifacts.find(item => item?.name === name)) || (invocation.prefix ? legacyArtifact : artifacts.find(item => item?.name === "usage") || legacyArtifact);
+      if (artifact?.id && usedArtifacts.has(artifact.id)) throw new Error(`Usage artifact ${artifact.id} is already assigned to another call`);
+      total += await readUsageArtifactAIC(artifactClient, artifact, artifacts, runId, token, owner, repo, run, invocation, artifactSummaries);
+      if (artifact?.id) usedArtifacts.add(artifact.id);
+    } catch (error) {
+      if (getErrorStatus(error) || isQuotaError(error) || getAPIReadFailure(error) || safeResponseHeaders(error?.response?.headers)["retry-after"] != null) {
+        logDailyGuardrail("Invocation accounting unresolved", { runId, invocation: invocation.label, error: getErrorMessage(error) });
+        throw error;
+      }
+      throw new Error(`Daily AIC unresolved for ${invocation.label}: ${getErrorMessage(error)}`, { cause: error });
+    }
+  }
+  if (!Number.isFinite(total)) throw new Error("Daily AIC invocation total is not finite");
+  return total;
+}
+
+async function readUsageArtifactAIC(artifactClient, artifact, artifacts, runId, token, owner, repo, run, invocation, artifactSummaries) {
   if (!artifact) {
     if (run) {
       throw new Error(`No usage artifact proves AIC for completed run ${runId}; check artifact upload and retention`);
@@ -393,9 +430,6 @@ async function getRunAIC(artifactClient, runId, token, owner, repo, run, inspect
     });
 
     const usageJSONLFiles = findJSONLFiles(download.downloadPath || downloadRoot);
-    if (run && !components && usageJSONLFiles.length === 0) {
-      throw new Error(`Usage artifact contains no accounting records for run ${runId}`);
-    }
     logDailyGuardrail("Downloaded guardrail artifact", {
       runId,
       artifactId: artifact.id,
@@ -404,13 +438,15 @@ async function getRunAIC(artifactClient, runId, token, owner, repo, run, inspect
       usageJSONLFiles,
     });
     const artifactRoot = download.downloadPath || downloadRoot;
-    const legacyAgentEvidence = components ? await inspectLegacyAgentArtifact(artifactClient, artifacts, artifactRoot, token, owner, repo, run, components) : null;
-    const aic = components ? sumCoveredComponents(artifactRoot, components, artifact.createdAt.getTime(), artifacts, artifact.name, run.run_attempt, run.id, legacyAgentEvidence, priorJobs) : sumAICFromUsageJSONLFiles(usageJSONLFiles);
+    const legacyAgentEvidence = invocation ? await inspectLegacyAgentArtifact(artifactClient, artifacts, artifactRoot, token, owner, repo, run, invocation.components, artifact.name) : null;
+    const aic = invocation
+      ? sumCoveredComponents(artifactRoot, invocation.components, artifact.createdAt.getTime(), artifacts, artifact.name, run.run_attempt, run.id, legacyAgentEvidence, invocation.priorJobs)
+      : sumAICFromUsageJSONLFiles(usageJSONLFiles);
     logDailyGuardrail("Computed run AIC from artifact", {
       runId,
       artifactId: artifact.id,
       aic,
-      reason: components ? "covered_components" : "usage_files",
+      reason: invocation ? "covered_components" : "usage_files",
     });
     return aic;
   } catch (error) {
@@ -448,10 +484,10 @@ function computeMaxInspectableRuns(remaining) {
   if (!Number.isFinite(remaining) || remaining <= 0) {
     return 0;
   }
-  // Reserve headroom for the workflow-run listing overhead plus a conservative
-  // estimate of two API operations per inspected run (artifact lookup and
-  // artifact download). Adjust ESTIMATED_API_OPERATIONS_PER_RUN if observed
-  // usage changes.
+  // Reserve headroom for the primary and empty-history workflow-run listings
+  // plus a conservative estimate of two API operations per inspected run
+  // (artifact lookup and artifact download). Adjust ESTIMATED_API_OPERATIONS_PER_RUN
+  // if observed usage changes.
   return Math.max(0, Math.floor((remaining - RATE_LIMIT_RESERVE - REQUEST_OVERHEAD_BUDGET) / ESTIMATED_API_OPERATIONS_PER_RUN));
 }
 
@@ -678,6 +714,37 @@ async function appendDailyAICSummary(workflowName, actorLogin, threshold, counte
 }
 
 /**
+ * @param {string | undefined} value
+ * @returns {(import("./github_api_quota.cjs").GitHubAPIQuotaExhaustion & {operation?: string}) | null}
+ */
+function parseRestoreQuotaBlocked(value) {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed && typeof parsed === "object") return parsed;
+  } catch {
+    // Fall through: presence alone still means the restore was quota-blocked.
+  }
+  return { status: null, resource: "unknown", limit: null, remaining: null, used: null, reset: "", retryNotBefore: "", operation: "unknown" };
+}
+
+/**
+ * Publish a typed quota-blocked outcome. It never reports verified accounting,
+ * under_budget, or a zero total, and it is not an activation failure: the
+ * compiled agent job condition skips agent startup on this status.
+ * @param {import("./github_api_quota.cjs").GitHubAPIQuotaExhaustion} quota
+ * @param {string} operation
+ */
+function reportQuotaBlocked(quota, operation) {
+  const message = `Daily workflow AI Credits are unknown: ${GITHUB_API_QUOTA_EXHAUSTED} at ${operation} (${formatGitHubAPIQuotaDetails(quota)}). Accounting remains unverified; agent startup is blocked until a later run after the reset.`;
+  core.setOutput("daily_ai_credits_guardrail_status", "quota_blocked");
+  core.setOutput("daily_ai_credits_guardrail_error", message);
+  logDailyGuardrail("AIC inspection deferred", { status: "quota_blocked", operation, retryNotBefore: quota.retryNotBefore || null });
+  if (quota.retryNotBefore) core.info(`Daily AIC inspection must not retry before ${quota.retryNotBefore}`);
+  core.warning(message);
+}
+
+/**
  * @returns {Promise<void>}
  *
  * Requires github-script globals (`core`, `github`, `context`) provided by setupGlobals().
@@ -788,6 +855,13 @@ async function main(options = {}) {
       core.info(`Daily workflow AIC guardrail exceeded for ${workflowName}: ${totalAIC}/${threshold}.`);
       return;
     }
+    const restoreQuotaBlocked = parseRestoreQuotaBlocked(process.env[DAILY_AIC_QUOTA_BLOCKED_ENV]);
+    if (restoreQuotaBlocked) {
+      // The restore already observed genuine quota exhaustion that bounded
+      // recovery could not resume. Spend no further reads on the same quota.
+      reportQuotaBlocked(restoreQuotaBlocked, `restore ${restoreQuotaBlocked.operation || "unknown"}`);
+      return;
+    }
     const githubClient = createRateLimitAwareGithub(github);
     const budget = createAPIBudget();
     const artifactClient = await module.exports.getArtifactClient(undefined, budget.request);
@@ -854,6 +928,17 @@ async function main(options = {}) {
       `Daily workflow AIC guardrail exceeded for ${workflowName}: ${totalAIC}/${threshold} (measured AIC: ${totalAIC - estimatedAIC}, confirmed-zero runs: ${confirmedZeroRuns}, assumed AIC: ${estimatedAIC}). Guardrail accounting is not provider billing.`
     );
   } catch (error) {
+    const quota = isStructuralGuardrailError(error) ? null : getGitHubAPIQuotaExhaustion(error);
+    if (quota) {
+      const readFailure = getAPIReadFailure(error);
+      reportQuotaBlocked(quota, readFailure?.operation || "accounting");
+      await writeGitHubAPIQuotaSummary({
+        stage: "Activation: Check daily workflow token guardrail",
+        quota,
+        impact: "Daily AIC accounting remains unverified; agent startup is blocked. This is not an under-budget result. Check existing scheduled runs after the reset before retrying; do not queue simultaneous reruns.",
+      });
+      return;
+    }
     const status = isStructuralGuardrailError(error) ? "structural_error" : "transient_error";
     const readFailure = getAPIReadFailure(error);
     const reason = readFailure

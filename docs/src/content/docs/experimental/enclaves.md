@@ -31,7 +31,7 @@ The generated gateway upstream uses a fresh masked capability for each workflow 
 
 ### Docker setup and host repository credentials
 
-The default AWF release is `v0.29.5`. For Docker enclaves, compilation generates authenticated installation and probing of the same-release, runner-UID-scoped storage helper. Only helper provisioning is privileged; AWF remains rootless with network isolation and writable invocation storage mounted `noexec`. Copilot native addons load from the sealed image runtime, not writable storage.
+The default AWF release is `v0.29.7`. For Docker enclaves, compilation generates authenticated installation and probing of the same-release, runner-UID-scoped storage helper. Only helper provisioning is privileged; AWF remains rootless with network isolation and writable invocation storage mounted `noexec`. Copilot native addons load from the sealed image runtime, not writable storage.
 
 Use `sandbox.agent.host-github-token` for host-side repository staging:
 
@@ -42,7 +42,7 @@ sandbox:
     host-github-token: ${{ secrets.GH_AW_GITHUB_TOKEN }}
 ```
 
-The execution step rejects a missing staging credential and binds it as host `GH_TOKEN`, automatically excluded from the primary agent environment. This is separate from the enclave GitHub-tool credential and does not persist secrets through `GITHUB_ENV`. Grant only the repository read access needed for staging. Both agent and detection installers independently authenticate official release attestations and verify the reviewed checksum manifest and its release-tag identity.
+The execution step rejects a missing staging credential and binds it as host `GH_TOKEN`, automatically excluded from the primary agent environment. This is separate from the enclave GitHub-tool credential and does not persist secrets through `GITHUB_ENV`. Grant only the repository read access needed for staging. Both agent and detection installers verify the release-bound checksum manifest against a trusted SHA256 pin and verify payload checksums, without querying release attestations.
 
 ### Public Docker diagnostics
 

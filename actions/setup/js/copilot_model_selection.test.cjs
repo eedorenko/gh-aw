@@ -5,7 +5,7 @@ import fs from "fs";
 import path from "path";
 
 const require = createRequire(import.meta.url);
-const { createCopilotModelObserver, recordCopilotModelSelection, persistCopilotModelSelection } = require("./copilot_model_selection.cjs");
+const { createCopilotModelObserver, isCopilotSessionProgress, recordCopilotModelSelection, persistCopilotModelSelection } = require("./copilot_model_selection.cjs");
 const { resolveEffectiveModel, getEffectiveModelLabel } = require("./model_attribution.cjs");
 const { detectErrors } = require("./agent_error_patterns.cjs");
 
@@ -13,7 +13,16 @@ describe("Copilot configured versus observed model", () => {
   let root, env, session, infoPath;
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(process.cwd(), ".copilot-model-selection-"));
-    env = { GH_AW_TMP_DIR: root, GH_AW_AWF_CONFIG_PATH: path.join(root, "awf-config.json"), HOME: root, COPILOT_HOME: path.join(root, ".copilot"), GH_AW_ENGINE_ID: "copilot", GH_AW_ENGINE_MODEL: "gemini-3.8-flash" };
+    env = {
+      GH_AW_TMP_DIR: root,
+      GH_AW_AWF_CONFIG_PATH: path.join(root, "awf-config.json"),
+      GITHUB_WORKSPACE: root,
+      GH_AW_ENGINE_CWD: ".",
+      HOME: root,
+      COPILOT_HOME: path.join(root, ".copilot"),
+      GH_AW_ENGINE_ID: "copilot",
+      GH_AW_ENGINE_MODEL: "gemini-3.8-flash",
+    };
     session = path.join(root, ".copilot/session-state/session/events.jsonl");
     infoPath = path.join(root, "aw_info.json");
     fs.mkdirSync(path.dirname(session), { recursive: true });
@@ -32,6 +41,31 @@ describe("Copilot configured versus observed model", () => {
     persistCopilotModelSelection(env);
     return JSON.parse(fs.readFileSync(infoPath, "utf8"));
   }
+
+  it.each([{ COPILOT_MODEL: "" }, { GH_AW_PHASE: "detection" }])("observes owned native progress without model verification: %j", overrides => {
+    const progress = vi.fn();
+    const watch = createCopilotModelObserver({ configuredModel: "", resolvedModel: "", sessionId: "session", env: { ...env, ...overrides }, verifyModel: false, onSessionProgress: progress });
+    append({ type: "session.start", data: { sessionId: "session" } });
+    append({ type: "assistant.message", data: { content: "Runtime failure", rte: true } });
+    append({ type: "assistant.message", data: { content: "Subagent", agentId: "child" } });
+    expect(watch.check()).toBe("");
+    expect(progress).not.toHaveBeenCalled();
+    append({ type: "assistant.message", data: { content: "Working" } });
+    append({ type: "tool.execution_start", data: { toolName: "bash" } });
+    expect(watch.check()).toBe("");
+    expect(progress).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    { type: "assistant.message", data: { rte: true } },
+    { type: "assistant.message", data: { agentId: "child" } },
+    { type: "tool.execution_start", data: { parentToolCallId: "child" } },
+    { type: "assistant.message", data: { sessionId: "other" } },
+    { type: "session.start" },
+    { type: "session.error" },
+  ])("does not count unsuccessful or unowned events as progress: %j", event => {
+    expect(isCopilotSessionProgress(event, "session")).toBe(false);
+  });
 
   it.each(["gemini-3.8-flash", "claude-sonnet-5"])("verifies %s with read-only workflow metadata and persists only on the runner", model => {
     const original = fs.readFileSync(infoPath, "utf8");
@@ -53,6 +87,18 @@ describe("Copilot configured versus observed model", () => {
       model,
       model_selection: { status: model === "gemini-3.8-flash" ? "observed" : "substituted", effective_model: model },
     });
+  });
+
+  it("keeps models observed before a retry when the resumed session switches models", () => {
+    const autoObserver = () => createCopilotModelObserver({ configuredModel: "auto", resolvedModel: "auto", sessionId: "session", env });
+    const first = autoObserver();
+    append({ type: "assistant.message", data: { model: "gemini-3.8-flash" } });
+    expect(first.check()).toBe("");
+    const resumed = autoObserver();
+    append({ type: "assistant.message", data: { model: "claude-sonnet-5" } });
+    expect(resumed.check()).toBe("");
+    expect(readInfo().model_selection).toMatchObject({ status: "observed", effective_model: "claude-sonnet-5", observed_models: ["gemini-3.8-flash", "claude-sonnet-5"] });
+    expect(getEffectiveModelLabel(infoPath, "agent", { GH_AW_ENGINE_MODEL: "auto" })).toBe("auto (Gemini 3.8 Flash, Claude Sonnet 5)");
   });
 
   it("records an unavailable model without creating workflow metadata in the sandbox", () => {

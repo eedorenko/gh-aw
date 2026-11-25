@@ -137,6 +137,9 @@ const (
 	// contain secrets, credentials, downloaded remote content, or audit/log output.
 	FilePermSensitive fs.FileMode = 0o600
 
+	// FilePermOwnerReadOnly is owner-only read access for immutable snapshots.
+	FilePermOwnerReadOnly fs.FileMode = 0o400
+
 	// FilePermPublic is owner read/write + world read (0o644). Use for files that
 	// are intentionally world-readable (e.g. generated files for inspection).
 	FilePermPublic fs.FileMode = 0o644
@@ -518,7 +521,6 @@ var SharedWorkflowForbiddenFields = []string{
 	"if",              // Conditional execution
 	"name",            // Workflow name
 	"run-name",        // Run display name
-	"runs-on",         // Runner specification
 	"strict",          // Strict mode
 	"timeout-minutes", // Timeout in minutes
 	"tracker-id",      // Tracker ID
@@ -569,8 +571,9 @@ const TmpGhAwDir = "/tmp/gh-aw"
 // WorkQueueSnapshotPath is the activation artifact mounted into the queue MCP server.
 const WorkQueueSnapshotPath = TmpGhAwDir + "/work-queue.snapshot.json"
 const WorkQueueFinishIntentPath = TmpGhAwDir + "/work-queue.finish.jsonl"
-const WorkQueueAuthorizationPath = TmpGhAwDir + "/work-queue.authorizations.json"
-const WorkQueueDeliveryReceiptPath = TmpGhAwDir + "/work-queue.deliveries.json"
+
+// WorkQueueEffectsPath records one line per Claim-scoped effect applied by Process Safe Outputs.
+const WorkQueueEffectsPath = TmpGhAwDir + "/work-queue.effects.jsonl"
 const WorkQueueIntentPath = TmpGhAwDir + "/work-queue.intents.jsonl"
 const WorkQueueClaimArtifactsPath = TmpGhAwDir + "/claims"
 const WorkQueueFinishIntentDir = GhAwRootDirShell + "/safeoutputs/work-queue"
@@ -660,6 +663,9 @@ const ThreatDetectionLogPath = TmpGhAwDir + "/threat-detection/detection.log"
 
 // ThreatDetectionDir is the threat detection working directory.
 const ThreatDetectionDir = TmpGhAwDir + "/threat-detection"
+
+// ThreatDetectionInputDir contains only prepared threat detection inputs.
+const ThreatDetectionInputDir = TmpGhAwDir + "/threat-detection-inputs"
 
 // ThreatDetectionResultPath is the structured verdict output file written by the
 // external threat-detect binary (enabled by default; set features.gh-aw-detection to false

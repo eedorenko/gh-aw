@@ -7,6 +7,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { queueError } = require("./work_queue_codec.cjs");
 const { buildGitAuthEnv } = require("./git_auth_env.cjs");
+const { createQueueGitObjectReader } = require("./work_queue_git_objects.cjs");
 
 const OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 /** @type {WeakMap<object, Map<string, ReturnType<typeof createGitLedgerClient>>>} */
@@ -14,24 +15,15 @@ const clients = new WeakMap();
 const overrides = new WeakMap();
 const gitClients = new WeakMap();
 const directories = new Set();
+const objectReaders = new Set();
 process.once("exit", () => {
+  for (const reader of objectReaders) reader.close();
   for (const directory of directories) fs.rmSync(directory, { recursive: true, force: true });
 });
 
 // Explicit dependency injection for in-memory stores; production always uses Git.
 function registerQueueLedgerClient(client, ledgerClient) {
   overrides.set(client, ledgerClient);
-}
-
-function inheritQueueLedgerClient(source, target) {
-  if (overrides.has(source)) {
-    const ledger = overrides.get(source);
-    registerQueueLedgerClient(target, ledger === source ? target : ledger);
-  }
-}
-
-function queueGitScope(client) {
-  return gitClients.has(client) ? client : undefined;
 }
 
 function queueLedgerClient(githubClient, owner, repo, branch = "work-queue") {
@@ -82,6 +74,9 @@ function createGitLedgerClient({ githubClient, owner, repo, branch, remote }) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-queue-git-"));
   directories.add(directory);
   const baseEnv = gitEnvironment();
+  const gitArgs = ["-c", "credential.helper=", "-c", `core.hooksPath=${os.devNull}`, "-c", "http.followRedirects=false", "-c", "fetch.fsckObjects=true", "--git-dir", directory];
+  const objectReader = createQueueGitObjectReader(gitArgs, baseEnv);
+  objectReaders.add(objectReader);
   /** @type {Map<string, Buffer>} */
   const objects = new Map();
   let cachedBytes = 0;
@@ -94,7 +89,7 @@ function createGitLedgerClient({ githubClient, owner, repo, branch, remote }) {
   /** @param {string[]} args @param {string | Buffer | undefined} [input] */
   function git(args, input = undefined, env = baseEnv) {
     try {
-      return execFileSync("git", ["-c", "credential.helper=", "-c", `core.hooksPath=${os.devNull}`, "-c", "http.followRedirects=false", "-c", "fetch.fsckObjects=true", "--git-dir", directory, ...args], {
+      return execFileSync("git", [...gitArgs, ...args], {
         env,
         input,
         maxBuffer: 81 * 1024 * 1024,
@@ -150,8 +145,7 @@ function createGitLedgerClient({ githubClient, owner, repo, branch, remote }) {
     const cached = objects.get(key);
     if (cached) return cached;
     await fetchObjects();
-    if (git(["cat-file", "-t", oid]).toString("utf8").trim() !== type) throw queueError("ledger_invalid", "queue Git object has the wrong type");
-    const data = git(["cat-file", type, oid]);
+    const data = await objectReader.object(oid, type);
     // Keep the immutable ancestry hot without retaining an unbounded ledger.
     if (data.length <= 4 * 1024 * 1024) {
       while (objects.size && (cachedBytes + data.length > 16 * 1024 * 1024 || objects.size >= 512)) {
@@ -267,33 +261,9 @@ function createGitLedgerClient({ githubClient, owner, repo, branch, remote }) {
         createRef: async ({ ref, sha }) => push(ref, sha, ""),
       },
     },
-    async readFiles(head, paths) {
-      await fetchObjects();
-      const result = new Map();
-      for (const file of paths) {
-        const entry = git(["ls-tree", "-z", head, "--", file]).toString("utf8");
-        if (!entry) continue;
-        const [mode, type, oid] = entry.slice(0, entry.indexOf("\t")).split(" ");
-        if (mode !== "100644" || type !== "blob") throw queueError("projection_journal_conflict", "projection journal must be a regular blob");
-        result.set(file, new TextDecoder("utf-8", { fatal: true }).decode(await object(oid, "blob")));
-      }
-      return result;
-    },
-    async writeFiles(head, files) {
-      await fetchObjects();
-      const index = path.join(directory, "publication-index");
-      const env = { ...baseEnv, GIT_INDEX_FILE: index };
-      git(["read-tree", head], undefined, env);
-      for (const file of files) {
-        const oid = git(["hash-object", "-w", "--stdin"], file.content).toString("utf8").trim();
-        git(["update-index", "--add", "--cacheinfo", `100644,${oid},${file.path}`], undefined, env);
-      }
-      const tree = git(["write-tree"], undefined, env).toString("utf8").trim();
-      const commit = await client.rest.git.createCommit({ tree, parents: [head], message: "Publish checked work queue projection" });
-      await client.rest.git.updateRef({ ref: `heads/${branch}`, sha: commit.data.sha, force: false });
-      return commit.data.sha;
-    },
     close() {
+      objectReader.close();
+      objectReaders.delete(objectReader);
       fs.rmSync(directory, { recursive: true, force: true });
       directories.delete(directory);
     },
@@ -303,4 +273,4 @@ function createGitLedgerClient({ githubClient, owner, repo, branch, remote }) {
   return client;
 }
 
-module.exports = { createGitLedgerClient, queueLedgerClient, registerQueueLedgerClient, inheritQueueLedgerClient, queueGitScope, gitEnvironment };
+module.exports = { createGitLedgerClient, queueLedgerClient, registerQueueLedgerClient, gitEnvironment };

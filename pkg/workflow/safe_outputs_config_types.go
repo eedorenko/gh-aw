@@ -20,14 +20,15 @@ var safeOutputsConfigLog = logger.New("workflow:safe_outputs_config")
 
 // BaseSafeOutputConfig holds common configuration fields for all safe output types
 type BaseSafeOutputConfig struct {
-	Max                      *string          `yaml:"max,omitempty"`                        // Maximum number of items to create (supports integer or GitHub Actions expression)
-	GitHubToken              string           `yaml:"github-token,omitempty"`               // GitHub token for this specific output type
-	GitHubApp                *GitHubAppConfig `yaml:"github-app,omitempty"`                 // GitHub App credentials for minting a per-handler installation access token
-	Staged                   *TemplatableBool `yaml:"staged,omitempty"`                     // Templatable preview-only mode for this specific output type
-	Footer                   *string          `yaml:"footer,omitempty"`                     // Controls AI-generated footer behavior. Values vary by handler; false omits the visible footer but keeps XML markers.
-	BodyFooter               string           `yaml:"body-footer,omitempty"`                // Deterministic template appended after agent-generated body content by supported handlers.
-	IssueIntent              *bool            `yaml:"issue-intent,omitempty"`               // When true, enable issue-intent rationale/confidence guidance and schema requirements for this output type.
-	NormalizeClosingKeywords *bool            `yaml:"normalize-closing-keywords,omitempty"` // When true for this output type, strip backticks from recognized issue-closing keywords in body fields.
+	Authorization            *SafeOutputAuthorization `yaml:"authorization,omitempty"`
+	Max                      *string                  `yaml:"max,omitempty"`                        // Maximum number of items to create (supports integer or GitHub Actions expression)
+	GitHubToken              string                   `yaml:"github-token,omitempty"`               // GitHub token for this specific output type
+	GitHubApp                *GitHubAppConfig         `yaml:"github-app,omitempty"`                 // GitHub App credentials for minting a per-handler installation access token
+	Staged                   *TemplatableBool         `yaml:"staged,omitempty"`                     // Templatable preview-only mode for this specific output type
+	Footer                   *string                  `yaml:"footer,omitempty"`                     // Controls AI-generated footer behavior. Values vary by handler; false omits the visible footer but keeps XML markers.
+	BodyFooter               string                   `yaml:"body-footer,omitempty"`                // Deterministic template appended after agent-generated body content by supported handlers.
+	IssueIntent              *bool                    `yaml:"issue-intent,omitempty"`               // When true, enable issue-intent rationale/confidence guidance and schema requirements for this output type.
+	NormalizeClosingKeywords *bool                    `yaml:"normalize-closing-keywords,omitempty"` // When true for this output type, strip backticks from recognized issue-closing keywords in body fields.
 	// Samples carries deterministic replay samples for the hidden
 	// `gh aw compile --use-samples` flag. Each entry is the JSON object
 	// passed to the corresponding MCP tool's `tools/call` arguments.
@@ -39,17 +40,15 @@ type BaseSafeOutputConfig struct {
 
 // SafeOutputsConfig holds configuration for automatic output routes
 type SafeOutputsConfig struct {
+	Authorization                          *SafeOutputAuthorization `yaml:"authorization,omitempty"`
+	authorizationParseError                error
+	importedCustomAuthorizations           map[string]*SafeOutputAuthorization
+	AuthorizationRequirements              map[string]*SafeOutputAuthorization    `yaml:"-"`
+	AuthorizationCoverage                  map[string]string                      `yaml:"-"`
 	Steer                                  bool                                   `yaml:"steer,omitempty"` // Experimental. Create an issue and steer the agent from issue comments.
 	CreateIssues                           *CreateIssuesConfig                    `yaml:"create-issue,omitempty"`
-	CreateWorkItems                        *CreateWorkItemConfig                  `yaml:"ado-create-work-item,omitempty"`
-	UpdateWorkItems                        *UpdateWorkItemConfig                  `yaml:"ado-update-work-item,omitempty"`
-	CommentOnWorkItems                     *CommentOnWorkItemConfig               `yaml:"ado-comment-on-work-item,omitempty"`
-	AssignWorkItems                        *AssignWorkItemConfig                  `yaml:"ado-assign-work-item,omitempty"`
-	LinkWorkItems                          *LinkWorkItemsConfig                   `yaml:"ado-link-work-items,omitempty"`
-	UploadWorkItemAttachments              *UploadWorkItemAttachmentConfig        `yaml:"ado-upload-workitem-attachment,omitempty"`
-	LinearCreateIssue                      *LinearCreateIssueConfig               `yaml:"linear-create-issue,omitempty"`
-	LinearAddComment                       *LinearTargetConfig                    `yaml:"linear-add-comment,omitempty"`
-	LinearUpdateIssue                      *LinearUpdateIssueConfig               `yaml:"linear-update-issue,omitempty"`
+	CreateSecurityAdvisory                 *CreateSecurityAdvisoryConfig          `yaml:"create-security-advisory,omitempty"`
+	AddSecurityAdvisoryComment             *AddSecurityAdvisoryCommentConfig      `yaml:"add-security-advisory-comment,omitempty"`
 	CreateDiscussions                      *CreateDiscussionsConfig               `yaml:"create-discussion,omitempty"`
 	UpdateDiscussions                      *UpdateDiscussionsConfig               `yaml:"update-discussion,omitempty"`
 	CloseDiscussions                       *CloseDiscussionsConfig                `yaml:"close-discussion,omitempty"`
@@ -67,10 +66,6 @@ type SafeOutputsConfig struct {
 	CreateCodeScanningAlerts               *CreateCodeScanningAlertsConfig        `yaml:"create-code-scanning-alert,omitempty"`
 	AutofixCodeScanningAlert               *AutofixCodeScanningAlertConfig        `yaml:"autofix-code-scanning-alert,omitempty"`
 	CreateCheckRun                         *CreateCheckRunConfig                  `yaml:"create-check-run,omitempty"` // Create GitHub Check Runs to report agent analysis results
-	JiraCreateIssue                        *JiraSafeOutputConfig                  `yaml:"jira-create-issue,omitempty"`
-	JiraUpdateIssue                        *JiraSafeOutputConfig                  `yaml:"jira-update-issue,omitempty"`
-	JiraAddComment                         *JiraSafeOutputConfig                  `yaml:"jira-add-comment,omitempty"`
-	JiraAddLabel                           *JiraSafeOutputConfig                  `yaml:"jira-add-label,omitempty"`
 	AddLabels                              *AddLabelsConfig                       `yaml:"add-labels,omitempty"`
 	RemoveLabels                           *RemoveLabelsConfig                    `yaml:"remove-labels,omitempty"`
 	ReplaceLabel                           *ReplaceLabelConfig                    `yaml:"replace-label,omitempty"` // Replace one label with another in a single atomic operation
@@ -103,12 +98,15 @@ type SafeOutputsConfig struct {
 	MissingData                            *MissingDataConfig                     `yaml:"report-missing-data,omitempty"`          // Optional for reporting missing data required to achieve goals
 	NoOp                                   *NoOpConfig                            `yaml:"noop,omitempty"`                         // No-op output for logging only (always available as fallback)
 	ReportIncomplete                       *ReportIncompleteConfig                `yaml:"report-incomplete,omitempty"`            // Signal that the task could not be completed due to a tool or infrastructure failure
+	RequestContinuation                    *RequestContinuationConfig             `yaml:"request-continuation,omitempty"`         // Follow-up request: metadata only, or routed to a queue/issue/dispatch successor
 	ThreatDetection                        *ThreatDetectionConfig                 `yaml:"threat-detection,omitempty"`             // Threat detection configuration
 	Jobs                                   map[string]*SafeJobConfig              `yaml:"jobs,omitempty"`                         // Safe-jobs configuration (moved from top-level)
 	Scripts                                map[string]*SafeScriptConfig           `yaml:"scripts,omitempty"`                      // Custom inline handlers that run in the safe-output handler loop
 	ClaimAdapters                          map[string]*WorkQueueClaimAdapter      `yaml:"claim-adapters,omitempty"`               // Trusted queue-only custom preparation and independent effect verification
 	claimAdaptersParseError                error
-	GitHubApp                              *GitHubAppConfig                   `yaml:"github-app,omitempty"`                // GitHub App credentials for token minting
+	workQueueApprovalReads                 bool                               // Compile-only dispatcher flag: a schedulable worker has an issue continuation route, so dependency refresh reads approval Issues
+	GitHubApp                              *GitHubAppConfig                   `yaml:"github-app,omitempty"` // GitHub App credentials for token minting
+	TokenBroker                            bool                               `yaml:"token-broker,omitempty" json:"token-broker,omitempty"`
 	URLs                                   SafeOutputsURLsPolicy              `yaml:"urls,omitempty"`                      // URL sanitization policy: SafeOutputsURLsPolicyAllowedOnly (default) or SafeOutputsURLsPolicyAllowedOrCodeRegion
 	Data                                   any                                `yaml:"data,omitempty"`                      // Structured data mode for body-based safe outputs: false/omitted (disabled), true (allow any object), object (inline schema), or GitHub Actions expression string
 	DataEnabled                            bool                               `yaml:"-"`                                   // Internal flag controlling whether `data` is allowed for body-based safe outputs
@@ -117,9 +115,9 @@ type SafeOutputsConfig struct {
 	AllowedDomains                         []string                           `yaml:"allowed-domains,omitempty"`           // Allowed domains for URL redaction, unioned with network.allowed; supports ecosystem identifiers
 	AllowGitHubReferences                  []string                           `yaml:"allowed-github-references,omitempty"` // Allowed repositories for GitHub references (e.g., ["repo", "org/repo2"])
 	Staged                                 *TemplatableBool                   `yaml:"staged,omitempty"`                    // Templatable preview-only mode for all safe outputs
+	RequireAgentSuccess                    bool                               `yaml:"require-agent-success,omitempty"`     // Skip detection and safe output processing when the agent job is not successful
 	Env                                    map[string]string                  `yaml:"env,omitempty"`                       // Environment variables to pass to safe output jobs
 	GitHubToken                            string                             `yaml:"github-token,omitempty"`              // GitHub token for safe output jobs
-	LinearToken                            string                             `yaml:"linear-token,omitempty"`              // Linear API key for Linear safe output handlers
 	MaximumPatchSize                       int                                `yaml:"max-patch-size,omitempty"`            // Maximum allowed patch size in KB (defaults to 4096)
 	MaximumPatchFiles                      int                                `yaml:"max-patch-files,omitempty"`           // Maximum allowed unique files per create-pull-request patch (defaults to 100)
 	RunsOn                                 string                             `yaml:"runs-on,omitempty"`                   // Runner configuration for safe-outputs jobs

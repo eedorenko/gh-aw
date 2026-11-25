@@ -33,24 +33,28 @@ const (
 )
 
 type defaultsFile struct {
-	DefaultAdmissionURL               *string `yaml:"default_admission_url"`
-	DefaultAdmissionAudience          *string `yaml:"default_admission_audience"`
-	DefaultAdmissionOnOutage          *string `yaml:"default_admission_on_outage"`
-	DefaultArtifactRetentionDays      *string `yaml:"default_artifact_retention_days"`
-	DefaultMaxAICredits               *string `yaml:"default_max_ai_credits"`
-	DefaultMaxTurnCacheMisses         *string `yaml:"default_max_turn_cache_misses"`
-	DefaultDetectionMaxAICredits      *string `yaml:"default_detection_max_ai_credits"`
-	DefaultMaxDailyAICredits          *string `yaml:"default_max_daily_ai_credits"`
-	DefaultMaxTurns                   *string `yaml:"default_max_turns"`
-	DefaultTimeoutMinutes             *string `yaml:"default_timeout_minutes"`
-	DefaultAgentJobTimeoutMinutes     *string `yaml:"default_agent_job_timeout_minutes"`
-	DefaultDetectionJobTimeoutMinutes *string `yaml:"default_detection_job_timeout_minutes"`
-	DefaultDetectionModel             *string `yaml:"default_detection_model"`
-	DefaultOTLPEndpoint               *string `yaml:"default_otlp_endpoint"`
-	DefaultUTC                        *string `yaml:"default_utc"`
-	DefaultModelCopilot               *string `yaml:"default_model_copilot"`
-	DefaultModelClaude                *string `yaml:"default_model_claude"`
-	DefaultModelCodex                 *string `yaml:"default_model_codex"`
+	DefaultAdmissionURL                    *string `yaml:"default_admission_url"`
+	DefaultAdmissionAudience               *string `yaml:"default_admission_audience"`
+	DefaultAdmissionOnOutage               *string `yaml:"default_admission_on_outage"`
+	DefaultSafeOutputAuthorizationURL      *string `yaml:"default_safe_output_authorization_url"`
+	DefaultSafeOutputAuthorizationAudience *string `yaml:"default_safe_output_authorization_audience"`
+	DefaultArtifactRetentionDays           *string `yaml:"default_artifact_retention_days"`
+	DefaultMaxAICredits                    *string `yaml:"default_max_ai_credits"`
+	DefaultMaxTurnCacheMisses              *string `yaml:"default_max_turn_cache_misses"`
+	DefaultDetectionMaxAICredits           *string `yaml:"default_detection_max_ai_credits"`
+	DefaultMaxDailyAICredits               *string `yaml:"default_max_daily_ai_credits"`
+	DefaultMaxTurns                        *string `yaml:"default_max_turns"`
+	DefaultTimeoutMinutes                  *string `yaml:"default_timeout_minutes"`
+	DefaultAgentJobTimeoutMinutes          *string `yaml:"default_agent_job_timeout_minutes"`
+	DefaultDetectionJobTimeoutMinutes      *string `yaml:"default_detection_job_timeout_minutes"`
+	DefaultDetectionModel                  *string `yaml:"default_detection_model"`
+	DefaultOTLPEndpoint                    *string `yaml:"default_otlp_endpoint"`
+	DefaultOTLPProtocol                    *string `yaml:"default_otlp_protocol"`
+	DefaultOTLPMetrics                     *string `yaml:"default_otel_metrics"`
+	DefaultUTC                             *string `yaml:"default_utc"`
+	DefaultModelCopilot                    *string `yaml:"default_model_copilot"`
+	DefaultModelClaude                     *string `yaml:"default_model_claude"`
+	DefaultModelCodex                      *string `yaml:"default_model_codex"`
 }
 
 type defaultsBinding struct {
@@ -110,6 +114,8 @@ var defaultsBindings = []defaultsBinding{
 	{envName: compilerenv.DefaultAdmissionURL, fieldName: "default_admission_url", get: func(f *defaultsFile) **string { return &f.DefaultAdmissionURL }},
 	{envName: compilerenv.DefaultAdmissionAudience, fieldName: "default_admission_audience", get: func(f *defaultsFile) **string { return &f.DefaultAdmissionAudience }},
 	{envName: compilerenv.DefaultAdmissionOnOutage, fieldName: "default_admission_on_outage", get: func(f *defaultsFile) **string { return &f.DefaultAdmissionOnOutage }},
+	{envName: compilerenv.DefaultSafeOutputAuthorizationURL, fieldName: "default_safe_output_authorization_url", get: func(f *defaultsFile) **string { return &f.DefaultSafeOutputAuthorizationURL }},
+	{envName: compilerenv.DefaultSafeOutputAuthorizationAudience, fieldName: "default_safe_output_authorization_audience", get: func(f *defaultsFile) **string { return &f.DefaultSafeOutputAuthorizationAudience }},
 	{envName: compilerenv.DefaultArtifactRetentionDays, fieldName: "default_artifact_retention_days", get: func(f *defaultsFile) **string { return &f.DefaultArtifactRetentionDays }},
 	{envName: compilerenv.DefaultMaxAICredits, fieldName: "default_max_ai_credits", get: func(f *defaultsFile) **string { return &f.DefaultMaxAICredits }},
 	{envName: compilerenv.DefaultMaxTurnCacheMisses, fieldName: "default_max_turn_cache_misses", get: func(f *defaultsFile) **string { return &f.DefaultMaxTurnCacheMisses }},
@@ -121,6 +127,8 @@ var defaultsBindings = []defaultsBinding{
 	{envName: compilerenv.DefaultDetectionJobTimeoutMinutes, fieldName: "default_detection_job_timeout_minutes", get: func(f *defaultsFile) **string { return &f.DefaultDetectionJobTimeoutMinutes }},
 	{envName: compilerenv.DefaultDetectionModel, fieldName: "default_detection_model", get: func(f *defaultsFile) **string { return &f.DefaultDetectionModel }},
 	{envName: compilerenv.DefaultOTLPEndpoint, fieldName: "default_otlp_endpoint", get: func(f *defaultsFile) **string { return &f.DefaultOTLPEndpoint }},
+	{envName: compilerenv.OTLPProtocol, fieldName: "default_otlp_protocol", get: func(f *defaultsFile) **string { return &f.DefaultOTLPProtocol }},
+	{envName: compilerenv.OTLPMetrics, fieldName: "default_otel_metrics", get: func(f *defaultsFile) **string { return &f.DefaultOTLPMetrics }},
 	{envName: compilerenv.DefaultUTC, fieldName: "default_utc", get: func(f *defaultsFile) **string { return &f.DefaultUTC }},
 	{envName: compilerenv.DefaultModelCopilot, fieldName: "default_model_copilot", get: func(f *defaultsFile) **string { return &f.DefaultModelCopilot }},
 	{envName: compilerenv.DefaultModelClaude, fieldName: "default_model_claude", get: func(f *defaultsFile) **string { return &f.DefaultModelClaude }},
@@ -137,6 +145,8 @@ func NewEnvCommand() *cobra.Command {
 		Long: `Manage compiler default variables in bulk for a repository, organization, or enterprise scope.
 
 The YAML file is flat and uses default_-prefixed lowercase keys (e.g., default_max_turns).
+The default_otlp_protocol field manages the standard OTEL_EXPORTER_OTLP_PROTOCOL variable.
+The default_otel_metrics field manages GH_AW_OTEL_METRICS; when unset, workflows enable metrics by default.
 Set a field to null (or omit it) in update mode to delete the variable from the selected scope.
 Any field with a non-null string value will be set or updated.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -146,6 +156,7 @@ Any field with a non-null string value will be set or updated.`,
 
 	cmd.AddCommand(newDefaultsGetCommand())
 	cmd.AddCommand(newDefaultsUpdateCommand())
+	cmd.AddCommand(newEnvOTELCommand())
 	cmd.AddCommand(newLegacyGHGuardSubcommand())
 	return cmd
 }
@@ -316,6 +327,9 @@ func defaultsValidateFile(file *defaultsFile) error {
 	if err := validateAdmissionDefaults(file); err != nil {
 		validationErrors = append(validationErrors, err.Error())
 	}
+	if err := validateSafeOutputAuthorizationDefaults(file); err != nil {
+		validationErrors = append(validationErrors, err.Error())
+	}
 	if err := validateDefaultArtifactRetentionDays(file.DefaultArtifactRetentionDays); err != nil {
 		validationErrors = append(validationErrors, err.Error())
 	}
@@ -356,6 +370,7 @@ func defaultsValidateFile(file *defaultsFile) error {
 	validatePositiveInt("default_agent_job_timeout_minutes", file.DefaultAgentJobTimeoutMinutes)
 	validatePositiveInt("default_detection_job_timeout_minutes", file.DefaultDetectionJobTimeoutMinutes)
 	validateNonEmpty("default_detection_model", file.DefaultDetectionModel)
+	validationErrors = append(validationErrors, validateDefaultOTLP(file)...)
 	if err := validateDefaultUTCOffset(file.DefaultUTC); err != nil {
 		validationErrors = append(validationErrors, err.Error())
 	}
@@ -367,6 +382,17 @@ func defaultsValidateFile(file *defaultsFile) error {
 		return fmt.Errorf("invalid defaults file: %s", strings.Join(validationErrors, "; "))
 	}
 	return nil
+}
+
+func validateDefaultOTLP(file *defaultsFile) []string {
+	var validationErrors []string
+	if protocol := file.DefaultOTLPProtocol; protocol != nil && *protocol != "http/json" && *protocol != "http/protobuf" {
+		validationErrors = append(validationErrors, `default_otlp_protocol must be http/json or http/protobuf when set, for example: "http/protobuf"`)
+	}
+	if metrics := file.DefaultOTLPMetrics; metrics != nil && *metrics != "true" && *metrics != "false" {
+		validationErrors = append(validationErrors, `default_otel_metrics must be "true" or "false" when set`)
+	}
+	return validationErrors
 }
 
 func validateDefaultUTCOffset(value *string) error {

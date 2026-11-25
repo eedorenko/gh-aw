@@ -233,6 +233,32 @@ func TestGetThreatDetectionAdditionalAllowedDomains_DetectionOnlyBaseURL(t *test
 	}
 }
 
+func TestGetThreatDetectionAdditionalAllowedDomains_OpenAIWIFDoesNotAllowTokenHost(t *testing.T) {
+	data := &WorkflowData{
+		EngineConfig: &EngineConfig{
+			ID: "codex",
+			Auth: &EngineAuthConfig{
+				Type:                     "github-oidc",
+				Provider:                 "openai",
+				OpenAIIdentityProviderID: "idp",
+				ServiceAccountID:         "service-account",
+				Audience:                 "https://api.openai.com/v1",
+			},
+		},
+		NetworkPermissions: &NetworkPermissions{
+			Allowed: []string{"defaults"},
+		},
+		SafeOutputs: &SafeOutputsConfig{
+			ThreatDetection: &ThreatDetectionConfig{},
+		},
+	}
+
+	got := getThreatDetectionAdditionalAllowedDomains(data, string(constants.CodexEngine))
+	if slices.Contains(got, "auth.openai.com") {
+		t.Fatalf("OpenAI WIF exchange host is reached through the API proxy, not the detector allowlist; got %v", got)
+	}
+}
+
 func TestThreatDetectionExecutionPreservesVendorOptIn(t *testing.T) {
 	compiler := NewCompiler()
 	for _, tt := range []struct {
@@ -282,6 +308,56 @@ func firewallDomainRules(t *testing.T, command, field string) []string {
 		t.Fatalf("invalid firewall network.%s: %v", field, err)
 	}
 	return rules
+}
+
+func TestCopilotDetectionNpmRegistryOptIn(t *testing.T) {
+	compiler := NewCompiler()
+	for _, tt := range []struct {
+		name    string
+		allowed []string
+		blocked []string
+		want    bool
+	}{
+		{name: "default"},
+		{name: "compatibility alias", allowed: []string{"threat-detection"}},
+		{name: "unrelated ecosystem", allowed: []string{"python"}},
+		{name: "node", allowed: []string{"node"}, want: true},
+		{name: "explicit host", allowed: []string{"registry.npmjs.org"}, want: true},
+		{name: "blocked host", allowed: []string{"node"}, blocked: []string{"registry.npmjs.org"}, want: true},
+		{name: "blocked parent", allowed: []string{"node"}, blocked: []string{"npmjs.org"}, want: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			data := &WorkflowData{
+				AI:                 "copilot",
+				SafeOutputs:        &SafeOutputsConfig{ThreatDetection: &ThreatDetectionConfig{}},
+				NetworkPermissions: &NetworkPermissions{Allowed: tt.allowed, Blocked: tt.blocked},
+				Runtimes:           map[string]any{"node": map[string]any{"version": "24"}},
+			}
+			command := strings.Join(compiler.buildDetectionEngineExecutionStep(data), "")
+			var allowed []string
+			if strings.Contains(command, "allowDomains") {
+				allowed = firewallDomainRules(t, command, "allowDomains")
+			} else if !strings.Contains(command, "awf-config.json") {
+				t.Fatal("expected generated AWF configuration")
+			}
+			reachable := false
+			for _, rule := range allowed {
+				reachable = reachable || awfDomainAllowsHost(rule, "registry.npmjs.org")
+			}
+			if reachable != tt.want {
+				t.Fatalf("registry allowed = %t, want %t; rules: %v", reachable, tt.want, allowed)
+			}
+			if slices.Contains(allowed, "yarnpkg.com") || slices.Contains(allowed, "nodejs.org") {
+				t.Fatalf("detection should inherit only the npm registry, got %v", allowed)
+			}
+			if len(tt.blocked) > 0 {
+				blocked := firewallDomainRules(t, command, "blockDomains")
+				if !reflect.DeepEqual(blocked, tt.blocked) || !awfDomainAllowsHost(blocked[0], "registry.npmjs.org") {
+					t.Fatalf("expected effective registry block %v, got %v", tt.blocked, blocked)
+				}
+			}
+		})
+	}
 }
 
 func TestThreatDetectionExecutionPreservesBlockedVendorDomains(t *testing.T) {

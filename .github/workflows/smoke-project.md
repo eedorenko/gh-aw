@@ -31,19 +31,19 @@ tools:
   bash:
     - "*"
 safe-outputs:
-    steer: true
     allowed-domains: [default-safe-outputs]
     add-comment:
       hide-older-comments: true
       max: 2
     create-pull-request:
+      draft: true
       title-prefix: "[smoke-project] "
       if-no-changes: "warn"
       labels: [ai-generated]
       expires: 2h
     create-issue:
       expires: 2h
-      labels: [ai-generated, automation, testing]
+      labels: [ai-generated, automation, testing, "backlog:smoke-tests"]
       group: true
       close-older-issues: true
     add-labels:
@@ -90,6 +90,7 @@ experiments:
     notify:
       issue: 37302
 imports:
+  - shared/pr-safe-output-defaults.md
   - shared/otlp.md
   - shared/token-telemetry-check.md
   - shared/reporting.md

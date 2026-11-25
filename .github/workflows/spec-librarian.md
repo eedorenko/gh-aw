@@ -28,6 +28,9 @@ imports:
     - automation
     title-prefix: "[spec-librarian] "
 - shared/go-source-analysis.md
+- uses: shared/pageindex.md
+  with:
+    patterns: "pkg/**/README.md"
 - shared/otlp.md
 safe-outputs:
   create-issue:
@@ -48,29 +51,13 @@ safe-outputs:
 description: Daily review of all package README.md specifications to detect inconsistencies, staleness, and cross-package conflicts
 emoji: 📚
 engine:
-  id: copilot
-  copilot-sdk: true
+  id: codex
+  model-provider: github
 name: Package Specification Librarian
 strict: true
 timeout-minutes: 25
 tools:
-  bash:
-  - find pkg -name "README.md" -type f
-  - find pkg -maxdepth 1 -type d
-  - find pkg/* -maxdepth 0 -type d
-  - cat pkg/*/README.md
-  - wc -l pkg/*/README.md
-  - head -n * pkg/*/*.go
-  - cat pkg/*/*.go
-  - wc -l pkg/*/*.go
-  - grep -rn "func [A-Z]" pkg --include="*.go"
-  - grep -rn "type [A-Z]" pkg --include="*.go"
-  - grep -rn "const [A-Z]" pkg --include="*.go"
-  - grep -rn "import " pkg --include="*.go"
-  - grep -rn "package " pkg --include="*.go"
-  - "git log --oneline --since=\"30 days ago\" -- pkg/*"
-  - "git log --oneline --since=\"7 days ago\" -- pkg/*/README.md"
-  - "git log -1 --format=%H -- pkg/*"
+  bash: ["*"]
   cli-proxy: true
   edit: null
   github:
@@ -103,6 +90,15 @@ Do not use background sub-agents for this workflow. Run checks directly with she
 Run direct shell commands to compute `total_packages`, `packages_with_specs`,
 `coverage_pct`, `all_pkgs`, `has_spec`, and `missing_specs`. Use these values for all subsequent phases.
 
+Apply the repository's package-documentation policy when classifying packages:
+
+- Every production Go package under `pkg/` requires a package-root `README.md`, except the centralized linter packages below.
+- `pkg/linters/<analyzer>` packages are documented in the `Subpackages` table and rule catalog in `pkg/linters/README.md`. Count an analyzer as documented only when its package directory name and analyzer behavior are represented there; do not report the lack of a repeated leaf README as a missing specification.
+- Packages under `pkg/linters/internal/` are implementation helpers and are documented collectively in `pkg/linters/internal/README.md`. Verify that the table covers every production helper package; do not require a separate README for each helper.
+- Exclude `testdata` and generated fixture directories from the production package inventory.
+
+Keep `all_pkgs` as the complete production package inventory. Count the centralized linter packages as documented only after checking their parent specification; include them in `has_spec` and exclude them from `missing_specs`. Do not inflate README coverage by counting an incomplete parent table as a complete child specification.
+
 ## Phase 2: Staleness Detection
 
 Run direct shell commands for each package in `has_spec` to detect stale specifications with
@@ -113,6 +109,9 @@ Run direct shell commands for each package in `has_spec` to detect stale specifi
 Run direct shell commands to validate import paths, naming conventions, and dependency graphs.
 Produce `import_issues`, `naming_issues`, and `dependency_issues`.
 Perform terminology consistency analysis (Check 3) using the spec content collected in Phase 1.
+Use the local PageIndex outlines to find related sections across package specifications,
+then read the selected nodes and verify conflicts against the source files.
+Keep the complete package inventory and exhaustive checks; index search is a navigation aid.
 
 ### Check 3: Terminology Consistency
 

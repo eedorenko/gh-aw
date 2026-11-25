@@ -27,11 +27,13 @@
       }
     },
     "actions/setup/js/error_helpers.cjs": {
-      "sha256": "f57bf8346ebabe515ed0fa41071537a3cd8d70cb40c5b4fb4c1798b5fd7a977d",
+      "sha256": "a05a639d3f0d83af176af28580d0fb2ed33e1f86bac3b24ad20c727714f52cc5",
       "exports": {
         "getErrorMessage": "error-message",
+        "getErrorStatus": "argument-object",
         "isHtmlContent": "boolean",
         "isLockedError": "boolean",
+        "isCommentLimitError": "boolean",
         "isRateLimitError": "boolean",
         "isConnectTimeoutError": "boolean"
       }

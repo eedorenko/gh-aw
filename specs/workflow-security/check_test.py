@@ -199,22 +199,30 @@ class TransportRunnerTest(unittest.TestCase):
 
 class RuntimePinTest(unittest.TestCase):
     def test_release_pin_matches_workflow_and_documentation(self):
-        expected = "011267fca25d0752cf18894dd585cd28b96960c112ea8a20b823ea770e7e10cd"
+        expected = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
         self.assertEqual(check.JAR_SHA256, expected)
+        self.assertEqual(check_transport.JAR_SHA256, expected)
         workflow = (check.ROOT.parents[1] / ".github/workflows/daily-workflow-security-model.md").read_text()
         self.assertIn("  - shared/tla-plus.md", workflow)
         runtime = (check.ROOT.parents[1] / ".github/workflows/shared/tla-plus.md").read_text()
-        self.assertIn("https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar",
-                      runtime)
-        match = re.search(
-            r"printf '%s  %s\\n' \\\n\s+([a-f0-9]{64}) \\\n"
-            r'\s+"\$tools/tla2tools\.jar" \| sha256sum --check --strict',
+        installer = (check.ROOT.parents[1] / ".github/scripts/install_tla_runtime.sh").read_text()
+        self.assertIn("https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar",
+                      installer)
+        self.assertIn(f"jar_sha={expected}", installer)
+        self.assertIn('"$staging/runtime/tla2tools.jar" "$jar_sha"', installer)
+        installer_hash = re.search(
+            r'([a-f0-9]{64}) "\$trusted/\.github/scripts/install_tla_runtime\.sh"',
             runtime,
         )
-        self.assertIsNotNone(match)
-        self.assertEqual(match.group(1), expected)
+        self.assertIsNotNone(installer_hash)
+        self.assertIn('bash "$trusted/.github/scripts/install_tla_runtime.sh"', runtime)
         lock = (check.ROOT.parents[1] / ".github/workflows/daily-workflow-security-model.lock.yml").read_text()
-        self.assertIn(expected, lock)
+        self.assertIn(".github/scripts/install_tla_runtime.sh", lock)
+        self.assertIn(installer_hash.group(1), lock)
+        for content in [runtime, lock]:
+            self.assertNotIn("releases/download/v1.8.0/tla2tools.jar", content)
+            self.assertNotIn("011267fca25d0752cf18894dd585cd28b96960c112ea8a20b823ea770e7e10cd",
+                             content)
         self.assertIn(expected, (check.ROOT / "README.md").read_text())
 
     def test_missing_or_mismatched_jar_fails_before_execution(self):
@@ -276,12 +284,23 @@ class ResultContractTest(unittest.TestCase):
             check.check_result(12, "Error parsing module", "DetectionGate")
 
     def test_trace_shape(self):
-        raw = {"counterexample": {"state": [[1, {"s": {"lastEvent": "Init"}}],
-                                            [2, {"s": {"lastEvent": "Execute"}}]]}}
+        raw = ('Error: The behavior up to this point is:\n'
+               'State 1: <Initial predicate>\n'
+               's = [lastEvent |-> "Init", nested |-> [ok |-> TRUE, values |-> {}]]\n\n'
+               'State 2: <Execute line 1>\n'
+               's = [lastEvent |-> "Execute", nested |-> [ok |-> FALSE, '
+               'values |-> {[x |-> 1], [x |-> 2]}, '
+               'mapping |-> ("a" :> "public" @@ "b" :> "private")]]\n\n'
+               '10 states generated, 8 distinct states found\n')
         trace = check.normalize_trace(raw)
         self.assertEqual(trace["states"][1]["s"]["lastEvent"], "Execute")
-        for invalid in [{}, {"counterexample": {"state": []}},
-                        {"counterexample": {"state": [[1, {}], [2, {}]]}}]:
+        self.assertEqual(trace["states"][1]["s"]["nested"]["values"], [{"x": 1}, {"x": 2}])
+        self.assertEqual(trace["states"][1]["s"]["nested"]["mapping"],
+                         [["a", "public"], ["b", "private"]])
+        self.assertEqual(trace["actions"], ["Initial predicate", "Execute line 1"])
+        for invalid in ["", raw.replace("State 2:", "State 3:"),
+                        raw.replace("lastEvent |->", "lastEvent ->"),
+                        raw.replace("10 states generated", "missing counts")]:
             with self.assertRaises(RuntimeError):
                 check.normalize_trace(invalid)
 
@@ -340,6 +359,64 @@ class ResultContractTest(unittest.TestCase):
                 self.assertEqual(saved["failed"], 0 if outcome == "success" else 1)
 
 
+class CrossRepoSourceCompilationTest(unittest.TestCase):
+    def test_both_compiles_and_return_codes_are_recorded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            results = root / "results"
+            (results / "agent-write").mkdir(parents=True)
+            (results / "agent-write" / "source.md").write_text(
+                "---\npermissions:\n  contents: write\n---\n"
+            )
+            seed = root / "cross-repo.md"
+            seed.write_text("---\nname: seed\n---\n")
+            compiler = root / "gh-aw"
+            compiler.write_bytes(b"test compiler")
+            compile_reports = [
+                {"workflow": "cross-repo.md", "valid": True, "errors": []},
+                {"workflow": "source.md", "valid": False, "errors": [
+                    {"message": "strict mode: write permission 'contents: write' is not allowed"}
+                ]},
+            ]
+
+            def run(command, **_kwargs):
+                if command[1] == "version":
+                    return subprocess.CompletedProcess(command, 0, "test-version", "")
+                if "--no-emit" in command:
+                    return subprocess.CompletedProcess(command, 1, json.dumps(compile_reports), "")
+                Path(command[2]).with_suffix(".lock.yml").write_text(
+                    "\n".join([
+                        '  GH_AW_CHECKOUT_MANIFEST_COUNT: "2"',
+                        'GH_AW_CHECKOUT_REPO_0: "github/gh-aw"',
+                        'GH_AW_CHECKOUT_REPO_1: "example/private-dependency"',
+                        'GH_AW_CHECKOUT_TOKEN_1: ${{ secrets.MODEL_DEPENDENCY_READ_TOKEN }}',
+                        "- name: Generate GitHub App token",
+                        "  uses: actions/create-github-app-token@sha",
+                        "  client-id: ${{ vars.MODEL_APP_ID }}",
+                        "  private-key: ${{ secrets.MODEL_APP_PRIVATE_KEY }}",
+                        "  repositories: gh-aw",
+                        "- name: Generate GitHub App token",
+                        "  uses: actions/create-github-app-token@sha",
+                        "  client-id: ${{ vars.MODEL_APP_ID }}",
+                        "  private-key: ${{ secrets.MODEL_APP_PRIVATE_KEY }}",
+                        "  repositories: gh-aw",
+                        "create_issue",
+                    ])
+                )
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with patch.object(check.subprocess, "run", side_effect=run):
+                check.check_sources(compiler, results)
+
+            evidence = json.loads((results / "source-compilation.json").read_text())
+            self.assertEqual(len(evidence["compilations"]), 2)
+            self.assertEqual([item["returncode"] for item in evidence["compilations"]], [1, 0])
+            self.assertIn("--no-emit", evidence["compilations"][0]["command"])
+            self.assertIn("--action-mode", evidence["compilations"][1]["command"])
+            self.assertTrue((results / "source-compilation.log").is_file())
+            self.assertTrue((results / "source-compilation-lock.log").is_file())
+
+
 class RuntimeCheckoutModelTest(unittest.TestCase):
     def test_controls_are_declared_and_check_configured_invariants(self):
         model = (check.ROOT / "RuntimeRepositoryCheckout.tla").read_text()
@@ -356,14 +433,12 @@ class RuntimeCheckoutModelTest(unittest.TestCase):
     def test_runtime_counterexamples_are_separate_from_source_mutations(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            raw = {"counterexample": {"state": [
-                [1, {"s": {"lastEvent": "Init"}}],
-                [2, {"s": {"lastEvent": "Compile"}}],
-            ]}}
-
             def tlc(command, **kwargs):
-                Path(command[command.index("-dumpTrace") + 2]).write_text(json.dumps(raw))
+                self.assertNotIn("-dumpTrace", command)
                 text = ("Invariant PolicyProvenance is violated.\n"
+                        "Error: The behavior up to this point is:\n"
+                        'State 1: <Initial predicate>\ns = [lastEvent |-> "Init"]\n\n'
+                        'State 2: <Compile line 1>\ns = [lastEvent |-> "Compile"]\n\n'
                         "10 states generated, 8 distinct states found")
                 return subprocess.CompletedProcess(command, 12, text, "")
 
@@ -402,7 +477,8 @@ class RuntimeCheckoutModelTest(unittest.TestCase):
             report = json.loads((results / "results.json").read_text())
             self.assertEqual(report["additional_models"],
                              ["RuntimeRepositoryCheckout", "StatusOnlyJob", "MCPCompile",
-                              "ActivationAdmission", "AdmissionConclusion"])
+                              "ActivationAdmission", "AdmissionConclusion",
+                              "IssueRelationshipAuthorization"])
             cases = {case["case"] for case in report["cases"]
                      if case["model"] == "RuntimeRepositoryCheckout"}
             self.assertEqual(cases, {"secure-runtime-checkout"} |
@@ -597,6 +673,47 @@ class ConclusionModelTest(unittest.TestCase):
             report = json.loads((root / "results" / "results.json").read_text())
             self.assertEqual(report["model"], "AdmissionConclusion")
             self.assertEqual(report["additional_models"], [])
+
+
+class P1BacklogModulesTest(unittest.TestCase):
+    def write_readme(self, root, *rows):
+        table = [
+            "| Boundary | Priority | Owner | Target TLA+ module | Evidence |",
+            "|---|---|---|---|---|",
+            *rows,
+        ]
+        (root / "README.md").write_text("\n".join(table))
+
+    def test_checks_every_p1_module_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_readme(
+                root,
+                "| First boundary | P1 | Owner | `Existing.tla` | Evidence |",
+                "| Second boundary | P1 | Owner | `Missing.tla` | Evidence |",
+            )
+            (root / "Existing.tla").touch()
+
+            with patch.object(check, "ROOT", root):
+                with self.assertRaisesRegex(RuntimeError, "Missing.tla"):
+                    check.check_p1_backlog_modules()
+
+    def test_rejects_malformed_or_empty_target_cells(self):
+        rows = [
+            ("| Boundary | P1 | Owner |  | Evidence |", "backticked .tla module target"),
+            ("| Boundary | P1 | Owner | MissingBackticks.tla | Evidence |",
+             "backticked .tla module target"),
+            ("Boundary | P1 | Owner | `MissingStartPipe.tla` | Evidence |",
+             "pipe-delimited table row"),
+        ]
+        for row, expected_error in rows:
+            with self.subTest(row=row), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.write_readme(root, row)
+
+                with patch.object(check, "ROOT", root):
+                    with self.assertRaisesRegex(RuntimeError, expected_error):
+                        check.check_p1_backlog_modules()
 
 
 if __name__ == "__main__":

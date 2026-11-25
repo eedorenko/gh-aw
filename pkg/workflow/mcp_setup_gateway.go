@@ -58,17 +58,12 @@ func generateMCPGatewaySetup(yaml *strings.Builder, tools map[string]any, mcpToo
 	ensureDefaultMCPGatewayConfig(workflowData)
 	gatewayConfig := workflowData.SandboxConfig.MCP
 	mcpEnvVars := collectMCPEnvironmentVariables(tools, mcpTools, workflowData, hasAgenticWorkflows)
-	if auth, ok := jiraAuthConfig(tools); ok && auth["type"] == jiraAPITokenAuth {
-		mcpEnvVars[jiraBasicAuthEnvVar] = ""
-	}
 	stepEnvVars := maps.Clone(mcpEnvVars)
 	stepEnvVars["DEBUG"] = mcpDebugEnv
-	maps.Copy(stepEnvVars, jiraAPIAuthStepEnv(tools))
 	customGatewayEnvNames := sanitizedGatewayEnvNames(gatewayConfig.Env)
 	writeMCPGatewayStepEnvWithCustomGatewayEnvNames(yaml, stepEnvVars, safeOutputsInputEnvVars, gatewayConfig.Env, customGatewayEnvNames, gatewayConfig.AgentID)
 	yaml.WriteString("        run: |\n")
 	yaml.WriteString("          set -eo pipefail\n")
-	writeJiraAPIAuthPreparation(yaml, tools)
 	yaml.WriteString("          mkdir -p \"${RUNNER_TEMP}/gh-aw/mcp-config\"\n")
 	yaml.WriteString("          if [ -n \"${GITHUB_EVENT_PATH:-}\" ] && [ -r \"${GITHUB_EVENT_PATH}\" ]; then\n")
 	yaml.WriteString("            GH_AW_SAFEOUTPUTS_EVENT_PATH=\"${RUNNER_TEMP}/gh-aw/safeoutputs/github_event.json\"\n")
@@ -397,6 +392,9 @@ func writeMCPGatewayExports(yaml *strings.Builder, opts writeMCPGatewayExportsOp
 		yaml.WriteString("          } >> \"$GITHUB_ENV\"\n")
 	}
 	yaml.WriteString("          export GH_AW_ENGINE=\"" + engine.GetID() + "\"\n")
+	if usesWebFetchMCPForEngine(engine, workflowData) {
+		yaml.WriteString("          export GH_AW_WEB_FETCH_MCP=1\n")
+	}
 	if adapterProvider, ok := engine.(MCPConfigAdapterProvider); ok {
 		if adapterFilename := adapterProvider.GetMCPConfigAdapterFilename(); adapterFilename != "" {
 			yaml.WriteString("          export GH_AW_MCP_CONFIG_ADAPTER=\"" + adapterFilename + "\"\n")

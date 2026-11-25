@@ -14,6 +14,14 @@
 
 const MAX_DECISION_QUESTIONS = 400;
 
+class DecisionsModelUnavailableError extends Error {
+  /** @param {number} status */
+  constructor(status) {
+    super(`Decisions model is unavailable or unsupported (HTTP ${status})`);
+    this.name = "DecisionsModelUnavailableError";
+  }
+}
+
 /**
  * Validate a complete batch before sending any request.
  * @param {DecisionQuestion[]} questions
@@ -90,10 +98,10 @@ function validateDecisionResponse(response, questions) {
  * No SDK, Actions globals, agent engine, automatic retries, or credential discovery.
  * Refusals are returned to the caller; transport and protocol failures throw.
  *
- * @param {{baseURL: string, apiKey?: string, model: string, input: string | object[], questions: DecisionQuestion[], timeoutMs?: number, fetchImpl?: typeof fetch, onUsage?: (usage: unknown, model: string) => void}} options
+ * @param {{baseURL: string, apiKey?: string, integrationId?: string, model: string, input: string | object[], questions: DecisionQuestion[], timeoutMs?: number, fetchImpl?: typeof fetch, onUsage?: (usage: unknown, model: string) => void}} options
  * @returns {Promise<DecisionResponse>}
  */
-async function invokeDecisions({ baseURL, apiKey, model, input, questions, timeoutMs = 120000, fetchImpl = fetch, onUsage }) {
+async function invokeDecisions({ baseURL, apiKey, integrationId, model, input, questions, timeoutMs = 120000, fetchImpl = fetch, onUsage }) {
   validateQuestions(questions);
   if (typeof model !== "string" || !model.trim()) throw new Error("Decisions requires a model");
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("Decisions timeout must be positive");
@@ -104,13 +112,32 @@ async function invokeDecisions({ baseURL, apiKey, model, input, questions, timeo
   url.pathname = url.pathname.replace(/\/+$/, "") + "/decisions";
   const response = await fetchImpl(url.toString(), {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
+    headers: {
+      "Content-Type": "application/json",
+      ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      ...(integrationId ? { "Copilot-Integration-Id": integrationId } : {}),
+    },
     body: JSON.stringify({ model, input, questions }),
     signal: AbortSignal.timeout(timeoutMs),
     redirect: "error",
   });
-  // Do not include provider bodies: they may echo credentials or untrusted evidence.
-  if (!response.ok) throw new Error(`Decisions request failed (HTTP ${response.status})`);
+  // Inspect only allowlisted codes; never expose provider bodies or messages.
+  if (!response.ok) {
+    // A 404 may come from routing infrastructure, even with a model error code.
+    if ([400, 422].includes(response.status)) {
+      let body;
+      try {
+        body = await response.json();
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+      }
+      const code = body?.error?.code ?? body?.code;
+      if (["model_not_supported", "model_not_found", "model_not_available", "model_unavailable", "unsupported_model"].includes(code)) {
+        throw new DecisionsModelUnavailableError(response.status);
+      }
+    }
+    throw new Error(`Decisions request failed (HTTP ${response.status})`);
+  }
   const result = await response.json();
   // Account for billed requests even if the answer batch fails validation.
   if (onUsage && result && typeof result === "object") {
@@ -119,4 +146,4 @@ async function invokeDecisions({ baseURL, apiKey, model, input, questions, timeo
   return validateDecisionResponse(result, questions);
 }
 
-module.exports = { invokeDecisions, validateDecisionResponse, validateQuestions, MAX_DECISION_QUESTIONS };
+module.exports = { invokeDecisions, validateDecisionResponse, validateQuestions, MAX_DECISION_QUESTIONS, DecisionsModelUnavailableError };

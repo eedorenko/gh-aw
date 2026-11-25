@@ -6,7 +6,6 @@ on:
     paths:
       - 'actions/setup/js/**'
       - 'actions/setup/md/**'
-      - 'pkg/cli/data/models.json'
       - 'scripts/**/*.js'
       - 'scripts/check-cgo-cjs-workflow-purity.sh'
       - 'Makefile'
@@ -17,7 +16,6 @@ on:
     paths:
       - 'actions/setup/js/**'
       - 'actions/setup/md/**'
-      - 'pkg/cli/data/models.json'
       - 'scripts/**/*.js'
       - 'scripts/check-cgo-cjs-workflow-purity.sh'
       - 'Makefile'
@@ -92,8 +90,116 @@ jobs:
       - name: Run typecheck
         run: cd actions/setup/js && npm run typecheck
 
+  otlp-protobuf:
+    name: OTLP protobuf SDK compatibility
+    needs: [checkout-cache]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    concurrency:
+      group: ci-${{ github.ref }}-otlp-protobuf
+      cancel-in-progress: true
+    steps:
+      - name: Restore checkout
+        id: restore-checkout
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .
+          key: checkout-cjs-${{ github.run_id }}-${{ github.sha }}
+      - name: Checkout on cache miss
+        if: steps.restore-checkout.outputs.cache-hit != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+        with:
+          node-version: "24"
+      - name: Install isolated Node.js OpenTelemetry SDK
+        run: |
+          npm install --prefix "$RUNNER_TEMP/otel-protobuf-sdk" --no-audit --no-fund --ignore-scripts --package-lock=false \
+            @opentelemetry/sdk-trace-base@2.2.0 @opentelemetry/otlp-transformer@0.208.0 \
+            @opentelemetry/resources@2.2.0 @opentelemetry/api@1.9.0
+      - name: Compare minimal OTLP protobuf encoder with Node.js SDK
+        env:
+          GH_AW_OTEL_SDK_DIR: ${{ runner.temp }}/otel-protobuf-sdk
+        run: |
+          node --test actions/setup/js/scripts/test_otlp_protobuf.mjs
+
+  genai-semconv-conformance:
+    name: GenAI semantic-convention conformance
+    needs: [checkout-cache]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    concurrency:
+      group: ci-${{ github.ref }}-genai-semconv-conformance
+      cancel-in-progress: true
+    steps:
+      - name: Restore checkout
+        id: restore-checkout
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .
+          key: checkout-cjs-${{ github.run_id }}-${{ github.sha }}
+      - name: Checkout on cache miss
+        if: steps.restore-checkout.outputs.cache-hit != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+        with:
+          node-version: "24"
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Checkout semantic-conventions-conformance
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: open-telemetry/semantic-conventions-conformance
+          ref: a4321907b3768c468966538a459130ac6b095bdc
+          path: semantic-conventions-conformance
+          persist-credentials: false
+      - name: Move conformance checkout to runner temp
+        run: mv "$GITHUB_WORKSPACE/semantic-conventions-conformance" "$RUNNER_TEMP/semantic-conventions-conformance"
+      - name: Install pinned Weaver
+        run: |
+          mkdir -p "$RUNNER_TEMP/weaver"
+          asset=weaver-x86_64-unknown-linux-gnu.tar.xz
+          # runner-guard:ignore RGS-018 -- SHA-256 checked before extraction.
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            "https://github.com/open-telemetry/weaver/releases/download/v0.28.0/$asset" \
+            --output "$RUNNER_TEMP/$asset"
+          printf '%s  %s\n' '9878e2d56ad82ae441b0b527377a4f6001ae19f4af362fb0a4d951884f59ab61' "$RUNNER_TEMP/$asset" | sha256sum --check --strict
+          tar -xJf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/weaver"
+          weaver_binary="$(find "$RUNNER_TEMP/weaver" -type f -name weaver -print -quit)"
+          test -n "$weaver_binary"
+          chmod +x "$weaver_binary"
+          echo "$(dirname "$weaver_binary")" >> "$GITHUB_PATH"
+      - name: Install isolated conformance runner
+        run: |
+          python -m venv "$RUNNER_TEMP/otel-conformance-venv"
+          "$RUNNER_TEMP/otel-conformance-venv/bin/pip" install \
+            -e "$RUNNER_TEMP/semantic-conventions-conformance/tools/runner" \
+            -e "$RUNNER_TEMP/semantic-conventions-conformance/tools/gen-ai/mock-server" \
+            -e "$RUNNER_TEMP/semantic-conventions-conformance/tools/gen-ai/runner"
+          echo "$RUNNER_TEMP/otel-conformance-venv/bin" >> "$GITHUB_PATH"
+      - name: Validate GenAI semantic conventions
+        env:
+          SEMCONV_CACHE: ${{ runner.temp }}/semconv-cache
+          OTEL_CONFORMANCE_REPORT_DIR: ${{ runner.temp }}/gh-aw-genai-conformance
+        run: make validate-otel-conformance
+
   js-tests:
-    name: JS Tests (shard ${{ matrix.shard }}/4)
+    name: JS Tests (shard ${{ matrix.shard }}/8)
     needs: [checkout-cache]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -101,7 +207,7 @@ jobs:
       contents: read
     strategy:
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     concurrency:
       group: ci-${{ github.ref }}-js-tests-${{ matrix.shard }}
       cancel-in-progress: true
@@ -141,7 +247,7 @@ jobs:
           cp actions/setup/md/*.md ${{ runner.temp }}/gh-aw/prompts/
       - name: Run tests
         # Keep no-file-parallelism so Vitest sharding has deterministic test scheduling per shard.
-        run: cd actions/setup/js && npm run test:js -- --no-file-parallelism --shard=${{ matrix.shard }}/4
+        run: cd actions/setup/js && npm run test:js -- --no-file-parallelism --shard=${{ matrix.shard }}/8
 
   impacted-js-tests:
     needs: [checkout-cache]
@@ -175,6 +281,45 @@ jobs:
           cache-dependency-path: actions/setup/js/package-lock.json
       - name: Run impacted JavaScript unit tests
         run: make test-impacted-js BASE_REF=HEAD^
+
+  docker-root-owned-cleanup:
+    name: Docker root-owned staging cleanup
+    needs: [checkout-cache]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    concurrency:
+      group: ci-${{ github.ref }}-docker-root-owned-cleanup
+      cancel-in-progress: true
+    env:
+      GH_AW_TEST_DOCKER_IMAGE: alpine:3.21@sha256:2d8a11041a92082ba21e364dec73559ce44f1de69b60fa68315f6d3774e59117
+    steps:
+      - name: Restore checkout
+        id: restore-checkout
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .
+          key: checkout-cjs-${{ github.run_id }}-${{ github.sha }}
+      - name: Checkout on cache miss
+        if: steps.restore-checkout.outputs.cache-hit != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Ensure runner is unprivileged
+        run: test "$(id -u)" -ne 0
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+        with:
+          node-version: "24"
+      - name: Install npm dependencies
+        run: cd actions/setup/js && npm ci
+      - name: Preload pinned Docker fixture
+        run: docker pull "$GH_AW_TEST_DOCKER_IMAGE"
+      - name: Run root-owned cleanup regression
+        run: cd actions/setup/js && npm run test:js -- --no-file-parallelism release_staging.test.cjs
 
   lint-js:
     needs: [checkout-cache]
@@ -224,9 +369,6 @@ jobs:
 
       - name: Check JSON formatting
         run: make fmt-check-json
-
-      - name: Validate models.json mirror consistency
-        run: make validate-models-json-sync
 
   artifact-integration:
     name: Artifact API Integration
@@ -315,8 +457,10 @@ jobs:
     needs:
       - checkout-cache
       - js-typecheck
+      - otlp-protobuf
       - js-tests
       - impacted-js-tests
+      - docker-root-owned-cleanup
       - lint-js
       - artifact-integration
       - nvx-musl-integration

@@ -14,14 +14,35 @@ import (
 // TestAddHandlerManagerConfigEnvVar tests handler config JSON generation
 func TestAddHandlerManagerConfigEnvVar(t *testing.T) {
 	tests := []struct {
-		name          string
-		safeOutputs   *SafeOutputsConfig
-		commentMemory *CommentMemoryConfig
-		checkContains []string
-		checkJSON     bool
-		expectedKeys  []string
-		absentKeys    []string
+		name                     string
+		safeOutputs              *SafeOutputsConfig
+		commentMemory            *CommentMemoryConfig
+		tools                    map[string]any
+		tokenBrokerCopilotTask   bool
+		checkContains            []string
+		checkJSON                bool
+		expectedKeys             []string
+		absentKeys               []string
+		expectedRunsOn           string
+		expectedMessagesFooter   string
+		expectedSteps            int
+		expectedEnvironment      string
+		checkRequireAgentSuccess bool
 	}{
+		{
+			name: "authorization config",
+			safeOutputs: &SafeOutputsConfig{
+				Authorization: &SafeOutputAuthorization{
+					Endpoint: "https://authority.example/a",
+					Audience: "https://authority.example/gh-aw",
+				},
+			},
+			checkContains: []string{
+				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
+			},
+			checkJSON:    true,
+			expectedKeys: []string{"authorization"},
+		},
 		{
 			name: "create issue config",
 			safeOutputs: &SafeOutputsConfig{
@@ -836,6 +857,37 @@ func TestAddHandlerManagerConfigEnvVar(t *testing.T) {
 			expectedKeys: []string{"report_incomplete"},
 		},
 		{
+			name: "request_continuation config",
+			safeOutputs: &SafeOutputsConfig{
+				RequestContinuation: &RequestContinuationConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						Max: strPtr("1"),
+					},
+				},
+			},
+			checkContains: []string{
+				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
+			},
+			checkJSON:    true,
+			expectedKeys: []string{"request_continuation"},
+		},
+		{
+			name: "create report incomplete issue config",
+			safeOutputs: &SafeOutputsConfig{
+				ReportIncomplete: &ReportIncompleteConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						Max: strPtr("5"),
+					},
+					CreateIssue: strPtr("true"),
+				},
+			},
+			checkContains: []string{
+				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
+			},
+			checkJSON:    true,
+			expectedKeys: []string{"report_incomplete", "create_report_incomplete_issue"},
+		},
+		{
 			name: "merge_pull_request config",
 			safeOutputs: &SafeOutputsConfig{
 				MergePullRequest: &MergePullRequestConfig{
@@ -983,161 +1035,9 @@ func TestAddHandlerManagerConfigEnvVar(t *testing.T) {
 			expectedKeys: []string{"create_issue"},
 		},
 		{
-			name: "ado create work item config",
+			name: "create security advisory config",
 			safeOutputs: &SafeOutputsConfig{
-				CreateWorkItems: &CreateWorkItemConfig{
-					BaseSafeOutputConfig: BaseSafeOutputConfig{
-						Max: strPtr("1"),
-					},
-					WorkItemType: "Task",
-				},
-			},
-			checkContains: []string{
-				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
-			},
-			checkJSON:    true,
-			expectedKeys: []string{"ado_create_work_item"},
-		},
-		{
-			name: "ado update work item config",
-			safeOutputs: &SafeOutputsConfig{
-				UpdateWorkItems: &UpdateWorkItemConfig{
-					BaseSafeOutputConfig: BaseSafeOutputConfig{
-						Max: strPtr("1"),
-					},
-					Target: "*",
-					Title:  true,
-				},
-			},
-			checkContains: []string{
-				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
-			},
-			checkJSON:    true,
-			expectedKeys: []string{"ado_update_work_item"},
-		},
-		{
-			name: "ado comment on work item config",
-			safeOutputs: &SafeOutputsConfig{
-				CommentOnWorkItems: &CommentOnWorkItemConfig{
-					BaseSafeOutputConfig: BaseSafeOutputConfig{
-						Max: strPtr("1"),
-					},
-					Target: "*",
-				},
-			},
-			checkContains: []string{
-				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
-			},
-			checkJSON:    true,
-			expectedKeys: []string{"ado_comment_on_work_item"},
-		},
-		{
-			name: "ado assign work item config",
-			safeOutputs: &SafeOutputsConfig{
-				AssignWorkItems: &AssignWorkItemConfig{
-					BaseSafeOutputConfig: BaseSafeOutputConfig{
-						Max: strPtr("1"),
-					},
-					Target:  "*",
-					Allowed: []string{"owner@example.com"},
-				},
-			},
-			checkContains: []string{
-				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
-			},
-			checkJSON:    true,
-			expectedKeys: []string{"ado_assign_work_item"},
-		},
-		{
-			name: "ado link work items config",
-			safeOutputs: &SafeOutputsConfig{
-				LinkWorkItems: &LinkWorkItemsConfig{
-					BaseSafeOutputConfig: BaseSafeOutputConfig{
-						Max: strPtr("5"),
-					},
-					Target:           "*",
-					AllowedLinkTypes: []string{"parent", "child", "related"},
-				},
-			},
-			checkContains: []string{
-				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
-			},
-			checkJSON:    true,
-			expectedKeys: []string{"ado_link_work_items"},
-		},
-		{
-			name: "ado upload workitem attachment config",
-			safeOutputs: &SafeOutputsConfig{
-				UploadWorkItemAttachments: &UploadWorkItemAttachmentConfig{
-					BaseSafeOutputConfig: BaseSafeOutputConfig{
-						Max: strPtr("1"),
-					},
-					Target:            "*",
-					AllowedExtensions: []string{".txt", ".log"},
-				},
-			},
-			checkContains: []string{
-				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
-			},
-			checkJSON:    true,
-			expectedKeys: []string{"ado_upload_workitem_attachment"},
-		},
-		{
-			name: "linear create issue config",
-			safeOutputs: &SafeOutputsConfig{
-				LinearCreateIssue: &LinearCreateIssueConfig{
-					BaseSafeOutputConfig: BaseSafeOutputConfig{
-						Max: strPtr("1"),
-					},
-					TeamID: "9cfb482a-81e3-4154-b5b9-2c805e70a02d",
-				},
-			},
-			checkContains: []string{
-				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
-			},
-			checkJSON:    true,
-			expectedKeys: []string{"linear_create_issue"},
-		},
-		{
-			name: "linear add comment config",
-			safeOutputs: &SafeOutputsConfig{
-				LinearAddComment: &LinearTargetConfig{
-					BaseSafeOutputConfig: BaseSafeOutputConfig{
-						Max: strPtr("1"),
-					},
-					Target: "ENG-123",
-				},
-			},
-			checkContains: []string{
-				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
-			},
-			checkJSON:    true,
-			expectedKeys: []string{"linear_add_comment"},
-		},
-		{
-			name: "linear update issue config",
-			safeOutputs: &SafeOutputsConfig{
-				LinearUpdateIssue: &LinearUpdateIssueConfig{
-					LinearTargetConfig: LinearTargetConfig{
-						BaseSafeOutputConfig: BaseSafeOutputConfig{
-							Max: strPtr("1"),
-						},
-						Target: "ENG-123",
-					},
-					Title: boolPtr(true),
-					Body:  boolPtr(true),
-				},
-			},
-			checkContains: []string{
-				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
-			},
-			checkJSON:    true,
-			expectedKeys: []string{"linear_update_issue"},
-		},
-		{
-			name: "jira create issue config",
-			safeOutputs: &SafeOutputsConfig{
-				JiraCreateIssue: &JiraSafeOutputConfig{
+				CreateSecurityAdvisory: &CreateSecurityAdvisoryConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{
 						Max: strPtr("1"),
 					},
@@ -1147,42 +1047,12 @@ func TestAddHandlerManagerConfigEnvVar(t *testing.T) {
 				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
 			},
 			checkJSON:    true,
-			expectedKeys: []string{"jira_create_issue"},
+			expectedKeys: []string{"create_security_advisory"},
 		},
 		{
-			name: "jira update issue config",
+			name: "add security advisory comment config",
 			safeOutputs: &SafeOutputsConfig{
-				JiraUpdateIssue: &JiraSafeOutputConfig{
-					BaseSafeOutputConfig: BaseSafeOutputConfig{
-						Max: strPtr("1"),
-					},
-				},
-			},
-			checkContains: []string{
-				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
-			},
-			checkJSON:    true,
-			expectedKeys: []string{"jira_update_issue"},
-		},
-		{
-			name: "jira add comment config",
-			safeOutputs: &SafeOutputsConfig{
-				JiraAddComment: &JiraSafeOutputConfig{
-					BaseSafeOutputConfig: BaseSafeOutputConfig{
-						Max: strPtr("1"),
-					},
-				},
-			},
-			checkContains: []string{
-				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
-			},
-			checkJSON:    true,
-			expectedKeys: []string{"jira_add_comment"},
-		},
-		{
-			name: "jira add label config",
-			safeOutputs: &SafeOutputsConfig{
-				JiraAddLabel: &JiraSafeOutputConfig{
+				AddSecurityAdvisoryComment: &AddSecurityAdvisoryCommentConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{
 						Max: strPtr("3"),
 					},
@@ -1192,7 +1062,145 @@ func TestAddHandlerManagerConfigEnvVar(t *testing.T) {
 				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
 			},
 			checkJSON:    true,
-			expectedKeys: []string{"jira_add_label"},
+			expectedKeys: []string{"add_security_advisory_comment"},
+		},
+		{
+			name: "create agent session config",
+			safeOutputs: &SafeOutputsConfig{
+				CreateAgentSessions: &CreateAgentSessionConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						Max: strPtr("1"),
+					},
+					Base: "main",
+				},
+			},
+			checkContains: []string{
+				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
+			},
+			checkJSON:    true,
+			expectedKeys: []string{"create_agent_session"},
+		},
+		{
+			name: "set issue field config",
+			safeOutputs: &SafeOutputsConfig{
+				SetIssueField: &SetIssueFieldConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						Max: strPtr("5"),
+					},
+					AllowedFields: []string{"Priority"},
+				},
+			},
+			checkContains: []string{
+				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
+			},
+			checkJSON:    true,
+			expectedKeys: []string{"set_issue_field"},
+		},
+		{
+			name: "claim adapters config",
+			safeOutputs: &SafeOutputsConfig{
+				ClaimAdapters: map[string]*WorkQueueClaimAdapter{
+					"custom": {
+						Mode:       "script",
+						EffectType: "update_issue",
+						TargetRepo: "owner/repo",
+						FieldMap:   map[string]string{"body": "content"},
+						Expected:   map[string]any{"item_number": 42},
+					},
+				},
+			},
+			tools: map[string]any{"work-queue": true},
+			checkContains: []string{
+				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
+			},
+			checkJSON:    true,
+			expectedKeys: []string{"claim_adapters"},
+		},
+		{
+			name: "token broker config",
+			safeOutputs: &SafeOutputsConfig{
+				TokenBroker: true,
+				AssignToAgent: &AssignToAgentConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						Max: strPtr("1"),
+					},
+				},
+			},
+			tokenBrokerCopilotTask: true,
+			checkContains: []string{
+				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
+			},
+			checkJSON:    true,
+			expectedKeys: []string{"_token_broker", "assign_to_agent"},
+		},
+		{
+			name: "require agent success config",
+			safeOutputs: &SafeOutputsConfig{
+				RequireAgentSuccess: true,
+				NoOp: &NoOpConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						Max: strPtr("2"),
+					},
+				},
+			},
+			checkContains: []string{
+				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
+			},
+			checkJSON:                true,
+			expectedKeys:             []string{"noop"},
+			checkRequireAgentSuccess: true,
+		},
+		{
+			name: "runs-on config",
+			safeOutputs: &SafeOutputsConfig{
+				RunsOn: "ubuntu-latest",
+				NoOp: &NoOpConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("2")},
+				},
+			},
+			checkContains:  []string{"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG"},
+			checkJSON:      true,
+			expectedKeys:   []string{"noop"},
+			expectedRunsOn: "ubuntu-latest",
+		},
+		{
+			name: "messages config",
+			safeOutputs: &SafeOutputsConfig{
+				Messages: &SafeOutputMessagesConfig{Footer: "Generated by the test"},
+				NoOp: &NoOpConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("2")},
+				},
+			},
+			checkContains:          []string{"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG"},
+			checkJSON:              true,
+			expectedKeys:           []string{"noop"},
+			expectedMessagesFooter: "Generated by the test",
+		},
+		{
+			name: "steps config",
+			safeOutputs: &SafeOutputsConfig{
+				Steps: []any{map[string]any{"name": "prepare", "run": "echo prepared"}},
+				NoOp: &NoOpConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("2")},
+				},
+			},
+			checkContains: []string{"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG"},
+			checkJSON:     true,
+			expectedKeys:  []string{"noop"},
+			expectedSteps: 1,
+		},
+		{
+			name: "environment config",
+			safeOutputs: &SafeOutputsConfig{
+				Environment: "safe-output-test",
+				NoOp: &NoOpConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("2")},
+				},
+			},
+			checkContains:       []string{"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG"},
+			checkJSON:           true,
+			expectedKeys:        []string{"noop"},
+			expectedEnvironment: "safe-output-test",
 		},
 	}
 
@@ -1201,15 +1209,34 @@ func TestAddHandlerManagerConfigEnvVar(t *testing.T) {
 			compiler := NewCompiler()
 
 			workflowData := &WorkflowData{
-				Name:                "Test Workflow",
-				SafeOutputs:         tt.safeOutputs,
-				CommentMemoryConfig: tt.commentMemory,
+				Name:                   "Test Workflow",
+				SafeOutputs:            tt.safeOutputs,
+				CommentMemoryConfig:    tt.commentMemory,
+				Tools:                  tt.tools,
+				TokenBrokerCopilotTask: tt.tokenBrokerCopilotTask,
 			}
 
 			var steps []string
 			compiler.addHandlerManagerConfigEnvVar(&steps, workflowData)
 
 			require.NotEmpty(t, steps)
+			require.NotNil(t, workflowData.SafeOutputs)
+			if tt.checkRequireAgentSuccess {
+				assert.True(t, workflowData.SafeOutputs.RequireAgentSuccess)
+			}
+			if tt.expectedRunsOn != "" {
+				assert.Equal(t, tt.expectedRunsOn, workflowData.SafeOutputs.RunsOn)
+			}
+			if tt.expectedMessagesFooter != "" {
+				require.NotNil(t, workflowData.SafeOutputs.Messages)
+				assert.Equal(t, tt.expectedMessagesFooter, workflowData.SafeOutputs.Messages.Footer)
+			}
+			if tt.expectedSteps > 0 {
+				assert.Len(t, workflowData.SafeOutputs.Steps, tt.expectedSteps)
+			}
+			if tt.expectedEnvironment != "" {
+				assert.Equal(t, tt.expectedEnvironment, workflowData.SafeOutputs.Environment)
+			}
 
 			stepsContent := strings.Join(steps, "")
 

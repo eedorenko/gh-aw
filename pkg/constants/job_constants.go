@@ -75,8 +75,10 @@ const ConclusionAdmissionJobName JobName = "conclusion_admission"
 const GradersJobName JobName = "graders"
 const UnlockJobName JobName = "unlock"
 const PushExperimentsStateJobName JobName = "push_experiments_state"
+const ReportExperimentsJobName JobName = "report_experiments"
 const PushEvalsStateJobName JobName = "push_evals_state"
 const PushRepoMemoryJobName JobName = "push_repo_memory"
+const PushRoutingHistoryJobName JobName = "push_routing_history"
 const PushLedgerChangesJobName JobName = "push_ledger_changes"
 const UpdateCacheMemoryJobName JobName = "update_cache_memory"
 const UpdateDriveMemoryJobName JobName = "update_drive_memory"
@@ -147,6 +149,8 @@ var MaintenanceJobDependencies = map[string]JobName{
 	string(PushLedgerChangesJobName):    AgentJobName,
 	string(PushEvalsStateJobName):       AgentJobName,
 	string(PushExperimentsStateJobName): ActivationJobName,
+	string(ReportExperimentsJobName):    ConclusionJobName,
+	string(PushRoutingHistoryJobName):   ConclusionJobName,
 }
 
 // IsCompilerOwnedJobName includes generated maintenance jobs, which are not
@@ -235,6 +239,9 @@ const GithubRateLimitsFilename Filename = "github_rate_limits.jsonl"
 // by send_otlp_span.cjs. Each line is a full OTLP/HTTP JSON traces payload.
 // Included in the agent artifact so spans are available without a live collector.
 const OtelJsonlFilename Filename = "otel.jsonl"
+
+// OtelMetricsJsonlFilename is the filename of the OTLP metrics mirror written to /tmp/gh-aw/.
+const OtelMetricsJsonlFilename Filename = "otel-metrics.jsonl"
 
 // OtlpExportErrorsFilename is the filename of the OTLP per-endpoint export failure log
 // written to /tmp/gh-aw/ by send_otlp_span.cjs. Each line is a JSON object containing the

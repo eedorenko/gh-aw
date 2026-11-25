@@ -34,6 +34,7 @@ const instructionTemplates = new Set([
   "cache_memory_prompt_multi.md",
   "cli_proxy_prompt.md",
   "cli_proxy_with_safeoutputs_prompt.md",
+  "github_mcp_cli_tools_prompt.md",
   "github_mcp_tools_prompt.md",
   "github_mcp_tools_with_safeoutputs_prompt.md",
   "markdown.md",
@@ -53,6 +54,7 @@ const instructionTemplates = new Set([
   "safe_outputs_prompt.md",
   "safe_outputs_push_to_pr_branch.md",
   "safe_outputs_steering_issue.md",
+  "safe_outputs_steering_issue_cli.md",
   "temp_folder_prompt.md",
   "threat_detection.md",
   "xpia.md",
@@ -144,7 +146,7 @@ function renderMessagePreviews() {
   const previews = [];
   const add = (name, body) => previews.push(`## ${name}\n\n${body.trimEnd() || "_Empty by default._"}\n`);
 
-  for (const name of ["getRunStartedMessage", "getRunSuccessMessage", "getRunFailureMessage", "getDetectionFailureMessage", "getPullRequestCreatedMessage", "getIssueCreatedMessage", "getCommitPushedMessage"]) {
+  for (const name of ["getRunStartedMessage", "getRunSuccessMessage", "getRunFailureMessage", "getPullRequestCreatedMessage", "getIssueCreatedMessage", "getCommitPushedMessage"]) {
     add(name, status[name](context));
   }
   for (const reason of ["threat_detected", "agent_failure", "parse_error"]) {

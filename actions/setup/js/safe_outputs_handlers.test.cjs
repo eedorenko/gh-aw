@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import crypto from "crypto";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { execSync } from "child_process";
 import { createHandlers, hasUpdatePullRequestFields } from "./safe_outputs_handlers.cjs";
@@ -21,6 +22,7 @@ import {
 } from "./intent_probe.cjs";
 
 const LARGE_CONTENT_BODY = "A".repeat(70000);
+const outputId = expect.stringMatching(/^so_[A-Za-z0-9_-]{12}$/);
 const testScratchRoot = path.resolve(`.safe-outputs-handlers-${crypto.randomUUID()}`);
 const originalGitCeiling = process.env.GIT_CEILING_DIRECTORIES;
 
@@ -83,15 +85,257 @@ describe("safe_outputs_handlers", () => {
     handlers = createHandlers(mockServer, mockAppendSafeOutput);
   });
 
-  it("collects Azure DevOps proposals using namespaced message types", () => {
-    handlers.createWorkItemHandler({ temporary_id: "item", title: "Create item" });
-    handlers.updateWorkItemHandler({ id: "#item", title: "Update item" });
-    handlers.commentOnWorkItemHandler({ work_item_id: "#item", body: "Comment" });
-    handlers.assignWorkItemHandler({ work_item_id: "#item", assignee: "user@example.com" });
-    handlers.linkWorkItemsHandler({ source_id: "#item", target_id: 42, type: "related" });
+  describe("update_issue artifact paths", () => {
+    let restoreDescriptors;
 
-    expect(mockAppendSafeOutput.mock.calls.map(call => call[0].type)).toEqual(["ado_create_work_item", "ado_update_work_item", "ado_comment_on_work_item", "ado_assign_work_item", "ado_link_work_items"]);
-    expect(mockAppendSafeOutput.mock.calls[0][0].temporary_id).toMatch(/^#aw_/);
+    beforeEach(() => {
+      restoreDescriptors = simulateLinuxDescriptors(vi);
+    });
+
+    afterEach(() => {
+      restoreDescriptors?.();
+      vi.restoreAllMocks();
+      vi.unstubAllGlobals();
+    });
+
+    it("records artifact-only file requests as content on the triggering issue", () => {
+      const source = path.join(testWorkspaceDir, "plan.md");
+      fs.writeFileSync(source, "Implementation plan");
+      vi.stubGlobal("context", { ...mockContext, eventName: "issues", payload: { issue: { number: 123 } } });
+      try {
+        const input = { artifacts: [{ type: "plan", name: "Plan", path: source }] };
+        const result = handlers.updateIssueHandler(input);
+        expect(result.isError).not.toBe(true);
+        expect(mockAppendSafeOutput).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: "update_issue",
+            artifacts: [{ type: "plan", name: "Plan", body: "Implementation plan" }],
+          })
+        );
+        expect(input.artifacts[0].path).toBe(source);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it.each([0, -1, 1])("enforces count cap %s before opening files or recording requests", max => {
+      const configured = createHandlers(mockServer, mockAppendSafeOutput, { update_issue: { target: "*", max_issue_artifacts: max } });
+      const open = vi.spyOn(fs, "openSync");
+      expect(() =>
+        configured.updateIssueHandler({
+          issue_number: 123,
+          artifacts: [
+            { name: "Plan", path: path.join(testWorkspaceDir, "missing.md") },
+            { name: "Notes", body: "Research" },
+          ],
+        })
+      ).toThrow("max-issue-artifacts");
+      expect(open).not.toHaveBeenCalled();
+      expect(mockAppendSafeOutput).not.toHaveBeenCalled();
+    });
+
+    it("enforces the configured byte limit for inline and file inputs", () => {
+      const source = path.join(testWorkspaceDir, "plan.md");
+      fs.writeFileSync(source, "é");
+      const configured = createHandlers(mockServer, mockAppendSafeOutput, { update_issue: { target: "*", max_issue_artifact_size: 2 } });
+      configured.updateIssueHandler({ issue_number: 123, artifacts: [{ name: "Plan", path: source }] });
+      expect(mockAppendSafeOutput.mock.calls[0][0].artifacts[0].body).toBe("é");
+      mockAppendSafeOutput.mockClear();
+      fs.appendFileSync(source, "a");
+      expect(() => configured.updateIssueHandler({ issue_number: 123, artifacts: [{ name: "Plan", path: source }] })).toThrow("exceeds maximum allowed size");
+      expect(() => configured.updateIssueHandler({ issue_number: 123, artifacts: [{ name: "Plan", body: "éa" }] })).toThrow("update_issue artifacts[0].body is 3 UTF-8 bytes");
+      expect(mockAppendSafeOutput).not.toHaveBeenCalled();
+    });
+
+    it("rejects unsafe paths without recording requests", () => {
+      const configured = createHandlers(mockServer, mockAppendSafeOutput, { update_issue: { target: "*" } });
+      for (const source of ["/etc/passwd", path.join(testWorkspaceDir, ".git", "config")]) {
+        expect(() => configured.updateIssueHandler({ issue_number: 123, artifacts: [{ name: "Plan", path: source }] })).toThrow();
+      }
+      expect(mockAppendSafeOutput).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("create_issue artifact paths", () => {
+    let restoreDescriptors;
+    const request = artifacts => ({ title: "Implement parser caching", body: "Cache parsed workflows and add regression coverage.", artifacts });
+
+    beforeEach(() => {
+      restoreDescriptors = simulateLinuxDescriptors(vi);
+    });
+
+    afterEach(() => {
+      restoreDescriptors?.();
+      vi.restoreAllMocks();
+      vi.unstubAllGlobals();
+    });
+
+    it("reads UTF-8 files into recorded content without echoing them or persisting paths", () => {
+      const source = path.join(testWorkspaceDir, "plan.md");
+      const output = path.join(testWorkspaceDir, "output.jsonl");
+      const body = "## Plan\n\n" + "Cache éach parsed workflow.\n".repeat(3000);
+      fs.writeFileSync(source, body);
+      const input = request([
+        { type: "plan", name: "Plan", path: source },
+        { name: "Notes", body: "Inline notes" },
+      ]);
+      const configured = createHandlers(mockServer, entry => fs.appendFileSync(output, `${JSON.stringify(entry)}\n`), { create_issue: { staged: true } });
+
+      const result = configured.createIssueHandler(input);
+      const recorded = JSON.parse(fs.readFileSync(output, "utf8"));
+      expect(recorded.artifacts).toEqual([
+        { type: "plan", name: "Plan", body },
+        { type: "generic", name: "Notes", body: "Inline notes" },
+      ]);
+      expect(recorded.artifacts[0]).not.toHaveProperty("path");
+      expect(input.artifacts[0]).toHaveProperty("path", source);
+      expect(JSON.parse(result.content[0].text)).toEqual({ result: "success", output_id: outputId });
+      expect(result.content[0].text).not.toContain(body);
+    });
+
+    it("accepts the exact default byte limit and rejects an oversized file before recording", () => {
+      const source = path.join(testWorkspaceDir, "plan.md");
+      const body = "x".repeat(1024 * 1024);
+      fs.writeFileSync(source, body);
+      handlers.createIssueHandler(request([{ name: "Plan", path: source }]));
+      expect(mockAppendSafeOutput.mock.calls[0][0].artifacts[0].body).toBe(body);
+      mockAppendSafeOutput.mockClear();
+      fs.appendFileSync(source, "x");
+      expect(() => handlers.createIssueHandler(request([{ name: "Plan", path: source }]))).toThrow("exceeds maximum allowed size");
+      expect(mockAppendSafeOutput).not.toHaveBeenCalled();
+    });
+
+    it("applies configured UTF-8 byte limits to both file and inline content", () => {
+      const source = path.join(testWorkspaceDir, "plan.md");
+      const configured = createHandlers(mockServer, mockAppendSafeOutput, { create_issue: { max_issue_artifacts: 2, max_issue_artifact_size: 2 } });
+      fs.writeFileSync(source, "é");
+      configured.createIssueHandler(
+        request([
+          { name: "Plan", path: source },
+          { name: "Note", body: "é" },
+        ])
+      );
+      expect(mockAppendSafeOutput.mock.calls[0][0].artifacts[0].body).toBe("é");
+      mockAppendSafeOutput.mockClear();
+      fs.writeFileSync(source, "éa");
+      expect(() => configured.createIssueHandler(request([{ name: "Plan", path: source }]))).toThrow("exceeds maximum allowed size");
+      expect(() => configured.createIssueHandler(request([{ name: "Note", body: "éa" }]))).toThrow("3 UTF-8 bytes");
+      expect(mockAppendSafeOutput).not.toHaveBeenCalled();
+    });
+
+    it.each([0, -1, 1])("checks count limit %s before opening any source", max => {
+      const configured = createHandlers(mockServer, mockAppendSafeOutput, { create_issue: { max_issue_artifacts: max } });
+      const open = vi.spyOn(fs, "openSync");
+      expect(() =>
+        configured.createIssueHandler(
+          request([
+            { name: "Plan", path: path.join(testWorkspaceDir, "missing.md") },
+            { name: "Notes", body: "Details" },
+          ])
+        )
+      ).toThrow("max-issue-artifacts");
+      expect(open).not.toHaveBeenCalled();
+      expect(mockAppendSafeOutput).not.toHaveBeenCalled();
+    });
+
+    it("validates every input before reading any file", () => {
+      const open = vi.spyOn(fs, "openSync");
+      expect(() => handlers.createIssueHandler(request([{ name: "Plan", path: path.join(testWorkspaceDir, "plan.md") }, { name: "Invalid" }]))).toThrow("exactly one of body or path");
+      expect(open).not.toHaveBeenCalled();
+      expect(mockAppendSafeOutput).not.toHaveBeenCalled();
+    });
+
+    it.each([{ name: "Plan" }, { name: "Plan", body: "Details", path: "/tmp/plan.md" }, { name: "Plan", path: "" }, { name: "Plan", path: "plan.md" }, { name: "Plan", path: 42 }])("rejects invalid content sources: %j", artifact => {
+      expect(() => handlers.createIssueHandler(request([artifact]))).toThrow("artifacts[0]");
+      expect(mockAppendSafeOutput).not.toHaveBeenCalled();
+    });
+
+    it.each(["", " \n\t", Buffer.from([0xff, 0xfe]), Buffer.from([0])])("rejects empty or invalid UTF-8 files: %j", content => {
+      const source = path.join(testWorkspaceDir, "plan.md");
+      fs.writeFileSync(source, content);
+      expect(() => handlers.createIssueHandler(request([{ name: "Plan", path: source }]))).toThrow(/non-empty text|UTF-8 text/);
+      expect(mockAppendSafeOutput).not.toHaveBeenCalled();
+    });
+
+    it("rejects outside-root paths, traversal, and prefix collisions", () => {
+      for (const source of [path.join(testWorkspaceDir, "..", "outside.md"), `${testWorkspaceDir}-other/plan.md`]) {
+        expect(() => handlers.createIssueHandler(request([{ name: "Plan", path: source }]))).toThrow("within workspace directory");
+      }
+      expect(mockAppendSafeOutput).not.toHaveBeenCalled();
+    });
+
+    it.each([".git/config", "nested/.git/credentials"])("rejects repository metadata before reading: %s", filename => {
+      const source = path.join(testWorkspaceDir, filename);
+      fs.mkdirSync(path.dirname(source), { recursive: true });
+      fs.writeFileSync(source, "sensitive metadata");
+      const open = vi.spyOn(fs, "openSync");
+      expect(() => handlers.createIssueHandler(request([{ name: "Plan", path: source }]))).toThrow("sensitive repository metadata");
+      expect(open).not.toHaveBeenCalled();
+      expect(mockAppendSafeOutput).not.toHaveBeenCalled();
+    });
+
+    it.each([".ssh/id_rsa", ".aws/credentials", ".config/gh/hosts.yml", ".netrc", ".npmrc", ".git-credentials"])("rejects HOME credentials even when HOME is the workspace: %s", filename => {
+      vi.spyOn(os, "homedir").mockReturnValue(testWorkspaceDir);
+      const open = vi.spyOn(fs, "openSync");
+      expect(() => handlers.createIssueHandler(request([{ name: "Plan", path: path.join(testWorkspaceDir, filename) }]))).toThrow("sensitive HOME location");
+      expect(open).not.toHaveBeenCalled();
+      expect(mockAppendSafeOutput).not.toHaveBeenCalled();
+    });
+
+    it.each(["/tmp/gh-aw/mcp-config.json", "/tmp/runtime.log", "/tmp/gh-aw/agent-other/plan.md", "/tmp/gh-aw/agent/../gateway/config.json"])("rejects general temporary files before opening: %s", source => {
+      const open = vi.spyOn(fs, "openSync");
+      expect(() => handlers.createIssueHandler(request([{ name: "Plan", path: source }]))).toThrow("/tmp/gh-aw/agent directory");
+      expect(open).not.toHaveBeenCalled();
+      expect(mockAppendSafeOutput).not.toHaveBeenCalled();
+    });
+
+    it("allows absolute paths in the agent working root without permitting sibling roots", () => {
+      const { resolveIssueArtifactPath, normalizeGuardedPath } = require("./symlink_guard.cjs");
+      expect(resolveIssueArtifactPath("/tmp/gh-aw/agent/plan.md")).toBe(normalizeGuardedPath("/tmp/gh-aw/agent/plan.md"));
+      expect(resolveIssueArtifactPath(path.join(testWorkspaceDir, "plan.md"))).toBe(normalizeGuardedPath(path.join(testWorkspaceDir, "plan.md")));
+    });
+
+    it("rejects system files even if the configured workspace overlaps a system directory", () => {
+      vi.stubEnv("GITHUB_WORKSPACE", "/etc");
+      const open = vi.spyOn(fs, "openSync");
+      expect(() => handlers.createIssueHandler(request([{ name: "Plan", path: "/etc/passwd" }]))).toThrow("system directory");
+      expect(open).not.toHaveBeenCalled();
+      expect(mockAppendSafeOutput).not.toHaveBeenCalled();
+    });
+
+    it("does not expand variables or glob patterns", () => {
+      for (const name of ["$GITHUB_WORKSPACE/plan.md", "*.md"]) {
+        expect(() => handlers.createIssueHandler(request([{ name: "Plan", path: path.join(testWorkspaceDir, name) }]))).toThrow("could not be read");
+      }
+      expect(mockAppendSafeOutput).not.toHaveBeenCalled();
+    });
+
+    it("rejects symlinks, hard links, directories, and missing files", () => {
+      const source = path.join(testWorkspaceDir, "plan.md");
+      fs.writeFileSync(source, "Plan");
+      const symlink = path.join(testWorkspaceDir, "symlink.md");
+      const hardlink = path.join(testWorkspaceDir, "hardlink.md");
+      const parentLink = path.join(testWorkspaceDir, "linked-directory");
+      fs.symlinkSync(source, symlink);
+      fs.symlinkSync(testWorkspaceDir, parentLink);
+      fs.linkSync(source, hardlink);
+      for (const filename of [symlink, hardlink, path.join(parentLink, "plan.md"), testWorkspaceDir, path.join(testWorkspaceDir, "missing.md")]) {
+        expect(() => handlers.createIssueHandler(request([{ name: "Plan", path: filename }]))).toThrow("could not be read");
+      }
+      expect(mockAppendSafeOutput).not.toHaveBeenCalled();
+    });
+
+    it("leaves deduplication state and operation budgets unchanged after a failed read", () => {
+      const source = path.join(testWorkspaceDir, "plan.md");
+      const configured = createHandlers(mockServer, mockAppendSafeOutput, { create_issue: { max: 1 } });
+      const input = { ...request([{ name: "Plan", path: source }]), temporary_id: "aw_artifact" };
+      expect(() => configured.createIssueHandler(input)).toThrow("could not be read");
+      expect(mockAppendSafeOutput).not.toHaveBeenCalled();
+      fs.writeFileSync(source, "Plan");
+      expect(JSON.parse(configured.createIssueHandler(input).content[0].text)).toEqual({ result: "success", output_id: outputId });
+      expect(mockAppendSafeOutput).toHaveBeenCalledTimes(1);
+      expect(mockAppendSafeOutput.mock.calls[0][0].artifacts).toEqual([{ type: "generic", name: "Plan", body: "Plan" }]);
+    });
   });
 
   it("converts built-in map calls into ledger_append entries", () => {
@@ -110,8 +354,8 @@ describe("safe_outputs_handlers", () => {
     expect(configured.ledgerBuiltinHandler("map", "put")({ ledger: "cache", key: "a", value: { status: "ready" }, temp_id: "entry" }).isError).not.toBe(true);
     expect(configured.ledgerBuiltinHandler("map", "put")({ ledger: "other", key: "b", value: 2 }).isError).not.toBe(true);
     expect(mockAppendSafeOutput.mock.calls.map(([entry]) => entry)).toEqual([
-      { type: "ledger_append", ledger: "cache", operation: "put", key: "a", value: { status: "ready" }, temp_id: "entry" },
-      { type: "ledger_append", ledger: "other", operation: "put", key: "b", value: 2 },
+      { type: "ledger_append", ledger: "cache", operation: "put", key: "a", value: { status: "ready" }, temp_id: "entry", output_id: outputId },
+      { type: "ledger_append", ledger: "other", operation: "put", key: "b", value: 2, output_id: outputId },
     ]);
   });
 
@@ -133,9 +377,9 @@ describe("safe_outputs_handlers", () => {
     expect(configured.ledgerAgentAppendHandler({ ledger: "knowledge", operation: "note", ...note }).isError).toBe(true);
     expect(configured.ledgerAgentAppendHandler({ ledger: "history", operation: "append", value: "ok" }).isError).not.toBe(true);
     expect(mockAppendSafeOutput.mock.calls.map(([entry]) => entry)).toEqual([
-      { type: "ledger_append", ledger: "knowledge", temp_id: "first", operation: "note", ...note },
-      { type: "ledger_append", ledger: "knowledge", operation: "vote", note_id: "#first", vote: "up" },
-      { type: "ledger_append", ledger: "history", operation: "append", value: "ok" },
+      { type: "ledger_append", ledger: "knowledge", temp_id: "first", operation: "note", ...note, output_id: outputId },
+      { type: "ledger_append", ledger: "knowledge", operation: "vote", note_id: "#first", vote: "up", output_id: outputId },
+      { type: "ledger_append", ledger: "history", operation: "append", value: "ok", output_id: outputId },
     ]);
   });
 
@@ -174,7 +418,7 @@ describe("safe_outputs_handlers", () => {
     expect(configured.ledgerAgentAppendHandler({ ledger: "unknown", record }).isError).toBe(true);
     expect(mockAppendSafeOutput).not.toHaveBeenCalled();
     expect(configured.ledgerAgentAppendHandler({ record }).isError).not.toBe(true);
-    expect(mockAppendSafeOutput).toHaveBeenCalledExactlyOnceWith({ type: "ledger_append", record });
+    expect(mockAppendSafeOutput).toHaveBeenCalledExactlyOnceWith({ type: "ledger_append", record, output_id: outputId });
 
     const previousRunnerTemp = process.env.RUNNER_TEMP;
     process.env.RUNNER_TEMP = testWorkspaceDir;
@@ -440,12 +684,13 @@ describe("safe_outputs_handlers", () => {
         field1: "value1",
         field2: "value2",
         type: "test-type",
+        output_id: outputId,
       });
       expect(result).toEqual({
         content: [
           {
             type: "text",
-            text: JSON.stringify({ result: "success" }),
+            text: JSON.stringify({ result: "success", output_id: mockAppendSafeOutput.mock.calls[0][0].output_id }),
           },
         ],
       });
@@ -477,8 +722,8 @@ describe("safe_outputs_handlers", () => {
 
       const result = handler(null);
 
-      expect(mockAppendSafeOutput).toHaveBeenCalledWith({ type: "test-type" });
-      expect(result.content[0].text).toBe(JSON.stringify({ result: "success" }));
+      expect(mockAppendSafeOutput).toHaveBeenCalledWith({ type: "test-type", output_id: outputId });
+      expect(JSON.parse(result.content[0].text)).toEqual({ result: "success", output_id: mockAppendSafeOutput.mock.calls[0][0].output_id });
     });
 
     it("should handle undefined args", () => {
@@ -486,8 +731,8 @@ describe("safe_outputs_handlers", () => {
 
       const result = handler(undefined);
 
-      expect(mockAppendSafeOutput).toHaveBeenCalledWith({ type: "test-type" });
-      expect(result.content[0].text).toBe(JSON.stringify({ result: "success" }));
+      expect(mockAppendSafeOutput).toHaveBeenCalledWith({ type: "test-type", output_id: outputId });
+      expect(JSON.parse(result.content[0].text)).toEqual({ result: "success", output_id: mockAppendSafeOutput.mock.calls[0][0].output_id });
     });
 
     it("should enforce data_schema for default handler payloads", () => {
@@ -641,6 +886,13 @@ describe("safe_outputs_handlers", () => {
       expect(entry.size).toBe(Buffer.byteLength("test content"));
       const stagedFile = path.join(testRunnerTemp, "gh-aw", "safeoutputs", "assets", `${crypto.createHash("sha256").update(testFile).digest("hex")}.png`);
       expect(fs.readFileSync(stagedFile)).toEqual(Buffer.from("test content"));
+      const stagedStat = fs.statSync(stagedFile);
+      expect(stagedStat.mode & 0o777).toBe(0o600);
+      expect(stagedStat.uid).toBe(process.getuid());
+      expect(stagedStat.gid).toBe(process.getgid());
+      for (const directory of [path.dirname(stagedFile), path.dirname(path.dirname(stagedFile)), path.dirname(path.dirname(path.dirname(stagedFile)))]) {
+        expect(fs.statSync(directory).mode & 0o777).toBe(0o700);
+      }
       expect(entry.url).toContain("test-branch");
 
       expect(result.content[0].type).toBe("text");
@@ -987,7 +1239,7 @@ describe("safe_outputs_handlers", () => {
       expect(() => handlers.uploadArtifactHandler({ path: linkPath })).toThrow(expect.objectContaining({ message: expect.stringContaining("symlinks are not allowed") }));
     });
 
-    it("should not overwrite existing staged file on duplicate call", () => {
+    it("should allow an identical file to be staged more than once", () => {
       const srcFile = path.join(testWorkspaceDir, "chart.png");
       fs.writeFileSync(srcFile, "original");
 
@@ -997,10 +1249,22 @@ describe("safe_outputs_handlers", () => {
       const stagedPath = path.join(testStagingDir, "gh-aw", "safeoutputs", "upload-artifacts", "chart.png");
       expect(fs.readFileSync(stagedPath, "utf8")).toBe("original");
 
-      // Second call with modified source should not overwrite
-      fs.writeFileSync(srcFile, "updated");
-      handlers.uploadArtifactHandler({ path: srcFile });
+      // Re-staging identical content is safe.
+      expect(() => handlers.uploadArtifactHandler({ path: srcFile })).not.toThrow();
       expect(fs.readFileSync(stagedPath, "utf8")).toBe("original");
+    });
+
+    it("should reject different files with the same basename", () => {
+      const firstFile = path.join(testWorkspaceDir, "first", "report.png");
+      const secondFile = path.join(testWorkspaceDir, "second", "report.png");
+      fs.mkdirSync(path.dirname(firstFile), { recursive: true });
+      fs.mkdirSync(path.dirname(secondFile), { recursive: true });
+      fs.writeFileSync(firstFile, "first report");
+      fs.writeFileSync(secondFile, "second report");
+
+      handlers.uploadArtifactHandler({ path: firstFile });
+
+      expect(() => handlers.uploadArtifactHandler({ path: secondFile })).toThrow(expect.objectContaining({ message: expect.stringContaining("staging name conflict for report.png") }));
     });
 
     it("should wrap staging copy failures for absolute-path files", () => {
@@ -1119,6 +1383,51 @@ describe("safe_outputs_handlers", () => {
       expect(mockAppendSafeOutput).toHaveBeenCalledWith(expect.objectContaining({ type: "upload_artifact", path: "charts" }));
     });
 
+    it("should return early when the staged directory is identical", () => {
+      const srcDir = path.join(testWorkspaceDir, "charts");
+      fs.mkdirSync(srcDir, { recursive: true });
+      fs.writeFileSync(path.join(srcDir, "chart.png"), "same chart");
+      handlers.uploadArtifactHandler({ path: srcDir });
+
+      const copySpy = vi.spyOn(fs, "copyFileSync");
+      expect(() => handlers.uploadArtifactHandler({ path: srcDir })).not.toThrow();
+
+      expect(copySpy).not.toHaveBeenCalled();
+    });
+
+    it("should remove a partial directory copy so the same source can be retried", () => {
+      const srcDir = path.join(testWorkspaceDir, "retry-charts");
+      fs.mkdirSync(path.join(srcDir, "sub"), { recursive: true });
+      fs.writeFileSync(path.join(srcDir, "a.png"), "first chart");
+      const secondFile = path.join(srcDir, "sub", "b.png");
+      fs.writeFileSync(secondFile, "second chart");
+      const copySpy = vi.spyOn(fs, "copyFileSync").mockImplementation((source, dest) => {
+        if (source === secondFile) throw new Error("disk full");
+        fs.writeFileSync(dest, fs.readFileSync(source));
+      });
+
+      expect(() => handlers.uploadArtifactHandler({ path: srcDir })).toThrow(/disk full/);
+      const stagedDir = path.join(testStagingDir, "gh-aw", "safeoutputs", "upload-artifacts", "retry-charts");
+      expect(fs.existsSync(stagedDir)).toBe(false);
+      copySpy.mockRestore();
+
+      expect(() => handlers.uploadArtifactHandler({ path: srcDir })).not.toThrow();
+      expect(fs.readFileSync(path.join(stagedDir, "sub", "b.png"), "utf8")).toBe("second chart");
+    });
+
+    it("should reject different directories with the same basename", () => {
+      const firstDir = path.join(testWorkspaceDir, "first", "charts");
+      const secondDir = path.join(testWorkspaceDir, "second", "charts");
+      fs.mkdirSync(firstDir, { recursive: true });
+      fs.mkdirSync(secondDir, { recursive: true });
+      fs.writeFileSync(path.join(firstDir, "first.png"), "first chart");
+      fs.writeFileSync(path.join(secondDir, "second.png"), "second chart");
+
+      handlers.uploadArtifactHandler({ path: firstDir });
+
+      expect(() => handlers.uploadArtifactHandler({ path: secondDir })).toThrow(expect.objectContaining({ message: expect.stringContaining("staging name conflict for charts") }));
+    });
+
     it("should reject absolute path outside GITHUB_WORKSPACE and staging directory", () => {
       const outsideDir = path.join(testScratchRoot, "gh-aw-outside-handler-" + Math.random().toString(36).substring(7));
       try {
@@ -1148,6 +1457,20 @@ describe("safe_outputs_handlers", () => {
       fs.writeFileSync(gitConfig, "[core]\n  repositoryformatversion = 0\n");
 
       expect(() => handlers.uploadArtifactHandler({ path: gitConfig })).toThrow(expect.objectContaining({ message: expect.stringContaining("sensitive repository metadata") }));
+    });
+
+    it("should validate nested sensitive paths before comparing an existing directory", () => {
+      const sourceDir = path.join(testWorkspaceDir, "project");
+      const sourceConfig = path.join(sourceDir, ".git", "config");
+      const stagedConfig = path.join(testStagingDir, "gh-aw", "safeoutputs", "upload-artifacts", "project", ".git", "config");
+      fs.mkdirSync(path.dirname(sourceConfig), { recursive: true });
+      fs.mkdirSync(path.dirname(stagedConfig), { recursive: true });
+      fs.writeFileSync(sourceConfig, "sensitive metadata");
+      fs.writeFileSync(stagedConfig, "sensitive metadata");
+      const open = vi.spyOn(fs, "openSync");
+
+      expect(() => handlers.uploadArtifactHandler({ path: sourceDir })).toThrow(expect.objectContaining({ message: expect.stringContaining("sensitive repository metadata") }));
+      expect(open).not.toHaveBeenCalled();
     });
 
     it("should reject absolute path under system directories like /etc", () => {
@@ -3868,6 +4191,28 @@ describe("safe_outputs_handlers", () => {
   });
 
   describe("createIssueHandler", () => {
+    it.each([
+      [true, ["documentation", "automated"], "Same title", "duplicate_dropped"],
+      [true, ["automated"], "Same title", "success"],
+      [true, ["documentation", "automated"], "Different title", "success"],
+      [1, ["Documentation", "automated"], "Same titlf", "duplicate_dropped"],
+      [false, ["documentation", "automated"], "Different title", "duplicate_dropped"],
+      [false, ["automated"], "Different title", "success"],
+    ])("should combine MCP title %j and labels %j as AND filters for %s", (titleFilter, firstLabels, secondTitle, expected) => {
+      const h = createHandlers(mockServer, mockAppendSafeOutput, {
+        create_issue: {
+          deduplicate_by_title: titleFilter,
+          deduplicate_by_labels: [" documentation ", "automated", " "],
+          labels: ["automated"],
+        },
+      });
+
+      h.createIssueHandler({ title: "Same title", body: "First body", labels: firstLabels.filter(label => label !== "automated") });
+      const second = h.createIssueHandler({ title: secondTitle, body: "Second body", labels: ["documentation"] });
+
+      expect(JSON.parse(second.content[0].text).result).toBe(expected);
+    });
+
     it("should deduplicate against fallback title derived from first meaningful body line", () => {
       const h = createHandlers(mockServer, mockAppendSafeOutput, {
         create_issue: {
@@ -3975,8 +4320,8 @@ describe("safe_outputs_handlers", () => {
 
       const response = h.defaultHandler("publish_report")({ payload });
 
-      expect(JSON.parse(response.content[0].text)).toEqual({ result: "success" });
-      expect(mockAppendSafeOutput).toHaveBeenCalledExactlyOnceWith({ payload, type: "publish_report" });
+      expect(JSON.parse(response.content[0].text)).toEqual({ result: "success", output_id: outputId });
+      expect(mockAppendSafeOutput).toHaveBeenCalledExactlyOnceWith({ payload, type: "publish_report", output_id: JSON.parse(response.content[0].text).output_id });
     });
 
     it("should reject invalid deduplicate-by-title configuration", () => {
@@ -5036,39 +5381,6 @@ describe("safe_outputs_handlers", () => {
     });
   });
 
-  describe("Jira handlers", () => {
-    it("assigns a temporary ID when recording issue creation", () => {
-      const result = handlers.jiraCreateIssueHandler({ project_key: "ENG", issue_type: "Task", summary: "Smoke test" });
-      const response = JSON.parse(result.content[0].text);
-
-      expect(response).toMatchObject({ result: "success", temporary_id: expect.stringMatching(/^#aw_[A-Za-z0-9]{8}$/) });
-      expect(result.structuredContent).toEqual(response);
-      expect(mockAppendSafeOutput).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: "jira_create_issue",
-          temporary_id: response.temporary_id,
-        })
-      );
-    });
-
-    it.each([{}, { summary: "" }, { description: "   " }])("rejects updates without a non-empty field", args => {
-      const result = handlers.jiraUpdateIssueHandler(args);
-      expect(result.isError).toBe(true);
-      expect(JSON.parse(result.content[0].text)).toMatchObject({
-        result: "error",
-        error: expect.stringContaining("summary or description"),
-      });
-      expect(mockAppendSafeOutput).not.toHaveBeenCalled();
-    });
-
-    it("records an update with a non-empty field", () => {
-      const result = handlers.jiraUpdateIssueHandler({ issue_key: "ENG-123", summary: "Updated" });
-      expect(result.isError).toBeUndefined();
-      expect(JSON.parse(result.content[0].text).result).toBe("success");
-      expect(mockAppendSafeOutput).toHaveBeenCalledWith(expect.objectContaining({ type: "jira_update_issue", issue_key: "ENG-123", summary: "Updated" }));
-    });
-  });
-
   describe("updateIssueHandler", () => {
     it.each([undefined, null, {}, { issue_number: 42 }, { operation: "append" }, { secrecy: "public", integrity: "high" }, { status: "" }, { labels: " " }, { milestone: " \t\n" }])(
       "should reject calls without update fields before recording an output: %j",
@@ -5094,7 +5406,7 @@ describe("safe_outputs_handlers", () => {
         });
         const result = wildcardHandlers.updateIssueHandler({ issue_number: 42, ...update });
         expect(result.isError).toBeUndefined();
-        expect(mockAppendSafeOutput).toHaveBeenCalledWith({ type: "update_issue", issue_number: 42, ...update });
+        expect(mockAppendSafeOutput).toHaveBeenCalledWith({ type: "update_issue", issue_number: 42, ...update, output_id: outputId });
       }
     );
 

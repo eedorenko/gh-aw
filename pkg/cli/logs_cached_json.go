@@ -17,17 +17,26 @@ import (
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/lifecycle"
 )
 
 type cachedLogsRuns map[int64]cachedLogsJSONLRunData
 
-const cachedLogsJSONLSchemaVersion = 5
+const (
+	legacyCachedLogsJSONLSchemaVersion = 7
+	cachedLogsJSONLSchemaVersion       = 8
+)
+
+func supportedCachedLogsJSONLSchemaVersion(version int) bool {
+	return version == legacyCachedLogsJSONLSchemaVersion || version == cachedLogsJSONLSchemaVersion
+}
 
 const (
 	cachedLogsJSONLKindRun          = "run"
 	cachedLogsJSONLKindWorkflowRuns = "workflow_runs"
 	cachedLogsJSONLKindRateLimit    = "github_api_rate_limit"
 	cachedLogsJSONLKindSafeOutput   = "safe_output_item"
+	cachedLogsJSONLKindLifecycle    = "output_lifecycle"
 )
 
 type cachedWorkflowRunsRequest struct {
@@ -82,6 +91,7 @@ type cachedLogsJSONLMCPToolCall struct {
 }
 
 type cachedLogsJSONLRecord struct {
+	Lifecycle     *lifecycle.Record             `json:"lifecycle,omitempty"`
 	SchemaVersion int                           `json:"schema_version"`
 	Kind          string                        `json:"kind,omitempty"`
 	Run           *cachedLogsJSONLRunData       `json:"run,omitempty"`
@@ -103,6 +113,7 @@ type cachedLogsJSONLSafeOutputRow struct {
 type cachedLogsJSONLCache struct {
 	runs             cachedLogsRuns
 	workflowRunLists map[string]json.RawMessage
+	lifecycles       map[string]lifecycle.Record
 }
 
 type preparedCachedLogsJSONL struct {
@@ -192,6 +203,13 @@ func loadCachedLogsJSONLFiles(paths []string) (*cachedLogsJSONLCache, error) {
 				warnDuplicateCachedLogsJSONLRecord(fmt.Sprintf("Duplicate cached workflow runs JSONL record in %s; newer cache file wins", path))
 			}
 			merged.workflowRunLists[key] = append(json.RawMessage(nil), payload...)
+		}
+		for _, record := range cache.lifecycles {
+			if err := merged.addRecord(cachedLogsJSONLRecord{
+				SchemaVersion: cachedLogsJSONLSchemaVersion, Kind: cachedLogsJSONLKindLifecycle, Lifecycle: &record,
+			}, 0); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return merged, nil
@@ -380,7 +398,7 @@ func cachedLogsJSONLFileDateRangeStatus(path string, dateRange cachedLogsJSONLDa
 	hasPreservedRecord := false
 	_, err := visitCachedLogsJSONLRecords(path, func(record cachedLogsJSONLRecord, _ int) error {
 		if record.Kind != cachedLogsJSONLKindRun ||
-			record.SchemaVersion != cachedLogsJSONLSchemaVersion ||
+			!supportedCachedLogsJSONLSchemaVersion(record.SchemaVersion) ||
 			record.Run == nil ||
 			record.Run.CreatedAt.IsZero() {
 			hasPreservedRecord = true
@@ -399,11 +417,24 @@ func cachedLogsJSONLFileDateRangeStatus(path string, dateRange cachedLogsJSONLDa
 }
 
 func (cache *cachedLogsJSONLCache) addRecord(record cachedLogsJSONLRecord, recordNumber int) error {
-	if record.SchemaVersion != cachedLogsJSONLSchemaVersion {
+	if !supportedCachedLogsJSONLSchemaVersion(record.SchemaVersion) {
 		logsCacheLog.Printf("Ignoring incompatible cached logs JSONL record: record=%d, schema_version=%d", recordNumber, record.SchemaVersion)
 		return nil
 	}
 	switch record.Kind {
+	case cachedLogsJSONLKindLifecycle:
+		if record.Lifecycle == nil {
+			return fmt.Errorf("missing lifecycle evidence in cached record %d", recordNumber)
+		}
+		if cache.lifecycles == nil {
+			cache.lifecycles = make(map[string]lifecycle.Record)
+		}
+		merged, err := lifecycle.Merge(cache.lifecycles[record.Lifecycle.ID], *record.Lifecycle)
+		if err != nil {
+			return fmt.Errorf("invalid cached lifecycle record %d: %w", recordNumber, err)
+		}
+		cache.lifecycles[merged.ID] = merged
+		return nil
 	case cachedLogsJSONLKindWorkflowRuns:
 		if record.Request == nil || len(record.Payload) == 0 {
 			return nil
@@ -693,7 +724,7 @@ func (w *cachedLogsJSONLWriter) filterDateRange(startDate, endDate string) error
 		var record cachedLogsJSONLRecord
 		if err := json.Unmarshal(trimmed, &record); err != nil ||
 			record.Kind != cachedLogsJSONLKindRun ||
-			record.SchemaVersion != cachedLogsJSONLSchemaVersion ||
+			!supportedCachedLogsJSONLSchemaVersion(record.SchemaVersion) ||
 			record.Run == nil ||
 			record.Run.CreatedAt.IsZero() {
 			filtered = append(filtered, line...)
@@ -829,6 +860,19 @@ func cachedJSONLCanSatisfy(artifactFilter []string, parse, train, toolGraph bool
 }
 
 func processedRunFromCachedData(data RunData, audit *AuditData, outputDir string) ProcessedRun {
+	attempt, err := strconv.Atoi(data.RunAttempt)
+	if err != nil {
+		// Unknown attempt: cached continuation evidence cannot be matched to the run.
+		attempt = 0
+	}
+	run := WorkflowRun{
+		DatabaseID: data.RunID, WorkflowName: data.WorkflowName, Repository: data.Repository,
+		Attempt: attempt, UpdatedAt: data.UpdatedAt,
+	}
+	runDir := filepath.Join(outputDir, fmt.Sprintf("run-%d", data.RunID))
+	backfillContinuationRequests(&data.ContinuationRequests, run, runDir, false)
+	data.ContinuationRequestCount = continuationRequestCount(data.ContinuationRequests)
+	mergeContinuationRequestsIntoAudit(audit, data.ContinuationRequests)
 	return ProcessedRun{
 		Run: WorkflowRun{
 			DatabaseID:       data.RunID,
@@ -846,6 +890,7 @@ func processedRunFromCachedData(data RunData, audit *AuditData, outputDir string
 			HeadSha:          data.HeadSHA,
 			DisplayTitle:     data.DisplayTitle,
 			Repository:       data.Repository,
+			Attempt:          attempt,
 			Actor:            data.Actor,
 			Duration:         parseDurationString(data.Duration),
 			ActionMinutes:    data.ActionMinutes,
@@ -858,16 +903,17 @@ func processedRunFromCachedData(data RunData, audit *AuditData, outputDir string
 			SafeItemsCount:   data.SafeItemsCount,
 			LogsPath:         filepath.Join(outputDir, fmt.Sprintf("run-%d", data.RunID)),
 		},
-		AwContext:           data.AwContext,
-		TaskDomain:          data.TaskDomain,
-		BehaviorFingerprint: data.BehaviorFingerprint,
-		AgenticAssessments:  data.AgenticAssessments,
-		TokenUsage:          data.TokenUsageSummary,
-		WorkingSet:          data.WorkingSet,
-		Ledger:              data.Ledger,
-		WorkQueue:           data.WorkQueue,
-		Friction:            data.Friction,
-		cachedData:          &data,
-		cachedAudit:         audit,
+		AwContext:            data.AwContext,
+		TaskDomain:           data.TaskDomain,
+		BehaviorFingerprint:  data.BehaviorFingerprint,
+		AgenticAssessments:   data.AgenticAssessments,
+		TokenUsage:           data.TokenUsageSummary,
+		WorkingSet:           data.WorkingSet,
+		ContinuationRequests: data.ContinuationRequests,
+		Ledger:               data.Ledger,
+		WorkQueue:            data.WorkQueue,
+		Friction:             data.Friction,
+		cachedData:           &data,
+		cachedAudit:          audit,
 	}
 }

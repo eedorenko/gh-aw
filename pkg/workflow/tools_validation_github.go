@@ -40,6 +40,9 @@ func validateGitHubToolConfig(tools *Tools, workflowName string) error {
 		toolsValidationLog.Printf("Invalid GitHub tool configuration in workflow: %s", workflowName)
 		return errors.New("'tools.github.github-app' and 'tools.github.github-token' cannot both be set. Use one authentication method: either 'github-app' (GitHub App) or 'github-token' (personal access token). Example:\ntools:\n  github:\n    github-token: \"${{ secrets.GITHUB_TOKEN }}\"")
 	}
+	if tools.GitHub.TokenBroker && (tools.GitHub.GitHubApp != nil || tools.GitHub.GitHubToken != "") {
+		return errors.New("tools.github.token-broker: true is mutually exclusive with github-app and github-token; choose one credential source")
+	}
 
 	return nil
 }
@@ -121,6 +124,9 @@ func validateGitHubGuardPolicy(tools *Tools, workflowName string) error {
 	}
 
 	github := tools.GitHub
+	if err := unsupportedGitHubAccessControlFieldsError(github.unsupportedAccessControlFields); err != nil {
+		return err
+	}
 	if github.reposParseErr != nil {
 		return github.reposParseErr
 	}
@@ -210,6 +216,29 @@ func validateGitHubGuardPolicy(tools *Tools, workflowName string) error {
 	}
 
 	return nil
+}
+
+func unsupportedGitHubAccessControlFieldsError(fields []string) error {
+	if len(fields) == 0 {
+		return nil
+	}
+
+	var quotedFields []string
+	for _, field := range fields {
+		quotedFields = append(quotedFields, "'tools.github."+field+"'")
+	}
+
+	verb, enforcementAndRemoval := "is", "it is not enforced. Remove this unsupported field."
+	if len(fields) > 1 {
+		verb = "are"
+		enforcementAndRemoval = "these settings are not enforced. Remove these unsupported fields."
+	}
+	return fmt.Errorf(
+		"%s %s not supported by the local compiler; %s "+
+			"Supported repository-scope example (not a substitute for role or visibility filtering):\n"+
+			"tools:\n  github:\n    allowed-repos: [\"owner/repo\"]",
+		strings.Join(quotedFields, ", "), verb, enforcementAndRemoval,
+	)
 }
 
 // validateReposScope validates the repos field in the guard policy

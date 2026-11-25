@@ -121,7 +121,7 @@ func buildCopilotMCPConfigExport(workflowData *WorkflowData) string {
 
 const nodePathSetupCommand = `GH_AW_NPM_GLOBAL_ROOT="$(npm root -g 2>/dev/null || true)"; if [ -n "$GH_AW_NPM_GLOBAL_ROOT" ]; then export NODE_PATH="${GH_AW_NPM_GLOBAL_ROOT}${NODE_PATH:+:${NODE_PATH}}"; fi`
 const nodeRuntimeResolutionCommand = `GH_AW_NODE_EXEC="${GH_AW_NODE_BIN:-}"; if [ -z "$GH_AW_NODE_EXEC" ] || [ ! -x "$GH_AW_NODE_EXEC" ]; then GH_AW_NODE_EXEC="$(command -v node 2>/dev/null || true)"; fi; if [ -z "$GH_AW_NODE_EXEC" ]; then echo "node runtime missing on this runner — check runtimes.node in workflow YAML" >&2; exit 127; fi; ` + nodePathSetupCommand + `; "$GH_AW_NODE_EXEC"`
-const nodePathSetupCommandForCopilotSDK = `GH_AW_WORKSPACE_NODE_MODULES="${GITHUB_WORKSPACE:-$PWD}/node_modules"; if [ -d "$GH_AW_WORKSPACE_NODE_MODULES" ]; then export NODE_PATH="${GH_AW_WORKSPACE_NODE_MODULES}${NODE_PATH:+:${NODE_PATH}}"; fi; ` + nodePathSetupCommand
+const nodePathSetupCommandForCopilotSDK = nodePathSetupCommand + `; GH_AW_COPILOT_SDK_NODE_MODULES="` + copilotSDKNodeTargetDir + `/node_modules"; if [ -d "$GH_AW_COPILOT_SDK_NODE_MODULES" ]; then export NODE_PATH="${GH_AW_COPILOT_SDK_NODE_MODULES}${NODE_PATH:+:${NODE_PATH}}"; fi`
 const nodeRuntimeResolutionCommandForCopilotSDK = `GH_AW_NODE_EXEC="${GH_AW_NODE_BIN:-}"; if [ -z "$GH_AW_NODE_EXEC" ] || [ ! -x "$GH_AW_NODE_EXEC" ]; then GH_AW_NODE_EXEC="$(command -v node 2>/dev/null || true)"; fi; if [ -z "$GH_AW_NODE_EXEC" ]; then echo "node runtime missing on this runner — check runtimes.node in workflow YAML" >&2; exit 127; fi; ` + nodePathSetupCommandForCopilotSDK + `; "$GH_AW_NODE_EXEC"`
 const copilotBinaryPathSetup = `GH_AW_COPILOT_SRC="$(command -v copilot 2>/dev/null || true)"
 if [ -z "$GH_AW_COPILOT_SRC" ] || [ ! -x "$GH_AW_COPILOT_SRC" ]; then
@@ -423,6 +423,8 @@ func (e *CopilotEngine) buildCopilotSDKExecPrefix(workflowData *WorkflowData, co
 
 func (e *CopilotEngine) buildCopilotCommand(workflowData *WorkflowData, copilotArgs []string, execPrefix, customCommandScriptSetup, logFile, mkdirCommands string, isBYOKMode bool) (string, string) {
 	copilotCommand, copilotSDKServerArgsJSON := e.buildCopilotBaseCommand(workflowData, copilotArgs, execPrefix)
+	copilotCommand = wrapCustomHarnessDecisionCommand(workflowData, e.GetID(), e.GetHarnessScriptName(), copilotCommand)
+	copilotCommand = prependTypeScriptLSPPath(workflowData, copilotCommand)
 	if isFirewallEnabled(workflowData) {
 		return e.buildCopilotFirewallCommand(workflowData, copilotCommand, customCommandScriptSetup, isBYOKMode, logFile), copilotSDKServerArgsJSON
 	}
@@ -625,9 +627,7 @@ func (e *CopilotEngine) addCopilotWorkflowStepEnv(env map[string]string, workflo
 	}
 	// Always add GH_AW_PROMPT for agentic workflows
 	env["GH_AW_PROMPT"] = constants.AwPromptsFile
-	if workflowData.EngineConfig != nil && workflowData.EngineConfig.ModelRouting != nil {
-		env["GH_AW_MODEL_ROUTING"] = "1"
-	}
+	applyModelRoutingEnv(env, workflowData)
 	applyModelAliasesEnv(env, workflowData)
 	// Tag the step as a GitHub AW agentic execution for discoverability by agents
 	env["GITHUB_AW"] = "true"
@@ -661,6 +661,10 @@ func (e *CopilotEngine) addCopilotGitHubToolEnv(env map[string]string, workflowD
 		githubToolConfig = config
 	}
 	customGitHubToken := getGitHubToken(githubToolConfig)
+	if usesTokenBrokerGitHubTool(workflowData) {
+		env["GITHUB_MCP_SERVER_TOKEN"] = "${{ steps.github-mcp-app-token.outputs.token }}"
+		return
+	}
 	if workflowData.ParsedTools != nil && workflowData.ParsedTools.GitHub != nil && workflowData.ParsedTools.GitHub.GitHubApp != nil {
 		tokenExpression := "${{ steps.github-mcp-app-token.outputs.token }}"
 		if workflowData.ParsedTools.GitHub.GitHubApp.shouldIgnoreMissingKey() {
@@ -673,7 +677,7 @@ func (e *CopilotEngine) addCopilotGitHubToolEnv(env map[string]string, workflowD
 }
 
 func (e *CopilotEngine) addCopilotModelEnv(env map[string]string, workflowData *WorkflowData, modelConfigured bool, modelEnvVar string) {
-	if workflowData.EngineConfig != nil && workflowData.EngineConfig.ModelRouting != nil {
+	if isModelRoutingUnconditional(workflowData) {
 		return
 	}
 	// Set the model environment variable.
@@ -685,15 +689,18 @@ func (e *CopilotEngine) addCopilotModelEnv(env map[string]string, workflowData *
 		}
 		copilotExecLog.Printf("Setting %s env var for model: %s", constants.CopilotCLIModelEnvVar, workflowData.Model)
 		env[constants.CopilotCLIModelEnvVar] = workflowData.Model
+		guardImplicitRoutingModelEnv(env, workflowData, constants.CopilotCLIModelEnvVar)
 		return
 	}
 	env[constants.CopilotCLIModelEnvVar] = compilerenv.BuildModelOverrideExpression(modelEnvVar, compilerenv.DefaultModelCopilot, constants.CopilotBYOKDefaultModel)
+	guardImplicitRoutingModelEnv(env, workflowData, constants.CopilotCLIModelEnvVar)
 }
 
 func (e *CopilotEngine) addCopilotFinalStepEnv(env map[string]string, workflowData *WorkflowData) {
 	// Inject GH_AW_ENGINE_CWD when engine.cwd is configured.
 	applyEngineCwdEnv(env, workflowData)
 	applyEngineAndAgentEnv(env, workflowData, copilotExecLog)
+	applyDurableExecutionEnv(env, workflowData)
 	// Always inject the Copilot integration ID for agentic workflows after all env merges
 	// so user-supplied env does not override this value.
 	env[constants.CopilotCLIIntegrationIDEnvVar] = constants.CopilotCLIIntegrationIDValue
@@ -737,8 +744,9 @@ func (e *CopilotEngine) buildCopilotExecutionStep(workflowData *WorkflowData, co
 	// Add tool arguments comment before the run section
 	toolArgsComment := e.generateCopilotToolArgumentsComment(workflowData.Tools, workflowData.SafeOutputs, workflowData.MCPScripts, workflowData, "        ")
 	if toolArgsComment != "" {
-		commentLines := strings.Split(strings.TrimSuffix(toolArgsComment, "\n"), "\n")
-		stepLines = append(stepLines, commentLines...)
+		for line := range strings.SplitSeq(strings.TrimSuffix(toolArgsComment, "\n"), "\n") {
+			stepLines = append(stepLines, strings.TrimSuffix(line, "\r"))
+		}
 	}
 	stepLines = append(stepLines, "        timeout-minutes: "+timeoutValue)
 	// Filter environment variables to only include allowed secrets

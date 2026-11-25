@@ -26,6 +26,7 @@ const {
   waitForProviderListenerReady,
   getCatalogModelEntry,
   hasAzureOIDCProviderEndpoint,
+  hasOIDCProviderEndpoint,
   hasAPIProxyLocalhostAlias,
   inferProviderTypeForModel,
   inferWireApiForModel,
@@ -44,6 +45,16 @@ describe("awf_reflect.cjs", () => {
       expect(hasAzureOIDCProviderEndpoint({ endpoints: [{ ...endpoint, auth_type: "static-key" }] }, "openai")).toBe(false);
       expect(hasAzureOIDCProviderEndpoint({ endpoints: [{ ...endpoint, configured: false }] }, "openai")).toBe(false);
       expect(hasAzureOIDCProviderEndpoint({ endpoints: [endpoint] }, "anthropic")).toBe(false);
+    });
+
+    describe("hasOIDCProviderEndpoint", () => {
+      it("requires a configured resolved endpoint using the selected provider OIDC", () => {
+        const endpoint = { provider: "openai", configured: true, auth_type: "github-oidc/openai", port: 10000 };
+        expect(hasOIDCProviderEndpoint({ endpoints: [endpoint] }, "openai", "openai")).toBe(true);
+        expect(hasOIDCProviderEndpoint({ endpoints: [{ ...endpoint, auth_type: "github-oidc/azure" }] }, "openai", "openai")).toBe(false);
+        expect(hasOIDCProviderEndpoint({ endpoints: [{ ...endpoint, configured: false }] }, "openai", "openai")).toBe(false);
+        expect(hasOIDCProviderEndpoint({ endpoints: [endpoint] }, "anthropic", "openai")).toBe(false);
+      });
     });
   });
 
@@ -961,8 +972,9 @@ describe("awf_reflect.cjs", () => {
       expect(inferWireApiForModel("openai", "gpt-4.1", null)).toBe("completions");
     });
 
-    it.each(["gpt-5-mini", "gpt-6-luna"])("uses the bundled Responses API metadata for %s", model => {
-      const modelsJson = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "models.json"), "utf8"));
+    it("uses explicit Responses API metadata for a custom model", () => {
+      const model = "custom-model";
+      const modelsJson = { providers: { openai: { models: { [model]: { wire_api: "responses" } } } } };
       const catalogEntry = getCatalogModelEntry(modelsJson, model, "openai");
       expect(catalogEntry.wire_api).toBe("responses");
       expect(inferWireApiForModel("openai", model, catalogEntry)).toBe("responses");

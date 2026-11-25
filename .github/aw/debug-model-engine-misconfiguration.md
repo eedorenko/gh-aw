@@ -20,6 +20,10 @@ examples below rather than inferring the target from the current checkout.
 before changing model pins or runtimes.
 
 Read the [run artifacts](#5-read-the-run-artifacts) before proposing changes.
+For pricing errors, check [pricing evidence](#ai-credit-pricing-rejection-is-separate-from-alias-or-endpoint-resolution).
+Follow the [fix order](#3-apply-fixes-in-this-order) and consult the
+[version-field mapping](#4-identify-the-version-field-from-the-failing-install-step)
+for install failures.
 Explanation-only sessions inspect evidence without installing or upgrading.
 Preserve intentional pins unless a verified relevant fix requires a change
 within the user's authorized scope.
@@ -63,7 +67,8 @@ The Copilot harness resolves aliases such as `auto` through the AWF alias map an
 model catalog to a concrete model ID. An alias is not a fixed model: inspect the
 run's resolution rather than assuming what `auto` selected.
 
-When `engine.model-routing` is enabled, AWF's per-model endpoint metadata
+When model routing is enabled (`model: router`, `router/economy`, `router/balanced`,
+`router/robust`, or `engine.model-routing`), AWF's per-model endpoint metadata
 (`/reflect` `supported_endpoints`) takes precedence. AWF checks compatibility at
 startup and fails fast with `Model endpoint mismatch: … Pin a compatible model,
 remove the COPILOT_PROVIDER_WIRE_API override, or upgrade gh-aw.` This check
@@ -106,6 +111,8 @@ succeed without showing the sub-agent failure in its final output. Check for
 `subagent.failed` events in `usage/aw_session.jsonl`, and for the **Sub-agent
 Failed** finding and `deviated` requests in `gh aw audit RUN_ID`.
 
+<!-- instruction-prefix-end -->
+
 ### AI-credit pricing rejection is separate from alias or endpoint resolution
 
 `unknown_model_ai_credits` or `Model "<model>" has no AI credits pricing` means
@@ -123,7 +130,7 @@ provider/runtime metadata or an explicitly configured, accurate pricing table;
 do not invent a fallback rate, disable the budget, or substitute an older model.
 
 The parent can recover and leave Actions green. After collecting compact usage
-with `gh aw logs --artifacts usage`, inspect `gh aw health --logs-dir <cache-dir>`
+with `gh aw logs --artifacts usage`, inspect `gh aw health WORKFLOW --logs-dir <cache-dir>`
 for `subagent_failures_observed`, invocation counts, and affected run URLs.
 Health reuses matching cached summaries without downloading more artifacts;
 missing cached evidence does not establish successful delegation.

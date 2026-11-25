@@ -1,15 +1,15 @@
 package workflow
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 )
 
 type WorkQueueIssuesConfig struct {
-	Label       string `json:"label"`
-	TitlePrefix string `json:"title_prefix,omitempty"`
+	Label             string
+	TitlePrefix       string
+	OrphanedAfterDays int
 }
 
 func workQueueProjectorPermissions() *Permissions {
@@ -34,7 +34,15 @@ func (c *Compiler) workQueueProjectorTokenSteps(data *WorkflowData, job string) 
 	return steps
 }
 
-func (c *Compiler) addWorkQueueProjectorToken(steps *[]string, data *WorkflowData) {
+func (c *Compiler) addWorkQueueProjectorToken(steps *[]string, data *WorkflowData, job string) {
+	if usesTokenBrokerSafeOutputs(data) {
+		if job == "activation" {
+			*steps = append(*steps, "          github-token: ${{ steps.work-queue-activation-broker-token.outputs.token }}\n")
+		} else {
+			*steps = append(*steps, "          github-token: ${{ steps.safe-outputs-app-token.outputs.token }}\n")
+		}
+		return
+	}
 	if data.SafeOutputs == nil || data.SafeOutputs.GitHubApp == nil {
 		c.addSafeOutputGitHubTokenForConfig(steps, data, "")
 		return
@@ -58,7 +66,7 @@ func workQueueIssuesConfig(data *WorkflowData) *WorkQueueIssuesConfig {
 	if !exists || value == false {
 		return nil
 	}
-	result := &WorkQueueIssuesConfig{Label: "work"}
+	result := &WorkQueueIssuesConfig{Label: "work", TitlePrefix: "[work queue]", OrphanedAfterDays: 30}
 	if fields, ok := value.(map[string]any); ok {
 		if label, ok := fields["label"].(string); ok {
 			result.Label = label
@@ -66,8 +74,26 @@ func workQueueIssuesConfig(data *WorkflowData) *WorkQueueIssuesConfig {
 		if prefix, ok := fields["title_prefix"].(string); ok {
 			result.TitlePrefix = prefix
 		}
+		if days, ok := workQueueOrphanedAfterDays(fields["orphaned_after_days"]); ok {
+			result.OrphanedAfterDays = days
+		}
 	}
 	return result
+}
+
+func workQueueOrphanedAfterDays(value any) (int, bool) {
+	switch days := value.(type) {
+	case int:
+		return days, days >= 1 && days <= 3650
+	case float64:
+		if days != float64(int(days)) {
+			return 0, false
+		}
+		integer := int(days)
+		return integer, integer >= 1 && integer <= 3650
+	default:
+		return 0, false
+	}
 }
 
 // WorkQueueIssueMirroringEnabled reports whether any compiled workflow enables
@@ -95,11 +121,17 @@ func validateWorkQueueIssuesConfig(data *WorkflowData) error {
 	}
 	fields, ok := value.(map[string]any)
 	if !ok {
-		return errors.New("tools.work-queue.issues must be true, false, or an object with optional label and title_prefix fields")
+		return errors.New("tools.work-queue.issues must be true, false, or an object with optional label, title_prefix, and orphaned_after_days fields")
 	}
 	for key, value := range fields {
+		if key == "orphaned_after_days" {
+			if _, ok := workQueueOrphanedAfterDays(value); !ok {
+				return errors.New("tools.work-queue.issues.orphaned_after_days must be an integer between 1 and 3650")
+			}
+			continue
+		}
 		if key != "label" && key != "title_prefix" {
-			return fmt.Errorf("tools.work-queue.issues: unsupported field %q; use label or title_prefix", key)
+			return fmt.Errorf("tools.work-queue.issues: unsupported field %q; use label, title_prefix, or orphaned_after_days", key)
 		}
 		text, ok := value.(string)
 		maxBytes := 33
@@ -111,55 +143,4 @@ func validateWorkQueueIssuesConfig(data *WorkflowData) error {
 		}
 	}
 	return nil
-}
-
-func configureWorkQueueIssues(data *WorkflowData, policy *WorkQueuePolicyConfig) error {
-	if issues := workQueueIssuesConfig(data); issues != nil {
-		encoded, err := json.Marshal(issues)
-		if err != nil {
-			return fmt.Errorf("encode work queue Issues configuration: %w", err)
-		}
-		policy.IssuesJSON = string(encoded)
-	}
-	return nil
-}
-
-func workQueueIssuesEnvironment(data *WorkflowData) []string {
-	config := workQueueIssuesConfig(data)
-	if config == nil || !isWorkQueueParticipant(data) {
-		return nil
-	}
-	return []string{
-		fmt.Sprintf("          GH_AW_WORK_QUEUE_ISSUES: %q\n", data.WorkQueuePolicy.IssuesJSON),
-		"          GH_AW_WORK_QUEUE_CHECKED_TRANSPORT: \"graphql\"\n",
-	}
-}
-
-func (c *Compiler) buildWorkQueueIssuesStep(data *WorkflowData) []string {
-	if workQueueIssuesConfig(data) == nil || !isWorkQueueParticipant(data) {
-		return nil
-	}
-	steps := c.workQueueProjectorTokenSteps(data, "conclusion")
-	steps = append(steps,
-		"      - name: Project this run's work queue Issues\n",
-		"        id: work_queue_issues\n",
-		"        if: always()\n",
-		fmt.Sprintf("        uses: %s\n", c.getActionPin("actions/github-script")),
-	)
-	steps = append(steps, workQueuePolicyEnvironment(data)...)
-	var staged *TemplatableBool
-	if data.SafeOutputs != nil {
-		staged = data.SafeOutputs.Staged
-	}
-	if value := resolveSafeOutputsStagedValue(c.trialMode, staged); value != nil {
-		steps = append(steps, "          GH_AW_SAFE_OUTPUTS_STAGED: "+fmt.Sprintf("%q", *value)+"\n")
-	}
-	steps = append(steps, "          GH_AW_WORK_QUEUE_JOB_RESULTS: ${{ toJSON(needs) }}\n", "        with:\n")
-	c.addWorkQueueProjectorToken(&steps, data)
-	return append(steps,
-		"          script: |\n",
-		"            const { main } = require('${{ runner.temp }}/gh-aw/actions/work_queue_issues.cjs');\n",
-		"            const result = await main({ core, githubClient: github, context });\n",
-		"            if (result.pending?.length) core.setFailed('Work queue is committed; Issue synchronization remains pending. Inspect the exact terminal request before using work-queue sync-issues --request-id.');\n",
-	)
 }

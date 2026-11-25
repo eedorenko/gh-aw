@@ -108,6 +108,7 @@ async function main(config = {}) {
   }
 
   let processedCount = 0;
+  const reviewTargets = new Set();
 
   /**
    * Message handler that stores review metadata
@@ -115,7 +116,7 @@ async function main(config = {}) {
    * @param {Object} resolvedTemporaryIds - Map of temporary IDs
    * @returns {Promise<Object>} Result with success status
    */
-  return async function handleSubmitPRReview(message, resolvedTemporaryIds) {
+  async function handleSubmitPRReview(message, resolvedTemporaryIds) {
     if (processedCount >= maxCount) {
       core.warning(`Skipping submit_pull_request_review: max count of ${maxCount} reached`);
       return {
@@ -162,7 +163,14 @@ async function main(config = {}) {
       return await handleWithRegistry(message, event, body);
     }
     return await handleWithLegacyBuffer(message, event, body);
+  }
+
+  handleSubmitPRReview.getReviewTarget = message => {
+    const target = resolveTarget({ targetConfig, item: message, context, itemType: "PR review", supportsPR: false, supportsIssue: false });
+    const repository = resolveAndValidateRepo(message, defaultTargetRepo, allowedRepos, "PR review");
+    return target.success && target.number && repository.success ? { repo: repository.repo, pull_request_number: target.number } : null;
   };
+  return handleSubmitPRReview;
 
   /**
    * Registry path: resolve target PR first, then obtain a per-PR buffer and store metadata.
@@ -210,7 +218,8 @@ async function main(config = {}) {
     const filterResult = await checkRequiredFilter(githubClient, repoParts, prNum, requiredLabels, requiredTitlePrefix, "submit_pr_review");
     if (filterResult) return filterResult;
 
-    if (buffer.hasReviewMetadata()) {
+    const reviewTarget = `${repo}#${prNum}`;
+    if (reviewTargets.has(reviewTarget)) {
       const errMsg = `PR ${repo}#${prNum} already has a pending review submission. Only one submit_pull_request_review per PR per run is allowed; use target: "*" with max: 1 so each PR gets its own invocation.`;
       core.warning(`submit_pull_request_review: ${errMsg}`);
       return { success: false, error: errMsg };
@@ -218,6 +227,7 @@ async function main(config = {}) {
 
     core.info(`Setting review metadata for ${repo}#${prNum}: event=${event}, bodyLength=${body.length}`);
     buffer.setReviewMetadata(body, event);
+    reviewTargets.add(reviewTarget);
 
     if (!buffer.getReviewContext()) {
       await setReviewContextOnBuffer(buffer, prNum, repo, repoParts, message);

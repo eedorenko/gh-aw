@@ -94,7 +94,7 @@ func InitRepository(opts InitOptions) error {
 	// Write dispatcher skill
 	if opts.Skill {
 		initLog.Print("Writing agentic workflows dispatcher skill")
-		if err := ensureAgenticWorkflowsDispatcher(opts.Verbose, false, true); err != nil {
+		if err := ensureAgenticWorkflowsDispatcher(ctx, opts.Verbose, false, true); err != nil {
 			initLog.Printf("Failed to write dispatcher skill: %v", err)
 			return fmt.Errorf("failed to write dispatcher skill: %w", err)
 		}
@@ -234,6 +234,13 @@ func InitRepository(opts InitOptions) error {
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Or add an example workflow, see https://github.com/githubnext/agentics"))
 		fmt.Fprintln(os.Stderr, "")
+		root, err := gitutil.FindGitRoot()
+		if err == nil {
+			err = writeRepositoryConnectorGuidance(os.Stderr, root)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Connector setup discovery incomplete: %v", err)))
+		}
 	}
 
 	return nil

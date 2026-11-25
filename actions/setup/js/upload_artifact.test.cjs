@@ -3,10 +3,14 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { buildSafeOutputOutcomes } from "./safe_output_outcomes.cjs";
+import { createRequire } from "node:module";
+import { buildSafeOutputExecutions } from "./safe_output_execution.cjs";
+import { VERSION } from "./safe_output_authorization.cjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const { withSafeOutputInvocation } = createRequire(import.meta.url)("./safe_output_execution.cjs");
+const { directoriesHaveSameContents } = createRequire(import.meta.url)("./staging_conflicts.cjs");
 
 const TEST_ROOT = path.join(fs.realpathSync(process.cwd()), `.gh-aw-upload-artifact-${process.pid}`);
 const STAGING_DIR = path.join(TEST_ROOT, "gh-aw", "safeoutputs", "upload-artifacts") + path.sep;
@@ -112,6 +116,56 @@ describe("upload_artifact.cjs", () => {
   });
 
   describe("path-based upload", () => {
+    it.each(["deny", "changed_artifact"])("does not upload after %s at the prepared invocation boundary", async mode => {
+      writeStaging("protected.txt", "original");
+      process.env.ACTIONS_ID_TOKEN_REQUEST_URL = "https://oidc.example.org/token";
+      process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = "bootstrap";
+      process.env.GITHUB_RUN_ID = "456";
+      mockCore.setSecret = vi.fn();
+      const audience = "https://authority.example.org/gh-aw";
+      vi.spyOn(global, "fetch").mockImplementation(async (_url, options) => {
+        if (options.method === "GET") {
+          const payload = Buffer.from(JSON.stringify({ aud: audience, exp: Math.floor(Date.now() / 1000) + 60 })).toString("base64url");
+          return Response.json({ value: `header.${payload}.signature` });
+        }
+        const request = JSON.parse(options.body);
+        if (mode === "changed_artifact") writeStaging("protected.txt", "changed after preparation");
+        return Response.json({
+          version: VERSION,
+          decision: mode === "deny" ? "deny" : "allow",
+          request_digest: request.request_digest,
+          invocation_id: request.invocation.invocation_id,
+          run_attempt: "1",
+          policy_revision: "policy-v1",
+          decision_id: "decision-v1",
+          issued_at: new Date().toISOString(),
+          expires_at: new Date(Date.now() + 20000).toISOString(),
+        });
+      });
+      const state = {
+        requirement: { endpoint: "https://authority.example.org/authorize", audience, source: "local" },
+        batchDigest: "b".repeat(64),
+        recordIndex: 0,
+        invocation: {
+          caller: {
+            host: "https://github.com",
+            repository_id: "123",
+            workflow_ref: "owner/repo/.github/workflows/test.lock.yml@refs/heads/main",
+            workflow_sha: "a".repeat(40),
+            workflow_hash: "b".repeat(64),
+            run_id: "456",
+            run_attempt: "1",
+          },
+          output: { type: "upload_artifact", name: "upload_artifact", executor: "manager", implementation_digest: "a".repeat(64) },
+          context: {},
+        },
+      };
+      const results = await withSafeOutputInvocation(state, () => runHandler(buildConfig(), [{ type: "upload_artifact", path: "protected.txt" }]));
+      expect(results[0].success).toBe(false);
+      expect(results[0].error).toContain(mode === "deny" ? "denied" : "changed after approval");
+      expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
+    });
+
     it.each(["7", "400"])("uses expression-resolved retention %s", async retention => {
       writeStaging("report.json");
       await runHandler(buildConfig({ "retention-days": retention }), [{ type: "upload_artifact", path: "report.json" }]);
@@ -202,6 +256,15 @@ describe("upload_artifact.cjs", () => {
     it("fails when path does not exist in staging dir", async () => {
       await runHandler(buildConfig(), [{ type: "upload_artifact", path: "nonexistent.json" }]);
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("does not exist in staging directory"));
+      expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
+    });
+
+    it("rejects a staged file with a leading-dash filename", async () => {
+      writeStaging("-T");
+
+      await runHandler(buildConfig(), [{ type: "upload_artifact", path: "-T" }]);
+
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining('filenames beginning with "-" are not allowed'));
       expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
     });
 
@@ -367,6 +430,21 @@ describe("upload_artifact.cjs", () => {
   });
 
   describe("allowed-paths policy", () => {
+    it("publishes Daily Cracktro screenshots using its staging-relative policy", async () => {
+      const source = fs.readFileSync(path.join(__dirname, "../../../.github/workflows/daily-cracktro-maintainer.md"), "utf8");
+      const policy = source.match(/allowed-paths: \[("[^"]+")\]/);
+      if (!policy) throw new Error("Daily Cracktro must declare an artifact path policy");
+      const allowedPaths = [JSON.parse(policy[1])];
+      writeStaging("cracktro-review/slide.png");
+      writeStaging("unrelated/secret.env");
+
+      const results = await runHandler(buildConfig({ "allowed-paths": allowedPaths }), [{ type: "upload_artifact", path: "cracktro-review" }]);
+
+      expect(results[0].success).toBe(true);
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+      expect(mockArtifactClient.uploadArtifact.mock.calls[0][1]).toEqual([path.join(STAGING_DIR, "cracktro-review/slide.png")]);
+    });
+
     it("filters out files not in allowed-paths", async () => {
       writeStaging("dist/app.js");
       writeStaging("secret.env");
@@ -416,7 +494,7 @@ describe("upload_artifact.cjs", () => {
       expect(results[0].success).toBe(true);
       expect(results[0].staged).toBe(true);
       expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
-      const [outcome] = buildSafeOutputOutcomes([{ type: "upload_artifact", messageIndex: 0, success: true, result: results[0] }], false);
+      const [outcome] = buildSafeOutputExecutions([{ type: "upload_artifact", messageIndex: 0, success: true, result: results[0] }], false);
       expect(outcome).toMatchObject({ type: "upload_artifact", status: "staged", staged: true });
       expect(outcome).not.toHaveProperty("url");
     });
@@ -665,6 +743,18 @@ describe("upload_artifact.cjs", () => {
       expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Auto-copied file"));
     });
 
+    it("rejects leading-dash filenames before copying them into staging", async () => {
+      const absFile = path.join(WORKSPACE_DIR, "-T");
+      writeWorkspace("-T");
+
+      const results = await runHandler(buildConfig(), [{ type: "upload_artifact", path: absFile }]);
+
+      expect(results[0].success).toBe(false);
+      expect(results[0].error).toContain('filenames beginning with "-" are not allowed');
+      expect(fs.existsSync(path.join(STAGING_DIR, "-T"))).toBe(false);
+      expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
+    });
+
     it("auto-copies a directory from an absolute path", async () => {
       writeWorkspace("output/a.txt", "aaa");
       writeWorkspace("output/sub/b.txt", "bbb");
@@ -712,18 +802,143 @@ describe("upload_artifact.cjs", () => {
       expect(content).toBe("staged version");
     });
 
-    it("does not overwrite pre-staged file when auto-copying from absolute path", async () => {
+    it("rejects a conflicting pre-staged file when auto-copying from absolute path", async () => {
       writeStaging("data.json", "original staged");
       writeWorkspace("data.json", "workspace version");
       const absFile = path.join(WORKSPACE_DIR, "data.json");
 
       const results = await runHandler(buildConfig(), [{ type: "upload_artifact", path: absFile }]);
 
-      expect(results[0].success).toBe(true);
-      // The pre-staged file must not be overwritten.
+      expect(results[0].success).toBe(false);
+      expect(results[0].error).toContain("staging name conflict for data.json");
       const content = fs.readFileSync(path.join(STAGING_DIR, "data.json"), "utf8");
       expect(content).toBe("original staged");
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("already exists in staging"));
+      expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
+    });
+
+    it("accepts identical pre-staged content when auto-copying from absolute path", async () => {
+      writeStaging("data.json", "same content");
+      writeWorkspace("data.json", "same content");
+
+      const results = await runHandler(buildConfig(), [{ type: "upload_artifact", path: path.join(WORKSPACE_DIR, "data.json") }]);
+
+      expect(results[0].success).toBe(true);
+      expect(mockArtifactClient.uploadArtifact).toHaveBeenCalledOnce();
+    });
+
+    it("rejects directory basename collisions with different contents", async () => {
+      writeStaging("output/staged.txt", "staged content");
+      writeWorkspace("output/workspace.txt", "workspace content");
+
+      const results = await runHandler(buildConfig(), [{ type: "upload_artifact", path: path.join(WORKSPACE_DIR, "output") }]);
+
+      expect(results[0].success).toBe(false);
+      expect(results[0].error).toContain("staging name conflict for output");
+      expect(fs.existsSync(path.join(STAGING_DIR, "output/workspace.txt"))).toBe(false);
+      expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
+    });
+
+    it("rejects a directory that collides with a staged file", async () => {
+      writeStaging("output", "existing file");
+      writeWorkspace("output/report.txt", "new directory content");
+
+      const results = await runHandler(buildConfig(), [{ type: "upload_artifact", path: path.join(WORKSPACE_DIR, "output") }]);
+
+      expect(results[0].success).toBe(false);
+      expect(results[0].error).toContain("staging name conflict for output");
+      expect(fs.readFileSync(path.join(STAGING_DIR, "output"), "utf8")).toBe("existing file");
+    });
+
+    it("does not recopy an identical staged directory", async () => {
+      writeWorkspace("output/report.txt", "same content");
+      const sourceDir = path.join(WORKSPACE_DIR, "output");
+      const firstResult = await runHandler(buildConfig(), [{ type: "upload_artifact", path: sourceDir }]);
+      expect(firstResult[0].success).toBe(true);
+
+      const copySpy = vi.spyOn(fs, "copyFileSync");
+      const secondResult = await runHandler(buildConfig(), [{ type: "upload_artifact", path: sourceDir }]);
+
+      expect(secondResult[0].success).toBe(true);
+      expect(copySpy).not.toHaveBeenCalled();
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("(0 file(s))"));
+    });
+
+    it("removes a partial directory copy so the same source can be retried", async () => {
+      writeWorkspace("retry-output/a.txt", "first file");
+      writeWorkspace("retry-output/sub/b.txt", "second file");
+      const sourceDir = path.join(WORKSPACE_DIR, "retry-output");
+      const failingFile = path.join(sourceDir, "sub", "b.txt");
+      const copySpy = vi.spyOn(fs, "copyFileSync").mockImplementation((source, dest) => {
+        if (source === failingFile) throw new Error("disk full");
+        fs.writeFileSync(dest, fs.readFileSync(source));
+      });
+
+      const failedResult = await runHandler(buildConfig(), [{ type: "upload_artifact", path: sourceDir }]);
+
+      expect(failedResult[0].success).toBe(false);
+      expect(fs.existsSync(path.join(STAGING_DIR, "retry-output"))).toBe(false);
+      copySpy.mockRestore();
+
+      const retryResult = await runHandler(buildConfig(), [{ type: "upload_artifact", path: sourceDir }]);
+
+      expect(retryResult[0].success).toBe(true);
+      expect(fs.readFileSync(path.join(STAGING_DIR, "retry-output", "sub", "b.txt"), "utf8")).toBe("second file");
+    });
+
+    it.skipIf(process.platform !== "linux")("does not read through a parent replaced by a symlink during comparison", () => {
+      const sourceParent = path.join(TEST_ROOT, "pinned-source-parent");
+      const sourceDir = path.join(sourceParent, "source");
+      const replacementDir = path.join(TEST_ROOT, "replacement", "source");
+      const destDir = path.join(TEST_ROOT, "destination");
+      const originalParent = `${sourceParent}-original`;
+      fs.mkdirSync(sourceDir, { recursive: true });
+      fs.mkdirSync(replacementDir, { recursive: true });
+      fs.mkdirSync(destDir, { recursive: true });
+      fs.writeFileSync(path.join(sourceDir, "report.txt"), "source");
+      fs.writeFileSync(path.join(replacementDir, "report.txt"), "forbidden");
+      fs.writeFileSync(path.join(destDir, "report.txt"), "forbidden");
+      const originalOpen = fs.openSync;
+      let swapped = false;
+      vi.spyOn(fs, "openSync").mockImplementation((filename, ...args) => {
+        if (!swapped && String(filename).endsWith(`${path.sep}pinned-source-parent`)) {
+          swapped = true;
+          fs.renameSync(sourceParent, originalParent);
+          fs.symlinkSync(path.dirname(replacementDir), sourceParent, "dir");
+        }
+        return originalOpen(filename, ...args);
+      });
+      const readSpy = vi.spyOn(fs, "readSync");
+
+      try {
+        expect(() => directoriesHaveSameContents(sourceDir, destDir)).toThrow();
+        expect(swapped).toBe(true);
+        expect(readSpy).not.toHaveBeenCalled();
+      } finally {
+        fs.unlinkSync(sourceParent);
+        fs.renameSync(originalParent, sourceParent);
+      }
+    });
+
+    it("rejects directory equality when file metadata changes during comparison", () => {
+      const sourceDir = path.join(TEST_ROOT, "changing-source");
+      const destDir = path.join(TEST_ROOT, "unchanged-destination");
+      const content = "x".repeat(128 * 1024);
+      fs.mkdirSync(sourceDir);
+      fs.mkdirSync(destDir);
+      fs.writeFileSync(path.join(sourceDir, "report.txt"), content);
+      fs.writeFileSync(path.join(destDir, "report.txt"), content);
+      const originalRead = fs.readSync;
+      let changed = false;
+      vi.spyOn(fs, "readSync").mockImplementation((...args) => {
+        const count = originalRead(...args);
+        if (!changed) {
+          changed = true;
+          fs.appendFileSync(path.join(sourceDir, "report.txt"), "changed");
+        }
+        return count;
+      });
+
+      expect(() => directoriesHaveSameContents(sourceDir, destDir)).toThrow(/changed while comparing/);
     });
 
     it("rejects symlinks during auto-copy from absolute path", async () => {
@@ -855,11 +1070,15 @@ describe("upload_artifact.cjs", () => {
       fs.mkdirSync(gitDir, { recursive: true });
       fs.writeFileSync(path.join(gitDir, "config"), "[core]\n  repositoryformatversion = 0\n");
       fs.writeFileSync(path.join(srcDir, "readme.md"), "hello");
+      writeStaging("project/.git/config", "[core]\n  repositoryformatversion = 0\n");
+      writeStaging("project/readme.md", "hello");
+      const open = vi.spyOn(fs, "openSync");
 
       await runHandler(buildConfig(), [{ type: "upload_artifact", path: srcDir }]);
 
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("sensitive repository metadata"));
       expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
+      expect(open).not.toHaveBeenCalled();
     });
 
     it("allows a path within GITHUB_WORKSPACE", async () => {

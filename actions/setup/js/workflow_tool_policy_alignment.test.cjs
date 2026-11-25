@@ -6,25 +6,33 @@ import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
-import { parseDocument } from "./work_queue_yaml.cjs";
+import { readDocumentMetadata } from "../../../scripts/markdown_metadata_test_adapter.cjs";
+import { Readable } from "node:stream";
+import { readLockFileHeaders } from "./lock_file_headers.cjs";
 
 const require = createRequire(import.meta.url);
 const { buildCopilotSDKPermissionHandler } = require("./copilot_sdk_permissions.cjs");
 const { parseToolArgs } = require("./mcp_cli_bridge.cjs");
 const root = resolve(import.meta.dirname, "../../..");
 const names = ["draft-pr-cleanup", "instructions-janitor", "daily-mcp-concurrency-analysis"];
+const manifests = new Map(
+  await Promise.all(
+    [...names, "daily-file-diet", "daily-caveman-optimizer"].map(async name => {
+      const { manifest } = await readLockFileHeaders(Readable.from([readFileSync(resolve(root, `.github/workflows/${name}.lock.yml`), "utf8")]));
+      return [name, manifest];
+    })
+  )
+);
 const readWorkflow = name => {
   const source = readFileSync(resolve(root, `.github/workflows/${name}.md`), "utf8");
   const [, frontmatter, prompt] = source.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
-  const document = parseDocument(frontmatter, { version: "1.2", uniqueKeys: true });
-  if (document.errors.length) throw new AggregateError(document.errors, `Invalid ${name} source`);
+  const document = readDocumentMetadata(frontmatter, { version: "1.2", uniqueKeys: true });
   const lock = readFileSync(resolve(root, `.github/workflows/${name}.lock.yml`), "utf8");
-  const compiled = parseDocument(lock, { version: "1.2", uniqueKeys: true });
-  if (compiled.errors.length) throw new AggregateError(compiled.errors, `Invalid ${name} lock`);
-  const manifest = JSON.parse(lock.match(/^# gh-aw-manifest: (.+)$/m)[1]);
-  const steps = compiled.toJS().jobs.agent.steps;
+  const compiled = readDocumentMetadata(lock, { version: "1.2", uniqueKeys: true });
+  const manifest = manifests.get(name);
+  const steps = compiled.value.jobs.agent.steps;
   const sdkConfig = steps.find(step => step.env?.GH_AW_COPILOT_SDK_TOOL_CONFIG)?.env.GH_AW_COPILOT_SDK_TOOL_CONFIG;
-  return { workflow: document.toJS(), prompt, lock, manifest, steps, sdkConfig: sdkConfig && JSON.parse(sdkConfig) };
+  return { workflow: document.value, prompt, lock, manifest, steps, sdkConfig: sdkConfig && JSON.parse(sdkConfig) };
 };
 
 describe("workflow native MCP permission alignment", () => {
@@ -214,29 +222,13 @@ describe("workflow native MCP permission alignment", () => {
     expect(lock).not.toContain("--allow-all-tools");
   });
 
-  it("allows draft reads and safe outputs but rejects the observed compound commands", () => {
-    const { workflow, prompt, sdkConfig } = readWorkflow("draft-pr-cleanup");
+  it("keeps draft cleanup on native MCP reads and safe outputs without a shell", () => {
+    const { workflow, prompt, steps } = readWorkflow("draft-pr-cleanup");
+    expect(workflow.engine.id).toBe("codex");
     expect(workflow.tools.bash).toBe(false);
-    expect(workflow["max-tool-denials"]).toBe(3);
-    expect(sdkConfig.capabilities).toMatchObject({ bash: false, cliProxy: false, mcp: true });
-    const denied = [];
-    const handler = buildCopilotSDKPermissionHandler(sdkConfig.permissions, () => ({ kind: "approve-once" }), { onDenied: command => denied.push(command) });
-    for (const [serverName, toolName] of [
-      ["github", "search_pull_requests"],
-      ["safeoutputs", "add_comment"],
-      ["safeoutputs", "report_incomplete"],
-    ]) {
-      expect(handler({ kind: "mcp", serverName, toolName })).toEqual({ kind: "approve-once" });
-    }
-    for (const fullCommandText of [
-      'github search_pull_requests --query "repo:github/gh-aw is:pr is:open is:draft" --perPage 100 | python3 -c "import json"',
-      'github search_pull_requests --query "repo:github/gh-aw is:pr is:open is:draft" > /tmp/gh-aw/agent/o.json; python3 -c "import json"',
-      'cd /tmp/gh-aw/agent && github search_pull_requests --query "repo:github/gh-aw is:pr is:open is:draft"',
-    ]) {
-      expect(handler({ kind: "shell", commands: [], fullCommandText }).kind).toBe("reject");
-    }
-    expect(denied).toHaveLength(3);
-    expect(handler({ kind: "mcp", serverName: "undeclared", toolName: "write" }).kind).toBe("reject");
+    const codexConfig = JSON.parse(steps.find(step => step.env?.GH_AW_CODEX_CONFIG_JSON).env.GH_AW_CODEX_CONFIG_JSON);
+    expect(codexConfig.defaults.features).toMatchObject({ shell_tool: false, code_mode: false, plugins: false });
+    expect(Object.keys(codexConfig.defaults.mcp_servers).sort()).toEqual(["github", "safeoutputs"]);
     expect(prompt).toContain("at most 20 results per page");
     expect(prompt).not.toMatch(/"type": "(?:add_labels|add_comment|close_pull_request)"/);
     expect(prompt).toContain("Label removal is not enabled");
@@ -275,7 +267,7 @@ describe("workflow native MCP permission alignment", () => {
     expect(prompt).toContain("Complete the cache read-back and ledger query/submission before calling `noop`");
   });
 
-  it.each(names)("%s produces native gateway config rather than CLI-only config", name => {
+  it.each(names.filter(name => readWorkflow(name).workflow.engine.id !== "codex"))("%s produces native gateway config rather than CLI-only config", name => {
     const { workflow, manifest, steps } = readWorkflow(name);
     const directory = mkdtempSync(resolve(tmpdir(), "gh-aw-tool-policy-"));
     try {

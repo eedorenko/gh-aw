@@ -4,6 +4,8 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -383,6 +385,166 @@ func TestHandleEmptyWorkflowRunBatch(t *testing.T) {
 		assert.True(t, shouldContinue)
 		assert.False(t, shouldStop)
 	})
+
+	t.Run("stop when no pagination cursor is available", func(t *testing.T) {
+		cursor, shouldContinue, shouldStop := handleEmptyWorkflowRunBatch(workflowRunBatch{
+			totalFetched: BatchSize,
+			batchSize:    BatchSize,
+		}, true)
+		assert.Empty(t, cursor)
+		assert.False(t, shouldContinue)
+		assert.True(t, shouldStop)
+	})
+}
+
+func TestCleanupLogsOutputDir(t *testing.T) {
+	t.Run("invalid cutoff", func(t *testing.T) {
+		err := cleanupLogsOutputDir(LogsDownloadOptions{After: "invalid"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid --after value")
+	})
+
+	t.Run("removes old run folder", func(t *testing.T) {
+		outputDir := t.TempDir()
+		runDir := filepath.Join(outputDir, "run-123")
+		require.NoError(t, os.Mkdir(runDir, 0o700))
+
+		_, stderr := captureOutput(t, func() error {
+			return cleanupLogsOutputDir(LogsDownloadOptions{
+				After:     "2030-01-01",
+				OutputDir: outputDir,
+				Verbose:   true,
+			})
+		})
+		_, err := os.Stat(runDir)
+		require.ErrorIs(t, err, os.ErrNotExist)
+		assert.Contains(t, stderr, "Removed 1 cached run folder")
+	})
+}
+
+func TestHandleLogsRateLimitWaitError(t *testing.T) {
+	t.Run("deadline marks timeout", func(t *testing.T) {
+		state := logsCollectionState{}
+		stop, err := handleLogsRateLimitWaitError(&state, false, LogsDownloadOptions{}, context.DeadlineExceeded)
+		assert.True(t, stop)
+		require.NoError(t, err)
+		assert.True(t, state.timeoutReached)
+	})
+
+	t.Run("shared count cancellation stops cleanly", func(t *testing.T) {
+		limit := newLogsCountLimit(1)
+		require.True(t, limit.tryAdd())
+		state := logsCollectionState{}
+		stop, err := handleLogsRateLimitWaitError(&state, true, LogsDownloadOptions{countLimit: limit}, context.Canceled)
+		assert.True(t, stop)
+		require.NoError(t, err)
+		assert.True(t, state.countLimitReached)
+	})
+
+	t.Run("rate limit cancellation returns rate limit error", func(t *testing.T) {
+		rateLimitState := &logsRateLimitState{}
+		rateLimitState.reached.Store(true)
+		state := logsCollectionState{}
+		stop, err := handleLogsRateLimitWaitError(&state, false, LogsDownloadOptions{rateLimitState: rateLimitState}, context.Canceled)
+		assert.True(t, stop)
+		require.ErrorIs(t, err, errLogsAPIRateLimitReached)
+	})
+
+	t.Run("genuine cancellation clears partial state", func(t *testing.T) {
+		state := logsCollectionState{iteration: 2, beforeDate: "cursor"}
+		stop, err := handleLogsRateLimitWaitError(&state, false, LogsDownloadOptions{}, context.Canceled)
+		assert.True(t, stop)
+		require.ErrorIs(t, err, context.Canceled)
+		assert.Equal(t, logsCollectionState{}, state)
+	})
+
+	t.Run("transient error retries next iteration", func(t *testing.T) {
+		state := logsCollectionState{}
+		stop, err := handleLogsRateLimitWaitError(&state, false, LogsDownloadOptions{}, errors.New("temporary error"))
+		assert.False(t, stop)
+		require.NoError(t, err)
+		assert.Equal(t, 1, state.iteration)
+	})
+}
+
+func TestShouldStopLogsIteration(t *testing.T) {
+	t.Run("deadline context", func(t *testing.T) {
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		defer cancel()
+		stop, timedOut, err := shouldStopLogsIteration(logsDownloadRuntime{activeCtx: ctx}, LogsDownloadOptions{})
+		assert.True(t, stop)
+		assert.True(t, timedOut)
+		assert.NoError(t, err)
+	})
+
+	t.Run("shared count cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		limit := newLogsCountLimit(1)
+		require.True(t, limit.tryAdd())
+		stop, timedOut, err := shouldStopLogsIteration(logsDownloadRuntime{activeCtx: ctx}, LogsDownloadOptions{countLimit: limit})
+		assert.False(t, stop)
+		assert.False(t, timedOut)
+		assert.NoError(t, err)
+	})
+
+	t.Run("rate limit cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		rateLimitState := &logsRateLimitState{}
+		rateLimitState.reached.Store(true)
+		stop, timedOut, err := shouldStopLogsIteration(
+			logsDownloadRuntime{activeCtx: ctx},
+			LogsDownloadOptions{rateLimitState: rateLimitState},
+		)
+		assert.True(t, stop)
+		assert.False(t, timedOut)
+		assert.ErrorIs(t, err, errLogsAPIRateLimitReached)
+	})
+
+	t.Run("caller cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		stop, timedOut, err := shouldStopLogsIteration(logsDownloadRuntime{activeCtx: ctx}, LogsDownloadOptions{})
+		assert.True(t, stop)
+		assert.False(t, timedOut)
+		assert.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("elapsed timeout", func(t *testing.T) {
+		stop, timedOut, err := shouldStopLogsIteration(
+			logsDownloadRuntime{
+				activeCtx:       context.Background(),
+				startTime:       time.Now().Add(-time.Second),
+				timeoutDuration: time.Nanosecond,
+			},
+			LogsDownloadOptions{},
+		)
+		assert.True(t, stop)
+		assert.True(t, timedOut)
+		assert.NoError(t, err)
+	})
+}
+
+func TestParseWorkflowRunArtifacts(t *testing.T) {
+	outputDir := t.TempDir()
+	_, stderr := captureOutput(t, func() error {
+		parseWorkflowRunArtifacts(
+			context.Background(),
+			DownloadResult{LogsPath: outputDir},
+			ProcessedRun{Run: WorkflowRun{DatabaseID: 42}},
+			true,
+			true,
+		)
+		return nil
+	})
+	assert.Contains(t, stderr, "No engine detected")
+}
+
+func TestShouldSkipProcessedWorkflowRun(t *testing.T) {
+	assert.True(t, shouldSkipProcessedWorkflowRun(DownloadResult{Skipped: true}, false))
+	assert.True(t, shouldSkipProcessedWorkflowRun(DownloadResult{Error: errors.New("download failed")}, false))
+	assert.False(t, shouldSkipProcessedWorkflowRun(DownloadResult{}, false))
 }
 
 // TestCollectProcessedWorkflowRunsAccumulatesBatches is a regression test for a bug where
@@ -390,6 +552,12 @@ func TestHandleEmptyWorkflowRunBatch(t *testing.T) {
 // processed run was discarded and `gh aw logs` reported "No workflow runs with artifacts
 // found matching the specified criteria" even though artifacts had been downloaded.
 func TestCollectProcessedWorkflowRunsAccumulatesBatches(t *testing.T) {
+	oldFetchRateLimitFunc := fetchRateLimitFunc
+	fetchRateLimitFunc = func(context.Context) (rateLimitResource, error) {
+		return rateLimitResource{Limit: 5000, Remaining: 5000, Reset: time.Now().Add(time.Hour).Unix()}, nil
+	}
+	t.Cleanup(func() { fetchRateLimitFunc = oldFetchRateLimitFunc })
+
 	batches := [][]WorkflowRun{
 		{{DatabaseID: 1}, {DatabaseID: 2}},
 		{{DatabaseID: 3}},
@@ -429,6 +597,64 @@ func TestCollectProcessedWorkflowRunsAccumulatesBatches(t *testing.T) {
 	require.Len(t, runs, 3, "runs from every batch should accumulate across iterations")
 	assert.Equal(t, int64(1), runs[0].Run.DatabaseID)
 	assert.Equal(t, int64(3), runs[2].Run.DatabaseID)
+}
+
+// TestCollectProcessedWorkflowRunsStopsAtAfterRunIDBoundary is a regression test for
+// unbounded backward pagination when --count exceeds the runs inside a
+// --after-run-id/--before-run-id window, which made the Auditor's bounded
+// `gh aw logs` call exhaust its timeout paging through unrelated history.
+func TestCollectProcessedWorkflowRunsStopsAtAfterRunIDBoundary(t *testing.T) {
+	oldFetchRateLimitFunc := fetchRateLimitFunc
+	fetchRateLimitFunc = func(context.Context) (rateLimitResource, error) {
+		return rateLimitResource{Limit: 5000, Remaining: 5000, Reset: time.Now().Add(time.Hour).Unix()}, nil
+	}
+	t.Cleanup(func() { fetchRateLimitFunc = oldFetchRateLimitFunc })
+
+	originalFetch := logsFetchWorkflowRunBatch
+	originalProcess := logsProcessWorkflowRunBatch
+	t.Cleanup(func() {
+		logsFetchWorkflowRunBatch = originalFetch
+		logsProcessWorkflowRunBatch = originalProcess
+	})
+
+	for _, tt := range []struct {
+		name     string
+		runs     []WorkflowRun
+		wantRuns int
+	}{
+		{name: "matching run found", runs: []WorkflowRun{{DatabaseID: 100}}, wantRuns: 1},
+		{name: "batch filtered to zero runs", wantRuns: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fetchCalls := 0
+			logsFetchWorkflowRunBatch = func(_ context.Context, _ LogsDownloadOptions, _ string, _ int, _ bool) (workflowRunBatch, error) {
+				fetchCalls++
+				// A full page whose oldest run is already older than --after-run-id.
+				return workflowRunBatch{
+					runs:                   tt.runs,
+					totalFetched:           6,
+					batchSize:              6,
+					oldestFetchedCreatedAt: time.Now().Add(-time.Hour),
+					oldestFetchedRunID:     42,
+				}, nil
+			}
+			logsProcessWorkflowRunBatch = func(_ context.Context, batch workflowRunBatch, processedRuns []ProcessedRun, _ processWorkflowRunBatchOptions) ([]ProcessedRun, int, bool, bool, bool) {
+				for _, run := range batch.runs {
+					processedRuns = append(processedRuns, ProcessedRun{Run: run})
+				}
+				return processedRuns, len(batch.runs), true, false, false
+			}
+
+			runs, timeoutReached, _, _, _, err := collectProcessedWorkflowRuns(
+				logsDownloadRuntime{activeCtx: context.Background()},
+				LogsDownloadOptions{Count: 2, AfterRunID: 99, BeforeRunID: 101},
+			)
+			require.NoError(t, err)
+			assert.False(t, timeoutReached)
+			assert.Len(t, runs, tt.wantRuns)
+			assert.Equal(t, 1, fetchCalls, "pagination must stop once the after-run-id boundary is reached")
+		})
+	}
 }
 
 // TestFetchAndProcessLogsBatchKeepsCursorWhenStorageLimitReached verifies that
@@ -1235,7 +1461,8 @@ func TestDownloadWorkflowLogsFromStdinReportsCollectionStatsForJSONLAndDiskCache
 		RunID:       diskCachedRunID,
 		ProcessedAt: time.Now(),
 		RunAnalysis: RunAnalysis{
-			Run: WorkflowRun{DatabaseID: diskCachedRunID, WorkflowName: "Disk Cached", WorkflowPath: ".github/workflows/disk-cached.lock.yml", Status: "completed", Conclusion: "success"},
+			Run:        WorkflowRun{DatabaseID: diskCachedRunID, WorkflowName: "Disk Cached", WorkflowPath: ".github/workflows/disk-cached.lock.yml", Status: "completed", Conclusion: "success"},
+			TokenUsage: &TokenUsageSummary{AICFound: true},
 		},
 	}, false))
 	require.NoError(t, markArtifactDownloaded(diskRunDir, constants.UsageArtifactName.String()))
@@ -1248,15 +1475,25 @@ func TestDownloadWorkflowLogsFromStdinReportsCollectionStatsForJSONLAndDiskCache
 	)
 	require.NoError(t, os.WriteFile(cachedJSONLPath, []byte(cachedRecord), 0o600))
 
-	_, stderr := captureOutput(t, func() error {
+	stdout, stderr := captureOutput(t, func() error {
 		return DownloadWorkflowLogsFromStdin(context.Background(), StdinLogsOptions{
 			RunURLs:      []string{strconv.FormatInt(diskCachedRunID, 10), strconv.FormatInt(jsonlCachedRunID, 10)},
 			OutputDir:    outputDir,
 			RepoOverride: "owner/repo",
 			CachedJSONL:  cachedJSONLPath,
 			ArtifactSets: []string{"usage"},
+			JSONOutput:   true,
 		})
 	})
 
 	assert.Contains(t, stderr, "Runs: 2 discovered; reports: 0 downloaded, 2 skipped because cached analyses were reused")
+	var report LogsData
+	require.NoError(t, json.Unmarshal([]byte(stdout), &report))
+	assert.Equal(t, "partial", report.Summary.AICCoverage)
+	assert.Nil(t, report.Summary.TotalAIC)
+	coverageByRun := make(map[int64]string)
+	for _, run := range report.Runs {
+		coverageByRun[run.RunID] = run.AICCoverage
+	}
+	assert.Equal(t, map[int64]string{diskCachedRunID: "available", jsonlCachedRunID: "unavailable"}, coverageByRun)
 }

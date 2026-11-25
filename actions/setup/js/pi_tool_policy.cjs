@@ -30,14 +30,41 @@ function reservePiBudget(kind, count, limit) {
   return limit + 1;
 }
 
+/**
+ * Replaces the contents of literal quoted strings with inert placeholders so
+ * JSON arguments such as `safeoutputs add_comment '{"body":"(x)"}'` are not
+ * mistaken for shell syntax. Returns null for unterminated quotes or double
+ * quotes containing expansions or escapes.
+ * @param {string} command @returns {string|null}
+ */
+function maskQuotedLiterals(command) {
+  let masked = "";
+  for (let i = 0; i < command.length; i++) {
+    const quote = command[i];
+    if (quote !== "'" && quote !== '"') {
+      masked += quote;
+      continue;
+    }
+    const end = command.indexOf(quote, i + 1);
+    if (end < 0) return null;
+    const literal = command.slice(i + 1, end);
+    if (quote === '"' && /[$`\\]/.test(literal)) return null;
+    masked += quote + "_".repeat(literal.length) + quote;
+    i = end;
+  }
+  return masked;
+}
+
 /** @param {unknown} command @param {unknown} allowed @returns {boolean} */
 function isPiBashAllowed(command, allowed) {
   if (allowed === false || (Array.isArray(allowed) && allowed.length === 0)) return false;
   if (!Array.isArray(allowed) || allowed.includes("*") || allowed.includes(":*")) return true;
   if (typeof command !== "string" || !command.trim()) return false;
-  // Dynamic expansions, redirections, grouping, and background execution are
-  // deliberately refused rather than attempting to infer their executable scope.
-  if (/[$`\\()<>{}#]/.test(command) || /(^|[^&])&([^&]|$)/.test(command)) return false;
+  // Dynamic expansions, redirections, grouping, comments, and background execution
+  // outside literal quotes are deliberately refused rather than attempting to infer
+  // their executable scope.
+  const unquoted = maskQuotedLiterals(command);
+  if (unquoted === null || /[$`\\()<>{}#]/.test(unquoted) || /(^|[^&])&([^&]|$)/.test(unquoted)) return false;
   const segments = splitOnPipelineOperators(command);
   return (
     segments.length > 0 &&
@@ -68,7 +95,8 @@ function piToolPolicy(pi) {
       callCount = reservePiBudget("calls", callCount, limit);
       let reason;
       if (limit !== undefined && callCount > limit) reason = `Workflow tool-call budget exhausted (${limit} calls)`;
-      else if (process.env.GH_AW_PI_SUBAGENT_CHILD === "1" && /(?:^|[^a-z0-9])(?:noop|report_incomplete|create_report_incomplete_issue)$/i.test(event.toolName || "")) reason = "Workflow-completion reporting is owned by the parent agent";
+      else if (process.env.GH_AW_PI_SUBAGENT_CHILD === "1" && /(?:^|[^a-z0-9])(?:noop|request_continuation|report_incomplete|create_report_incomplete_issue)$/i.test(event.toolName || ""))
+        reason = "Workflow-completion reporting is owned by the parent agent";
       else if (event.toolName === "bash" && !isPiBashAllowed(event.input?.command, policy.bash)) reason = "Command is outside the workflow tools.bash allowlist";
       else if (policy.edit === false && ["edit", "write"].includes(event.toolName)) reason = "File editing is disabled by the workflow";
       if (!reason) return;

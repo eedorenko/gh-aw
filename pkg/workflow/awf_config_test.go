@@ -5,6 +5,10 @@ package workflow
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -827,7 +831,7 @@ func TestBuildAWFConfigJSON(t *testing.T) {
 
 		jsonStr, err := BuildAWFConfigJSON(config)
 		require.NoError(t, err)
-		assert.NotContains(t, jsonStr, `"enableTokenSteering"`, "apiProxy should omit enableTokenSteering when max-ai-credits is negative")
+		assert.Contains(t, jsonStr, `"enableTokenSteering":false`, "apiProxy should explicitly disable steering when max-ai-credits is negative")
 		assert.NotContains(t, jsonStr, `"maxAiCredits"`, "apiProxy should omit maxAiCredits when negative (disabled)")
 	})
 
@@ -1639,6 +1643,17 @@ func TestBuildAWFConfigJSON(t *testing.T) {
 					"providers": map[string]any{
 						"anthropic": map[string]any{
 							"models": map[string]any{
+								"compiler-default": map[string]any{
+									"cost": map[string]any{"input": "0.000001"},
+								},
+							},
+						},
+					},
+				},
+				ModelCostOverrides: map[string]any{
+					"providers": map[string]any{
+						"anthropic": map[string]any{
+							"models": map[string]any{
 								"accounts/fireworks/models/minimax-m3": map[string]any{
 									"cost": map[string]any{
 										"input":       "3e-07",
@@ -1646,6 +1661,9 @@ func TestBuildAWFConfigJSON(t *testing.T) {
 										"cache_read":  "3e-08",
 										"cache_write": "3.75e-07",
 									},
+								},
+								"authored-free-model": map[string]any{
+									"cost": map[string]any{"input": "0"},
 								},
 							},
 						},
@@ -1675,6 +1693,9 @@ func TestBuildAWFConfigJSON(t *testing.T) {
 		cost, ok := model["cost"].(map[string]any)
 		require.True(t, ok, "expected model cost object")
 		assert.Equal(t, "3e-08", cost["cache_read"], "apiProxy.providers should preserve custom cache_read pricing")
+		assert.NotContains(t, models, "compiler-default", "reporting-only defaults must not become apiProxy overrides")
+		freeModel := models["authored-free-model"].(map[string]any)
+		assert.Equal(t, "0", freeModel["cost"].(map[string]any)["input"], "explicit zero rates must remain operator overrides")
 	})
 
 	t.Run("models.providers is not emitted when AWF version does not support apiProxy.providers", func(t *testing.T) {
@@ -1685,7 +1706,7 @@ func TestBuildAWFConfigJSON(t *testing.T) {
 				EngineConfig: &EngineConfig{
 					ID: "claude",
 				},
-				ModelCosts: map[string]any{
+				ModelCostOverrides: map[string]any{
 					"providers": map[string]any{
 						"anthropic": map[string]any{
 							"models": map[string]any{
@@ -1714,6 +1735,57 @@ func TestBuildAWFConfigJSON(t *testing.T) {
 		_, hasProviders := apiProxy["providers"]
 		assert.False(t, hasProviders, "apiProxy should omit providers when AWF version does not support it")
 	})
+}
+
+func TestBuildAWFConfigJSON_ProxiedEngineTransportDoesNotGrantDirectModelAPI(t *testing.T) {
+	tests := []struct {
+		engine   constants.EngineName
+		set      string
+		modelAPI string
+	}{
+		{constants.CopilotEngine, "copilot", "api.githubcopilot.com"},
+		{constants.ClaudeEngine, "claude", "api.anthropic.com"},
+		{constants.CodexEngine, "codex", "api.openai.com"},
+		{constants.GeminiEngine, "gemini", "generativelanguage.googleapis.com"},
+		{constants.PiEngine, "pi", "api.githubcopilot.com"},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.engine), func(t *testing.T) {
+			network := &NetworkPermissions{
+				Allowed:  []string{tt.set},
+				Firewall: &FirewallConfig{Enabled: true},
+			}
+			allowedDomains := GetAllowedDomainsForEngine(tt.engine, network, nil, nil)
+			if tt.engine == constants.ClaudeEngine {
+				allowedDomains = NewClaudeEngine().claudeAllowedDomains(&WorkflowData{NetworkPermissions: network})
+			}
+			configJSON, err := BuildAWFConfigJSON(AWFCommandConfig{
+				EngineName:     string(tt.engine),
+				AllowedDomains: allowedDomains,
+				WorkflowData: &WorkflowData{
+					EngineConfig:       &EngineConfig{ID: string(tt.engine)},
+					NetworkPermissions: network,
+				},
+			})
+			require.NoError(t, err)
+
+			var parsed struct {
+				Network struct {
+					AllowDomains []string `json:"allowDomains"`
+				} `json:"network"`
+				APIProxy struct {
+					Enabled bool `json:"enabled"`
+				} `json:"apiProxy"`
+			}
+			require.NoError(t, json.Unmarshal([]byte(configJSON), &parsed))
+			assert.True(t, parsed.APIProxy.Enabled, "the inference gateway should remain enabled")
+			assert.Contains(t, parsed.Network.AllowDomains, "host.docker.internal",
+				"the agent must retain transport to the gateway")
+			assert.NotContains(t, parsed.Network.AllowDomains, tt.modelAPI,
+				"the proxied transport baseline must not grant direct model API egress")
+		})
+	}
 }
 
 // TestBuildAWFConfigJSON_APIProxyCACert verifies that sandbox.agent.ca-cert is
@@ -1793,7 +1865,7 @@ func TestBuildAWFConfigJSON_APIProxyCACert(t *testing.T) {
 func TestExtractModelCostProviders(t *testing.T) {
 	t.Run("returns a cloned providers map", func(t *testing.T) {
 		workflowData := &WorkflowData{
-			ModelCosts: map[string]any{
+			ModelCostOverrides: map[string]any{
 				"providers": map[string]any{
 					"anthropic": map[string]any{"models": map[string]any{}},
 				},
@@ -1804,14 +1876,14 @@ func TestExtractModelCostProviders(t *testing.T) {
 		require.NotNil(t, got)
 		got["openai"] = map[string]any{}
 
-		origProviders := workflowData.ModelCosts["providers"].(map[string]any)
+		origProviders := workflowData.ModelCostOverrides["providers"].(map[string]any)
 		_, mutatedOriginal := origProviders["openai"]
-		assert.False(t, mutatedOriginal, "returned providers map should not alias ModelCosts.providers")
+		assert.False(t, mutatedOriginal, "returned providers map should not alias ModelCostOverrides.providers")
 	})
 
 	t.Run("returns nil when providers has unexpected type", func(t *testing.T) {
 		workflowData := &WorkflowData{
-			ModelCosts: map[string]any{
+			ModelCostOverrides: map[string]any{
 				"providers": map[string]string{"anthropic": "invalid"},
 			},
 		}
@@ -1893,6 +1965,13 @@ func TestBuildAWFConfigJSON_SchemaURLIsVersionPinned(t *testing.T) {
 		assert.Contains(t, jsonStr, expectedVersion, "schema URL should contain the default firewall version")
 		assert.Contains(t, jsonStr, "releases/download/", "schema URL should use release download path")
 		assert.Contains(t, jsonStr, "awf-config.schema.json", "schema URL should reference awf-config.schema.json")
+
+		var awfConfig AWFConfigFile
+		require.NoError(t, json.Unmarshal([]byte(jsonStr), &awfConfig))
+		require.NotNil(t, awfConfig.Container)
+		imageTag, _, _ := strings.Cut(awfConfig.Container.ImageTag, ",")
+		assert.Equal(t, strings.TrimPrefix(expectedVersion, "v"), imageTag, "container images should match the default firewall release")
+		require.NoError(t, validateAWFConfigJSON(jsonStr))
 	})
 
 	t.Run("pinned version appears in schema URL", func(t *testing.T) {
@@ -1954,6 +2033,47 @@ func TestBuildAWFConfigJSON_DomainDeduplication(t *testing.T) {
 // validateAWFConfigJSON path, which is triggered at compile time when --validate is used
 // (WorkflowData.ValidateAWFConfig == true). Running it unconditionally here ensures schema
 // compliance is verified in CI without the per-compile performance cost.
+func TestAWFConfigSchemaMaxAiCredits(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		value string
+		valid bool
+	}{
+		{`1000`, true},
+		{`0.5`, true},
+		{`0`, true},
+		{`-1`, true},
+		{`"20K"`, true},
+		{`"20k"`, true},
+		{`"100M"`, true},
+		{`"100m"`, true},
+		{`" 001K "`, true},
+		{`"9223372036854775K"`, true},
+		{`"9223372036854M"`, true},
+		{`"0K"`, false},
+		{`"000m"`, false},
+		{`"9223372036854776K"`, false},
+		{`"9223372036855M"`, false},
+		{`"9999999999999999999K"`, false},
+		{`"-1K"`, false},
+		{`"1.5M"`, false},
+		{`"1000"`, false},
+		{`"1G"`, false},
+		{`-2`, false},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			t.Parallel()
+			err := validateAWFConfigJSON(`{"apiProxy":{"maxAiCredits":` + tc.value + `}}`)
+			if tc.valid {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
+}
+
 func TestBuildAWFConfigJSON_SchemaCompliance(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -2111,6 +2231,10 @@ func TestValidateAWFConfigJSON_RejectsInvalidJSON(t *testing.T) {
 func TestValidateAWFConfigJSON_AllowsTemplatableModelFallbackEnabled(t *testing.T) {
 	err := validateAWFConfigJSON(`{"apiProxy":{"enabled":true,"modelFallback":{"enabled":"${{ inputs.model-fallback }}"}}}`)
 	require.NoError(t, err, "modelFallback.enabled expressions should pass compile-time schema validation")
+}
+
+func TestValidateAWFConfigJSON_AllowsBudgetSteeringConfig(t *testing.T) {
+	require.NoError(t, validateAWFConfigJSON(`{"apiProxy":{"steering":{"budget":false}}}`))
 }
 
 func TestValidateAWFConfigJSON_AllowsMaxTurnCacheMisses(t *testing.T) {
@@ -2389,13 +2513,55 @@ func TestBuildAWFCommand_ResolvesMaxAICreditsFromEnv(t *testing.T) {
 
 			command := BuildAWFCommand(config)
 			assert.Contains(t, command, fmt.Sprintf(`GH_AW_MAX_AI_CREDITS="${GH_AW_MAX_AI_CREDITS:-%d}"`, tt.defaultBudget))
-			assert.Contains(t, command, `if [[ ! "$GH_AW_MAX_AI_CREDITS" =~ ^[0-9]+$ ]]; then`)
+			assert.Contains(t, command, `if [[ ! "$GH_AW_MAX_AI_CREDITS" =~ ^(-1|[0-9]+)$ ]]; then`)
 			assert.Contains(t, command, fmt.Sprintf(`GH_AW_MAX_AI_CREDITS="%d"`, tt.defaultBudget))
 			assert.Contains(t, command, `\"maxAiCredits\":${GH_AW_MAX_AI_CREDITS}`)
 			assert.NotContains(t, command, "vars.GH_AW_DEFAULT_MAX_AI_CREDITS")
 			assert.NotContains(t, command, "vars.GH_AW_DEFAULT_DETECTION_MAX_AI_CREDITS")
 			assert.NotContains(t, command, "${{")
 		})
+	}
+}
+
+// T-AIC-PR-003 exercises the generated runtime setup, not just the vars expression.
+func TestBuildAWFCommand_RuntimeMaxAICredits(t *testing.T) {
+	for _, component := range []struct {
+		name             string
+		detection, evals bool
+		fallback         int
+	}{
+		{"agent", false, false, 1000},
+		{"detection", true, false, 400},
+		{"evals", false, true, 400},
+	} {
+		for _, tc := range []struct {
+			value    string
+			expected string
+		}{
+			{"-1", "-1"},
+			{"0", "0"},
+			{"750", "750"},
+			{"", strconv.Itoa(component.fallback)},
+			{"-2", strconv.Itoa(component.fallback)},
+			{"100M", strconv.Itoa(component.fallback)},
+		} {
+			t.Run(component.name+"/"+tc.value, func(t *testing.T) {
+				runnerTemp := t.TempDir()
+				require.NoError(t, os.MkdirAll(filepath.Join(runnerTemp, "gh-aw"), 0o755))
+				script := buildAWFConfigFileSetup(AWFCommandConfig{
+					WorkflowData: &WorkflowData{IsDetectionRun: component.detection, IsEvalsRun: component.evals},
+				}, `{"apiProxy":{"maxRuns":1}}`)
+				script, _, found := strings.Cut(script, "\ncp ")
+				require.True(t, found, "omit the shared artifact copy from the runtime fixture")
+				cmd := exec.Command("bash", "-eu", "-c", script)
+				cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "RUNNER_TEMP=" + runnerTemp, "GH_AW_MAX_AI_CREDITS=" + tc.value}
+				output, err := cmd.CombinedOutput()
+				require.NoError(t, err, "%s", output)
+				configJSON, err := os.ReadFile(filepath.Join(runnerTemp, "gh-aw", "awf-config.json"))
+				require.NoError(t, err)
+				assert.JSONEq(t, `{"apiProxy":{"maxRuns":1,"maxAiCredits":`+tc.expected+`}}`, string(configJSON))
+			})
+		}
 	}
 }
 

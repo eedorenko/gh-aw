@@ -45,6 +45,34 @@ test.describe("Homepage Links", () => {
     await expect(page).toHaveURL(/\/gh-aw\/setup\/creating-workflows\//);
   });
 
+  test("should link the header slideshow control to external slides without an extra CTA", async ({ page }) => {
+    const slides = page.locator(".site-header").getByRole("link", { name: "Slides", exact: true });
+    await expect(slides).toBeVisible();
+    await expect(slides).toHaveAttribute("href", "https://gh.io/gh-aw-slides");
+    await expect(page.locator(".aw-cta").getByRole("link", { name: "Slides", exact: true })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Start slideshow" })).toHaveCount(0);
+    await expect(page.locator("#landing-slideshow, .aw-title-slide")).toHaveCount(0);
+    await page.route("https://gh.io/gh-aw-slides", route => route.fulfill({ body: "Slides" }));
+    await slides.click();
+    await expect(page).toHaveURL("https://gh.io/gh-aw-slides");
+  });
+
+  test("should offer skill help above the legal footer on landing and docs pages", async ({ page }) => {
+    for (const path of ["/gh-aw/", "/gh-aw/setup/creating-workflows/"]) {
+      await page.goto(path);
+      const callout = page.locator(".site-footer-skill");
+      await expect(callout).toHaveCount(1);
+      await expect(callout).toContainText("Have a question or a workflow issue?");
+      const skillLink = callout.getByRole("link", { name: "agentic-workflows skill" });
+      await expect(skillLink).toHaveAttribute("href", "/gh-aw/reference/custom-agent-for-aw/");
+      await expect(callout).toBeVisible();
+      expect(await callout.evaluate(element => !!element.nextElementSibling?.querySelector('nav[aria-label="Legal"]'))).toBe(true);
+      await skillLink.click();
+      await expect(page).toHaveURL(/\/gh-aw\/reference\/custom-agent-for-aw\//);
+      await expect(page.getByRole("heading", { level: 1, name: "Skills support for Agentic Workflows" })).toBeVisible();
+    }
+  });
+
   test("should provide accessible labels for homepage videos", async ({ page }) => {
     const videos = page.locator(".aw-watch-frame video");
     await expect(videos).toHaveCount(2);

@@ -24,10 +24,9 @@ strict: true
 engine:
   id: copilot
   bare: true
-  model-routing:
-    goal: cost
-    mode: economy
-    allowed-models: [gpt-5.6-luna, claude-haiku-4.5]
+model: router/economy
+model-routing:
+  allowed-models: [gpt-5.6-luna, claude-haiku-4.5]
 imports:
   - shared/smoke-test-brevity.md
   - shared/reporting.md
@@ -40,7 +39,7 @@ safe-outputs:
     group: true
     close-older-issues: true
     close-older-key: "smoke-copilot-routed"
-    labels: [automation, testing]
+    labels: [automation, testing, "backlog:smoke-tests"]
   threat-detection:
     model: claude-haiku-5.5
     post-steps:

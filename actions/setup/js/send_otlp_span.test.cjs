@@ -7,16 +7,21 @@ import { createRequire } from "module";
 
 const require = createRequire(import.meta.url);
 const nodeFs = require("node:fs");
+const perfHooks = require("perf_hooks");
 const originalMkdirSync = nodeFs.mkdirSync.bind(nodeFs);
 const originalOpenSync = nodeFs.openSync.bind(nodeFs);
 const originalReadSync = nodeFs.readSync.bind(nodeFs);
 const originalCloseSync = nodeFs.closeSync.bind(nodeFs);
+const originalExistsSync = nodeFs.existsSync.bind(nodeFs);
+const originalSemconvStabilityOptIn = process.env.OTEL_SEMCONV_STABILITY_OPT_IN;
 
 // Keep the suite's virtual files available through streaming reads as well.
 beforeEach(() => {
   const files = new Map();
   let nextFd = -100;
+  vi.spyOn(fs, "existsSync").mockImplementation(file => (String(file) === "/tmp/gh-aw/aw_info.json" ? false : originalExistsSync(file)));
   vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+    if (String(file) === "/tmp/gh-aw/otel-metrics.jsonl") return nextFd--;
     if (!vi.isMockFunction(fs.readFileSync)) return originalOpenSync(file, flags, mode);
     const content = Buffer.from(fs.readFileSync(file, "utf8"));
     const fd = nextFd--;
@@ -38,6 +43,11 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  if (originalSemconvStabilityOptIn === undefined) {
+    delete process.env.OTEL_SEMCONV_STABILITY_OPT_IN;
+  } else {
+    process.env.OTEL_SEMCONV_STABILITY_OPT_IN = originalSemconvStabilityOptIn;
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -45,6 +55,7 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 const {
+  buildServiceRequestHeaders,
   isValidTraceId,
   isValidSpanId,
   generateTraceId,
@@ -81,9 +92,69 @@ const {
   parseOTLPCustomAttributes,
   buildCustomOTLPAttributes,
   FAILURE_CATEGORIES_PATH,
+  resolveGenAiProvider,
+  resolveRunGenAiProvider,
+  isGenAiV1,
+  GEN_AI_SCHEMA_URL,
+  resolveInclusiveInputTokens,
 } = await import("./send_otlp_span.cjs");
 
 const { readExperimentAssignments, EXPERIMENT_ASSIGNMENTS_PATH } = await import("./experiment_helpers.cjs");
+const otlpMetrics = require("./otlp_metrics.cjs");
+
+describe("service request correlation", () => {
+  const traceId = "a".repeat(32);
+  const spanId = "b".repeat(16);
+
+  it("propagates the current context and percent-encodes job identity without forwarding other metadata", () => {
+    expect(
+      buildServiceRequestHeaders({
+        GITHUB_AW_OTEL_TRACE_ID: traceId,
+        GITHUB_AW_OTEL_PARENT_SPAN_ID: spanId,
+        GITHUB_JOB: "safe outputs/review\r\n",
+        TRACEPARENT: "untrusted",
+        BAGGAGE: "private=never-forward",
+        OTEL_BAGGAGE: "private",
+        OTEL_EXPORTER_OTLP_HEADERS: "authorization=private",
+      })
+    ).toEqual({ traceparent: `00-${traceId}-${spanId}-01`, baggage: "cicd.pipeline.task.name=safe%20outputs%2Freview%0D%0A" });
+  });
+
+  it("encodes baggage delimiters, literal percent signs, and UTF-8 bytes", () => {
+    expect(buildServiceRequestHeaders({ GITHUB_JOB: "review,step;key=100% \u00e9" }).baggage).toBe("cicd.pipeline.task.name=review%2Cstep%3Bkey%3D100%25%20%C3%A9");
+    expect(buildServiceRequestHeaders({})).toEqual({});
+  });
+
+  it("omits malformed job baggage without losing valid trace context", () => {
+    expect(
+      buildServiceRequestHeaders({
+        GITHUB_AW_OTEL_TRACE_ID: traceId,
+        GITHUB_AW_OTEL_PARENT_SPAN_ID: spanId,
+        GITHUB_JOB: "\ud800",
+      })
+    ).toEqual({ traceparent: `00-${traceId}-${spanId}-01` });
+  });
+
+  it.each(["safe_outputs", "review\r\ninjected: value", "review\t\u0000\u007f\u0085", 'review,"step";key=100% \u00e9'])("produces HTTP-safe baggage without changing job identity (%j)", jobId => {
+    const headers = new Headers(buildServiceRequestHeaders({ GITHUB_JOB: jobId }));
+    const baggage = headers.get("baggage");
+    expect(baggage).toMatch(/^[\x21-\x7e]+$/);
+    expect(baggage.split(",")).toHaveLength(1);
+    expect(decodeURIComponent(baggage.slice("cicd.pipeline.task.name=".length))).toBe(jobId);
+    expect([...headers.keys()]).toEqual(["baggage"]);
+  });
+
+  it.each([
+    {},
+    { GITHUB_AW_OTEL_TRACE_ID: traceId },
+    { GITHUB_AW_OTEL_PARENT_SPAN_ID: spanId },
+    { GITHUB_AW_OTEL_TRACE_ID: "0".repeat(32), GITHUB_AW_OTEL_PARENT_SPAN_ID: spanId },
+    { GITHUB_AW_OTEL_TRACE_ID: traceId, GITHUB_AW_OTEL_PARENT_SPAN_ID: "0".repeat(16) },
+    { GITHUB_AW_OTEL_TRACE_ID: "invalid", GITHUB_AW_OTEL_PARENT_SPAN_ID: spanId },
+  ])("omits missing or invalid context without losing job identity (%j)", env => {
+    expect(buildServiceRequestHeaders({ ...env, GITHUB_JOB: "agent" })).toEqual({ baggage: "cicd.pipeline.task.name=agent" });
+  });
+});
 
 // ---------------------------------------------------------------------------
 // isValidTraceId
@@ -207,6 +278,11 @@ describe("toNanoString", () => {
 // ---------------------------------------------------------------------------
 
 describe("buildAttr", () => {
+  it("uses the generated attribute registry and preserves caller-defined keys", () => {
+    expect(buildAttr("gh-aw.work_queue.snapshot.present", true).key).toBe("gh-aw.work_queue.snapshot.present");
+    expect(buildAttr("custom.attribute", true).key).toBe("custom.attribute");
+  });
+
   it("returns stringValue for string input", () => {
     expect(buildAttr("k", "v")).toEqual({ key: "k", value: { stringValue: "v" } });
   });
@@ -790,6 +866,7 @@ describe("sendOTLPSpan", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     mkdirSpy.mockRestore();
     appendSpy.mockRestore();
     spawnSyncSpy.mockRestore();
@@ -806,7 +883,7 @@ describe("sendOTLPSpan", () => {
     vi.stubGlobal("fetch", mockFetch);
 
     const payload = { resourceSpans: [] };
-    await sendOTLPSpan("https://traces.example.com:4317", payload);
+    await expect(sendOTLPSpan("https://traces.example.com:4317", payload)).resolves.toBe(true);
 
     expect(mockFetch).toHaveBeenCalledOnce();
     const [url, init] = mockFetch.mock.calls[0];
@@ -814,6 +891,36 @@ describe("sendOTLPSpan", () => {
     expect(init.method).toBe("POST");
     expect(init.headers["Content-Type"]).toBe("application/json");
     expect(JSON.parse(init.body)).toEqual(payload);
+  });
+
+  it.each([Number.MAX_SAFE_INTEGER + 10_000, Number.MIN_SAFE_INTEGER - 10_000])("exports unsafe numeric attribute %s as protobuf double while preserving exact int64 strings", async value => {
+    for (const key of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]) {
+      vi.stubEnv(key, "");
+    }
+    vi.stubEnv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf");
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    vi.stubGlobal("fetch", mockFetch);
+    const payload = buildOTLPPayload({
+      traceId: "0123456789abcdef0123456789abcdef",
+      spanId: "fedcba9876543210",
+      spanName: "gh-aw.test",
+      serviceName: "gh-aw",
+      startMs: 1700000000000,
+      endMs: 1700000000123,
+      attributes: [buildAttr("large.count", value), { key: "exact.count", value: { intValue: "9007199254740993" } }],
+    });
+
+    await sendOTLPSpan("https://traces.example.com", payload);
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(url).toBe("https://traces.example.com/v1/traces");
+    expect(init.headers["Content-Type"]).toBe("application/x-protobuf");
+    expect(Buffer.isBuffer(init.body)).toBe(true);
+    const doubleBytes = Buffer.alloc(8);
+    doubleBytes.writeDoubleLE(value);
+    expect(init.body.includes(Buffer.concat([Buffer.from([0x12, 0x09, 0x21]), doubleBytes]))).toBe(true);
+    expect(init.body.includes(Buffer.from("1209188180808080808010", "hex"))).toBe(true);
   });
 
   it("strips trailing slash from endpoint before appending /v1/traces", async () => {
@@ -846,7 +953,7 @@ describe("sendOTLPSpan", () => {
     const writeSpy = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {});
 
     // Should not throw
-    await expect(sendOTLPSpan("https://traces.example.com", {}, { maxRetries: 1, baseDelayMs: 1 })).resolves.toBeUndefined();
+    await expect(sendOTLPSpan("https://traces.example.com", {}, { maxRetries: 1, baseDelayMs: 1 })).resolves.toBe(false);
 
     // Two attempts (1 initial + 1 retry)
     expect(mockFetch).toHaveBeenCalledTimes(2);
@@ -864,7 +971,7 @@ describe("sendOTLPSpan", () => {
     vi.stubGlobal("fetch", mockFetch);
     const appendSpy = vi.spyOn(fs, "appendFileSync").mockImplementation(() => {});
 
-    await expect(sendOTLPSpan("https://collector.example.com:4318", {}, { maxRetries: 0, skipJSONL: true })).resolves.toBeUndefined();
+    await expect(sendOTLPSpan("https://collector.example.com:4318", {}, { maxRetries: 0, skipJSONL: true })).resolves.toBe(false);
 
     expect(appendSpy).toHaveBeenCalledWith("/tmp/gh-aw/otlp-export-errors.jsonl", `${JSON.stringify({ host: "collector.example.com:4318", status: 401, reason: "Unauthorized" })}\n`);
 
@@ -877,7 +984,7 @@ describe("sendOTLPSpan", () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const writeSpy = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {});
 
-    await expect(sendOTLPSpan("https://collector.example.com", { resourceSpans: [] }, { baseDelayMs: 1 })).resolves.toBeUndefined();
+    await expect(sendOTLPSpan("https://collector.example.com", { resourceSpans: [] }, { baseDelayMs: 1 })).resolves.toBe(false);
 
     expect(mockFetch).toHaveBeenCalledOnce();
     expect(warnSpy).toHaveBeenCalledOnce();
@@ -896,7 +1003,7 @@ describe("sendOTLPSpan", () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const writeSpy = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {});
 
-    await expect(sendOTLPSpan("https://collector.example.com", {}, { baseDelayMs: 1, skipJSONL: true })).resolves.toBeUndefined();
+    await expect(sendOTLPSpan("https://collector.example.com", {}, { baseDelayMs: 1, skipJSONL: true })).resolves.toBe(false);
 
     expect(spawnSyncSpy).toHaveBeenCalledOnce();
     expect(fetch).not.toHaveBeenCalled();
@@ -912,7 +1019,7 @@ describe("sendOTLPSpan", () => {
     spawnSyncSpy.mockReturnValue({ error: undefined, status: 0, stdout: "401", stderr: "" });
     const appendSpy = vi.spyOn(fs, "appendFileSync").mockImplementation(() => {});
 
-    await expect(sendOTLPSpan("https://collector.example.com:4318", {}, { maxRetries: 0, skipJSONL: true })).resolves.toBeUndefined();
+    await expect(sendOTLPSpan("https://collector.example.com:4318", {}, { maxRetries: 0, skipJSONL: true })).resolves.toBe(false);
 
     expect(appendSpy).toHaveBeenCalledWith("/tmp/gh-aw/otlp-export-errors.jsonl", `${JSON.stringify({ host: "collector.example.com:4318", status: 401, reason: "HTTP 401" })}\n`);
 
@@ -924,7 +1031,7 @@ describe("sendOTLPSpan", () => {
     vi.stubGlobal("fetch", mockFetch);
     const appendSpy = vi.spyOn(fs, "appendFileSync").mockImplementation(() => {});
 
-    await expect(sendOTLPSpan("https://user:secret@collector.example.com:4318?token=abc", {}, { maxRetries: 0, skipJSONL: true })).resolves.toBeUndefined();
+    await expect(sendOTLPSpan("https://user:secret@collector.example.com:4318?token=abc", {}, { maxRetries: 0, skipJSONL: true })).resolves.toBe(false);
 
     expect(appendSpy).toHaveBeenCalledWith("/tmp/gh-aw/otlp-export-errors.jsonl", `${JSON.stringify({ host: "collector.example.com:4318", reason: "Failed to parse URL from [REDACTED]" })}\n`);
 
@@ -951,7 +1058,7 @@ describe("sendOTLPSpan", () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const writeSpy = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {});
 
-    await expect(sendOTLPSpan("https://traces.example.com", {}, { maxRetries: 1, baseDelayMs: 1 })).resolves.toBeUndefined();
+    await expect(sendOTLPSpan("https://traces.example.com", {}, { maxRetries: 1, baseDelayMs: 1 })).resolves.toBe(false);
 
     expect(mockFetch).toHaveBeenCalledTimes(2);
     expect(warnSpy.mock.calls[1][0]).toContain("error after 2 attempts");
@@ -1310,6 +1417,98 @@ describe("buildGitHubActionsResourceAttributes", () => {
     expect(attrs["gh-aw.workflow.name"]).toBe("Daily Token, Report");
     expect(attrs["gh-aw.engine.id"]).toBe("claude=sonnet\\4");
     expect(attrs["service.version"]).toBe("1.2.3");
+  });
+
+  it("adds standard resource aliases without overriding supplied values", () => {
+    process.env.OTEL_RESOURCE_ATTRIBUTES = "cicd.pipeline.name=custom,cicd.pipeline.run.id=custom-run,vcs.ref.head.name=custom-ref,deployment.environment.name=custom-env";
+    const attributes = Object.fromEntries(
+      buildGitHubActionsResourceAttributes({
+        repository: "owner/repo",
+        runId: "123",
+        workflowName: "CI",
+        job: "agent",
+        refName: "main",
+        sha: "abc123",
+        staged: true,
+      }).map(attr => [attr.key, attr.value.stringValue])
+    );
+
+    expect(attributes["cicd.pipeline.name"]).toBe("custom");
+    expect(attributes["cicd.pipeline.run.id"]).toBe("custom-run");
+    expect(attributes["cicd.pipeline.task.name"]).toBe("agent");
+    expect(attributes["vcs.provider.name"]).toBe("github");
+    expect(attributes["vcs.repository.url.full"]).toBe("https://github.com/owner/repo");
+    expect(attributes["vcs.ref.head.name"]).toBe("custom-ref");
+    expect(attributes["vcs.ref.head.revision"]).toBe("abc123");
+    expect(attributes["cicd.pipeline.run.url.full"]).toBe(attributes["github.actions.run_url"]);
+    expect(attributes["deployment.environment"]).toBe("staging");
+    expect(attributes["deployment.environment.name"]).toBe("custom-env");
+  });
+
+  it("uses GITHUB_WORKFLOW for the standard pipeline name", () => {
+    const previousWorkflow = process.env.GITHUB_WORKFLOW;
+    process.env.GITHUB_WORKFLOW = "Reusable Caller";
+    try {
+      const attributes = Object.fromEntries(buildGitHubActionsResourceAttributes({ repository: "owner/repo", workflowName: "Logical Workflow", staged: false }).map(attr => [attr.key, attr.value.stringValue]));
+      expect(attributes["cicd.pipeline.name"]).toBe("Reusable Caller");
+    } finally {
+      if (previousWorkflow === undefined) delete process.env.GITHUB_WORKFLOW;
+      else process.env.GITHUB_WORKFLOW = previousWorkflow;
+    }
+  });
+
+  it("uses only deployment.environment.name for the opt-in", () => {
+    process.env.OTEL_SEMCONV_STABILITY_OPT_IN = "http, gen_ai_v1";
+    const attributes = buildGitHubActionsResourceAttributes({ repository: "owner/repo", runId: "123", staged: false });
+    expect(attributes.map(attr => attr.key)).not.toContain("deployment.environment");
+    expect(attributes).toContainEqual({ key: "deployment.environment.name", value: { stringValue: "production" } });
+  });
+});
+
+describe("GenAI semantic convention helpers", () => {
+  it.each([
+    ["copilot", "github"],
+    ["claude", "anthropic"],
+    ["codex", "openai"],
+    ["gemini", "gcp.gen_ai"],
+    ["custom-engine", "custom-engine"],
+  ])("maps engine %s to provider %s", (engine, provider) => {
+    expect(resolveGenAiProvider(engine)).toBe(provider);
+  });
+
+  it("prefers the compiler-resolved BYOK provider over the engine mapping", () => {
+    const saved = process.env.GH_AW_INFO_GENAI_PROVIDER;
+    try {
+      delete process.env.GH_AW_INFO_GENAI_PROVIDER;
+      expect(resolveRunGenAiProvider({}, "copilot")).toEqual({ provider: "github", system: "github_models" });
+      expect(resolveRunGenAiProvider({ genai_provider: "azure.ai.openai" }, "copilot")).toEqual({ provider: "azure.ai.openai", system: "az.ai.openai" });
+      process.env.GH_AW_INFO_GENAI_PROVIDER = "openai";
+      expect(resolveRunGenAiProvider({}, "copilot")).toEqual({ provider: "openai", system: "openai" });
+    } finally {
+      if (saved === undefined) delete process.env.GH_AW_INFO_GENAI_PROVIDER;
+      else process.env.GH_AW_INFO_GENAI_PROVIDER = saved;
+    }
+  });
+
+  it("recognizes the v1 opt-in as a trimmed comma-separated value", () => {
+    process.env.OTEL_SEMCONV_STABILITY_OPT_IN = "http, gen_ai_v1 ";
+    expect(isGenAiV1()).toBe(true);
+    process.env.OTEL_SEMCONV_STABILITY_OPT_IN = "http";
+    expect(isGenAiV1()).toBe(false);
+    process.env.OTEL_SEMCONV_STABILITY_OPT_IN = "gen_ai_v10";
+    expect(isGenAiV1()).toBe(false);
+  });
+
+  it.each([
+    [{ input_tokens: 10, input_tokens_include_cache: true, cache_read_tokens: 5, cache_write_tokens: 2 }, 10],
+    [{ input_tokens: 10, input_tokens_include_cache: true }, 10],
+    [{ input_tokens: 10, input_tokens_include_cache: false, cache_read_tokens: 5, cache_write_tokens: 2 }, 17],
+    [{ input_tokens: 10, cache_read_tokens: 0, cache_write_tokens: 0 }, 10],
+    [{ input_tokens: 10 }, undefined],
+    [{ input_tokens: 10, cache_read_tokens: 5, cache_write_tokens: 2 }, undefined],
+    [{ input_tokens: 10, input_tokens_include_cache: false, cache_read_tokens: 5 }, undefined],
+  ])("resolves inclusive input tokens from %j", (usage, expected) => {
+    expect(resolveInclusiveInputTokens(usage)).toBe(expected);
   });
 });
 
@@ -2131,7 +2330,32 @@ describe("sendJobSetupSpan", () => {
       const span = body.resourceSpans[0].scopeSpans[0].spans[0];
       const attrs = Object.fromEntries(span.attributes.map(a => [a.key, a.value.stringValue ?? a.value.intValue ?? a.value.boolValue]));
       expect(attrs["gen_ai.system"]).toBe("anthropic");
+      expect(attrs["gen_ai.provider.name"]).toBe("anthropic");
       expect(attrs["gh-aw.engine.id"]).toBe("claude");
+    });
+
+    it("reports the BYOK provider from aw_info.json instead of the engine provider", async () => {
+      const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, statusText: "OK" });
+      vi.stubGlobal("fetch", mockFetch);
+
+      process.env.GH_AW_OTLP_ENDPOINTS = JSON.stringify([{ url: "https://traces.example.com" }]);
+
+      readFileSpy.mockImplementation(filePath => {
+        if (filePath === "/tmp/gh-aw/aw_info.json") {
+          return JSON.stringify({ engine_id: "copilot", genai_provider: "azure.ai.openai", genai_server_address: "example.ai.gateway.azure.com" });
+        }
+        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      });
+
+      await sendJobSetupSpan();
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      const span = body.resourceSpans[0].scopeSpans[0].spans[0];
+      const attrs = Object.fromEntries(span.attributes.map(a => [a.key, a.value.stringValue ?? a.value.intValue ?? a.value.boolValue]));
+      expect(attrs["gen_ai.provider.name"]).toBe("azure.ai.openai");
+      expect(attrs["server.address"]).toBe("example.ai.gateway.azure.com");
+      expect(attrs["gen_ai.system"]).toBe("az.ai.openai");
+      expect(attrs["gh-aw.engine.id"]).toBe("copilot");
     });
 
     it("reads gh-aw.engine.id from aw_context when aw_info.json has no engine_id", async () => {
@@ -2659,6 +2883,8 @@ describe("sendJobConclusionSpan", () => {
   const savedEnv = {};
   const envKeys = [
     "GH_AW_OTLP_ENDPOINTS",
+    "GH_AW_OTEL_METRICS",
+    "GH_AW_JOB_RESULT",
     "OTEL_SERVICE_NAME",
     "GH_AW_DEPRECATED_COST",
     "GH_AW_AIC",
@@ -2692,6 +2918,8 @@ describe("sendJobConclusionSpan", () => {
     "GH_AW_ENGINE_ID",
     "GH_AW_ENGINE_MODEL",
     "GH_AW_ENGINE_MODEL_EFFORT",
+    "GH_AW_AWF_CONFIG_PATH",
+    "GH_AW_AGENT_OUTPUT",
     "GH_AW_INFO_MODEL",
     "GH_AW_MODEL_ROUTING_STATUS",
     "GH_AW_PHASE",
@@ -2700,7 +2928,7 @@ describe("sendJobConclusionSpan", () => {
     "GITHUB_WORKFLOW",
     "OTEL_RESOURCE_ATTRIBUTES",
   ];
-  let mkdirSpy, appendSpy;
+  let mkdirSpy, appendSpy, mirrorLines, chmodSpy, fchmodSpy, writeSpy, closeSpy;
 
   beforeEach(() => {
     vi.stubGlobal("fetch", vi.fn());
@@ -2710,6 +2938,14 @@ describe("sendJobConclusionSpan", () => {
     }
     mkdirSpy = vi.spyOn(fs, "mkdirSync").mockImplementation(() => {});
     appendSpy = vi.spyOn(fs, "appendFileSync").mockImplementation(() => {});
+    mirrorLines = [];
+    chmodSpy = vi.spyOn(fs, "chmodSync").mockImplementation(() => {});
+    fchmodSpy = vi.spyOn(fs, "fchmodSync").mockImplementation(() => {});
+    writeSpy = vi.spyOn(fs, "writeSync").mockImplementation((_fd, data) => {
+      mirrorLines.push(String(data));
+      return String(data).length;
+    });
+    closeSpy = vi.spyOn(fs, "closeSync").mockImplementation(() => {});
   });
 
   afterEach(() => {
@@ -2723,6 +2959,10 @@ describe("sendJobConclusionSpan", () => {
     }
     mkdirSpy.mockRestore();
     appendSpy.mockRestore();
+    chmodSpy.mockRestore();
+    fchmodSpy.mockRestore();
+    writeSpy.mockRestore();
+    closeSpy.mockRestore();
   });
 
   it("skips OTLP export but writes JSONL mirror when GH_AW_OTLP_ENDPOINTS is not set", async () => {
@@ -2733,6 +2973,253 @@ describe("sendJobConclusionSpan", () => {
     expect(filePath).toBe(OTEL_JSONL_PATH);
     const payload = JSON.parse(content.trim());
     expect(payload).toHaveProperty("resourceSpans");
+  });
+
+  it("emits built-in metrics only when GH_AW_OTEL_METRICS is enabled", async () => {
+    process.env.GH_AW_OTEL_METRICS = "true";
+    await sendJobConclusionSpan("gh-aw.job.conclusion", { startMs: Date.now() - 5000 });
+    const metricWrite = mirrorLines.find(line => line.includes('"resourceMetrics"'));
+    expect(metricWrite).toBeDefined();
+    expect(JSON.parse(metricWrite.trim()).resourceMetrics[0].scopeMetrics[0].metrics[0]).toMatchObject({
+      name: "gh_aw.job.duration",
+      unit: "s",
+    });
+    const metric = JSON.parse(metricWrite.trim()).resourceMetrics[0].scopeMetrics[0].metrics[0];
+    expect(metric.histogram.dataPoints[0].exemplars[0]).toMatchObject({
+      traceId: expect.stringMatching(/^[0-9a-f]{32}$/),
+      spanId: expect.stringMatching(/^[0-9a-f]{16}$/),
+    });
+  });
+
+  describe("GenAI semantic convention opt-in runtime", () => {
+    const startMs = 1_700_000_000_000;
+    const endMs = startMs + 5000;
+    let fetchMock;
+    let readFileSpy;
+
+    beforeEach(() => {
+      for (const [name, value] of Object.entries({
+        GH_AW_OTLP_ENDPOINTS: JSON.stringify([{ url: "https://traces.example.com" }]),
+        GH_AW_OTEL_METRICS: "",
+        INPUT_JOB_NAME: "agent",
+        GITHUB_AW_OTEL_TRACE_ID: "f".repeat(32),
+        GITHUB_AW_OTEL_PARENT_SPAN_ID: "abcdef1234567890",
+        GH_AW_INFO_WORKFLOW_NAME: "CI",
+        GH_AW_AGENT_CONCLUSION: "success",
+        GH_AW_MAX_AI_CREDITS: "1000",
+        GITHUB_RUN_ID: "123",
+        GITHUB_REPOSITORY: "owner/repo",
+        OTEL_SEMCONV_STABILITY_OPT_IN: "http, gen_ai_v1",
+      })) {
+        vi.stubEnv(name, value);
+      }
+
+      fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, statusText: "OK" });
+      vi.stubGlobal("fetch", fetchMock);
+      vi.spyOn(fs, "statSync").mockImplementation(filePath => {
+        if (String(filePath) === "/tmp/gh-aw/agent_output.json") return /** @type {Partial<fs.Stats>} */ { mtimeMs: endMs };
+        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      });
+      readFileSpy = vi.spyOn(fs, "readFileSync").mockImplementation(filePath => {
+        if (filePath === "/tmp/gh-aw/aw_info.json") return JSON.stringify({ workflow_name: "CI", engine_id: "copilot", model: "gpt-4o" });
+        if (filePath === "/tmp/gh-aw/agent_usage.json") return JSON.stringify({ input_tokens: 10, output_tokens: 3, cache_read_tokens: 5, cache_write_tokens: 2, input_tokens_inclusive: 17 });
+        if (filePath === "/tmp/gh-aw/agent_output.json") return JSON.stringify({ items: [], errors: [] });
+        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      });
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    });
+
+    it("uses the current GenAI agent span shape and keeps usage on that span", async () => {
+      await sendJobConclusionSpan("gh-aw.agent.conclusion", { startMs });
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const agentPayload = JSON.parse(fetchMock.mock.calls[0][1].body);
+      const conclusionPayload = JSON.parse(fetchMock.mock.calls[1][1].body);
+      const agentSpan = agentPayload.resourceSpans[0].scopeSpans[0].spans[0];
+      const conclusionSpan = conclusionPayload.resourceSpans[0].scopeSpans[0].spans[0];
+      const agentAttrs = Object.fromEntries(agentSpan.attributes.map(attr => [attr.key, attr.value.stringValue ?? attr.value.intValue]));
+      const conclusionAttrs = Object.fromEntries(conclusionSpan.attributes.map(attr => [attr.key, attr.value.stringValue ?? attr.value.intValue]));
+
+      expect(agentSpan.name).toBe("invoke_agent CI");
+      expect(agentSpan.kind).toBe(SPAN_KIND_INTERNAL);
+      expect(agentSpan.parentSpanId).toBe(conclusionSpan.parentSpanId);
+      expect(agentSpan.parentSpanId).toBe("abcdef1234567890");
+      expect(agentSpan.parentSpanId).not.toBe(conclusionSpan.spanId);
+      expect(agentSpan.status.code).toBe(0);
+      expect(agentPayload.resourceSpans[0].scopeSpans[0].schemaUrl).toBe(GEN_AI_SCHEMA_URL);
+      expect(agentAttrs).toMatchObject({
+        "gen_ai.operation.name": "invoke_agent",
+        "gen_ai.agent.name": "CI",
+        "gen_ai.provider.name": "github",
+        "gen_ai.usage.input_tokens": 17,
+        "gen_ai.usage.cache_write.input_tokens": 2,
+      });
+      expect(agentAttrs).not.toHaveProperty("gen_ai.system");
+      expect(agentAttrs).not.toHaveProperty("server.address");
+      expect(agentAttrs).not.toHaveProperty("gen_ai.workflow.name");
+      expect(agentAttrs).not.toHaveProperty("gen_ai.usage.cache_creation.input_tokens");
+      expect(agentAttrs).not.toHaveProperty("gen_ai.usage.total_tokens");
+      expect(conclusionAttrs).not.toHaveProperty("gen_ai.operation.name");
+      expect(conclusionAttrs).not.toHaveProperty("gen_ai.response.finish_reasons");
+      expect(Object.keys(conclusionAttrs).some(key => key.startsWith("gen_ai.usage."))).toBe(false);
+      const resource = Object.fromEntries(agentPayload.resourceSpans[0].resource.attributes.map(attr => [attr.key, attr.value.stringValue]));
+      expect(resource["deployment.environment.name"]).toBe("production");
+      expect(resource).not.toHaveProperty("deployment.environment");
+    });
+
+    it.each(["", "gen_ai_v1"])("reports the BYOK endpoint host on run spans with opt-in %s", async optIn => {
+      vi.stubEnv("OTEL_SEMCONV_STABILITY_OPT_IN", optIn);
+      vi.stubEnv("GH_AW_INFO_GENAI_PROVIDER", "azure.ai.openai");
+      const endpoint = new URL("https://gw.azure-api.net:8443/v1?key=private#fragment");
+      endpoint.username = "user";
+      endpoint.password = "placeholder";
+      vi.stubEnv("GH_AW_INFO_GENAI_ENDPOINT", endpoint.href);
+
+      await sendJobSetupSpan();
+      await sendJobConclusionSpan("gh-aw.agent.conclusion", { startMs });
+
+      expect(fetchMock.mock.calls).toHaveLength(3);
+      for (const [, options] of fetchMock.mock.calls) {
+        const span = JSON.parse(options.body).resourceSpans[0].scopeSpans[0].spans[0];
+        const attrs = Object.fromEntries(span.attributes.map(attr => [attr.key, attr.value.stringValue]));
+        expect(attrs["gen_ai.provider.name"]).toBe("azure.ai.openai");
+        expect(attrs["server.address"]).toBe("gw.azure-api.net");
+        expect(options.body).not.toContain("placeholder");
+        expect(options.body).not.toContain("key=private");
+      }
+    });
+
+    it("omits the endpoint host when no BYOK provider is configured", async () => {
+      vi.stubEnv("GH_AW_INFO_GENAI_ENDPOINT", "https://gw.example.com/v1");
+
+      await sendJobSetupSpan();
+      await sendJobConclusionSpan("gh-aw.agent.conclusion", { startMs });
+
+      expect(fetchMock.mock.calls).toHaveLength(3);
+      for (const [, options] of fetchMock.mock.calls) {
+        const span = JSON.parse(options.body).resourceSpans[0].scopeSpans[0].spans[0];
+        const attrs = Object.fromEntries(span.attributes.map(attr => [attr.key, attr.value.stringValue]));
+        expect(attrs).not.toHaveProperty("server.address");
+      }
+    });
+
+    it.each([
+      ["failure", "agent_failed"],
+      ["timed_out", "timeout"],
+      ["cancelled", "cancelled"],
+    ])("sets error.type=%s on both agent spans for conclusion %s", async (conclusion, expectedErrorType) => {
+      vi.stubEnv("GH_AW_AGENT_CONCLUSION", conclusion);
+      await sendJobConclusionSpan("gh-aw.agent.conclusion", { startMs });
+      const spans = fetchMock.mock.calls.map(([, options]) => JSON.parse(options.body).resourceSpans[0].scopeSpans[0].spans[0]);
+      expect(spans).toHaveLength(2);
+      for (const span of spans) {
+        expect(span.attributes).toContainEqual({ key: "error.type", value: { stringValue: expectedErrorType } });
+        expect(span.status.code).toBe(2);
+      }
+    });
+
+    it.each([
+      ["", "exit-code"],
+      ["", "output-errors"],
+      ["gen_ai_v1", "exit-code"],
+      ["gen_ai_v1", "output-errors"],
+    ])("classifies inferred agent failures in mode %s from %s", async (mode, evidence) => {
+      vi.stubEnv("GH_AW_AGENT_CONCLUSION", "");
+      vi.stubEnv("GH_AW_OTEL_METRICS", "true");
+      vi.stubEnv("OTEL_SEMCONV_STABILITY_OPT_IN", mode);
+      const sendMetrics = vi.spyOn(otlpMetrics, "sendOTLPMetrics").mockResolvedValue(true);
+      const readFile = readFileSpy.getMockImplementation();
+      readFileSpy.mockImplementation(filePath => {
+        if (filePath === "/tmp/gh-aw/agent_execution_exit_code.txt" && evidence === "exit-code") return "1";
+        if (filePath === "/tmp/gh-aw/agent_output.json" && evidence === "output-errors") return JSON.stringify({ items: [], errors: [{ message: "agent failed" }] });
+        return readFile(filePath);
+      });
+
+      await sendJobConclusionSpan("gh-aw.agent.conclusion", { startMs });
+
+      const payloads = fetchMock.mock.calls.map(([, options]) => JSON.parse(options.body));
+      const spans = payloads.flatMap(payload => (payload.resourceSpans || []).flatMap(resource => resource.scopeSpans.flatMap(scope => scope.spans)));
+      expect(spans).toHaveLength(2);
+      for (const span of spans) {
+        expect(span.status.code).toBe(2);
+        expect(span.attributes).toContainEqual({ key: "error.type", value: { stringValue: "agent_failed" } });
+      }
+      expect(sendMetrics).toHaveBeenCalledOnce();
+      const metrics = sendMetrics.mock.calls[0][0].resourceMetrics.flatMap(resource => resource.scopeMetrics.flatMap(scope => scope.metrics));
+      const duration = metrics.find(metric => metric.name === "gen_ai.invoke_agent.duration");
+      expect(duration.histogram.dataPoints[0].attributes).toContainEqual({ key: "error.type", value: { stringValue: "agent_failed" } });
+    });
+
+    it("does not classify a successful agent from the triggering workflow_run conclusion", async () => {
+      vi.stubEnv("GH_AW_AGENT_CONCLUSION", "");
+      readFileSpy.mockImplementation(filePath => {
+        if (filePath === "/tmp/gh-aw/aw_info.json") return JSON.stringify({ workflow_name: "CI", engine_id: "copilot", model: "gpt-4o", workflow_run_conclusion: "failure" });
+        if (filePath === "/tmp/gh-aw/agent_usage.json") return JSON.stringify({ input_tokens: 10, output_tokens: 3, cache_read_tokens: 5, cache_write_tokens: 2, input_tokens_inclusive: 17 });
+        if (filePath === "/tmp/gh-aw/agent_output.json") return JSON.stringify({ items: [], errors: [] });
+        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      });
+
+      await sendJobConclusionSpan("gh-aw.agent.conclusion", { startMs });
+
+      const payloads = fetchMock.mock.calls.map(([, options]) => JSON.parse(options.body));
+      const spans = payloads.flatMap(payload => (payload.resourceSpans || []).flatMap(resourceSpans => (resourceSpans.scopeSpans || []).flatMap(scopeSpans => scopeSpans.spans || [])));
+      expect(spans).toHaveLength(2);
+      for (const span of spans) {
+        expect(span.attributes).not.toContainEqual(expect.objectContaining({ key: "error.type" }));
+        expect(span.status.code).toBe(0);
+      }
+    });
+
+    it("puts invoke_agent attributes on the conclusion span when no dedicated agent span exists", async () => {
+      vi.spyOn(fs, "statSync").mockImplementation(() => {
+        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      });
+      await sendJobConclusionSpan("gh-aw.agent.conclusion", { startMs });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const payload = JSON.parse(fetchMock.mock.calls[0][1].body);
+      const span = payload.resourceSpans[0].scopeSpans[0].spans[0];
+      expect(span.attributes).toContainEqual({ key: "gen_ai.operation.name", value: { stringValue: "invoke_agent" } });
+      expect(payload.resourceSpans[0].scopeSpans[0].schemaUrl).toBe(GEN_AI_SCHEMA_URL);
+    });
+
+    it("omits schema URLs and preserves the shipped span shape without the opt-in", async () => {
+      vi.stubEnv("OTEL_SEMCONV_STABILITY_OPT_IN", "");
+      await sendJobConclusionSpan("gh-aw.agent.conclusion", { startMs });
+      const agentPayload = JSON.parse(fetchMock.mock.calls[0][1].body);
+      const agentSpan = agentPayload.resourceSpans[0].scopeSpans[0].spans[0];
+      expect(agentSpan.name).toBe("gh-aw.agent.agent");
+      expect(agentSpan.kind).toBe(3);
+      expect(agentSpan.attributes).toContainEqual({ key: "gen_ai.system", value: { stringValue: "github_models" } });
+      expect(agentSpan.attributes).toContainEqual({ key: "gen_ai.provider.name", value: { stringValue: "github" } });
+      expect(agentPayload.resourceSpans[0].scopeSpans[0]).not.toHaveProperty("schemaUrl");
+    });
+
+    it("resets the semconv mode to unset for later tests", () => {
+      expect(process.env.OTEL_SEMCONV_STABILITY_OPT_IN).toBe("http, gen_ai_v1");
+    });
+  });
+
+  it.each([
+    ["detection", { GH_AW_DETECTION_CONCLUSION: "failure" }, {}, "failure"],
+    ["safe_outputs", {}, { jobResult: "failure" }, "failure"],
+    ["safe_outputs", {}, {}, undefined],
+  ])("labels %s job metrics with the job's own result, not the agent result", async (jobName, env, options, expectedJobResult) => {
+    process.env.GH_AW_OTEL_METRICS = "true";
+    process.env.INPUT_JOB_NAME = jobName;
+    process.env.GH_AW_AGENT_CONCLUSION = "success";
+    Object.assign(process.env, env);
+    await sendJobConclusionSpan(`gh-aw.${jobName}.conclusion`, { startMs: Date.now() - 5000, ...options });
+    const metrics = mirrorLines.filter(line => line.includes('"resourceMetrics"')).flatMap(line => JSON.parse(line.trim()).resourceMetrics[0].scopeMetrics[0].metrics);
+    const resultOf = name => metrics.find(metric => metric.name === name).histogram.dataPoints[0].attributes.find(attr => attr.key === "cicd.pipeline.task.run.result")?.value.stringValue;
+    expect(resultOf("gh_aw.job.duration")).toBe(expectedJobResult);
+    expect(resultOf("gh_aw.run.duration")).toBe("success");
+    expect(metrics.some(metric => metric.name === "gh_aw.job.errors")).toBe(expectedJobResult === "failure");
+    expect(metrics.some(metric => metric.name === "gh_aw.run.errors")).toBe(false);
   });
 
   it("sends a span with the given span name", async () => {
@@ -3013,6 +3500,25 @@ describe("sendJobConclusionSpan", () => {
     expect(span.name).toBe("gh-aw.job.conclusion");
   });
 
+  /**
+   * Hides host runner evidence (e.g. a retained /tmp/gh-aw/agent_cli_start_ms.txt or
+   * awf-config.json from an earlier job) so each test controls its own inputs.
+   */
+  function useNoRunnerEvidence() {
+    const enoent = () => {
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    };
+    vi.spyOn(fs, "existsSync").mockReturnValue(false);
+    vi.spyOn(fs, "readFileSync").mockImplementation(enoent);
+    vi.spyOn(fs, "statSync").mockImplementation(enoent);
+  }
+
+  /** @param {number} startMs */
+  function useKilledJobClock(startMs) {
+    vi.spyOn(perfHooks.performance, "timeOrigin", "get").mockReturnValue(startMs);
+    vi.spyOn(perfHooks.performance, "now").mockReturnValue(5000);
+  }
+
   it("emits a dedicated agent span on timed_out when agent_output mtime is unavailable", async () => {
     const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, statusText: "OK" });
     vi.stubGlobal("fetch", mockFetch);
@@ -3022,20 +3528,18 @@ describe("sendJobConclusionSpan", () => {
     process.env.GH_AW_AGENT_CONCLUSION = "timed_out";
 
     const startMs = 1_700_000_000_000;
-    const statSpy = vi.spyOn(fs, "statSync").mockImplementation(() => {
-      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
-    });
+    useNoRunnerEvidence();
+    useKilledJobClock(startMs);
 
     await sendJobConclusionSpan("gh-aw.agent.conclusion", { startMs });
 
-    statSpy.mockRestore();
     expect(mockFetch).toHaveBeenCalledTimes(2);
 
     const agentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
     const agentSpan = agentBody.resourceSpans[0].scopeSpans[0].spans[0];
     expect(agentSpan.name).toBe("gh-aw.agent.agent");
     expect(agentSpan.startTimeUnixNano).toBe(toNanoString(startMs));
-    expect(BigInt(agentSpan.endTimeUnixNano)).toBeGreaterThan(BigInt(toNanoString(startMs)));
+    expect(agentSpan.endTimeUnixNano).toBe(toNanoString(startMs + 5000));
 
     const conclusionBody = JSON.parse(mockFetch.mock.calls[1][1].body);
     const conclusionSpan = conclusionBody.resourceSpans[0].scopeSpans[0].spans[0];
@@ -3054,20 +3558,18 @@ describe("sendJobConclusionSpan", () => {
     process.env.GH_AW_AGENT_CONCLUSION = "cancelled";
 
     const startMs = 1_700_000_000_000;
-    const statSpy = vi.spyOn(fs, "statSync").mockImplementation(() => {
-      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
-    });
+    useNoRunnerEvidence();
+    useKilledJobClock(startMs);
 
     await sendJobConclusionSpan("gh-aw.agent.conclusion", { startMs });
 
-    statSpy.mockRestore();
     expect(mockFetch).toHaveBeenCalledTimes(2);
 
     const agentBody = JSON.parse(mockFetch.mock.calls[0][1].body);
     const agentSpan = agentBody.resourceSpans[0].scopeSpans[0].spans[0];
     expect(agentSpan.name).toBe("gh-aw.agent.agent");
     expect(agentSpan.startTimeUnixNano).toBe(toNanoString(startMs));
-    expect(BigInt(agentSpan.endTimeUnixNano)).toBeGreaterThan(BigInt(toNanoString(startMs)));
+    expect(agentSpan.endTimeUnixNano).toBe(toNanoString(startMs + 5000));
 
     const conclusionBody = JSON.parse(mockFetch.mock.calls[1][1].body);
     const conclusionSpan = conclusionBody.resourceSpans[0].scopeSpans[0].spans[0];
@@ -3150,6 +3652,8 @@ describe("sendJobConclusionSpan", () => {
     expect(attrs["gen_ai.operation.name"]).toBe("chat");
     expect(attrs["gen_ai.request.model"]).toBe("claude-3-5-sonnet-20241022");
     expect(attrs["gen_ai.system"]).toBe("anthropic");
+    expect(attrs["gen_ai.provider.name"]).toBe("anthropic");
+    expect(attrs["gen_ai.agent.name"]).toBe("otel-advisor");
     expect(attrs["gh-aw.engine.id"]).toBe("claude");
     expect(attrs["gh-aw.engine"]).toBeUndefined();
     expect(attrs["gen_ai.workflow.name"]).toBe("otel-advisor");
@@ -3158,6 +3662,7 @@ describe("sendJobConclusionSpan", () => {
     const conclusionSpan = conclusionBody.resourceSpans[0].scopeSpans[0].spans[0];
     const conclusionAttrs = Object.fromEntries(conclusionSpan.attributes.map(a => [a.key, a.value.stringValue ?? a.value.intValue]));
     expect(conclusionAttrs["gen_ai.operation.name"]).toBe("chat");
+    expect(conclusionAttrs["gen_ai.agent.name"]).toBe("otel-advisor");
     expect(conclusionAttrs["gen_ai.workflow.name"]).toBe("otel-advisor");
   });
 
@@ -4154,7 +4659,8 @@ describe("sendJobConclusionSpan", () => {
     const span = body.resourceSpans[0].scopeSpans[0].spans[0];
     const attrs = Object.fromEntries(span.attributes.map(attribute => [attribute.key, attribute.value]));
     expect(attrs["gh-aw.working_set.cumulative_input_tokens"]).toBeDefined();
-    expect(attrs["gh-aw.working_set.cumulative_input_tokens"].intValue).toBe(hugeCumulativeInputTokens);
+    expect(attrs["gh-aw.working_set.cumulative_input_tokens"].doubleValue).toBe(hugeCumulativeInputTokens);
+    expect(attrs["gh-aw.working_set.cumulative_input_tokens"].intValue).toBeUndefined();
     expect(attrs["gh-aw.working_set.rebuild_excess_tokens"]).toBeDefined();
     expect(attrs["gh-aw.working_set.invocations"].intValue).toBe(50000);
   });
@@ -4214,6 +4720,7 @@ describe("sendJobConclusionSpan", () => {
 
     process.env.GH_AW_OTLP_ENDPOINTS = JSON.stringify([{ url: "https://traces.example.com" }]);
     process.env.GH_AW_MAX_AI_CREDITS = "1000.5";
+    useNoRunnerEvidence();
 
     await sendJobConclusionSpan("gh-aw.job.conclusion");
 
@@ -4270,14 +4777,20 @@ describe("sendJobConclusionSpan", () => {
     vi.stubGlobal("fetch", mockFetch);
 
     process.env.GH_AW_OTLP_ENDPOINTS = JSON.stringify([{ url: "https://traces.example.com" }]);
-    process.env.GH_AW_MAX_AI_CREDITS = "not-a-number";
+    useNoRunnerEvidence();
 
-    await sendJobConclusionSpan("gh-aw.job.conclusion");
+    for (const budget of [undefined, "not-a-number"]) {
+      if (budget === undefined) delete process.env.GH_AW_MAX_AI_CREDITS;
+      else process.env.GH_AW_MAX_AI_CREDITS = budget;
+      mockFetch.mockClear();
 
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-    const span = body.resourceSpans[0].scopeSpans[0].spans[0];
-    const keys = span.attributes.map(a => a.key);
-    expect(keys).not.toContain("gh-aw.max_ai_credits");
+      await sendJobConclusionSpan("gh-aw.job.conclusion");
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      const span = body.resourceSpans[0].scopeSpans[0].spans[0];
+      const keys = span.attributes.map(a => a.key);
+      expect(keys).not.toContain("gh-aw.max_ai_credits");
+    }
   });
 
   it("emits dashboard metrics and aliases on the conclusion span", async () => {
@@ -6102,7 +6615,7 @@ describe("sendJobConclusionSpan", () => {
       expect(keys).not.toContain("gen_ai.usage.total_tokens");
     });
 
-    it("omits a gen_ai token attribute when its value is zero", async () => {
+    it("preserves zero token attributes alongside positive counts", async () => {
       const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, statusText: "OK" });
       vi.stubGlobal("fetch", mockFetch);
 
@@ -6123,11 +6636,46 @@ describe("sendJobConclusionSpan", () => {
       const attrs = Object.fromEntries(agentSpan.attributes.map(a => [a.key, a.value.intValue ?? a.value.stringValue]));
       expect(attrs["gen_ai.usage.input_tokens"]).toBe(1000);
       expect(attrs["gen_ai.usage.cache_read.input_tokens"]).toBe(500);
-      // total_tokens = input(1000) + output(0) = 1000 (non-zero so it IS emitted)
       expect(attrs["gen_ai.usage.total_tokens"]).toBe(1000);
-      const keys = agentSpan.attributes.map(a => a.key);
-      expect(keys).not.toContain("gen_ai.usage.output_tokens");
-      expect(keys).not.toContain("gen_ai.usage.cache_creation.input_tokens");
+      expect(attrs["gen_ai.usage.output_tokens"]).toBe(0);
+      expect(attrs["gen_ai.usage.cache_creation.input_tokens"]).toBe(0);
+    });
+
+    describe.each(["file", "runtime result"])("token availability from %s", source => {
+      it.each([
+        {
+          usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 },
+          expected: { input_tokens: 0, output_tokens: 0, "cache_read.input_tokens": 0, "cache_creation.input_tokens": 0, "cache_write.input_tokens": 0, total_tokens: 0 },
+        },
+        {
+          usage: { input_tokens: "0", output_tokens: "20", cache_read_input_tokens: "0", cache_creation_input_tokens: "5" },
+          expected: { input_tokens: 0, output_tokens: 20, "cache_read.input_tokens": 0, "cache_creation.input_tokens": 5, "cache_write.input_tokens": 5, total_tokens: 20 },
+        },
+        { usage: { input_tokens: 100 }, expected: { input_tokens: 100 } },
+        { usage: { output_tokens: 0 }, expected: { output_tokens: 0 } },
+        { usage: { cache_read_tokens: 0, cache_write_tokens: 4 }, expected: { "cache_read.input_tokens": 0, "cache_creation.input_tokens": 4, "cache_write.input_tokens": 4 } },
+        { usage: { input_tokens: null, output_tokens: 0, cache_read_tokens: false, cache_write_tokens: -1 }, expected: { output_tokens: 0 } },
+        { usage: { input_tokens: "NaN", output_tokens: "Infinity", cache_read_tokens: "", cache_write_tokens: " " }, expected: {} },
+        { usage: { input_tokens: [], output_tokens: {}, cache_read_tokens: true, cache_write_tokens: "-1" }, expected: {} },
+        { usage: { input_tokens: 1e308, output_tokens: 1e308 }, expected: { input_tokens: 1e308, output_tokens: 1e308 } },
+        { usage: {}, expected: {} },
+        { usage: null, expected: {} },
+        { usage: [], expected: {} },
+        { usage: undefined, expected: {} },
+      ])("exports only available counters for $usage", async ({ usage, expected }) => {
+        readFileSpy.mockImplementation(filePath => {
+          if (source === "file" && filePath === "/tmp/gh-aw/agent_usage.json") return JSON.stringify(usage ?? null);
+          if (source === "runtime result" && filePath === "/tmp/gh-aw/agent-stdio.log") return JSON.stringify({ type: "result", usage }) + "\n";
+          throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+        });
+
+        await sendJobConclusionSpan("gh-aw.agent.conclusion", { startMs: 1_700_000_000_000 });
+
+        const spans = appendSpy.mock.calls.flatMap(([, content]) => JSON.parse(content).resourceSpans[0].scopeSpans[0].spans);
+        const usageAttributes = spans.flatMap(span => span.attributes).filter(attr => attr.key.startsWith("gen_ai.usage."));
+        expect(Object.fromEntries(usageAttributes.map(attr => [attr.key.replace("gen_ai.usage.", ""), attr.value.intValue ?? attr.value.doubleValue]))).toEqual(expected);
+        expect(usageAttributes).toHaveLength(Object.keys(expected).length);
+      });
     });
 
     it("omits gen_ai token breakdown attributes when agent_usage.json contains invalid JSON", async () => {
@@ -6291,6 +6839,44 @@ describe("sendJobConclusionSpan", () => {
       expect(keys).not.toContain("gen_ai.usage.output_tokens");
       expect(keys).not.toContain("gen_ai.usage.cache_read.input_tokens");
       expect(keys).not.toContain("gen_ai.usage.cache_creation.input_tokens");
+    });
+
+    it.each([
+      { job: "agent", dedicated: true, owner: "gh-aw.agent.agent" },
+      { job: "agent", dedicated: false, owner: "gh-aw.agent.conclusion" },
+      { job: "copilot", dedicated: false, owner: "gh-aw.copilot.conclusion" },
+      { job: "detection", dedicated: false, owner: "gh-aw.detection.conclusion" },
+      { job: "detection", dedicated: false, skipped: true, owner: undefined },
+      { job: "conclusion", dedicated: false, owner: undefined },
+      { job: "safe_outputs", dedicated: false, owner: undefined },
+      { job: "", dedicated: false, owner: undefined },
+    ])("keeps measured zero accounting exclusive to $owner (job=$job, skipped=$skipped)", async ({ job, dedicated, skipped, owner }) => {
+      process.env.INPUT_JOB_NAME = job;
+      process.env.GH_AW_INFO_ENGINE_ID = "copilot";
+      process.env.GH_AW_DETECTION_CONCLUSION = skipped ? "skipped" : "success";
+      if (!dedicated) {
+        statSpy.mockImplementation(() => {
+          throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+        });
+      }
+      const usage = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 };
+      readFileSpy.mockImplementation(filePath => {
+        if (filePath === "/tmp/gh-aw/threat-detection/detection_usage.json") return JSON.stringify(usage);
+        if (filePath === "/tmp/gh-aw/agent_usage.json") return JSON.stringify(job === "detection" ? { input_tokens: 100, output_tokens: 50 } : usage);
+        if (filePath === "/tmp/gh-aw/agent-stdio.log") return '{"type":"result","usage":{"input_tokens":100,"output_tokens":50}}\n';
+        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      });
+
+      await sendJobConclusionSpan(`gh-aw.${job || "job"}.conclusion`, dedicated ? { startMs: 1_700_000_000_000 } : {});
+
+      const spans = appendSpy.mock.calls.flatMap(([, content]) => JSON.parse(content).resourceSpans[0].scopeSpans[0].spans);
+      const owners = spans.filter(span => span.attributes.some(attr => attr.key.startsWith("gen_ai.usage.")));
+      expect(owners.map(span => span.name)).toEqual(owner ? [owner] : []);
+      if (owner) {
+        const attrs = owners[0].attributes.filter(attr => attr.key.startsWith("gen_ai.usage."));
+        expect(attrs).toHaveLength(6);
+        expect(attrs.every(attr => attr.value.intValue === 0)).toBe(true);
+      }
     });
 
     it("includes gen_ai token breakdown on agent conclusion span when no agent sub-span is emitted", async () => {
@@ -7282,6 +7868,30 @@ describe("buildEvalTelemetry", () => {
   it.each([null, undefined, [], [null, {}, { id: "" }]])("returns empty telemetry without valid results", results => {
     expect(buildEvalTelemetry(results, 1)).toEqual({ attributes: [], events: [] });
   });
+
+  it.each(["judge_not_started", "judge_failed", "no_assistant_response", "execution_evidence_unavailable"])("records %s without inventing eval answers", reasonCode => {
+    const telemetry = buildEvalTelemetry([{ id: "stale", answer: "YES" }], 1, {
+      status: "not_evaluated",
+      reason_code: reasonCode,
+      reason: "Sensitive free-form failure details",
+    });
+    const attributes = [buildAttr("gh-aw.evals.status", "not_evaluated"), buildAttr("gh-aw.evals.reason_code", reasonCode)];
+    expect(telemetry).toEqual({ attributes, events: [{ timeUnixNano: toNanoString(1), name: "eval.status", attributes }] });
+    expect(JSON.stringify(telemetry)).not.toContain("Sensitive");
+    expect(JSON.stringify(telemetry)).not.toContain("gh-aw.eval.answer");
+  });
+
+  it("includes the configured Decisions model for not-evaluated runs", () => {
+    const telemetry = buildEvalTelemetry([], 1, {
+      status: "not_evaluated",
+      reason_code: "judge_failed",
+      reason: "No answers recorded",
+      model: "copilot/gpt-6-luna-decisions",
+    });
+    const model = buildAttr("gh-aw.eval.model", "copilot/gpt-6-luna-decisions");
+    expect(telemetry.attributes).toContainEqual(model);
+    expect(telemetry.events[0].attributes).toContainEqual(model);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -7458,6 +8068,23 @@ describe("sendOTLPToAllEndpoints", () => {
     expect(urls).toEqual(["https://primary.example.com:4317/v1/traces", "https://secondary.example.com:4317/v1/traces"].sort());
   });
 
+  it("returns one final result per endpoint", async () => {
+    const mockFetch = vi.fn().mockImplementation(url => Promise.resolve({ ok: !url.includes("failed"), status: url.includes("failed") ? 500 : 200, statusText: "status" }));
+    vi.stubGlobal("fetch", mockFetch);
+
+    await expect(sendOTLPToAllEndpoints([{ url: "https://failed.example" }, { url: "https://healthy.example" }], { resourceSpans: [] }, { skipJSONL: true, maxRetries: 0 })).resolves.toEqual([false, true]);
+  });
+
+  it("routes Azure metrics to the metrics stream", async () => {
+    vi.stubEnv("GH_AW_OTEL_METRICS", "true");
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, statusText: "OK" });
+    vi.stubGlobal("fetch", mockFetch);
+
+    await expect(sendOTLPSpan("https://example.ingest.monitor.azure.com/dcr-test/streams/Microsoft-OTLP-Traces/otlp/v1/traces", { resourceMetrics: [] }, { skipJSONL: true, signal: "metrics" })).resolves.toBe(true);
+
+    expect(mockFetch.mock.calls[0][0]).toBe("https://example.ingest.monitor.azure.com/dcr-test/streams/Microsoft-OTLP-Metrics/otlp/v1/metrics");
+  });
+
   it("uses per-endpoint headers (not global OTEL_EXPORTER_OTLP_HEADERS)", async () => {
     process.env.OTEL_EXPORTER_OTLP_HEADERS = "X-Global=global";
     const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, statusText: "OK" });
@@ -7513,7 +8140,7 @@ describe("sendOTLPToAllEndpoints", () => {
     });
 
     // Should not throw even if one endpoint fails.
-    await expect(sendOTLPToAllEndpoints([{ url: "https://primary.example.com:4317" }, { url: "https://secondary.example.com:4317" }], payload, { skipJSONL: true, maxRetries: 0 })).resolves.toBeUndefined();
+    await expect(sendOTLPToAllEndpoints([{ url: "https://primary.example.com:4317" }, { url: "https://secondary.example.com:4317" }], payload, { skipJSONL: true, maxRetries: 0 })).resolves.toEqual([false, true]);
 
     // Both endpoints were attempted.
     expect(mockFetch).toHaveBeenCalledTimes(2);
@@ -7846,6 +8473,7 @@ describe("sendJobConclusionSpan does not emit OTLP metrics", () => {
     vi.resetModules();
     process.env.INPUT_JOB_NAME = "agent";
     process.env.GH_AW_AGENT_CONCLUSION = "success";
+    delete process.env.GH_AW_OTEL_METRICS;
     readFileSpy = vi.spyOn(fs, "readFileSync");
     statSpy = vi.spyOn(fs, "statSync").mockImplementation(() => {
       throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
@@ -7864,6 +8492,7 @@ describe("sendJobConclusionSpan does not emit OTLP metrics", () => {
     statSpy.mockRestore();
     delete process.env.INPUT_JOB_NAME;
     delete process.env.GH_AW_AGENT_CONCLUSION;
+    delete process.env.GH_AW_OTEL_METRICS;
     delete process.env.GH_AW_AIC;
     delete process.env.GH_AW_OTLP_ENDPOINTS;
   });

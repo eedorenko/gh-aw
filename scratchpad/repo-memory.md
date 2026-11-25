@@ -12,7 +12,7 @@ Repo-memory provides persistent, git-backed storage for AI agents across workflo
 
 ### System Components
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │                    Workflow Execution                        │
 │                                                              │
@@ -64,7 +64,7 @@ Repo-memory provides persistent, git-backed storage for AI agents across workflo
 
 ## File Path Conventions
 
-All paths in the repo-memory system follow strict naming conventions to ensure consistency across layers.
+All paths in the repo-memory system follow the naming conventions below so that all layers use the same paths.
 
 ### Primary Path Patterns
 
@@ -395,7 +395,7 @@ The total size of all changes (git diff) in a single repo-memory push MUST not e
 - If the patch exceeds the limit, the push is aborted with an error message indicating the actual vs. allowed size
 
 **Error message format**:
-```
+```text
 Patch size (N KB, X bytes) exceeds maximum allowed size (M KB, Y bytes). Reduce the number or size of changes, or increase max-patch-size.
 ```
 
@@ -653,7 +653,7 @@ file-glob:
 2. **Incremental Sync**
    - Only upload changed files (rsync-style)
    - Track file hashes between runs
-   - Benefit: Faster uploads for large memories
+   - Benefit: Uploads only changed files, reducing transfer size for large memories
 
 3. **Multi-Repository Memory**
    - Support memory shared across multiple repositories

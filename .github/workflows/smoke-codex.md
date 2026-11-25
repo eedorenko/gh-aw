@@ -23,6 +23,8 @@ permissions:
 name: Smoke Codex
 engine:
   id: codex
+  durable:
+    retention-days: 7
   fallback-models:
     - openai/gpt-5.4
     - openai/gpt-5.4-mini
@@ -59,7 +61,7 @@ tools:
   web-fetch:
 runtimes:
   go:
-    version: "1.27.3"
+    version: "1.27.4"
 safe-outputs:
     allowed-domains: [default-safe-outputs]
     add-comment:
@@ -69,7 +71,7 @@ safe-outputs:
       expires: 2h
       close-older-issues: true
       close-older-key: "smoke-codex"
-      labels: [automation, testing]
+      labels: [automation, testing, "backlog:smoke-tests"]
     set-issue-field:
       max: 1
       allowed-fields: ["*"]

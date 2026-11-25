@@ -385,6 +385,12 @@ func appTokenPermissionFields(app *GitHubAppConfig, permissions *Permissions) ma
 			continue
 		}
 		level := strings.ToLower(strings.TrimSpace(val))
+		if scope == PermissionRepositoryAdvisories && level == string(PermissionNone) {
+			// Omit the denied scope from the explicit token permission set, including
+			// any inferred grant. The installation API does not accept "none".
+			delete(permissionFields, "permission-repository-advisories")
+			continue
+		}
 		tempPerms := NewPermissionsFromMap(map[PermissionScope]PermissionLevel{scope: PermissionLevel(level)})
 		maps.Copy(permissionFields, convertPermissionsToAppTokenFields(tempPerms))
 	}
@@ -418,7 +424,7 @@ func appendGitHubAppTokenRepositoryInput(steps []string, app *GitHubAppConfig, f
 	return steps
 }
 
-func (c *Compiler) buildGitHubAppTokenMintStepWithMeta(app *GitHubAppConfig, permissions *Permissions, fallbackRepoExpr string, ownerSourceRepository string, stepName string, stepID string) []string {
+func (c *Compiler) buildGitHubAppTokenMintStepWithMeta(app *GitHubAppConfig, permissions *Permissions, fallbackRepoExpr string, ownerSourceRepository string, stepName string, stepID string, conditions ...string) []string {
 	safeOutputsAppLog.Printf("Building GitHub App token mint step: owner=%s, repos=%d", app.Owner, len(app.Repositories))
 	var steps []string
 
@@ -426,12 +432,21 @@ func (c *Compiler) buildGitHubAppTokenMintStepWithMeta(app *GitHubAppConfig, per
 	steps = append(steps, ownerSteps...)
 	steps = append(steps, fmt.Sprintf("      - name: %s\n", stepName))
 	steps = append(steps, fmt.Sprintf("        id: %s\n", stepID))
+	condition := strings.Join(conditions, " && ")
+	if len(conditions) > 1 {
+		condition = combineGitHubIfExpressions(conditions...)
+	}
 	if app.shouldIgnoreMissingKey() {
 		guard := buildIgnoreIfMissingCondition(app)
 		steps = appendStepEnvAssignments(steps, guard.EnvAssignments)
-		if guard.Condition != "" {
-			steps = append(steps, fmt.Sprintf("        if: %s\n", guard.Condition))
+		if condition == "" {
+			condition = guard.Condition
+		} else if guard.Condition != "" {
+			condition = combineGitHubIfExpressions(condition, "("+stripExpressionWrapper(guard.Condition)+")")
 		}
+	}
+	if condition != "" {
+		steps = append(steps, fmt.Sprintf("        if: %s\n", condition))
 	}
 	steps = append(steps, fmt.Sprintf("        uses: %s\n", getActionPin("actions/create-github-app-token")))
 	steps = append(steps, "        with:\n")
@@ -548,6 +563,11 @@ func convertPermissionsToAppTokenFields(permissions *Permissions) map[string]str
 	}
 	if level, ok := permissions.GetExplicit(PermissionSecretScanningAlerts); ok && level != PermissionNone {
 		fields["permission-secret-scanning-alerts"] = string(level)
+	}
+	if level, ok := permissions.GetExplicit(PermissionRepositoryAdvisories); ok && level != PermissionNone {
+		// The pinned action reads every INPUT_PERMISSION-* environment variable,
+		// including inputs not yet declared in its action.yml.
+		fields["permission-repository-advisories"] = string(level)
 	}
 	// Organization-level
 	if level, ok := permissions.GetExplicit(PermissionOrganizationProj); ok {

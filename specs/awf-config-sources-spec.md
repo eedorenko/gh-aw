@@ -10,7 +10,7 @@ sidebar:
 **Version**: 0.1.0  
 **Status**: Working Draft  
 **Date**: 2026-05-10  
-**Last Updated**: 2026-05-10  
+**Last Updated**: 2026-11-20<br>
 **Editors**: GitHub gh-aw Team
 
 ---
@@ -142,7 +142,7 @@ The following fields previously existed in schema but were missed in spec CLI ma
 | `apiProxy.modelMultipliers` | config-only (AI Credits accounting) | `pkg/workflow/awf_config_test.go` |
 | `apiProxy.modelFallback` | config-only (model fallback policy; set `sandbox.agent.model-fallback: false` to prevent deployment-name rewriting for BYOK Azure) | `pkg/workflow/awf_config_test.go` (`TestAWFConfig_ModelFallback*`) |
 | `apiProxy.fallbackModels` | config-only (AWF v0.28.31+ ordered request-level fallback; `engine.fallback-models` uses this for concrete same-provider chains, with model-policy and budget guards unchanged) | `pkg/workflow/engine_fallback_awf_test.go` |
-| `apiProxy.enableTokenSteering` | config-only (set `sandbox.agent.token-steering: false` to preserve the explicitly configured provider and model) | `pkg/workflow/awf_config_test.go` |
+| `apiProxy.enableTokenSteering` | config-only (set `sandbox.agent.token-steering: false` to turn off AWF budget notices) | `pkg/workflow/awf_config_test.go` |
 | `apiProxy.maxRuns` | config-only (LLM invocation hard cap) | `pkg/workflow/awf_config_test.go` |
 | `apiProxy.auth.*` | config-only (maps to `AWF_AUTH_*` env vars) | `pkg/workflow/awf_config_test.go` |
 | `apiProxy.targets.openai.authHeader` | `--openai-api-auth-header` (frontmatter: `sandbox.agent.targets.openai.auth-header`) | `pkg/workflow/awf_config_test.go` |
@@ -156,6 +156,10 @@ The following fields previously existed in schema but were missed in spec CLI ma
 | `rateLimiting.maxGithubApiPointsRest` | `--max-github-api-points-rest` (requires `security.difcProxy.host`; AWF enforces this dependency at runtime rather than in JSON Schema) | `pkg/workflow/awf_config_test.go` (`TestValidateAWFConfigJSON_GitHubAPIPointBudgets`) |
 | `rateLimiting.maxGithubApiPointsGraphql` | `--max-github-api-points-graphql` (requires `security.difcProxy.host`; AWF enforces this dependency at runtime rather than in JSON Schema) | `pkg/workflow/awf_config_test.go` (`TestValidateAWFConfigJSON_GitHubAPIPointBudgets`) |
 | `experimental.modelRouting` | config-only (required and `true` when `apiProxy.routing` is present) | `pkg/workflow/awf_config_test.go` (`TestValidateAWFConfigJSON_ModelRoutingGate`) |
+
+AWF v0.29.17 restricts `apiProxy.routing.objective.goal` to `cost`. Its backward-compatible reader accepts legacy routing-table bundles, not `cost-speed` requests. gh-aw rejects `cost-speed` for effective AWF versions v0.29.17 and newer while retaining it in the embedded schema for older pinned versions. Existing feature minimums remain unchanged; `AWFCostOnlyModelRoutingMinVersion` gates this retirement.
+
+The v0.29.17 published schema, runtime schema, and release schema asset also add optional `apiProxy.routing.topK` (integer, 1–32). gh-aw does not emit this field; exposing ranked routing options remains follow-up work. The upstream spec additionally documents CLI-only `--home` and the optional Azure Foundry provider port; neither requires a new compiler-emitted config field.
 
 Agents SHOULD treat this class of mismatch as a regression signal and open a corrective PR when detected.
 
@@ -179,7 +183,7 @@ This subsection identifies the normative behavior that conforming AWF config sou
 
 **CR-05**: When drift is detected, the detecting agent or workflow SHOULD open a corrective pull request with specific field paths and suggested remediation.
 
-**CR-06**: Drift categorized as "missing in gh-aw" or "spec mismatch" MUST be remediated (merged or explicitly waived with rationale) within **5 business days** of detection. For this requirement, business days are Monday-Friday in UTC, excluding weekends. If this SLA is missed, maintainers MUST open (or update) an escalation tracking issue within 1 business day. The escalation issue MUST include an owner, unblock plan, and revised ETA.
+**CR-06**: Drift categorized as "missing in gh-aw" or "spec mismatch" MUST be remediated (merged or explicitly waived with rationale) within **5 business days** of detection. For this requirement, business days are Monday-Friday in UTC, excluding weekends. If this SLA is missed, maintainers MUST open (or update) an escalation tracking issue within 1 business day. The escalation issue MUST include an owner, unblock plan, and revised ETA (T-DR-007; owner assignment and acknowledgement are covered by T-DR-011).
 
 **CR-06a (Escalation Owner Assignment)**: When opening or updating an escalation tracking issue under CR-06, the assignee **SHOULD** be determined as follows: (a) the maintainer who merged the last change to the drifted property's corresponding implementation file in `pkg/workflow/` or `actions/setup/` is the **default escalation owner** (implementation guidance: this can be determined via `git log` on the relevant file, or through PR merge history); (b) if no such maintainer is identifiable (e.g., the property has never been implemented), the escalation owner **SHOULD** default to the on-call maintainer for the `github/gh-aw` repository at the time of escalation; (c) the assigned owner **MUST** be recorded in the `Owner` field of the escalation issue template and **MUST** acknowledge the assignment by commenting on the issue within 1 business day of assignment. The escalation issue **MUST NOT** be left unassigned. The formal conformance fixture is [T-DR-011](awf-config-sources-compliance/README.md#driftrecord-conformance-tests), implemented in `pkg/workflow/awf_config_safeguards_formal_test.go`; production issue assignment and comment-based acknowledgement enforcement are not yet automated. Until a dedicated production tracker exists, that enforcement is explicitly out of scope for T-DR-011 because the current fixture only validates the normative owner-selection and acknowledgement-window contract, not GitHub issue mutation side effects.
 
@@ -234,6 +238,12 @@ Drift detection MUST be triggered when:
    - Suggested corrective action (add coverage, open PR, update spec).
 
 6. **Open a corrective PR** when any drift of category "missing in gh-aw" or "spec mismatch" is found. The PR description MUST include the drift report and reference this procedure.
+
+7. **Run local conformance checks** from the repository root:
+   ```bash
+   go test ./pkg/workflow -run 'TestDriftRecord|TestAWFConfigSafeguard' -count=1
+   ```
+   These tests verify the local `DriftRecord`, corrective-PR, SLA-escalation, and unavailable-source safeguards. They do not fetch or compare the upstream schema; Steps 2–4 remain the schema-inventory and implementation comparison.
 
 ### 7.3 Example Drift Check (CLI)
 
@@ -299,7 +309,7 @@ To satisfy CR-06 tracking obligations, drift escalation records SHOULD use:
 - Waiver rationale (if any): <text>
 ```
 
-The scheduled schema consistency workflow SHOULD open or update one such issue when drift remains unresolved beyond 5 business days.
+The 5-business-day remediation window and 1-business-day escalation deadline are normative under CR-06. Maintainers MUST open or update the escalation issue within that deadline when the drift remains unresolved; the scheduled schema consistency workflow SHOULD detect the missed SLA and prepare the issue with the required owner, unblock plan, and revised ETA.
 
 ### 7.5 DriftRecord Entity Schema
 
@@ -332,3 +342,14 @@ Every invocation (scheduled, manual, or ad hoc) **MUST** attempt to refresh the 
 2. The workflow **SHOULD** emit a warning that canonical source retrieval failed, including the failing source path(s) and timestamp. (T-DR-SAFE-002; see the [fixture index](awf-config-sources-compliance/README.md#safeguards-conformance-tests))
 3. The workflow **MUST** skip destructive validation actions (for example failing required checks, auto-opening corrective PRs, or auto-creating drift issues from stale snapshots) when canonical data cannot be refreshed, and mark the run as degraded instead of silently passing. (T-DR-SAFE-003; see the [fixture index](awf-config-sources-compliance/README.md#safeguards-conformance-tests))
 4. The workflow **SHOULD** open or update a tracking issue when canonical source unavailability persists from one daily scheduled cron invocation through the next. Manual reruns and ad hoc invocations still perform the refresh and freshness checks above, but do not advance this consecutive-scheduled-run threshold. This persistence threshold applies only to unavailable-source reporting; the daily cadence in §7.4 applies to the full drift check. (T-DR-SAFE-004; see the [fixture index](awf-config-sources-compliance/README.md#safeguards-conformance-tests))
+
+## Change Log
+
+### 2026-11-17
+
+- Clarified that T-DR-011 validates the normative CR-06a owner-selection and acknowledgement requirements only; production GitHub issue assignment and comment side effects are not automated and remain out of scope.
+
+### 2026-11-04
+
+- Added the exact local conformance-test command and distinguished it from the upstream schema comparison procedure.
+- Aligned SLA escalation timing and required issue fields with CR-06 and compliance tests T-DR-007/T-DR-011.

@@ -24,7 +24,7 @@ test("README rule-table additions link existing sections and detect omitted or b
   const text = fs.readFileSync(path.join(root, "eslint-factory/README.md"), "utf8");
   const table = readmeTable(text);
   assert.deepEqual(table.brokenTargets, []);
-  for (const rule of ["no-async-foreach-callback", "no-single-char-string-replace", "no-string-fallback-for-non-string-message", "require-http-response-error-listener"]) {
+  for (const rule of ["no-async-foreach-callback", "no-dynamic-string-replacement", "no-single-char-string-replace", "no-string-fallback-for-non-string-message", "require-http-response-error-listener"]) {
     assert.equal(table.rules.filter(name => name === rule).length, 1);
     assert.ok(text.includes(`[\`${rule}\`](#${rule})`));
     const broken = text.replace(`[\`${rule}\`](#${rule})`, `[\`${rule}\`](#nonexistent-rule-section)`);
@@ -48,7 +48,7 @@ test("actual build, library scan commands, precheck and native Claim boundaries"
     facts => (facts.scanProbes.warning.status = 1),
     facts => (facts.coverage.ts = true),
     facts => (facts.precheck.warning.flag = false),
-    facts => (facts.defaultProfileMax = 16),
+    facts => (facts.claimsPerDispatch = [2, 1]),
     facts => (facts.monsterAssignmentMax = 2),
     facts => (facts.requiredAssignments[0] = false),
     facts => (facts.memoryAdapter.base = "b".repeat(40)),

@@ -30,13 +30,14 @@ func GenerateNodeJsSetupStep() GitHubActionStep {
 }
 
 func generateNodeJsSetupStep(data *WorkflowData) GitHubActionStep {
-	return GitHubActionStep{
+	step := GitHubActionStep{
 		"      - name: Setup Node.js",
 		"        uses: " + getActionPinForData("actions/setup-node", data),
 		"        with:",
 		fmt.Sprintf("          node-version: '%s'", constants.DefaultNodeVersion),
 		"          package-manager-cache: false",
 	}
+	return rewriteNodeSetupStep(step, "", resolveNodeSetupVersion(data))
 }
 
 // resolveNodeSetupActionOverride returns the runtimes.node.action-repo and
@@ -171,7 +172,7 @@ func installStepsContainNodeSetup(steps []GitHubActionStep) bool {
 	return false
 }
 
-// By default, --ignore-scripts is added to the install command to prevent pre/post install
+// By default, npm install scripts are disabled to prevent pre/post install
 // scripts from executing (supply chain security). Pass runInstallScripts=true to allow scripts.
 // By default, a 3-day npm dependency cooldown is enabled via NPM_CONFIG_MIN_RELEASE_AGE.
 // Pass cooldownEnabled=false to disable it.
@@ -181,7 +182,7 @@ func installStepsContainNodeSetup(steps []GitHubActionStep) bool {
 //   - stepName: The name to display for the install step (e.g., "Install Claude Code CLI")
 //   - cacheKeyPrefix: The prefix for the cache key (unused, kept for API compatibility)
 //   - options.IncludeNodeSetup: If true, includes Node.js setup step before npm install
-//   - options.RunInstallScripts: If true, allow pre/post install scripts (omits --ignore-scripts)
+//   - options.RunInstallScripts: If true, allow pre/post install scripts
 //   - options.CooldownEnabled: If true, apply a default 3-day npm release-age cooldown
 //
 // Returns steps for installing the npm package (optionally with Node.js setup)
@@ -235,7 +236,7 @@ func buildStandardNpmEngineInstallSteps(
 			CooldownDays:      configuredDays,
 		},
 	)
-	steps = append([]GitHubActionStep{generateNodeJsSetupStep(workflowData)}, steps...)
+	steps = append([]GitHubActionStep{generateNodeJsSetupStepForWorkflow(workflowData)}, steps...)
 	if isNVXRuntime(workflowData) {
 		steps = append(steps, GenerateMicroVMNpmCLIInstallStep(
 			packageName, version, stepName+" in microVM path", cacheKeyPrefix, false, cooldownEnabled, days,
@@ -248,9 +249,8 @@ func buildStandardNpmEngineInstallSteps(
 // setup step and the CLI install steps when the firewall is enabled. This eliminates the
 // duplicated AWF-injection pattern shared by npm-based engines. It never stages Copilot CLI.
 //
-// The expected layout of npmSteps is:
-//   - npmSteps[0]  – Node.js setup step
-//   - npmSteps[1:] – CLI installation step(s)
+// npmSteps may start with a Node.js setup step, followed by CLI installation steps.
+// The Copilot installer starts directly with its CLI installation step.
 //
 // Parameters:
 //   - npmSteps: Pre-computed npm installation steps (from BuildStandardNpmEngineInstallSteps
@@ -258,7 +258,7 @@ func buildStandardNpmEngineInstallSteps(
 //   - workflowData: The workflow data (used to determine firewall configuration)
 //
 // Returns:
-//   - []GitHubActionStep: Steps in order: Node.js setup, AWF (if enabled), CLI install
+//   - []GitHubActionStep: First npm step, AWF (if enabled), remaining npm steps
 func BuildNpmEngineInstallStepsWithAWF(npmSteps []GitHubActionStep, workflowData *WorkflowData) []GitHubActionStep {
 	return buildNpmEngineInstallStepsWithAWF(npmSteps, workflowData, false)
 }
@@ -267,7 +267,11 @@ func buildNpmEngineInstallStepsWithAWF(npmSteps []GitHubActionStep, workflowData
 	var steps []GitHubActionStep
 
 	if len(npmSteps) > 0 {
-		steps = append(steps, npmSteps[0]) // Node.js setup step
+		firstStep := npmSteps[0]
+		if extractStepName(strings.Join(firstStep, "\n")) == "Setup Node.js" {
+			firstStep = rewriteNodeSetupStep(firstStep, resolveNodeSetupActionRef(workflowData), resolveNodeSetupVersion(workflowData))
+		}
+		steps = append(steps, firstStep)
 	}
 
 	steps = appendAWFInstallationSteps(steps, workflowData)
@@ -407,7 +411,7 @@ func GetMicroVMNpmCLIPathSetup(workflowData *WorkflowData) string {
 }
 
 // GenerateNpmInstallStepsWithScope generates npm installation steps with control over global vs local installation.
-// By default, --ignore-scripts is added to the install command to prevent pre/post install
+// By default, npm install scripts are disabled to prevent pre/post install
 // scripts from executing (supply chain security). Pass options.RunInstallScripts=true to allow scripts.
 func GenerateNpmInstallStepsWithScope(packageName, version, stepName, cacheKeyPrefix string, options NPMInstallOptions) []GitHubActionStep {
 	days, cooldownEnabled := npmInstallCooldownDays(options)
@@ -427,10 +431,11 @@ func GenerateNpmInstallStepsWithScope(packageName, version, stepName, cacheKeyPr
 		globalFlag = "-g "
 	}
 
-	// Add --ignore-scripts by default to prevent pre/post install scripts (supply chain security).
-	// runInstallScripts=true disables this protection (emits a warning at compile time).
+	// Keep global commands in the scanner's pinned-install form without removing
+	// lifecycle-script protection. Local installs retain the explicit flag.
 	ignoreScriptsFlag := "--ignore-scripts "
-	if options.RunInstallScripts {
+	ignoreScriptsEnv := options.IsGlobal && !options.RunInstallScripts
+	if options.RunInstallScripts || ignoreScriptsEnv {
 		ignoreScriptsFlag = ""
 	}
 
@@ -449,8 +454,11 @@ func GenerateNpmInstallStepsWithScope(packageName, version, stepName, cacheKeyPr
 		"      - name: " + stepName,
 		"        run: " + installCmd,
 	}
-	if ExpressionPattern.MatchString(version) || cooldownEnabled {
+	if ExpressionPattern.MatchString(version) || cooldownEnabled || ignoreScriptsEnv {
 		installStep = append(installStep, "        env:")
+		if ignoreScriptsEnv {
+			installStep = append(installStep, "          NPM_CONFIG_IGNORE_SCRIPTS: 'true'")
+		}
 		if ExpressionPattern.MatchString(version) {
 			installStep = append(installStep, "          ENGINE_VERSION: "+version)
 		}
