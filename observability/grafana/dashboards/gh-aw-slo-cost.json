@@ -1,0 +1,1125 @@
+{
+  "uid": "gh-aw-slo-cost",
+  "title": "gh-aw / SLO Cost efficiency",
+  "description": "Scan: which workflows violate the Cost efficiency SLOs (\"tokens per useful output and a reasonable burn rate\"), and since when? Click a workflow to drill down.",
+  "tags": [
+    "gh-aw",
+    "otel",
+    "slo",
+    "scan"
+  ],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "timezone": "browser",
+  "refresh": "5m",
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "ds",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1,
+        "regex": "",
+        "includeAll": false,
+        "multi": false,
+        "options": []
+      },
+      {
+        "name": "workflow",
+        "label": "Workflow",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${ds}"
+        },
+        "definition": "label_values(gh_aw_job_duration_seconds_count, gh_aw_workflow_name)",
+        "query": {
+          "query": "label_values(gh_aw_job_duration_seconds_count, gh_aw_workflow_name)",
+          "refId": "var_workflow",
+          "qryType": 1
+        },
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "options": [],
+        "regex": "",
+        "hide": 0
+      },
+      {
+        "name": "slo_window",
+        "label": "SLO window (e.g. 7d)",
+        "type": "textbox",
+        "query": "7d",
+        "current": {
+          "text": "7d",
+          "value": "7d"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "7d",
+            "value": "7d"
+          }
+        ],
+        "hide": 0
+      },
+      {
+        "name": "gh_repo",
+        "label": "GitHub repo (owner/name)",
+        "type": "textbox",
+        "query": "github/gh-aw",
+        "current": {
+          "text": "github/gh-aw",
+          "value": "github/gh-aw"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "github/gh-aw",
+            "value": "github/gh-aw"
+          }
+        ],
+        "hide": 0
+      },
+      {
+        "name": "price_in",
+        "label": "Price: input (USD / 1M tokens)",
+        "type": "textbox",
+        "query": "0",
+        "current": {
+          "text": "0",
+          "value": "0"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "0",
+            "value": "0"
+          }
+        ],
+        "hide": 0
+      },
+      {
+        "name": "price_out",
+        "label": "Price: output (USD / 1M tokens)",
+        "type": "textbox",
+        "query": "0",
+        "current": {
+          "text": "0",
+          "value": "0"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "0",
+            "value": "0"
+          }
+        ],
+        "hide": 0
+      },
+      {
+        "name": "price_cache_read",
+        "label": "Price: cache read (USD / 1M tokens)",
+        "type": "textbox",
+        "query": "0",
+        "current": {
+          "text": "0",
+          "value": "0"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "0",
+            "value": "0"
+          }
+        ],
+        "hide": 0
+      },
+      {
+        "name": "price_cache_write",
+        "label": "Price: cache write (USD / 1M tokens)",
+        "type": "textbox",
+        "query": "0",
+        "current": {
+          "text": "0",
+          "value": "0"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "0",
+            "value": "0"
+          }
+        ],
+        "hide": 0
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "gh-aw dashboards",
+      "tags": [
+        "gh-aw"
+      ],
+      "asDropdown": true,
+      "includeVars": true,
+      "keepTime": true
+    },
+    {
+      "title": "GitHub Actions",
+      "url": "https://github.com/${gh_repo}/actions",
+      "targetBlank": true,
+      "type": "link",
+      "icon": "external link"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "table",
+      "title": "Cost efficiency SLIs per workflow (worst first, click a workflow to drill down)",
+      "description": "Question: Which workflows violate the Cost efficiency SLOs? Cells are coloured against the SLO; \"Jobs in window\" shows the sample size.\nMetrics: Tier A: emitted by gh-aw.\nSLI: C1, C2, C3.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "A",
+          "expr": "((((sum by (gh_aw_workflow_name) (increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"input\"}[7d])) + sum by (gh_aw_workflow_name) (increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"output\"}[7d])))) / ((sum by (gh_aw_workflow_name) (increase(gh_aw_workflow_output_items_total{gh_aw_workflow_name=~\"$workflow\",gh_aw_safe_output_type!=\"noop\"}[7d]))) > 0)) or (((sum by (gh_aw_workflow_name) (increase(gh_aw_workflow_output_items_total{gh_aw_workflow_name=~\"$workflow\",gh_aw_safe_output_type!=\"noop\"}[7d]))) > 0) * 0)) / (((((sum by (gh_aw_workflow_name) (increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"input\"}[28d])) + sum by (gh_aw_workflow_name) (increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"output\"}[28d])))) / ((sum by (gh_aw_workflow_name) (increase(gh_aw_workflow_output_items_total{gh_aw_workflow_name=~\"$workflow\",gh_aw_safe_output_type!=\"noop\"}[28d]))) > 0)) or (((sum by (gh_aw_workflow_name) (increase(gh_aw_workflow_output_items_total{gh_aw_workflow_name=~\"$workflow\",gh_aw_safe_output_type!=\"noop\"}[28d]))) > 0) * 0)) > 0)",
+          "legendFormat": "__auto",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "B",
+          "expr": "(((sum by (gh_aw_workflow_name) (increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"input\"}[1d])) + sum by (gh_aw_workflow_name) (increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"output\"}[1d])))) / (((sum by (gh_aw_workflow_name) (increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"input\"}[7d])) + sum by (gh_aw_workflow_name) (increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"output\"}[7d]))) / 7) > 0)) or ((((sum by (gh_aw_workflow_name) (increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"input\"}[7d])) + sum by (gh_aw_workflow_name) (increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"output\"}[7d]))) / 7) > 0) * 0)",
+          "legendFormat": "__auto",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "C",
+          "expr": "((sum by (gh_aw_workflow_name) (increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"cache_read\"}[$slo_window]))) / ((sum by (gh_aw_workflow_name) (increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"input\"}[$slo_window]))) > 0)) or (((sum by (gh_aw_workflow_name) (increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"input\"}[$slo_window]))) > 0) * 0)",
+          "legendFormat": "__auto",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "D",
+          "expr": "sum by (gh_aw_workflow_name) (increase(gh_aw_job_duration_seconds_count{gh_aw_workflow_name=~\"$workflow\",cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))",
+          "legendFormat": "__auto",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "C1 Tokens per productive output vs baseline"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 1.5000000015
+                    },
+                    {
+                      "color": "red",
+                      "value": 2.000000002
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "C2 Burn rate vs baseline"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 2.000000002
+                    },
+                    {
+                      "color": "red",
+                      "value": 3.000000003
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "C3 Cache hit ratio"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 0.2
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.4
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Jobs in window"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "gh_aw_workflow_name"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Drill down into this workflow",
+                    "url": "/d/gh-aw-workflow-drilldown?var-workflow=${__data.fields.gh_aw_workflow_name}&${__url_time_range}&var-ds=${ds}&var-gh_repo=${gh_repo}"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "C1 Tokens per productive output vs baseline",
+            "desc": true
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "Value #A": "C1 Tokens per productive output vs baseline",
+              "Value #B": "C2 Burn rate vs baseline",
+              "Value #C": "C3 Cache hit ratio",
+              "Value #D": "Jobs in window"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "C1 Tokens per productive output vs baseline vs SLO",
+      "description": "Question: When did tokens per productive output vs baseline cross its SLO? Rolling $slo_window value; honours the Workflow variable.\nMetrics: Tier A: emitted by gh-aw.\nSLI: C1.\nSLO: ≤ 1.5× (amber ≤ 2×).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "A",
+          "expr": "((((sum(increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"output\"}[7d])))) / ((sum(increase(gh_aw_workflow_output_items_total{gh_aw_workflow_name=~\"$workflow\",gh_aw_safe_output_type!=\"noop\"}[7d]))) > 0)) or (((sum(increase(gh_aw_workflow_output_items_total{gh_aw_workflow_name=~\"$workflow\",gh_aw_safe_output_type!=\"noop\"}[7d]))) > 0) * 0)) / (((((sum(increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"input\"}[28d])) + sum(increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"output\"}[28d])))) / ((sum(increase(gh_aw_workflow_output_items_total{gh_aw_workflow_name=~\"$workflow\",gh_aw_safe_output_type!=\"noop\"}[28d]))) > 0)) or (((sum(increase(gh_aw_workflow_output_items_total{gh_aw_workflow_name=~\"$workflow\",gh_aw_safe_output_type!=\"noop\"}[28d]))) > 0) * 0)) > 0)",
+          "legendFormat": "C1 Tokens per productive output vs baseline",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "B",
+          "expr": "vector(1.5)",
+          "legendFormat": "SLO",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "C",
+          "expr": "vector(2)",
+          "legendFormat": "Amber margin",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "SLO"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Amber margin"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    6
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "C2 Burn rate vs baseline vs SLO",
+      "description": "Question: When did burn rate vs baseline cross its SLO? Rolling $slo_window value; honours the Workflow variable.\nMetrics: Tier A: emitted by gh-aw.\nSLI: C2.\nSLO: ≤ 2× (amber ≤ 3×).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 9,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "A",
+          "expr": "(((sum(increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"input\"}[1d])) + sum(increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"output\"}[1d])))) / (((sum(increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"output\"}[7d]))) / 7) > 0)) or ((((sum(increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"output\"}[7d]))) / 7) > 0) * 0)",
+          "legendFormat": "C2 Burn rate vs baseline",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "B",
+          "expr": "vector(2)",
+          "legendFormat": "SLO",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "C",
+          "expr": "vector(3)",
+          "legendFormat": "Amber margin",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "SLO"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Amber margin"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    6
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "C3 Cache hit ratio vs SLO",
+      "description": "Question: When did cache hit ratio cross its SLO? Rolling $slo_window value; honours the Workflow variable.\nMetrics: Tier A: emitted by gh-aw.\nSLI: C3.\nSLO: ≥ 40% (amber ≥ 20%).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "A",
+          "expr": "((sum(increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"cache_read\"}[$slo_window]))) / ((sum(increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"input\"}[$slo_window]))) > 0)) or (((sum(increase(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\",gen_ai_token_type=\"input\"}[$slo_window]))) > 0) * 0)",
+          "legendFormat": "C3 Cache hit ratio",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "B",
+          "expr": "vector(0.4)",
+          "legendFormat": "SLO",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "C",
+          "expr": "vector(0.2)",
+          "legendFormat": "Amber margin",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "SLO"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Amber margin"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    6
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "C4 Credit and rate-limit events vs SLO",
+      "description": "Question: When did credit and rate-limit events cross its SLO? Rolling $slo_window value; honours the Workflow variable.\nMetrics: Tier A: emitted by gh-aw.\nSLI: C4.\nSLO: ≤ 0.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 17,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "A",
+          "expr": "(round((sum(increase(gh_aw_ai_credits_limit_exceeded_total{gh_aw_workflow_name=~\"$workflow\"}[$slo_window]))) or vector(0) + (sum(increase(gh_aw_ai_credits_rate_limit_errors_total{gh_aw_workflow_name=~\"$workflow\"}[$slo_window]))) or vector(0))) or vector(0)",
+          "legendFormat": "C4 Credit and rate-limit events",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "B",
+          "expr": "vector(0)",
+          "legendFormat": "SLO",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "SLO"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Tokens per hour by type",
+      "description": "Question: Where do tokens go over time? Input already includes cache, so non-cache input = input - cache read - cache write.\nMetrics: Tier A: emitted by gh-aw.\nSLI: C2.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 25,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "A",
+          "expr": "clamp_min(sum (rate(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\", gen_ai_token_type=\"input\"}[$__rate_interval])) - (sum (rate(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\", gen_ai_token_type=\"cache_read\"}[$__rate_interval])) or vector(0)) - (sum (rate(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\", gen_ai_token_type=\"cache_write\"}[$__rate_interval])) or vector(0)), 0) * 3600",
+          "legendFormat": "input (non-cache)",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "B",
+          "expr": "sum (rate(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\", gen_ai_token_type=\"cache_read\"}[$__rate_interval])) * 3600",
+          "legendFormat": "cache read",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "C",
+          "expr": "sum (rate(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\", gen_ai_token_type=\"cache_write\"}[$__rate_interval])) * 3600",
+          "legendFormat": "cache write",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "D",
+          "expr": "sum (rate(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\", gen_ai_token_type=\"output\"}[$__rate_interval])) * 3600",
+          "legendFormat": "output",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "{token}",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Estimated cost per hour (optional)",
+      "description": "Question: How does estimated spend evolve? Tokens x the price variables (USD per 1M tokens, default 0); not an SLO.\nMetrics: Tier A: emitted by gh-aw.\nSLI: C2.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 25,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "A",
+          "expr": "sum (label_replace(rate(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\", gen_ai_token_type=\"input\"}[$__rate_interval]) * ($price_in), \"kind\", \"input\", \"\", \"\") or label_replace(rate(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\", gen_ai_token_type=\"cache_read\"}[$__rate_interval]) * ($price_cache_read - $price_in), \"kind\", \"cache_read\", \"\", \"\") or label_replace(rate(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\", gen_ai_token_type=\"cache_write\"}[$__rate_interval]) * ($price_cache_write - $price_in), \"kind\", \"cache_write\", \"\", \"\") or label_replace(rate(gen_ai_client_token_usage_total{gh_aw_workflow_name=~\"$workflow\", gen_ai_token_type=\"output\"}[$__rate_interval]) * ($price_out), \"kind\", \"output\", \"\", \"\")) / 1e6 * 3600",
+          "legendFormat": "cost / hour",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ]
+}

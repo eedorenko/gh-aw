@@ -1,0 +1,906 @@
+{
+  "uid": "gh-aw-slo-quality",
+  "title": "gh-aw / SLO Quality",
+  "description": "Scan: which workflows violate the Quality SLOs (\"low failure rate and clean completions\"), and since when? Click a workflow to drill down.",
+  "tags": [
+    "gh-aw",
+    "otel",
+    "slo",
+    "scan"
+  ],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "timezone": "browser",
+  "refresh": "5m",
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "ds",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1,
+        "regex": "",
+        "includeAll": false,
+        "multi": false,
+        "options": []
+      },
+      {
+        "name": "workflow",
+        "label": "Workflow",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${ds}"
+        },
+        "definition": "label_values(gh_aw_job_duration_seconds_count, gh_aw_workflow_name)",
+        "query": {
+          "query": "label_values(gh_aw_job_duration_seconds_count, gh_aw_workflow_name)",
+          "refId": "var_workflow",
+          "qryType": 1
+        },
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "options": [],
+        "regex": "",
+        "hide": 0
+      },
+      {
+        "name": "slo_window",
+        "label": "SLO window (e.g. 7d)",
+        "type": "textbox",
+        "query": "7d",
+        "current": {
+          "text": "7d",
+          "value": "7d"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "7d",
+            "value": "7d"
+          }
+        ],
+        "hide": 0
+      },
+      {
+        "name": "gh_repo",
+        "label": "GitHub repo (owner/name)",
+        "type": "textbox",
+        "query": "github/gh-aw",
+        "current": {
+          "text": "github/gh-aw",
+          "value": "github/gh-aw"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "github/gh-aw",
+            "value": "github/gh-aw"
+          }
+        ],
+        "hide": 0
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "gh-aw dashboards",
+      "tags": [
+        "gh-aw"
+      ],
+      "asDropdown": true,
+      "includeVars": true,
+      "keepTime": true
+    },
+    {
+      "title": "GitHub Actions",
+      "url": "https://github.com/${gh_repo}/actions",
+      "targetBlank": true,
+      "type": "link",
+      "icon": "external link"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "table",
+      "title": "Quality SLIs per workflow (worst first, click a workflow to drill down)",
+      "description": "Question: Which workflows violate the Quality SLOs? Cells are coloured against the SLO; \"Jobs in window\" shows the sample size.\nMetrics: Tier A: emitted by gh-aw.\nSLI: Q1, Q2, Q3.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "A",
+          "expr": "((sum by (gh_aw_workflow_name) (increase(gh_aw_job_duration_seconds_count{gh_aw_workflow_name=~\"$workflow\",cicd_pipeline_task_run_result=\"success\"}[$slo_window]))) / ((sum by (gh_aw_workflow_name) (increase(gh_aw_job_duration_seconds_count{gh_aw_workflow_name=~\"$workflow\",cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0)) or (((sum by (gh_aw_workflow_name) (increase(gh_aw_job_duration_seconds_count{gh_aw_workflow_name=~\"$workflow\",cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0) * 0)",
+          "legendFormat": "__auto",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "B",
+          "expr": "((sum by (gh_aw_workflow_name) (increase(gh_aw_tool_calls_total{gh_aw_workflow_name=~\"$workflow\",gh_aw_tool_status=\"ok\"}[$slo_window]))) / ((sum by (gh_aw_workflow_name) (increase(gh_aw_tool_calls_total{gh_aw_workflow_name=~\"$workflow\"}[$slo_window]))) > 0)) or (((sum by (gh_aw_workflow_name) (increase(gh_aw_tool_calls_total{gh_aw_workflow_name=~\"$workflow\"}[$slo_window]))) > 0) * 0)",
+          "legendFormat": "__auto",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "C",
+          "expr": "((sum by (gh_aw_workflow_name) (increase(gh_aw_workflow_output_items_total{gh_aw_workflow_name=~\"$workflow\",gh_aw_safe_output_type=\"report_incomplete\"}[$slo_window]))) / ((sum by (gh_aw_workflow_name) (increase(gh_aw_job_duration_seconds_count{gh_aw_workflow_name=~\"$workflow\",gh_aw_job_name=\"agent\"}[$slo_window]))) > 0)) or (((sum by (gh_aw_workflow_name) (increase(gh_aw_job_duration_seconds_count{gh_aw_workflow_name=~\"$workflow\",gh_aw_job_name=\"agent\"}[$slo_window]))) > 0) * 0)",
+          "legendFormat": "__auto",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "D",
+          "expr": "sum by (gh_aw_workflow_name) (increase(gh_aw_job_duration_seconds_count{gh_aw_workflow_name=~\"$workflow\",cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))",
+          "legendFormat": "__auto",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Q1 Job success ratio"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 0.9
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.95
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Q2 Tool call success ratio"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 0.8
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.9
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Q3 Incomplete-run rate"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 0.050000001
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.100000001
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Jobs in window"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "gh_aw_workflow_name"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Drill down into this workflow",
+                    "url": "/d/gh-aw-workflow-drilldown?var-workflow=${__data.fields.gh_aw_workflow_name}&${__url_time_range}&var-ds=${ds}&var-gh_repo=${gh_repo}"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "Q1 Job success ratio",
+            "desc": false
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "Value #A": "Q1 Job success ratio",
+              "Value #B": "Q2 Tool call success ratio",
+              "Value #C": "Q3 Incomplete-run rate",
+              "Value #D": "Jobs in window"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Q1 Job success ratio vs SLO",
+      "description": "Question: When did job success ratio cross its SLO? Rolling $slo_window value; honours the Workflow variable.\nMetrics: Tier A: emitted by gh-aw.\nSLI: Q1.\nSLO: ≥ 95% (amber ≥ 90%).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "A",
+          "expr": "((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_workflow_name=~\"$workflow\",cicd_pipeline_task_run_result=\"success\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_workflow_name=~\"$workflow\",cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_workflow_name=~\"$workflow\",cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0) * 0)",
+          "legendFormat": "Q1 Job success ratio",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "B",
+          "expr": "vector(0.95)",
+          "legendFormat": "SLO",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "C",
+          "expr": "vector(0.9)",
+          "legendFormat": "Amber margin",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "SLO"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Amber margin"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    6
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Q2 Tool call success ratio vs SLO",
+      "description": "Question: When did tool call success ratio cross its SLO? Rolling $slo_window value; honours the Workflow variable.\nMetrics: Tier A: emitted by gh-aw.\nSLI: Q2.\nSLO: ≥ 90% (amber ≥ 80%).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 9,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "A",
+          "expr": "((sum(increase(gh_aw_tool_calls_total{gh_aw_workflow_name=~\"$workflow\",gh_aw_tool_status=\"ok\"}[$slo_window]))) / ((sum(increase(gh_aw_tool_calls_total{gh_aw_workflow_name=~\"$workflow\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_tool_calls_total{gh_aw_workflow_name=~\"$workflow\"}[$slo_window]))) > 0) * 0)",
+          "legendFormat": "Q2 Tool call success ratio",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "B",
+          "expr": "vector(0.9)",
+          "legendFormat": "SLO",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "C",
+          "expr": "vector(0.8)",
+          "legendFormat": "Amber margin",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "SLO"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Amber margin"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    6
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Q3 Incomplete-run rate vs SLO",
+      "description": "Question: When did incomplete-run rate cross its SLO? Rolling $slo_window value; honours the Workflow variable.\nMetrics: Tier A: emitted by gh-aw.\nSLI: Q3.\nSLO: ≤ 5% (amber ≤ 10%).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "A",
+          "expr": "((sum(increase(gh_aw_workflow_output_items_total{gh_aw_workflow_name=~\"$workflow\",gh_aw_safe_output_type=\"report_incomplete\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_workflow_name=~\"$workflow\",gh_aw_job_name=\"agent\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_workflow_name=~\"$workflow\",gh_aw_job_name=\"agent\"}[$slo_window]))) > 0) * 0)",
+          "legendFormat": "Q3 Incomplete-run rate",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "B",
+          "expr": "vector(0.05)",
+          "legendFormat": "SLO",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "C",
+          "expr": "vector(0.1)",
+          "legendFormat": "Amber margin",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "SLO"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Amber margin"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    6
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Jobs per hour by result",
+      "description": "Question: How does the result mix (success, failure, timed_out, cancelled) change over time?\nMetrics: Tier A: emitted by gh-aw.\nSLI: Q1.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 17,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "A",
+          "expr": "sum by (cicd_pipeline_task_run_result) (rate(gh_aw_job_duration_seconds_count{gh_aw_workflow_name=~\"$workflow\"}[$__rate_interval])) * 3600",
+          "legendFormat": "{{cicd_pipeline_task_run_result}}",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "bargauge",
+      "title": "Agent failures by error type",
+      "description": "Question: Why do agent invocations fail? Only invocations with a non-empty error_type are counted.\nMetrics: Tier A: emitted by gh-aw.\nSLI: Q1.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 25,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "A",
+          "expr": "sum by (error_type) (increase(gen_ai_invoke_agent_duration_seconds_count{gh_aw_workflow_name=~\"$workflow\",error_type!=\"\"}[$slo_window]))",
+          "legendFormat": "{{error_type}}",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true
+      }
+    }
+  ]
+}

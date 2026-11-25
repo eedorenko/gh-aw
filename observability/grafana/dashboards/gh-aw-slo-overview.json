@@ -1,0 +1,1203 @@
+{
+  "uid": "gh-aw-slo-overview",
+  "title": "gh-aw / SLO Overview",
+  "description": "Glance: is the agentic-workflow fleet meeting expectations right now, and which happiness factor is not? Five gauges, one per happiness factor, each showing the actual value of its worst SLI against the SLO: green (comfortable), yellow (approaching) or red (breached). Click a gauge to scan which workflows violate it.",
+  "tags": [
+    "gh-aw",
+    "otel",
+    "slo",
+    "glance"
+  ],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "timezone": "browser",
+  "refresh": "5m",
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "ds",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1,
+        "regex": "",
+        "includeAll": false,
+        "multi": false,
+        "options": []
+      },
+      {
+        "name": "slo_window",
+        "label": "SLO window (e.g. 7d)",
+        "type": "textbox",
+        "query": "7d",
+        "current": {
+          "text": "7d",
+          "value": "7d"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "7d",
+            "value": "7d"
+          }
+        ],
+        "hide": 0
+      },
+      {
+        "name": "gh_repo",
+        "label": "GitHub repo (owner/name)",
+        "type": "textbox",
+        "query": "github/gh-aw",
+        "current": {
+          "text": "github/gh-aw",
+          "value": "github/gh-aw"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "github/gh-aw",
+            "value": "github/gh-aw"
+          }
+        ],
+        "hide": 0
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "gh-aw dashboards",
+      "tags": [
+        "gh-aw"
+      ],
+      "asDropdown": true,
+      "includeVars": true,
+      "keepTime": true
+    },
+    {
+      "title": "GitHub Actions",
+      "url": "https://github.com/${gh_repo}/actions",
+      "targetBlank": true,
+      "type": "link",
+      "icon": "external link"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Telemetry health (A4): data may be understated when red",
+      "description": "Question: Can the numbers below be trusted? A4 is a trust gate for every other tile.\nMetrics: Tier A: emitted by gh-aw.\nSLI: A4.\nIgnores variables: all variables (not workflow-scoped).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 3
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "A",
+          "expr": "(round(sum(increase(gh_aw_otlp_export_failures_total[1h])))) or vector(0)",
+          "legendFormat": "__auto",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "range",
+              "options": {
+                "from": 1,
+                "to": 1000000000000,
+                "result": {
+                  "text": "OTLP export failing: other tiles may be understated",
+                  "index": 0
+                }
+              }
+            },
+            {
+              "type": "range",
+              "options": {
+                "from": 0,
+                "to": 0.999,
+                "result": {
+                  "text": "Telemetry healthy",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "links": [
+            {
+              "title": "Open Availability scan",
+              "url": "/d/gh-aw-slo-availability?${__url_time_range}&${__all_variables}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "id": 2,
+      "type": "gauge",
+      "title": "Availability",
+      "description": "Question: Are users happy with Availability: workflows run when triggered and are not stuck or dead? Shows the actual value of the SLI closest to breaching its SLO (smallest headroom), named under the gauge with its SLO. Threshold markers: red = SLO breached, yellow = approaching, green = comfortable. Click to scan which workflows violate it.\nMetrics: Tier A: emitted by gh-aw.\nSLI: A1, A2, A4.\nIgnores variables: workflow, job, model (fleet level).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 5,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "A",
+          "expr": "((round(sum(increase(gh_aw_job_duration_seconds_count[6h])))) or vector(0)) and on() ((((((round(sum(increase(gh_aw_job_duration_seconds_count[6h])))) or vector(0)) >= bool 1) * 4 - 1)) < scalar(min(label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\")))) and on() ((((((round(sum(increase(gh_aw_job_duration_seconds_count[6h])))) or vector(0)) >= bool 1) * 4 - 1)) <= scalar(min(label_replace(((0.02 - (((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result=\"timed_out\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0) * 0))) / 0.005), \"sli\", \"A2\", \"\", \"\") or label_replace(((((round(sum(increase(gh_aw_otlp_export_failures_total[1h])))) or vector(0)) <= bool 0) * 4 - 1), \"sli\", \"A4\", \"\", \"\") or label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\"))))",
+          "legendFormat": "Fleet liveness (SLO ≥ 1)",
+          "instant": true,
+          "range": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "B",
+          "expr": "(((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result=\"timed_out\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0) * 0)) and on() ((((0.02 - (((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result=\"timed_out\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0) * 0))) / 0.005)) < scalar(min(label_replace(((((round(sum(increase(gh_aw_job_duration_seconds_count[6h])))) or vector(0)) >= bool 1) * 4 - 1), \"sli\", \"A1\", \"\", \"\") or label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\")))) and on() ((((0.02 - (((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result=\"timed_out\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0) * 0))) / 0.005)) <= scalar(min(label_replace(((((round(sum(increase(gh_aw_otlp_export_failures_total[1h])))) or vector(0)) <= bool 0) * 4 - 1), \"sli\", \"A4\", \"\", \"\") or label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\"))))",
+          "legendFormat": "Timeout ratio (SLO ≤ 2%)",
+          "instant": true,
+          "range": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "C",
+          "expr": "((round(sum(increase(gh_aw_otlp_export_failures_total[1h])))) or vector(0)) and on() ((((((round(sum(increase(gh_aw_otlp_export_failures_total[1h])))) or vector(0)) <= bool 0) * 4 - 1)) < scalar(min(label_replace(((((round(sum(increase(gh_aw_job_duration_seconds_count[6h])))) or vector(0)) >= bool 1) * 4 - 1), \"sli\", \"A1\", \"\", \"\") or label_replace(((0.02 - (((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result=\"timed_out\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0) * 0))) / 0.005), \"sli\", \"A2\", \"\", \"\") or label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\")))) and on() ((((((round(sum(increase(gh_aw_otlp_export_failures_total[1h])))) or vector(0)) <= bool 0) * 4 - 1)) <= scalar(min(label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\"))))",
+          "legendFormat": "Telemetry health (SLO ≤ 0)",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No data",
+          "color": {
+            "mode": "thresholds"
+          },
+          "min": 0,
+          "max": 10,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "links": [
+            {
+              "title": "Open Availability scan",
+              "url": "/d/gh-aw-slo-availability?${__url_time_range}&${__all_variables}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 10
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "green",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 0.04
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.015
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.020000001
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 5
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showThresholdMarkers": true,
+        "showThresholdLabels": true,
+        "orientation": "auto",
+        "minVizHeight": 75,
+        "minVizWidth": 75,
+        "sizing": "auto"
+      }
+    },
+    {
+      "id": 3,
+      "type": "gauge",
+      "title": "Responsiveness",
+      "description": "Question: Are users happy with Responsiveness: work starts and finishes promptly? Shows the actual value of the SLI closest to breaching its SLO (smallest headroom), named under the gauge with its SLO. Threshold markers: red = SLO breached, yellow = approaching, green = comfortable. Click to scan which workflows violate it.\nMetrics: Tier A: emitted by gh-aw.\nSLI: R1.\nIgnores variables: workflow, job, model (fleet level).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "x": 5,
+        "y": 3,
+        "w": 5,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "A",
+          "expr": "(histogram_quantile(0.95, sum by (le) (increase(gh_aw_job_duration_seconds_bucket{gh_aw_job_name=\"agent\"}[$slo_window])))) and on() ((((1200 - (histogram_quantile(0.95, sum by (le) (increase(gh_aw_job_duration_seconds_bucket{gh_aw_job_name=\"agent\"}[$slo_window]))))) / 300)) < scalar(min(label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\")))) and on() ((((1200 - (histogram_quantile(0.95, sum by (le) (increase(gh_aw_job_duration_seconds_bucket{gh_aw_job_name=\"agent\"}[$slo_window]))))) / 300)) <= scalar(min(label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\"))))",
+          "legendFormat": "Agent job p95 duration (SLO ≤ 20 min)",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "No data",
+          "color": {
+            "mode": "thresholds"
+          },
+          "min": 0,
+          "max": 1500,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 900
+              },
+              {
+                "color": "red",
+                "value": 1200.0000012
+              }
+            ]
+          },
+          "links": [
+            {
+              "title": "Open Responsiveness scan",
+              "url": "/d/gh-aw-slo-responsiveness?${__url_time_range}&${__all_variables}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1500
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 900
+                    },
+                    {
+                      "color": "red",
+                      "value": 1200.0000012
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showThresholdMarkers": true,
+        "showThresholdLabels": true,
+        "orientation": "auto",
+        "minVizHeight": 75,
+        "minVizWidth": 75,
+        "sizing": "auto"
+      }
+    },
+    {
+      "id": 4,
+      "type": "gauge",
+      "title": "Throughput",
+      "description": "Question: Are users happy with Throughput: runs are productive and work gets done? Shows the actual value of the SLI closest to breaching its SLO (smallest headroom), named under the gauge with its SLO. Threshold markers: red = SLO breached, yellow = approaching, green = comfortable. Click to scan which workflows violate it.\nMetrics: Tier A: emitted by gh-aw.\nSLI: T1, T2.\nIgnores variables: workflow, job, model (fleet level).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "x": 10,
+        "y": 3,
+        "w": 5,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "A",
+          "expr": "(((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\",cicd_pipeline_task_run_result=\"success\"}[1d]))) / ((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\",cicd_pipeline_task_run_result=\"success\"}[7d])) / 7) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\",cicd_pipeline_task_run_result=\"success\"}[7d])) / 7) > 0) * 0)) and on() (((((((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\",cicd_pipeline_task_run_result=\"success\"}[1d]))) / ((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\",cicd_pipeline_task_run_result=\"success\"}[7d])) / 7) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\",cicd_pipeline_task_run_result=\"success\"}[7d])) / 7) > 0) * 0)) - 0.6) / 0.15)) < scalar(min(label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\")))) and on() (((((((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\",cicd_pipeline_task_run_result=\"success\"}[1d]))) / ((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\",cicd_pipeline_task_run_result=\"success\"}[7d])) / 7) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\",cicd_pipeline_task_run_result=\"success\"}[7d])) / 7) > 0) * 0)) - 0.6) / 0.15)) <= scalar(min(label_replace((((((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\"}[$slo_window]))) > 0) * 0)) - 0.5) / 0.15), \"sli\", \"T2\", \"\", \"\") or label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\"))))",
+          "legendFormat": "Throughput vs baseline (SLO ≥ 60%)",
+          "instant": true,
+          "range": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "B",
+          "expr": "(((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\"}[$slo_window]))) > 0) * 0)) and on() (((((((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\"}[$slo_window]))) > 0) * 0)) - 0.5) / 0.15)) < scalar(min(label_replace((((((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\",cicd_pipeline_task_run_result=\"success\"}[1d]))) / ((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\",cicd_pipeline_task_run_result=\"success\"}[7d])) / 7) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\",cicd_pipeline_task_run_result=\"success\"}[7d])) / 7) > 0) * 0)) - 0.6) / 0.15), \"sli\", \"T1\", \"\", \"\") or label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\")))) and on() (((((((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\"}[$slo_window]))) > 0) * 0)) - 0.5) / 0.15)) <= scalar(min(label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\"))))",
+          "legendFormat": "Productive outputs per agent run (SLO ≥ 0.5)",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "No data",
+          "color": {
+            "mode": "thresholds"
+          },
+          "min": 0,
+          "max": 1.5,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.6
+              },
+              {
+                "color": "green",
+                "value": 0.75
+              }
+            ]
+          },
+          "links": [
+            {
+              "title": "Open Throughput scan",
+              "url": "/d/gh-aw-slo-throughput?${__url_time_range}&${__all_variables}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1.5
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.6
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.75
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.5
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.65
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showThresholdMarkers": true,
+        "showThresholdLabels": true,
+        "orientation": "auto",
+        "minVizHeight": 75,
+        "minVizWidth": 75,
+        "sizing": "auto"
+      }
+    },
+    {
+      "id": 5,
+      "type": "gauge",
+      "title": "Quality",
+      "description": "Question: Are users happy with Quality: low failure rate and clean completions? Shows the actual value of the SLI closest to breaching its SLO (smallest headroom), named under the gauge with its SLO. Threshold markers: red = SLO breached, yellow = approaching, green = comfortable. Click to scan which workflows violate it.\nMetrics: Tier A: emitted by gh-aw.\nSLI: Q1, Q2, Q3.\nIgnores variables: workflow, job, model (fleet level).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "x": 15,
+        "y": 3,
+        "w": 5,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "A",
+          "expr": "(((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result=\"success\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0) * 0)) and on() (((((((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result=\"success\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0) * 0)) - 0.95) / 0.02)) < scalar(min(label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\")))) and on() (((((((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result=\"success\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0) * 0)) - 0.95) / 0.02)) <= scalar(min(label_replace((((((sum(increase(gh_aw_tool_calls_total{gh_aw_tool_status=\"ok\"}[$slo_window]))) / ((sum(increase(gh_aw_tool_calls_total[$slo_window]))) > 0)) or (((sum(increase(gh_aw_tool_calls_total[$slo_window]))) > 0) * 0)) - 0.9) / 0.05), \"sli\", \"Q2\", \"\", \"\") or label_replace(((0.05 - (((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type=\"report_incomplete\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\"}[$slo_window]))) > 0) * 0))) / 0.01), \"sli\", \"Q3\", \"\", \"\") or label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\"))))",
+          "legendFormat": "Job success ratio (SLO ≥ 95%)",
+          "instant": true,
+          "range": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "B",
+          "expr": "(((sum(increase(gh_aw_tool_calls_total{gh_aw_tool_status=\"ok\"}[$slo_window]))) / ((sum(increase(gh_aw_tool_calls_total[$slo_window]))) > 0)) or (((sum(increase(gh_aw_tool_calls_total[$slo_window]))) > 0) * 0)) and on() (((((((sum(increase(gh_aw_tool_calls_total{gh_aw_tool_status=\"ok\"}[$slo_window]))) / ((sum(increase(gh_aw_tool_calls_total[$slo_window]))) > 0)) or (((sum(increase(gh_aw_tool_calls_total[$slo_window]))) > 0) * 0)) - 0.9) / 0.05)) < scalar(min(label_replace((((((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result=\"success\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0) * 0)) - 0.95) / 0.02), \"sli\", \"Q1\", \"\", \"\") or label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\")))) and on() (((((((sum(increase(gh_aw_tool_calls_total{gh_aw_tool_status=\"ok\"}[$slo_window]))) / ((sum(increase(gh_aw_tool_calls_total[$slo_window]))) > 0)) or (((sum(increase(gh_aw_tool_calls_total[$slo_window]))) > 0) * 0)) - 0.9) / 0.05)) <= scalar(min(label_replace(((0.05 - (((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type=\"report_incomplete\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\"}[$slo_window]))) > 0) * 0))) / 0.01), \"sli\", \"Q3\", \"\", \"\") or label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\"))))",
+          "legendFormat": "Tool call success ratio (SLO ≥ 90%)",
+          "instant": true,
+          "range": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "C",
+          "expr": "(((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type=\"report_incomplete\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\"}[$slo_window]))) > 0) * 0)) and on() ((((0.05 - (((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type=\"report_incomplete\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\"}[$slo_window]))) > 0) * 0))) / 0.01)) < scalar(min(label_replace((((((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result=\"success\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{cicd_pipeline_task_run_result!=\"cancelled\"}[$slo_window]))) > 0) * 0)) - 0.95) / 0.02), \"sli\", \"Q1\", \"\", \"\") or label_replace((((((sum(increase(gh_aw_tool_calls_total{gh_aw_tool_status=\"ok\"}[$slo_window]))) / ((sum(increase(gh_aw_tool_calls_total[$slo_window]))) > 0)) or (((sum(increase(gh_aw_tool_calls_total[$slo_window]))) > 0) * 0)) - 0.9) / 0.05), \"sli\", \"Q2\", \"\", \"\") or label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\")))) and on() ((((0.05 - (((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type=\"report_incomplete\"}[$slo_window]))) / ((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\"}[$slo_window]))) > 0)) or (((sum(increase(gh_aw_job_duration_seconds_count{gh_aw_job_name=\"agent\"}[$slo_window]))) > 0) * 0))) / 0.01)) <= scalar(min(label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\"))))",
+          "legendFormat": "Incomplete-run rate (SLO ≤ 5%)",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "No data",
+          "color": {
+            "mode": "thresholds"
+          },
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.95
+              },
+              {
+                "color": "green",
+                "value": 0.97
+              }
+            ]
+          },
+          "links": [
+            {
+              "title": "Open Quality scan",
+              "url": "/d/gh-aw-slo-quality?${__url_time_range}&${__all_variables}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.95
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.97
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.9
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.95
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 0.1
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.04
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.050000001
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showThresholdMarkers": true,
+        "showThresholdLabels": true,
+        "orientation": "auto",
+        "minVizHeight": 75,
+        "minVizWidth": 75,
+        "sizing": "auto"
+      }
+    },
+    {
+      "id": 6,
+      "type": "gauge",
+      "title": "Cost efficiency",
+      "description": "Question: Are users happy with Cost efficiency: tokens per useful output and a reasonable burn rate? Shows the actual value of the SLI closest to breaching its SLO (smallest headroom), named under the gauge with its SLO. Threshold markers: red = SLO breached, yellow = approaching, green = comfortable. Click to scan which workflows violate it.\nMetrics: Tier A: emitted by gh-aw.\nSLI: C1, C2, C3, C4.\nIgnores variables: workflow, job, model (fleet level).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${ds}"
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 3,
+        "w": 4,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "A",
+          "expr": "(((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[7d])))) / ((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[7d]))) > 0)) or (((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[7d]))) > 0) * 0)) / (((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[28d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[28d])))) / ((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[28d]))) > 0)) or (((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[28d]))) > 0) * 0)) > 0)) and on() ((((1.5 - (((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[7d])))) / ((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[7d]))) > 0)) or (((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[7d]))) > 0) * 0)) / (((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[28d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[28d])))) / ((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[28d]))) > 0)) or (((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[28d]))) > 0) * 0)) > 0))) / 0.3)) < scalar(min(label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\")))) and on() ((((1.5 - (((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[7d])))) / ((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[7d]))) > 0)) or (((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[7d]))) > 0) * 0)) / (((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[28d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[28d])))) / ((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[28d]))) > 0)) or (((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[28d]))) > 0) * 0)) > 0))) / 0.3)) <= scalar(min(label_replace(((2 - ((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[1d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[1d])))) / (((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[7d]))) / 7) > 0)) or ((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[7d]))) / 7) > 0) * 0))) / 0.5), \"sli\", \"C2\", \"\", \"\") or label_replace((((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"cache_read\"}[$slo_window]))) / ((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[$slo_window]))) > 0)) or (((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[$slo_window]))) > 0) * 0)) - 0.4) / 0.1), \"sli\", \"C3\", \"\", \"\") or label_replace(((((round((sum(increase(gh_aw_ai_credits_limit_exceeded_total[$slo_window]))) or vector(0) + (sum(increase(gh_aw_ai_credits_rate_limit_errors_total[$slo_window]))) or vector(0))) or vector(0)) <= bool 0) * 4 - 1), \"sli\", \"C4\", \"\", \"\") or label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\"))))",
+          "legendFormat": "Tokens per productive output vs baseline (SLO ≤ 1.5×)",
+          "instant": true,
+          "range": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "B",
+          "expr": "((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[1d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[1d])))) / (((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[7d]))) / 7) > 0)) or ((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[7d]))) / 7) > 0) * 0)) and on() ((((2 - ((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[1d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[1d])))) / (((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[7d]))) / 7) > 0)) or ((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[7d]))) / 7) > 0) * 0))) / 0.5)) < scalar(min(label_replace(((1.5 - (((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[7d])))) / ((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[7d]))) > 0)) or (((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[7d]))) > 0) * 0)) / (((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[28d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[28d])))) / ((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[28d]))) > 0)) or (((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[28d]))) > 0) * 0)) > 0))) / 0.3), \"sli\", \"C1\", \"\", \"\") or label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\")))) and on() ((((2 - ((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[1d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[1d])))) / (((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[7d]))) / 7) > 0)) or ((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[7d]))) / 7) > 0) * 0))) / 0.5)) <= scalar(min(label_replace((((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"cache_read\"}[$slo_window]))) / ((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[$slo_window]))) > 0)) or (((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[$slo_window]))) > 0) * 0)) - 0.4) / 0.1), \"sli\", \"C3\", \"\", \"\") or label_replace(((((round((sum(increase(gh_aw_ai_credits_limit_exceeded_total[$slo_window]))) or vector(0) + (sum(increase(gh_aw_ai_credits_rate_limit_errors_total[$slo_window]))) or vector(0))) or vector(0)) <= bool 0) * 4 - 1), \"sli\", \"C4\", \"\", \"\") or label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\"))))",
+          "legendFormat": "Burn rate vs baseline (SLO ≤ 2×)",
+          "instant": true,
+          "range": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "C",
+          "expr": "(((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"cache_read\"}[$slo_window]))) / ((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[$slo_window]))) > 0)) or (((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[$slo_window]))) > 0) * 0)) and on() (((((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"cache_read\"}[$slo_window]))) / ((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[$slo_window]))) > 0)) or (((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[$slo_window]))) > 0) * 0)) - 0.4) / 0.1)) < scalar(min(label_replace(((1.5 - (((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[7d])))) / ((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[7d]))) > 0)) or (((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[7d]))) > 0) * 0)) / (((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[28d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[28d])))) / ((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[28d]))) > 0)) or (((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[28d]))) > 0) * 0)) > 0))) / 0.3), \"sli\", \"C1\", \"\", \"\") or label_replace(((2 - ((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[1d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[1d])))) / (((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[7d]))) / 7) > 0)) or ((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[7d]))) / 7) > 0) * 0))) / 0.5), \"sli\", \"C2\", \"\", \"\") or label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\")))) and on() (((((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"cache_read\"}[$slo_window]))) / ((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[$slo_window]))) > 0)) or (((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[$slo_window]))) > 0) * 0)) - 0.4) / 0.1)) <= scalar(min(label_replace(((((round((sum(increase(gh_aw_ai_credits_limit_exceeded_total[$slo_window]))) or vector(0) + (sum(increase(gh_aw_ai_credits_rate_limit_errors_total[$slo_window]))) or vector(0))) or vector(0)) <= bool 0) * 4 - 1), \"sli\", \"C4\", \"\", \"\") or label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\"))))",
+          "legendFormat": "Cache hit ratio (SLO ≥ 40%)",
+          "instant": true,
+          "range": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${ds}"
+          },
+          "refId": "D",
+          "expr": "((round((sum(increase(gh_aw_ai_credits_limit_exceeded_total[$slo_window]))) or vector(0) + (sum(increase(gh_aw_ai_credits_rate_limit_errors_total[$slo_window]))) or vector(0))) or vector(0)) and on() ((((((round((sum(increase(gh_aw_ai_credits_limit_exceeded_total[$slo_window]))) or vector(0) + (sum(increase(gh_aw_ai_credits_rate_limit_errors_total[$slo_window]))) or vector(0))) or vector(0)) <= bool 0) * 4 - 1)) < scalar(min(label_replace(((1.5 - (((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[7d])))) / ((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[7d]))) > 0)) or (((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[7d]))) > 0) * 0)) / (((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[28d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[28d])))) / ((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[28d]))) > 0)) or (((sum(increase(gh_aw_workflow_output_items_total{gh_aw_safe_output_type!=\"noop\"}[28d]))) > 0) * 0)) > 0))) / 0.3), \"sli\", \"C1\", \"\", \"\") or label_replace(((2 - ((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[1d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[1d])))) / (((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[7d]))) / 7) > 0)) or ((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[7d])) + sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"output\"}[7d]))) / 7) > 0) * 0))) / 0.5), \"sli\", \"C2\", \"\", \"\") or label_replace((((((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"cache_read\"}[$slo_window]))) / ((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[$slo_window]))) > 0)) or (((sum(increase(gen_ai_client_token_usage_total{gen_ai_token_type=\"input\"}[$slo_window]))) > 0) * 0)) - 0.4) / 0.1), \"sli\", \"C3\", \"\", \"\") or label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\")))) and on() ((((((round((sum(increase(gh_aw_ai_credits_limit_exceeded_total[$slo_window]))) or vector(0) + (sum(increase(gh_aw_ai_credits_rate_limit_errors_total[$slo_window]))) or vector(0))) or vector(0)) <= bool 0) * 4 - 1)) <= scalar(min(label_replace(vector(1e9), \"sli\", \"none\", \"\", \"\"))))",
+          "legendFormat": "Credit and rate-limit events (SLO ≤ 0)",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:×",
+          "noValue": "No data",
+          "color": {
+            "mode": "thresholds"
+          },
+          "min": 0,
+          "max": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1.2
+              },
+              {
+                "color": "red",
+                "value": 1.5000000015
+              }
+            ]
+          },
+          "links": [
+            {
+              "title": "Open Cost efficiency scan",
+              "url": "/d/gh-aw-slo-cost?${__url_time_range}&${__all_variables}",
+              "targetBlank": false
+            }
+          ]
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "suffix:×"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 2
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 1.2
+                    },
+                    {
+                      "color": "red",
+                      "value": 1.5000000015
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "suffix:×"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 3
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 1.5
+                    },
+                    {
+                      "color": "red",
+                      "value": 2.000000002
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.4
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.5
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "D"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 5
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showThresholdMarkers": true,
+        "showThresholdLabels": true,
+        "orientation": "auto",
+        "minVizHeight": 75,
+        "minVizWidth": 75,
+        "sizing": "auto"
+      }
+    }
+  ]
+}
